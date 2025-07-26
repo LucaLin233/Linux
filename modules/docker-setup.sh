@@ -1,5 +1,5 @@
 #!/bin/bash
-# Docker & NextTrace 配置模块 (优化版 v3.0)
+# Docker & NextTrace 配置模块 (优化版 v3.1)
 # 功能: Docker安装优化、NextTrace网络工具、容器管理
 
 set -euo pipefail
@@ -15,7 +15,6 @@ readonly DEFAULT_CONTAINER_DIRS=(
     "/root/proxy" 
     "/root/vmagent"
     "/opt/docker-compose"
-    "/home/*/docker"
 )
 
 # === 兼容性日志函数 ===
@@ -23,7 +22,7 @@ if ! command -v log &> /dev/null; then
     log() {
         local msg="$1" level="${2:-info}"
         local -A colors=([info]="\033[0;36m" [warn]="\033[0;33m" [error]="\033[0;31m")
-        echo -e "${colors[$level]:-\033[0;32m}$msg\033[0m"
+        echo -e "${colors[$level]:-\033[0m}$msg\033[0m"
     }
 fi
 
@@ -55,7 +54,7 @@ install_docker() {
     
     if command -v docker &>/dev/null; then
         local version
-        version=$(docker --version | awk '{print $3}' | tr -d ',')
+        version=$(docker --version 2>/dev/null | awk '{print $3}' | tr -d ',' || echo "未知")
         log "✓ Docker 已安装: $version" "info"
         return 0
     fi
@@ -70,7 +69,7 @@ install_docker() {
         systemctl enable --now docker
         
         # 验证安装
-        if docker --version; then
+        if docker --version &>/dev/null; then
             log "✓ Docker 服务启动成功" "info"
         else
             log "✗ Docker 服务启动失败" "error"
@@ -142,13 +141,13 @@ EOF
     fi
     
     # 重启Docker服务
-    if systemctl restart docker; then
+    if systemctl restart docker &>/dev/null; then
         log "✓ Docker 配置已应用" "info"
     else
         log "✗ Docker 配置应用失败" "error"
         # 恢复备份
         [[ -f "${DOCKER_DAEMON_CONFIG}.bak" ]] && mv "${DOCKER_DAEMON_CONFIG}.bak" "$DOCKER_DAEMON_CONFIG"
-        systemctl restart docker
+        systemctl restart docker &>/dev/null || true
         return 1
     fi
 }
@@ -159,7 +158,11 @@ install_nexttrace() {
     
     if command -v nexttrace &>/dev/null; then
         local version
-        version=$(nexttrace -V 2>&1 | head -n1 | awk '{print $2}' 2>/dev/null || echo "未知版本")
+        # 修复版本检测逻辑
+        version=$(nexttrace -V 2>/dev/null | head -n1 | awk '{print $2}' 2>/dev/null)
+        if [[ -z "$version" ]]; then
+            version="已安装"
+        fi
         log "✓ NextTrace 已安装: $version" "info"
         return 0
     fi
@@ -167,11 +170,11 @@ install_nexttrace() {
     log "开始安装 NextTrace..." "info"
     
     # 下载并执行安装脚本
-    if curl -Ls "$NEXTTRACE_INSTALL_URL" | bash; then
+    if curl -Ls "$NEXTTRACE_INSTALL_URL" | bash &>/dev/null; then
         # 验证安装
         if command -v nexttrace &>/dev/null; then
             local version
-            version=$(nexttrace -V 2>&1 | head -n1 | awk '{print $2}' 2>/dev/null || echo "安装成功")
+            version=$(nexttrace -V 2>/dev/null | head -n1 | awk '{print $2}' 2>/dev/null || echo "安装成功")
             log "✓ NextTrace 安装成功: $version" "info"
         else
             log "✗ NextTrace 安装验证失败" "error"
@@ -208,36 +211,32 @@ manage_container_projects() {
     log "扫描容器项目..." "info"
     
     local found_projects=0
-    local total_containers=0
     
     # 扫描预定义目录
-    for dir_pattern in "${DEFAULT_CONTAINER_DIRS[@]}"; do
-        # 展开路径（处理通配符）
-        for dir in $dir_pattern; do
-            [[ ! -d "$dir" ]] && continue
-            
-            # 查找 compose 文件
-            local compose_file=""
-            for file in compose.yaml docker-compose.yml docker-compose.yaml compose.yml; do
-                if [[ -f "$dir/$file" ]]; then
-                    compose_file="$file"
-                    break
-                fi
-            done
-            
-            if [[ -n "$compose_file" ]]; then
-                log "  发现项目: $dir/$compose_file" "info"
-                ((found_projects++))
-                
-                # 检查并启动容器
-                start_container_project "$dir" "$compose_file" "$compose_cmd"
-                
-                # 统计运行的容器
-                local running
-                running=$($compose_cmd -f "$dir/$compose_file" ps -q --filter status=running 2>/dev/null | wc -l)
-                total_containers=$((total_containers + running))
+    for dir in "${DEFAULT_CONTAINER_DIRS[@]}"; do
+        # 检查目录是否存在
+        [[ ! -d "$dir" ]] && continue
+        
+        # 查找 compose 文件
+        local compose_file=""
+        for file in compose.yaml docker-compose.yml docker-compose.yaml compose.yml; do
+            if [[ -f "$dir/$file" ]]; then
+                compose_file="$file"
+                break
             fi
         done
+        
+        if [[ -n "$compose_file" ]]; then
+            log "  发现项目: $dir/$compose_file" "info"
+            ((found_projects++))
+            
+            # 检查并启动容器 (安全模式)
+            if start_container_project "$dir" "$compose_file" "$compose_cmd"; then
+                log "    ✓ 项目处理成功" "info"
+            else
+                log "    ⚠ 项目处理遇到问题，已跳过" "warn"
+            fi
+        fi
     done
     
     if (( found_projects == 0 )); then
@@ -248,7 +247,7 @@ manage_container_projects() {
     
     # 显示总体容器状态
     local actual_running
-    actual_running=$(docker ps -q 2>/dev/null | wc -l)
+    actual_running=$(docker ps -q 2>/dev/null | wc -l || echo 0)
     log "当前运行容器总数: $actual_running" "info"
 }
 
@@ -256,31 +255,49 @@ start_container_project() {
     local project_dir="$1"
     local compose_file="$2"
     local compose_cmd="$3"
+    local original_dir
     
-    cd "$project_dir"
+    # 记录原始目录
+    original_dir=$(pwd)
+    
+    # 使用 trap 确保能返回原始目录
+    trap "cd '$original_dir'" RETURN
+    
+    # 切换到项目目录
+    if ! cd "$project_dir" 2>/dev/null; then
+        log "    ✗ 无法进入目录: $project_dir" "error"
+        return 1
+    fi
+    
+    # 检查 compose 文件是否有效
+    if ! $compose_cmd -f "$compose_file" config &>/dev/null; then
+        log "    ⚠ Compose 文件格式无效，跳过: $compose_file" "warn"
+        return 1
+    fi
     
     # 获取项目状态
     local expected_services running_containers
-    expected_services=$($compose_cmd -f "$compose_file" config --services 2>/dev/null | wc -l)
-    running_containers=$($compose_cmd -f "$compose_file" ps -q --filter status=running 2>/dev/null | wc -l)
+    expected_services=$($compose_cmd -f "$compose_file" config --services 2>/dev/null | wc -l || echo 0)
+    running_containers=$($compose_cmd -f "$compose_file" ps -q --filter status=running 2>/dev/null | wc -l || echo 0)
     
     log "    服务状态: $running_containers/$expected_services 运行中" "info"
     
     if (( running_containers < expected_services )); then
         log "    启动容器..." "info"
-        if $compose_cmd -f "$compose_file" up -d --remove-orphans; then
+        if $compose_cmd -f "$compose_file" up -d --remove-orphans &>/dev/null; then
             sleep 2  # 给容器启动时间
             local new_running
-            new_running=$($compose_cmd -f "$compose_file" ps -q --filter status=running 2>/dev/null | wc -l)
+            new_running=$($compose_cmd -f "$compose_file" ps -q --filter status=running 2>/dev/null | wc -l || echo 0)
             log "    ✓ 启动完成: $new_running 个容器运行中" "info"
         else
-            log "    ✗ 容器启动失败" "error"
+            log "    ⚠ 容器启动失败，但继续执行" "warn"
+            return 1
         fi
     else
         log "    ✓ 容器已在运行" "info"
     fi
     
-    cd - >/dev/null
+    return 0
 }
 
 # === 状态摘要 ===
@@ -291,8 +308,8 @@ show_status_summary() {
     # Docker 状态
     if command -v docker &>/dev/null; then
         local version running_containers
-        version=$(docker --version | awk '{print $3}' | tr -d ',')
-        running_containers=$(docker ps -q 2>/dev/null | wc -l)
+        version=$(docker --version 2>/dev/null | awk '{print $3}' | tr -d ',' || echo "未知")
+        running_containers=$(docker ps -q 2>/dev/null | wc -l || echo 0)
         log "  🐳 Docker: $version (运行 $running_containers 个容器)" "info"
         
         if systemctl is-active docker &>/dev/null; then
@@ -307,7 +324,7 @@ show_status_summary() {
     # NextTrace 状态
     if command -v nexttrace &>/dev/null; then
         local nt_version
-        nt_version=$(nexttrace -V 2>&1 | head -n1 | awk '{print $2}' 2>/dev/null || echo "已安装")
+        nt_version=$(nexttrace -V 2>/dev/null | head -n1 | awk '{print $2}' 2>/dev/null || echo "已安装")
         log "  🌐 NextTrace: $nt_version" "info"
     else
         log "  ✗ NextTrace: 未安装" "error"
