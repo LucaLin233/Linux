@@ -485,8 +485,19 @@ resolve_module_dependencies() {
     local -A visited=()
     local -A visiting=()
     
-    # 如果没有选择模块，直接返回
-    if (( ${#selected_modules[@]} == 0 )); then
+    # 清理和验证输入模块
+    local -a clean_modules=()
+    for module in "${selected_modules[@]}"; do
+        # 验证模块名：只允许字母、数字、连字符、下划线
+        if [[ "$module" =~ ^[a-zA-Z0-9_-]+$ ]] && [[ -n "${MODULES[$module]:-}" ]]; then
+            clean_modules+=("$module")
+        else
+            log "跳过无效模块名: $module" "warn"
+        fi
+    done
+    
+    # 如果没有有效模块，直接返回
+    if (( ${#clean_modules[@]} == 0 )); then
         return 0
     fi
     
@@ -495,7 +506,7 @@ resolve_module_dependencies() {
         local module="$1"
         
         # 安全检查模块名
-        if [[ -z "$module" ]]; then
+        if [[ -z "$module" ]] || [[ -z "${MODULES[$module]:-}" ]]; then
             return 1
         fi
         
@@ -514,13 +525,13 @@ resolve_module_dependencies() {
         
         # 处理依赖
         local dep="${MODULE_DEPS[$module]:-}"
-        if [[ -n "$dep" ]]; then
+        if [[ -n "$dep" ]] && [[ -n "${MODULES[$dep]:-}" ]]; then
             # 检查依赖是否在选择列表中
-            if [[ " ${selected_modules[*]} " =~ " $dep " ]]; then
-                visit_module "$dep" || true  # 不要因为依赖失败就退出
+            if [[ " ${clean_modules[*]} " =~ " $dep " ]]; then
+                visit_module "$dep" || true
             else
                 log "模块 $module 需要依赖 $dep，自动添加" "info"
-                selected_modules+=("$dep")
+                clean_modules+=("$dep")
                 visit_module "$dep" || true
             fi
         fi
@@ -533,7 +544,7 @@ resolve_module_dependencies() {
     }
     
     # 解析所有选中的模块
-    for module in "${selected_modules[@]}"; do
+    for module in "${clean_modules[@]}"; do
         if [[ -n "$module" ]]; then
             visit_module "$module" || {
                 log "跳过有问题的模块: $module" "warn"
@@ -547,7 +558,7 @@ resolve_module_dependencies() {
         printf '%s\n' "${resolved_order[@]}"
     else
         # 如果解析失败，返回原始顺序
-        printf '%s\n' "${selected_modules[@]}"
+        printf '%s\n' "${clean_modules[@]}"
     fi
 }
 
@@ -586,14 +597,38 @@ setup_gpg_verification() {
 # --- 安全的模块下载 (支持并发和签名验证) ---
 download_module() {
     local module="$1"
+    
+    # 验证模块名
+    if [[ -z "$module" ]]; then
+        log "模块名为空，跳过下载" "error"
+        return 1
+    fi
+    
+    # 验证模块名格式：只允许字母、数字、连字符、下划线
+    if [[ ! "$module" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+        log "无效模块名格式，跳过下载: '$module'" "error"
+        return 1
+    fi
+    
+    # 验证模块是否在定义列表中
+    if [[ -z "${MODULES[$module]:-}" ]]; then
+        log "未知模块，跳过下载: '$module'" "error"
+        return 1
+    fi
+    
     local module_file="$TEMP_DIR/${module}.sh"
     local sig_file="$TEMP_DIR/${module}.sh.sig"
     local max_retries=3
     
+    debug "开始下载模块: $module"
+    
     for (( retry=1; retry<=max_retries; retry++ )); do
         # 下载模块文件
+        local download_url="$MODULE_BASE_URL/${module}.sh"
+        debug "下载URL: $download_url"
+        
         if curl -fsSL --connect-timeout 10 --max-time 30 \
-           "$MODULE_BASE_URL/${module}.sh" -o "$module_file"; then
+           "$download_url" -o "$module_file"; then
             
             # 基本内容验证
             if [[ -s "$module_file" ]] && head -1 "$module_file" | grep -q "#!/bin/bash"; then
@@ -616,11 +651,14 @@ download_module() {
                 fi
                 
                 chmod +x "$module_file"
+                debug "模块 $module 下载成功"
                 return 0
             else
                 debug "模块 $module 内容格式异常"
                 rm -f "$module_file"
             fi
+        else
+            debug "模块 $module 下载连接失败"
         fi
         
         if (( retry < max_retries )); then
