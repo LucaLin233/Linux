@@ -1,5 +1,5 @@
 #!/bin/bash
-# Mise 版本管理器配置模块 (修复版 v3.1)
+# Mise 版本管理器配置模块 (修复版 v3.2)
 
 set -euo pipefail
 
@@ -27,7 +27,6 @@ check_dependencies() {
                          libncursesw5-dev xz-utils tk-dev libffi-dev liblzma-dev)
     local missing_deps=()
     
-    # 检查编译依赖
     for dep in "${required_deps[@]}"; do
         if ! dpkg -l "$dep" &>/dev/null; then
             missing_deps+=("$dep")
@@ -48,7 +47,6 @@ check_dependencies() {
 install_mise() {
     log "检查并安装 Mise..." "info"
     
-    # 检查是否已安装
     if [[ -f "$MISE_PATH" ]] && "$MISE_PATH" --version &>/dev/null; then
         local current_version
         current_version=$("$MISE_PATH" --version 2>/dev/null | head -1 || echo "未知")
@@ -60,10 +58,8 @@ install_mise() {
     
     log "开始安装 Mise..." "info"
     
-    # 创建目录
     mkdir -p "$HOME/.local/bin" "$MISE_CONFIG_DIR"
     
-    # 使用静默安装，避免输出干扰
     if curl -fsSL "$MISE_INSTALL_URL" | sh >/dev/null 2>&1; then
         log "✓ Mise 安装成功" "info"
     else
@@ -71,7 +67,6 @@ install_mise() {
         return 1
     fi
     
-    # 验证安装
     if [[ -f "$MISE_PATH" ]] && "$MISE_PATH" --version &>/dev/null; then
         local version
         version=$("$MISE_PATH" --version 2>/dev/null | head -1 || echo "未知")
@@ -86,15 +81,14 @@ install_mise() {
 cleanup_old_python() {
     log "清理旧Python版本..." "info"
     
-    # 获取所有已安装的Python版本
     local installed_versions
-    installed_versions=$("$MISE_PATH" list python 2>/dev/null | grep -E "python@[0-9]" | awk '{print $1}' || echo "")
+    installed_versions=$("$MISE_PATH" list python 2>/dev/null | grep -E "python" | awk '{print $1}' || echo "")
     
     if [[ -n "$installed_versions" ]]; then
-        log "发现已安装的Python版本:" "info"
-        echo "$installed_versions" | sed 's/^/  /'
+        echo "发现已安装的Python版本:" >&2
+        echo "$installed_versions" | sed 's/^/  /' >&2
         
-        read -p "是否清理所有旧版本? [y/N]: " -r cleanup_choice
+        read -p "是否清理所有旧版本? [y/N]: " -r cleanup_choice >&2
         if [[ "$cleanup_choice" =~ ^[Yy]$ ]]; then
             echo "$installed_versions" | while read -r version; do
                 if [[ -n "$version" ]]; then
@@ -106,23 +100,23 @@ cleanup_old_python() {
     fi
 }
 
-# === 选择Python版本 ===
+# === 选择Python版本 (修复版) ===
 select_python_version() {
-    # 清屏确保菜单显示正常
-    echo
-    echo "===================="
-    log "选择 Python 版本:" "info"
-    echo "===================="
-    cat << 'EOF'
-1) Python 3.12 (最新稳定版，推荐)
-2) Python 3.11 (LTS版本)
-3) Python 3.10 (兼容性好)
-4) 自定义版本
-5) 跳过 Python 安装
-EOF
-    echo
+    # 所有交互输出到stderr
+    {
+        echo
+        echo "===================="
+        log "选择 Python 版本:" "info"
+        echo "===================="
+        echo "1) Python 3.12 (最新稳定版，推荐)"
+        echo "2) Python 3.11 (LTS版本)"
+        echo "3) Python 3.10 (兼容性好)"
+        echo "4) 自定义版本"
+        echo "5) 跳过 Python 安装"
+        echo
+    } >&2
     
-    read -p "请选择 [1-5, 默认1]: " -r choice
+    read -p "请选择 [1-5, 默认1]: " -r choice >&2
     choice=${choice:-1}
     
     case "$choice" in
@@ -131,12 +125,12 @@ EOF
         3) echo "3.10" ;;
         4) 
             while true; do
-                read -p "请输入Python版本 (如: 3.11.7): " -r custom_version
+                read -p "请输入Python版本 (如: 3.11.7): " -r custom_version >&2
                 if [[ "$custom_version" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]]; then
                     echo "$custom_version"
                     break
                 else
-                    log "版本格式错误，请重新输入" "error"
+                    echo "版本格式错误，请重新输入" >&2
                 fi
             done
             ;;
@@ -157,13 +151,12 @@ setup_python() {
     # 安装指定版本
     log "安装 Python $python_version (这可能需要几分钟)..." "info"
     
-    # 设置环境变量避免交互
     export PYTHON_CONFIGURE_OPTS="--enable-shared"
     
+    # 先安装，再设置为全局
     if "$MISE_PATH" install "python@$python_version" && "$MISE_PATH" use -g "python@$python_version"; then
         log "✓ Python $python_version 安装完成" "info"
         
-        # 等待安装完成
         sleep 2
         
         # 验证安装
@@ -171,7 +164,6 @@ setup_python() {
             local python_path python_ver
             python_path=$("$MISE_PATH" which python 2>/dev/null || echo "未找到")
             
-            # 直接执行python获取版本，而不是通过mise exec
             if [[ -x "$python_path" ]]; then
                 python_ver=$("$python_path" --version 2>/dev/null || echo "版本获取失败")
                 log "  ✓ 安装版本: $python_ver" "info"
@@ -200,24 +192,18 @@ setup_system_python_links() {
     local python_path
     python_path=$("$MISE_PATH" which python 2>/dev/null)
     
-    if [[ -n "$python_path" ]] && [[ -x "$python_path" ]]; then
-        # 验证python可执行
-        if "$python_path" --version &>/dev/null; then
-            # 备份现有链接
-            [[ -L /usr/bin/python ]] && cp -P /usr/bin/python /usr/bin/python.backup 2>/dev/null || true
-            [[ -L /usr/bin/python3 ]] && cp -P /usr/bin/python3 /usr/bin/python3.backup 2>/dev/null || true
-            
-            # 创建新链接
-            ln -sf "$python_path" /usr/bin/python
-            ln -sf "$python_path" /usr/bin/python3
-            
-            log "✓ 系统 Python 链接已创建" "info"
-            log "  /usr/bin/python -> $python_path" "info"
-            log "  /usr/bin/python3 -> $python_path" "info"
-        else
-            log "✗ Python可执行文件验证失败" "error"
-            return 1
-        fi
+    if [[ -n "$python_path" ]] && [[ -x "$python_path" ]] && "$python_path" --version &>/dev/null; then
+        # 备份现有链接
+        [[ -L /usr/bin/python ]] && cp -P /usr/bin/python /usr/bin/python.backup 2>/dev/null || true
+        [[ -L /usr/bin/python3 ]] && cp -P /usr/bin/python3 /usr/bin/python3.backup 2>/dev/null || true
+        
+        # 创建新链接
+        ln -sf "$python_path" /usr/bin/python
+        ln -sf "$python_path" /usr/bin/python3
+        
+        log "✓ 系统 Python 链接已创建" "info"
+        log "  /usr/bin/python -> $python_path" "info"
+        log "  /usr/bin/python3 -> $python_path" "info"
     else
         log "✗ 无法找到有效的 Python 路径" "error"
         return 1
@@ -270,7 +256,6 @@ install_common_packages() {
     read -p "是否安装常用Python包? (pip, virtualenv, etc.) [Y/n]: " -r install_packages
     [[ "$install_packages" =~ ^[Nn]$ ]] && return 0
     
-    # 获取python路径
     local python_path
     python_path=$("$MISE_PATH" which python 2>/dev/null)
     
@@ -301,7 +286,6 @@ show_mise_summary() {
     echo
     log "📋 Mise 配置摘要:" "info"
     
-    # Mise 版本
     if [[ -f "$MISE_PATH" ]]; then
         local version
         version=$("$MISE_PATH" --version 2>/dev/null | head -1 || echo "未知")
@@ -311,7 +295,6 @@ show_mise_summary() {
         return 1
     fi
     
-    # Python 状态
     local python_path
     python_path=$("$MISE_PATH" which python 2>/dev/null)
     
@@ -321,7 +304,6 @@ show_mise_summary() {
         log "  ✓ Python: $python_version" "info"
         log "    路径: $python_path" "info"
         
-        # 检查pip
         if "$python_path" -m pip --version &>/dev/null; then
             local pip_version
             pip_version=$("$python_path" -m pip --version 2>/dev/null | awk '{print $2}' || echo "未知")
@@ -331,7 +313,6 @@ show_mise_summary() {
         log "  ✗ Python: 未配置" "warn"
     fi
     
-    # Shell 集成状态
     if grep -q "mise activate" "$HOME/.bashrc" 2>/dev/null; then
         log "  ✓ Bash 集成: 已配置" "info"
     fi
@@ -345,15 +326,13 @@ show_mise_summary() {
 main() {
     log "🔧 开始 Mise 版本管理器配置..." "info"
     
-    # 检查系统依赖
     check_dependencies
     echo
     
-    # 安装 Mise
     install_mise
     echo
     
-    # Python 配置
+    # 修复：确保只有版本号被捕获
     local python_version
     python_version=$(select_python_version)
     
@@ -361,11 +340,9 @@ main() {
         setup_python "$python_version"
         echo
         
-        # 系统链接
         setup_system_python_links
         echo
         
-        # 安装常用包
         install_common_packages
         echo
     else
@@ -373,10 +350,8 @@ main() {
         echo
     fi
     
-    # Shell 集成
     setup_shell_integration
     
-    # 显示摘要
     show_mise_summary
     
     log "🎉 Mise 配置完成!" "info"
@@ -386,5 +361,4 @@ main() {
     log "  设置版本: mise use python@3.12" "info"
 }
 
-# 执行主流程
 main "$@"
