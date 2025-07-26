@@ -103,12 +103,6 @@ configure_docker_daemon() {
     "max-size": "10m",
     "max-file": "3"
   },
-  "default-ulimits": {
-    "nofile": {
-      "hard": 32768,
-      "soft": 32768
-    }
-  },
   "max-concurrent-downloads": 2,
   "max-concurrent-uploads": 2,
   "live-restore": true,
@@ -117,19 +111,14 @@ configure_docker_daemon() {
 EOF
     else
         log "应用标准配置..." "info"
-        cat > "$DOCKER_DAEMON_CONFIG" << 'EOF'
+        # 标准配置（修复版）
+cat > "$DOCKER_DAEMON_CONFIG" << 'EOF'
 {
   "storage-driver": "overlay2",
   "log-driver": "json-file",
   "log-opts": {
     "max-size": "50m",
     "max-file": "5"
-  },
-  "default-ulimits": {
-    "nofile": {
-      "hard": 65536,
-      "soft": 65536
-    }
   },
   "max-concurrent-downloads": 6,
   "max-concurrent-uploads": 4,
