@@ -492,7 +492,7 @@ resolve_module_dependencies() {
         if [[ "$module" =~ ^[a-zA-Z0-9_-]+$ ]] && [[ -n "${MODULES[$module]:-}" ]]; then
             clean_modules+=("$module")
         else
-            log "跳过无效模块名: $module" "warn"
+            log "跳过无效模块名: $module" "warn" >&2  # 重定向到 stderr
         fi
     done
     
@@ -512,7 +512,7 @@ resolve_module_dependencies() {
         
         # 检查循环依赖
         if [[ -n "${visiting[$module]:-}" ]]; then
-            log "检测到循环依赖: $module，跳过" "warn"
+            log "检测到循环依赖: $module，跳过" "warn" >&2  # 重定向到 stderr
             return 1
         fi
         
@@ -530,7 +530,7 @@ resolve_module_dependencies() {
             if [[ " ${clean_modules[*]} " =~ " $dep " ]]; then
                 visit_module "$dep" || true
             else
-                log "模块 $module 需要依赖 $dep，自动添加" "info"
+                log "模块 $module 需要依赖 $dep，自动添加" "info" >&2  # 重定向到 stderr
                 clean_modules+=("$dep")
                 visit_module "$dep" || true
             fi
@@ -547,13 +547,13 @@ resolve_module_dependencies() {
     for module in "${clean_modules[@]}"; do
         if [[ -n "$module" ]]; then
             visit_module "$module" || {
-                log "跳过有问题的模块: $module" "warn"
+                log "跳过有问题的模块: $module" "warn" >&2  # 重定向到 stderr
                 continue
             }
         fi
     done
     
-    # 返回解析后的顺序
+    # 返回解析后的顺序 (只有这里输出到 stdout)
     if (( ${#resolved_order[@]} > 0 )); then
         printf '%s\n' "${resolved_order[@]}"
     else
@@ -1505,7 +1505,11 @@ show_deployment_summary() {
         echo
         log "✅ 成功执行的模块:" "info"
         for module in "${EXECUTED_MODULES[@]}"; do
-            log "   • $module: ${MODULES[$module]}" "info"
+            if [[ -n "${MODULES[$module]:-}" ]]; then
+                log "   • $module: ${MODULES[$module]}" "info"
+            else
+                log "   • $module: 未知模块" "warn"
+            fi
         done
     fi
     
