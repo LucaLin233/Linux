@@ -11,7 +11,7 @@ set -euo pipefail
 readonly SCRIPT_VERSION="2.5.0"
 readonly STATUS_FILE="/var/lib/system-deploy-status.json"
 readonly CONFIG_FILE="$HOME/setup.conf"
-readonly MODULE_BASE_URL="https://raw.githubusercontent.com/LucaLin233/Luca_Conf/refs/heads/main/Other/modules"
+readonly MODULE_BASE_URL="https://raw.githubusercontent.com/LucaLin233/Linux/refs/heads/main/modules"
 readonly TEMP_DIR="/tmp/debian_setup_modules"
 readonly LOG_FILE="/var/log/debian_setup.log"
 readonly BACKUP_DIR="/var/backups/debian_setup"
