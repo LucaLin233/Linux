@@ -237,7 +237,7 @@ manage_container_projects() {
             log "  发现项目: $dir/$compose_file" "info"
             ((found_projects++))
             
-            # 检查并启动容器 (安全模式)
+            # 安全地处理容器项目
             if start_container_project "$dir" "$compose_file" "$compose_cmd"; then
                 log "    ✓ 项目处理成功" "info"
             else
@@ -253,9 +253,14 @@ manage_container_projects() {
     fi
     
     # 显示总体容器状态
-    local actual_running
-    actual_running=$(docker ps -q 2>/dev/null | wc -l || echo 0)
-    log "当前运行容器总数: $actual_running" "info"
+    local actual_running=0
+    if actual_running=$(docker ps -q 2>/dev/null | wc -l 2>/dev/null); then
+        log "当前运行容器总数: $actual_running" "info"
+    else
+        log "无法获取容器状态" "warn"
+    fi
+    
+    return 0
 }
 
 start_container_project() {
@@ -265,45 +270,72 @@ start_container_project() {
     local original_dir
     
     # 记录原始目录
-    original_dir=$(pwd)
+    original_dir=$(pwd) || return 1
     
-    # 使用 trap 确保能返回原始目录
-    trap "cd '$original_dir'" RETURN
-    
-    # 切换到项目目录
+    # 切换到项目目录，添加错误处理
     if ! cd "$project_dir" 2>/dev/null; then
         log "    ✗ 无法进入目录: $project_dir" "error"
         return 1
     fi
     
-    # 检查 compose 文件是否有效
-    if ! $compose_cmd -f "$compose_file" config &>/dev/null; then
+    # 定义返回函数，确保总是能回到原目录
+    local return_to_original() {
+        cd "$original_dir" || true
+    }
+    
+    # 检查 compose 文件是否有效，添加错误捕获
+    if ! $compose_cmd -f "$compose_file" config >/dev/null 2>&1; then
         log "    ⚠ Compose 文件格式无效，跳过: $compose_file" "warn"
+        return_to_original
         return 1
     fi
     
-    # 获取项目状态
-    local expected_services running_containers
-    expected_services=$($compose_cmd -f "$compose_file" config --services 2>/dev/null | wc -l || echo 0)
-    running_containers=$($compose_cmd -f "$compose_file" ps -q --filter status=running 2>/dev/null | wc -l || echo 0)
+    # 获取项目状态，添加错误处理
+    local expected_services=0
+    local running_containers=0
+    
+    # 安全地获取服务数量
+    if expected_services=$($compose_cmd -f "$compose_file" config --services 2>/dev/null | wc -l 2>/dev/null); then
+        : # 成功获取
+    else
+        expected_services=0
+    fi
+    
+    # 安全地获取运行容器数量
+    if running_containers=$($compose_cmd -f "$compose_file" ps -q --filter status=running 2>/dev/null | wc -l 2>/dev/null); then
+        : # 成功获取
+    else
+        running_containers=0
+    fi
     
     log "    服务状态: $running_containers/$expected_services 运行中" "info"
     
-    if (( running_containers < expected_services )); then
+    # 如果需要启动容器
+    if (( expected_services > 0 && running_containers < expected_services )); then
         log "    启动容器..." "info"
-        if $compose_cmd -f "$compose_file" up -d --remove-orphans &>/dev/null; then
+        
+        # 安全地执行启动命令
+        if $compose_cmd -f "$compose_file" up -d --remove-orphans >/dev/null 2>&1; then
             sleep 2  # 给容器启动时间
-            local new_running
-            new_running=$($compose_cmd -f "$compose_file" ps -q --filter status=running 2>/dev/null | wc -l || echo 0)
-            log "    ✓ 启动完成: $new_running 个容器运行中" "info"
+            
+            # 重新检查运行状态
+            local new_running=0
+            if new_running=$($compose_cmd -f "$compose_file" ps -q --filter status=running 2>/dev/null | wc -l 2>/dev/null); then
+                log "    ✓ 启动完成: $new_running 个容器运行中" "info"
+            else
+                log "    ⚠ 无法获取启动后状态" "warn"
+            fi
         else
             log "    ⚠ 容器启动失败，但继续执行" "warn"
-            return 1
         fi
-    else
+    elif (( expected_services > 0 )); then
         log "    ✓ 容器已在运行" "info"
+    else
+        log "    ⚠ 未检测到有效服务配置" "warn"
     fi
     
+    # 返回原目录
+    return_to_original
     return 0
 }
 
