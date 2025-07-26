@@ -278,15 +278,10 @@ start_container_project() {
         return 1
     fi
     
-    # 定义返回函数，确保总是能回到原目录
-    local return_to_original() {
-        cd "$original_dir" || true
-    }
-    
     # 检查 compose 文件是否有效，添加错误捕获
     if ! $compose_cmd -f "$compose_file" config >/dev/null 2>&1; then
         log "    ⚠ Compose 文件格式无效，跳过: $compose_file" "warn"
-        return_to_original
+        cd "$original_dir" || true  # 直接返回原目录
         return 1
     fi
     
@@ -295,18 +290,10 @@ start_container_project() {
     local running_containers=0
     
     # 安全地获取服务数量
-    if expected_services=$($compose_cmd -f "$compose_file" config --services 2>/dev/null | wc -l 2>/dev/null); then
-        : # 成功获取
-    else
-        expected_services=0
-    fi
+    expected_services=$($compose_cmd -f "$compose_file" config --services 2>/dev/null | wc -l 2>/dev/null) || expected_services=0
     
     # 安全地获取运行容器数量
-    if running_containers=$($compose_cmd -f "$compose_file" ps -q --filter status=running 2>/dev/null | wc -l 2>/dev/null); then
-        : # 成功获取
-    else
-        running_containers=0
-    fi
+    running_containers=$($compose_cmd -f "$compose_file" ps -q --filter status=running 2>/dev/null | wc -l 2>/dev/null) || running_containers=0
     
     log "    服务状态: $running_containers/$expected_services 运行中" "info"
     
@@ -320,11 +307,8 @@ start_container_project() {
             
             # 重新检查运行状态
             local new_running=0
-            if new_running=$($compose_cmd -f "$compose_file" ps -q --filter status=running 2>/dev/null | wc -l 2>/dev/null); then
-                log "    ✓ 启动完成: $new_running 个容器运行中" "info"
-            else
-                log "    ⚠ 无法获取启动后状态" "warn"
-            fi
+            new_running=$($compose_cmd -f "$compose_file" ps -q --filter status=running 2>/dev/null | wc -l 2>/dev/null) || new_running=0
+            log "    ✓ 启动完成: $new_running 个容器运行中" "info"
         else
             log "    ⚠ 容器启动失败，但继续执行" "warn"
         fi
@@ -335,7 +319,7 @@ start_container_project() {
     fi
     
     # 返回原目录
-    return_to_original
+    cd "$original_dir" || true
     return 0
 }
 
