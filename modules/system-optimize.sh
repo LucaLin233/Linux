@@ -1,81 +1,286 @@
 #!/bin/bash
-# 系统优化模块: Zram, 时区, 服务管理
+# 系统优化模块 (优化版 v3.0)
+# 功能: Zram配置、时区设置、系统参数优化
 
-log() {
-    local color="\033[0;32m"
-    case "$2" in
-        "warn") color="\033[0;33m" ;;
-        "error") color="\033[0;31m" ;;
-        "info") color="\033[0;36m" ;;
-    esac
-    echo -e "${color}$1\033[0m"
+set -euo pipefail
+
+# === 常量定义 ===
+readonly ZRAM_CONFIG="/etc/default/zramswap"
+readonly SYSCTL_CONFIG="/etc/sysctl.d/99-debian-optimize.conf"
+readonly DEFAULT_TIMEZONE="Asia/Shanghai"
+
+# === 兼容性日志函数 ===
+if ! command -v log &> /dev/null; then
+    log() {
+        local msg="$1" level="${2:-info}"
+        local -A colors=([info]="\033[0;36m" [warn]="\033[0;33m" [error]="\033[0;31m")
+        echo -e "${colors[$level]:-\033[0;32m}$msg\033[0m"
+    }
+fi
+
+# === 系统信息获取 ===
+get_memory_info() {
+    # 返回物理内存大小(MB)
+    awk '/MemTotal/ {print int($2/1024)}' /proc/meminfo
 }
 
-# 配置 Zram Swap
-log "配置 Zram Swap..." "info"
+get_cpu_cores() {
+    nproc
+}
 
-# 获取物理内存大小 (MB)
-PHYS_MEM_MB=$(grep MemTotal /proc/meminfo | awk '{print int($2/1024)}')
-TARGET_ZRAM_SIZE=""
-
-# 根据物理内存设置 Zram 大小
-if [ "$PHYS_MEM_MB" -gt 2048 ]; then # 大于 2GB 内存
-    TARGET_ZRAM_SIZE="1G"
-    log "Zram 将设置为 1GB" "info"
-else # 小于等于 2GB 内存
-    CALCULATED_ZRAM_MB=$((PHYS_MEM_MB * 2))
-    if [ "$CALCULATED_ZRAM_MB" -ge 1024 ]; then
-        TARGET_ZRAM_SIZE="$((CALCULATED_ZRAM_MB / 1024))G"
-    else
-        TARGET_ZRAM_SIZE="${CALCULATED_ZRAM_MB}M"
+# === Zram 配置模块 ===
+calculate_zram_size() {
+    local mem_mb="$1"
+    local zram_mb
+    
+    if (( mem_mb > 4096 )); then      # >4GB: 固定2GB
+        echo "2G"
+    elif (( mem_mb > 2048 )); then   # 2-4GB: 固定1GB  
+        echo "1G"
+    elif (( mem_mb > 1024 )); then   # 1-2GB: 内存大小
+        echo "${mem_mb}M"
+    else                             # <1GB: 2倍内存
+        zram_mb=$((mem_mb * 2))
+        echo "${zram_mb}M"
     fi
-    log "Zram 将设置为 ${TARGET_ZRAM_SIZE} (物理内存的 2 倍)" "info"
-fi
+}
 
-# 安装 zram-tools
-if ! dpkg -l | grep -q "^ii\s*zram-tools\s"; then
-    log "安装 zram-tools" "info"
-    apt update && apt install -y zram-tools
-fi
-
-# 确保 zramswap 服务已启用
-if ! systemctl is-enabled zramswap.service &>/dev/null; then
-    log "启用 zramswap.service" "info"
+setup_zram() {
+    local mem_mb zram_size
+    
+    log "配置 Zram Swap..." "info"
+    
+    # 检查是否已有交换分区
+    if swapon --show | grep -v zram | grep -q .; then
+        log "检测到现有交换分区:" "warn"
+        swapon --show | grep -v zram
+        read -p "继续配置Zram? [Y/n]: " -r continue_zram
+        [[ "$continue_zram" =~ ^[Nn]$ ]] && return 0
+    fi
+    
+    # 计算Zram大小
+    mem_mb=$(get_memory_info)
+    zram_size=$(calculate_zram_size "$mem_mb")
+    
+    log "内存: ${mem_mb}MB, Zram大小: $zram_size" "info"
+    
+    # 安装zram-tools
+    if ! dpkg -l zram-tools &>/dev/null; then
+        log "安装 zram-tools..." "info"
+        apt-get update -qq
+        apt-get install -y zram-tools
+    fi
+    
+    # 停止现有zram服务
+    if systemctl is-active zramswap.service &>/dev/null; then
+        log "停止现有 zramswap 服务..." "info"
+        systemctl stop zramswap.service
+    fi
+    
+    # 配置zram大小
+    if [[ -f "$ZRAM_CONFIG" ]]; then
+        # 备份原配置
+        cp "$ZRAM_CONFIG" "${ZRAM_CONFIG}.bak"
+        
+        # 更新配置
+        if grep -q "^ZRAM_SIZE=" "$ZRAM_CONFIG"; then
+            sed -i "s/^ZRAM_SIZE=.*/ZRAM_SIZE=\"$zram_size\"/" "$ZRAM_CONFIG"
+        else
+            echo "ZRAM_SIZE=\"$zram_size\"" >> "$ZRAM_CONFIG"
+        fi
+    else
+        # 创建新配置文件
+        echo "ZRAM_SIZE=\"$zram_size\"" > "$ZRAM_CONFIG"
+    fi
+    
+    # 启用并启动服务
     systemctl enable zramswap.service
-fi
-
-# 停止 zramswap 服务以便应用新的配置
-if systemctl is-active zramswap.service &>/dev/null; then
-    log "停止 zramswap.service" "info"
-    systemctl stop zramswap.service
-fi
-
-# 修改 /etc/default/zramswap 文件
-if grep -q "^ZRAM_SIZE=" /etc/default/zramswap; then
-    sudo sed -i "s/^ZRAM_SIZE=.*/ZRAM_SIZE=\"${TARGET_ZRAM_SIZE}\"/" /etc/default/zramswap
-    log "更新 /etc/default/zramswap" "info"
-else
-    echo "ZRAM_SIZE=\"${TARGET_ZRAM_SIZE}\"" | sudo tee -a /etc/default/zramswap
-    log "添加配置到 /etc/default/zramswap" "info"
-fi
-
-# 重新启动 zramswap 服务
-log "启动 zramswap.service" "info"
-systemctl start zramswap.service
-
-log "Zram Swap 配置完成" "info"
-
-# 设置系统时区
-log "设置系统时区..." "info"
-if command -v timedatectl >/dev/null 2>&1; then
-    CURRENT_TZ=$(timedatectl | grep "Time zone" | awk '{print $3}')
-    if [ "$CURRENT_TZ" != "Asia/Shanghai" ]; then
-        timedatectl set-timezone Asia/Shanghai
-        log "时区已设置为 Asia/Shanghai" "info"
+    systemctl start zramswap.service
+    
+    # 验证配置
+    if systemctl is-active zramswap.service &>/dev/null; then
+        log "✓ Zram配置成功" "info"
+        log "  当前交换状态:" "info"
+        swapon --show | sed 's/^/    /'
     else
-        log "时区已是 Asia/Shanghai" "info"
+        log "✗ Zram配置失败" "error"
+        return 1
     fi
-fi
+}
 
-log "系统优化模块完成" "info"
-exit 0
+# === 时区配置模块 ===
+setup_timezone() {
+    local target_tz desired_tz current_tz
+    
+    log "配置系统时区..." "info"
+    
+    if ! command -v timedatectl &>/dev/null; then
+        log "timedatectl 不可用，跳过时区配置" "warn"
+        return 0
+    fi
+    
+    # 获取当前时区
+    current_tz=$(timedatectl show --property=Timezone --value)
+    
+    log "当前时区: $current_tz" "info"
+    
+    # 询问用户
+    cat << 'EOF'
+
+常用时区选择:
+1) Asia/Shanghai (中国标准时间)
+2) UTC (协调世界时)
+3) Asia/Tokyo (日本时间)
+4) Europe/London (伦敦时间)
+5) America/New_York (纽约时间)
+6) 自定义时区
+7) 保持当前时区
+
+EOF
+    
+    read -p "请选择时区 [1-7, 默认1]: " -r tz_choice
+    tz_choice=${tz_choice:-1}
+    
+    case "$tz_choice" in
+        1) target_tz="Asia/Shanghai" ;;
+        2) target_tz="UTC" ;;
+        3) target_tz="Asia/Tokyo" ;;
+        4) target_tz="Europe/London" ;;
+        5) target_tz="America/New_York" ;;
+        6) 
+            while true; do
+                read -p "请输入时区 (如: Asia/Shanghai): " -r desired_tz
+                if timedatectl list-timezones | grep -q "^$desired_tz$"; then
+                    target_tz="$desired_tz"
+                    break
+                else
+                    log "无效时区，请重新输入" "error"
+                fi
+            done
+            ;;
+        7) 
+            log "保持当前时区: $current_tz" "info"
+            return 0
+            ;;
+        *) 
+            log "无效选择，使用默认时区: $DEFAULT_TIMEZONE" "warn"
+            target_tz="$DEFAULT_TIMEZONE"
+            ;;
+    esac
+    
+    # 设置时区
+    if [[ "$current_tz" != "$target_tz" ]]; then
+        timedatectl set-timezone "$target_tz"
+        log "✓ 时区已设置为: $target_tz" "info"
+        log "  当前时间: $(date)" "info"
+    else
+        log "时区无需更改" "info"
+    fi
+}
+
+# === 系统参数优化模块 ===
+setup_sysctl_optimization() {
+    log "配置系统参数优化..." "info"
+    
+    read -p "是否应用系统参数优化? (网络、内存等) [Y/n]: " -r apply_sysctl
+    [[ "$apply_sysctl" =~ ^[Nn]$ ]] && return 0
+    
+    # 创建优化配置
+    cat > "$SYSCTL_CONFIG" << 'EOF'
+# Debian 系统优化参数
+# 生成时间: $(date)
+
+# 网络优化
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+net.core.rmem_max = 16777216
+net.core.wmem_max = 16777216
+net.ipv4.tcp_rmem = 4096 87380 16777216
+net.ipv4.tcp_wmem = 4096 65536 16777216
+
+# 内存管理优化
+vm.swappiness = 10
+vm.vfs_cache_pressure = 50
+vm.dirty_ratio = 15
+vm.dirty_background_ratio = 5
+
+# 文件系统优化
+fs.file-max = 2097152
+fs.inotify.max_user_watches = 524288
+
+EOF
+    
+    # 应用配置
+    if sysctl -p "$SYSCTL_CONFIG" &>/dev/null; then
+        log "✓ 系统参数优化已应用" "info"
+        log "  配置文件: $SYSCTL_CONFIG" "info"
+    else
+        log "✗ 系统参数优化应用失败" "error"
+        return 1
+    fi
+}
+
+# === 显示优化摘要 ===
+show_optimization_summary() {
+    echo
+    log "🎯 系统优化摘要:" "info"
+    
+    # Zram状态
+    if systemctl is-active zramswap.service &>/dev/null; then
+        local zram_info
+        zram_info=$(swapon --show | grep zram | awk '{print $3}')
+        log "  ✓ Zram: ${zram_info:-已启用}" "info"
+    else
+        log "  ✗ Zram: 未配置" "info"
+    fi
+    
+    # 时区状态
+    local current_tz
+    current_tz=$(timedatectl show --property=Timezone --value 2>/dev/null || echo "未知")
+    log "  ✓ 时区: $current_tz" "info"
+    
+    # 系统参数
+    if [[ -f "$SYSCTL_CONFIG" ]]; then
+        log "  ✓ 系统参数: 已优化" "info"
+    else
+        log "  - 系统参数: 未配置" "info"
+    fi
+    
+    # 内存使用情况
+    local mem_usage
+    mem_usage=$(free -h | awk '/^Mem:/ {printf "使用:%s/%s", $3, $2}')
+    log "  📊 内存: $mem_usage" "info"
+}
+
+# === 主执行流程 ===
+main() {
+    log "🔧 开始系统优化配置..." "info"
+    
+    # 显示系统信息
+    local mem_mb cores
+    mem_mb=$(get_memory_info)
+    cores=$(get_cpu_cores)
+    
+    echo
+    log "系统信息:" "info"
+    log "  内存: ${mem_mb}MB" "info" 
+    log "  CPU核心: $cores" "info"
+    log "  内核: $(uname -r)" "info"
+    
+    echo
+    
+    # 执行优化模块
+    setup_zram
+    echo
+    setup_timezone  
+    echo
+    setup_sysctl_optimization
+    
+    # 显示摘要
+    show_optimization_summary
+    
+    log "🎉 系统优化配置完成!" "info"
+}
+
+# 执行主流程
+main "$@"
