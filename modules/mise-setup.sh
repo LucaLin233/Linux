@@ -1,5 +1,5 @@
 #!/bin/bash
-# Mise 版本管理器配置模块 (修复版 v3.2)
+# Mise 版本管理器配置模块 (修复版 v3.3)
 
 set -euo pipefail
 
@@ -100,9 +100,8 @@ cleanup_old_python() {
     fi
 }
 
-# === 选择Python版本 (修复版) ===
+# === 选择Python版本 ===
 select_python_version() {
-    # 所有交互输出到stderr
     {
         echo
         echo "===================="
@@ -145,21 +144,17 @@ setup_python() {
     
     log "配置 Python $python_version..." "info"
     
-    # 清理旧版本
     cleanup_old_python
     
-    # 安装指定版本
     log "安装 Python $python_version (这可能需要几分钟)..." "info"
     
     export PYTHON_CONFIGURE_OPTS="--enable-shared"
     
-    # 先安装，再设置为全局
     if "$MISE_PATH" install "python@$python_version" && "$MISE_PATH" use -g "python@$python_version"; then
         log "✓ Python $python_version 安装完成" "info"
         
         sleep 2
         
-        # 验证安装
         if "$MISE_PATH" which python &>/dev/null; then
             local python_path python_ver
             python_path=$("$MISE_PATH" which python 2>/dev/null || echo "未找到")
@@ -210,46 +205,59 @@ setup_system_python_links() {
     fi
 }
 
-# === Shell 集成配置 ===
+# === Shell 集成配置 (修复版) ===
 setup_shell_integration() {
     log "配置 Shell 集成..." "info"
     
-    local shells_configured=0
+    local bash_success=false
+    local zsh_success=false
     
     # 配置 Bash
     local bashrc="$HOME/.bashrc"
     [[ ! -f "$bashrc" ]] && touch "$bashrc"
     
     if ! grep -q "mise activate bash" "$bashrc"; then
-        echo -e "\n# Mise version manager\neval \"\$($MISE_PATH activate bash)\"" >> "$bashrc"
-        log "  ✓ Bash 集成已添加" "info"
-        ((shells_configured++))
+        if echo -e "\n# Mise version manager\neval \"\$($MISE_PATH activate bash)\"" >> "$bashrc"; then
+            log "  ✓ Bash 集成已添加" "info"
+            bash_success=true
+        else
+            log "  ✗ Bash 集成添加失败" "error"
+        fi
     else
-        log "  Bash: 已配置" "info"
-        ((shells_configured++))
+        log "  ✓ Bash: 已配置" "info"
+        bash_success=true
     fi
     
     # 配置 Zsh (如果可用)
     if command -v zsh &>/dev/null && [[ -f "$HOME/.zshrc" ]]; then
         if ! grep -q "mise activate zsh" "$HOME/.zshrc"; then
-            echo -e "\n# Mise version manager\neval \"\$($MISE_PATH activate zsh)\"" >> "$HOME/.zshrc"
-            log "  ✓ Zsh 集成已添加" "info"
-            ((shells_configured++))
+            if echo -e "\n# Mise version manager\neval \"\$($MISE_PATH activate zsh)\"" >> "$HOME/.zshrc"; then
+                log "  ✓ Zsh 集成已添加" "info"
+                zsh_success=true
+            else
+                log "  ✗ Zsh 集成添加失败" "error"
+            fi
         else
-            log "  Zsh: 已配置" "info"
+            log "  ✓ Zsh: 已配置" "info"
+            zsh_success=true
         fi
+    else
+        # Zsh不可用或配置文件不存在，算作成功
+        zsh_success=true
     fi
     
-    if (( shells_configured > 0 )); then
+    # 只要Bash配置成功就算整体成功
+    if $bash_success; then
         log "✓ Shell 集成配置完成" "info"
         log "  请运行 'source ~/.bashrc' 或重新登录以激活" "warn"
+        return 0
     else
         log "✗ Shell 集成配置失败" "error"
         return 1
     fi
 }
 
-# === 安装常用Python包 ===
+# === 安装常用Python包 (修复版) ===
 install_common_packages() {
     log "安装常用 Python 包..." "info"
     
@@ -265,7 +273,8 @@ install_common_packages() {
     fi
     
     log "更新 pip..." "info"
-    if "$python_path" -m pip install --upgrade pip; then
+    # 添加 --root-user-action=ignore 来避免警告
+    if "$python_path" -m pip install --upgrade pip --root-user-action=ignore >/dev/null; then
         log "✓ pip 更新成功" "info"
     else
         log "⚠ pip 更新失败" "warn"
@@ -274,7 +283,8 @@ install_common_packages() {
     local packages=(setuptools wheel virtualenv pipenv)
     log "安装包: ${packages[*]}" "info"
     
-    if "$python_path" -m pip install "${packages[@]}"; then
+    # 安装包时也添加相同选项，并重定向输出避免过多信息
+    if "$python_path" -m pip install "${packages[@]}" --root-user-action=ignore >/dev/null; then
         log "✓ Python 包安装完成" "info"
     else
         log "⚠ 部分包安装失败" "warn"
@@ -332,7 +342,6 @@ main() {
     install_mise
     echo
     
-    # 修复：确保只有版本号被捕获
     local python_version
     python_version=$(select_python_version)
     
