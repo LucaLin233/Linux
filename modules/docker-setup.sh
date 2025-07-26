@@ -364,9 +364,9 @@ main() {
     configure_docker_daemon "$low_memory"
     echo
     
-    # 安装 NextTrace
-    install_nexttrace
-    echo
+    # 临时注释掉 NextTrace
+    # install_nexttrace
+    # echo
     
     # 管理容器项目
     manage_container_projects
