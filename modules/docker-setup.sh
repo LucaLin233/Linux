@@ -157,20 +157,23 @@ install_nexttrace() {
     log "检查并安装 NextTrace..." "info"
     
     if command -v nexttrace &>/dev/null; then
+        # 修复版本检测，避免输出"未知"
         local version
-        version=$(nexttrace -V 2>&1 | head -n1 | awk '{print $2}' || echo "未知")
-        log "✓ NextTrace 已安装: $version" "info"
+        version=$(nexttrace -V 2>/dev/null | head -n1 | awk '{print $2}' 2>/dev/null)
+        if [[ -n "$version" ]]; then
+            log "✓ NextTrace 已安装: $version" "info"
+        else
+            log "✓ NextTrace 已安装" "info"
+        fi
         return 0
     fi
     
     log "开始安装 NextTrace..." "info"
     
-    # 使用原版的简单方式
-    if curl -Ls https://github.com/sjlleo/nexttrace/raw/main/nt_install.sh | bash; then
+    # 使用原版的简单方式，但捕获所有输出
+    if curl -Ls https://github.com/sjlleo/nexttrace/raw/main/nt_install.sh | bash >/dev/null 2>&1; then
         if command -v nexttrace &>/dev/null; then
-            local version
-            version=$(nexttrace -V 2>&1 | head -n1 | awk '{print $2}' || echo "安装成功")
-            log "✓ NextTrace 安装成功: $version" "info"
+            log "✓ NextTrace 安装成功" "info"
         else
             log "⚠ NextTrace 安装脚本执行了，但命令不可用" "warn"
         fi
@@ -178,7 +181,7 @@ install_nexttrace() {
         log "⚠ NextTrace 安装失败" "warn"
     fi
     
-    # 不管成功失败都返回0，避免影响整个脚本
+    # 总是返回0，避免影响整个脚本
     return 0
 }
 
