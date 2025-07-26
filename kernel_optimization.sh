@@ -157,4 +157,4 @@ fi
 
 echo ""
 echo "🎉 优化完成！"
-echo "提示：如需恢复初始配置，请运行：'curl -fsSL https://raw.githubusercontent.com/LucaLin233/Luca_Conf/refs/heads/main/Other/kernel_optimization.sh | sudo bash -s restore'"
+echo "提示：如需恢复初始配置，请运行：'curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/refs/heads/main/kernel_optimization.sh | sudo bash -s restore'"
