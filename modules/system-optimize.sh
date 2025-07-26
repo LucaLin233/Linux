@@ -1,12 +1,11 @@
 #!/bin/bash
 # 系统优化模块 (优化版 v3.0)
-# 功能: Zram配置、时区设置、系统参数优化
+# 功能: Zram配置、时区设置
 
 set -euo pipefail
 
 # === 常量定义 ===
 readonly ZRAM_CONFIG="/etc/default/zramswap"
-readonly SYSCTL_CONFIG="/etc/sysctl.d/99-debian-optimize.conf"
 readonly DEFAULT_TIMEZONE="Asia/Shanghai"
 
 # === 兼容性日志函数 ===
@@ -24,14 +23,9 @@ get_memory_info() {
     awk '/MemTotal/ {print int($2/1024)}' /proc/meminfo
 }
 
-get_cpu_cores() {
-    nproc
-}
-
 # === Zram 配置模块 ===
 calculate_zram_size() {
     local mem_mb="$1"
-    local zram_mb
     
     if (( mem_mb > 4096 )); then      # >4GB: 固定2GB
         echo "2G"
@@ -40,8 +34,7 @@ calculate_zram_size() {
     elif (( mem_mb > 1024 )); then   # 1-2GB: 内存大小
         echo "${mem_mb}M"
     else                             # <1GB: 2倍内存
-        zram_mb=$((mem_mb * 2))
-        echo "${zram_mb}M"
+        echo "$((mem_mb * 2))M"
     fi
 }
 
@@ -110,7 +103,7 @@ setup_zram() {
 
 # === 时区配置模块 ===
 setup_timezone() {
-    local target_tz desired_tz current_tz
+    local target_tz current_tz
     
     log "配置系统时区..." "info"
     
@@ -178,48 +171,6 @@ EOF
     fi
 }
 
-# === 系统参数优化模块 ===
-setup_sysctl_optimization() {
-    log "配置系统参数优化..." "info"
-    
-    read -p "是否应用系统参数优化? (网络、内存等) [Y/n]: " -r apply_sysctl
-    [[ "$apply_sysctl" =~ ^[Nn]$ ]] && return 0
-    
-    # 创建优化配置
-    cat > "$SYSCTL_CONFIG" << 'EOF'
-# Debian 系统优化参数
-# 生成时间: $(date)
-
-# 网络优化
-net.core.default_qdisc = fq
-net.ipv4.tcp_congestion_control = bbr
-net.core.rmem_max = 16777216
-net.core.wmem_max = 16777216
-net.ipv4.tcp_rmem = 4096 87380 16777216
-net.ipv4.tcp_wmem = 4096 65536 16777216
-
-# 内存管理优化
-vm.swappiness = 10
-vm.vfs_cache_pressure = 50
-vm.dirty_ratio = 15
-vm.dirty_background_ratio = 5
-
-# 文件系统优化
-fs.file-max = 2097152
-fs.inotify.max_user_watches = 524288
-
-EOF
-    
-    # 应用配置
-    if sysctl -p "$SYSCTL_CONFIG" &>/dev/null; then
-        log "✓ 系统参数优化已应用" "info"
-        log "  配置文件: $SYSCTL_CONFIG" "info"
-    else
-        log "✗ 系统参数优化应用失败" "error"
-        return 1
-    fi
-}
-
 # === 显示优化摘要 ===
 show_optimization_summary() {
     echo
@@ -228,7 +179,7 @@ show_optimization_summary() {
     # Zram状态
     if systemctl is-active zramswap.service &>/dev/null; then
         local zram_info
-        zram_info=$(swapon --show | grep zram | awk '{print $3}')
+        zram_info=$(swapon --show | grep zram | awk '{print $3}' | head -1)
         log "  ✓ Zram: ${zram_info:-已启用}" "info"
     else
         log "  ✗ Zram: 未配置" "info"
@@ -239,17 +190,17 @@ show_optimization_summary() {
     current_tz=$(timedatectl show --property=Timezone --value 2>/dev/null || echo "未知")
     log "  ✓ 时区: $current_tz" "info"
     
-    # 系统参数
-    if [[ -f "$SYSCTL_CONFIG" ]]; then
-        log "  ✓ 系统参数: 已优化" "info"
-    else
-        log "  - 系统参数: 未配置" "info"
-    fi
-    
     # 内存使用情况
     local mem_usage
     mem_usage=$(free -h | awk '/^Mem:/ {printf "使用:%s/%s", $3, $2}')
     log "  📊 内存: $mem_usage" "info"
+    
+    # 交换空间使用情况
+    local swap_usage
+    swap_usage=$(free -h | awk '/^Swap:/ {printf "使用:%s/%s", $3, $2}')
+    if [[ "$swap_usage" != "使用:0B/0B" ]]; then
+        log "  💾 交换: $swap_usage" "info"
+    fi
 }
 
 # === 主执行流程 ===
@@ -257,14 +208,13 @@ main() {
     log "🔧 开始系统优化配置..." "info"
     
     # 显示系统信息
-    local mem_mb cores
+    local mem_mb
     mem_mb=$(get_memory_info)
-    cores=$(get_cpu_cores)
     
     echo
     log "系统信息:" "info"
     log "  内存: ${mem_mb}MB" "info" 
-    log "  CPU核心: $cores" "info"
+    log "  CPU核心: $(nproc)" "info"
     log "  内核: $(uname -r)" "info"
     
     echo
@@ -272,9 +222,8 @@ main() {
     # 执行优化模块
     setup_zram
     echo
+    
     setup_timezone  
-    echo
-    setup_sysctl_optimization
     
     # 显示摘要
     show_optimization_summary
