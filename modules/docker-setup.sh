@@ -158,32 +158,28 @@ install_nexttrace() {
     
     if command -v nexttrace &>/dev/null; then
         local version
-        # 修复版本检测逻辑
-        version=$(nexttrace -V 2>/dev/null | head -n1 | awk '{print $2}' 2>/dev/null)
-        if [[ -z "$version" ]]; then
-            version="已安装"
-        fi
+        version=$(nexttrace -V 2>&1 | head -n1 | awk '{print $2}' || echo "未知")
         log "✓ NextTrace 已安装: $version" "info"
         return 0
     fi
     
     log "开始安装 NextTrace..." "info"
     
-    # 下载并执行安装脚本
-    if curl -Ls "$NEXTTRACE_INSTALL_URL" | bash &>/dev/null; then
-        # 验证安装
+    # 使用原版的简单方式
+    if curl -Ls https://github.com/sjlleo/nexttrace/raw/main/nt_install.sh | bash; then
         if command -v nexttrace &>/dev/null; then
             local version
-            version=$(nexttrace -V 2>/dev/null | head -n1 | awk '{print $2}' 2>/dev/null || echo "安装成功")
+            version=$(nexttrace -V 2>&1 | head -n1 | awk '{print $2}' || echo "安装成功")
             log "✓ NextTrace 安装成功: $version" "info"
         else
-            log "✗ NextTrace 安装验证失败" "error"
-            return 1
+            log "⚠ NextTrace 安装脚本执行了，但命令不可用" "warn"
         fi
     else
-        log "✗ NextTrace 安装失败" "error"
-        return 1
+        log "⚠ NextTrace 安装失败" "warn"
     fi
+    
+    # 不管成功失败都返回0，避免影响整个脚本
+    return 0
 }
 
 # === 检测 Docker Compose 命令 ===
