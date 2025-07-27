@@ -1,7 +1,6 @@
 #!/bin/bash
-# 网络性能优化模块 v4.0
-# 功能: BBR拥塞控制、cake队列调度、sysctl优化
-# 统一代码风格，智能备份策略
+# 网络性能优化模块 v4.1
+# 修复网卡检测和tc命令问题
 
 set -euo pipefail
 
@@ -32,17 +31,15 @@ backup_sysctl_config() {
     fi
 }
 
-# 检测主用网络接口
+# 检测主用网络接口（修复版）
 detect_main_interface() {
     local interface
     interface=$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++){if($i=="dev"){print $(i+1);exit}}}' || echo "")
     
     if [[ -z "$interface" ]]; then
-        log "✗ 未检测到主用网卡" "error"
         return 1
     fi
     
-    log "检测到主用网卡: $interface" "info"
     echo "$interface"
 }
 
@@ -163,11 +160,12 @@ EOF
     fi
 }
 
-# 配置网卡队列调度
+# 配置网卡队列调度（修复版）
 configure_interface_qdisc() {
     local interface="$1"
     
     log "配置网卡队列调度..." "info"
+    log "检测到主用网卡: $interface" "info"
     
     # 检查tc命令
     if ! command -v tc &>/dev/null; then
@@ -182,10 +180,13 @@ configure_interface_qdisc() {
     fi
     
     # 切换到cake队列
+    log "切换 $interface 队列为 cake..." "info"
     if tc qdisc replace dev "$interface" root cake 2>/dev/null; then
         log "✓ $interface 队列已切换为 cake" "info"
+        return 0
     else
-        log "✗ $interface 队列切换失败" "warn"
+        log "✗ $interface 队列切换失败 (可能需要管理员权限或硬件不支持)" "warn"
+        return 1
     fi
 }
 
@@ -239,6 +240,7 @@ setup_network_optimization() {
     # 检测网络接口
     local interface
     if ! interface=$(detect_main_interface); then
+        log "✗ 未检测到主用网卡" "error"
         return 1
     fi
     
@@ -258,7 +260,7 @@ setup_network_optimization() {
     verify_network_config
 }
 
-# 显示网络优化摘要
+# 显示网络优化摘要（修复版）
 show_network_summary() {
     echo
     log "🎯 网络优化摘要:" "info"
@@ -288,7 +290,7 @@ show_network_summary() {
         log "  ✓ 最近配置: 已备份" "info"
     fi
     
-    # 主网卡状态
+    # 主网卡状态（修复版）
     local interface
     if interface=$(detect_main_interface 2>/dev/null); then
         if command -v tc &>/dev/null && tc qdisc show dev "$interface" 2>/dev/null | grep -q "cake"; then
@@ -296,6 +298,8 @@ show_network_summary() {
         else
             log "  ✗ 网卡 $interface: 未使用 cake 队列" "info"
         fi
+    else
+        log "  ✗ 网卡检测: 失败" "warn"
     fi
 }
 
