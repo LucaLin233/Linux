@@ -1,7 +1,6 @@
 #!/bin/bash
-# SSH 安全配置模块 v4.0
-# 功能: SSH端口配置、安全设置、密钥管理
-# 统一代码风格，智能备份策略
+# SSH 安全配置模块 v4.1
+# 修复sed兼容性，添加多端口支持
 
 set -euo pipefail
 
@@ -34,10 +33,14 @@ backup_ssh_config() {
 }
 
 # 获取当前SSH端口
-get_current_ssh_port() {
-    local port
-    port=$(grep "^Port " "$SSH_CONFIG" 2>/dev/null | awk '{print $2}' | head -n 1 || echo "")
-    echo "${port:-22}"
+get_current_ssh_ports() {
+    local ports
+    ports=$(grep "^Port " "$SSH_CONFIG" 2>/dev/null | awk '{print $2}' || echo "")
+    if [[ -z "$ports" ]]; then
+        echo "22"
+    else
+        echo "$ports" | tr '\n' ' ' | sed 's/ $//'
+    fi
 }
 
 # 验证端口号
@@ -46,117 +49,163 @@ validate_port() {
     
     # 检查格式
     if ! [[ "$port" =~ ^[0-9]+$ ]]; then
-        log "✗ 无效的端口号格式" "error"
+        log "✗ 无效的端口号格式: $port" "error"
         return 1
     fi
     
     # 检查范围
     if (( port < 1024 || port > 65535 )); then
-        log "✗ 端口号必须在 1024-65535 范围内" "error"
+        log "✗ 端口号必须在 1024-65535 范围内: $port" "error"
         return 1
     fi
     
     # 检查是否被占用
     if ss -tuln 2>/dev/null | grep -q ":$port\b"; then
-        log "✗ 端口 $port 已被占用" "error"
+        log "⚠ 端口 $port 已被占用" "warn"
         return 1
     fi
     
     return 0
 }
 
+# 验证多个端口
+validate_ports() {
+    local ports="$1"
+    local port_array=($ports)
+    local valid_ports=()
+    
+    for port in "${port_array[@]}"; do
+        if validate_port "$port"; then
+            valid_ports+=("$port")
+        fi
+    done
+    
+    if (( ${#valid_ports[@]} == 0 )); then
+        log "✗ 没有有效的端口号" "error"
+        return 1
+    fi
+    
+    echo "${valid_ports[*]}"
+    return 0
+}
+
 # 显示端口选择选项
 show_port_options() {
-    local current_port="$1"
+    local current_ports="$1"
     
     echo >&2
     echo "SSH端口配置:" >&2
-    echo "  1) 保持当前端口 ($current_port)" >&2
-    echo "  2) 使用常用安全端口 (2222)" >&2
-    echo "  3) 使用常用安全端口 (2022)" >&2
-    echo "  4) 自定义端口" >&2
+    echo "  1) 保持当前端口 ($current_ports)" >&2
+    echo "  2) 单端口 - 常用安全端口 (2222)" >&2
+    echo "  3) 单端口 - 常用安全端口 (2022)" >&2
+    echo "  4) 单端口 - 自定义端口" >&2
+    echo "  5) 多端口 - 自定义多个端口" >&2
     echo >&2
 }
 
 # 选择SSH端口
-choose_ssh_port() {
-    local current_port=$(get_current_ssh_port)
+choose_ssh_ports() {
+    local current_ports=$(get_current_ssh_ports)
     
-    log "当前SSH端口: $current_port" "info"
+    log "当前SSH端口: $current_ports" "info"
     
-    show_port_options "$current_port"
+    show_port_options "$current_ports"
     
-    local choice new_port
-    read -p "请选择 [1-4] (默认: 1): " choice </dev/tty >&2
+    local choice new_ports
+    read -p "请选择 [1-5] (默认: 1): " choice </dev/tty >&2
     choice=${choice:-1}
     
     case "$choice" in
         1)
-            log "保持当前端口: $current_port" "info"
-            echo "$current_port"
+            log "保持当前端口: $current_ports" "info"
+            echo "$current_ports"
             ;;
         2)
-            new_port="2222"
-            if validate_port "$new_port"; then
-                echo "$new_port"
+            if validate_port "2222"; then
+                echo "2222"
             else
-                echo "$current_port"
+                echo "$current_ports"
             fi
             ;;
         3)
-            new_port="2022"
-            if validate_port "$new_port"; then
-                echo "$new_port"
+            if validate_port "2022"; then
+                echo "2022"
             else
-                echo "$current_port"
+                echo "$current_ports"
             fi
             ;;
         4)
             while true; do
-                read -p "请输入端口号 (1024-65535): " new_port </dev/tty >&2
-                if [[ -n "$new_port" ]] && validate_port "$new_port"; then
-                    echo "$new_port"
+                read -p "请输入端口号 (1024-65535): " new_ports </dev/tty >&2
+                if [[ -n "$new_ports" ]] && validate_port "$new_ports"; then
+                    echo "$new_ports"
                     break
                 fi
             done
             ;;
+        5)
+            echo >&2
+            log "多端口配置说明:" "info" >&2
+            log "  - 可以监听多个端口，提供更好的可用性" "info" >&2
+            log "  - 用空格分隔端口号，如: 2222 9399 22022" "info" >&2
+            echo >&2
+            while true; do
+                read -p "请输入多个端口号 (用空格分隔): " new_ports </dev/tty >&2
+                if [[ -n "$new_ports" ]]; then
+                    local validated_ports
+                    if validated_ports=$(validate_ports "$new_ports"); then
+                        echo "$validated_ports"
+                        break
+                    fi
+                fi
+            done
+            ;;
         *)
-            log "无效选择，保持当前端口: $current_port" "warn"
-            echo "$current_port"
+            log "无效选择，保持当前端口: $current_ports" "warn"
+            echo "$current_ports"
             ;;
     esac
 }
 
-# 配置SSH端口
-configure_ssh_port() {
-    local new_port="$1"
-    local current_port=$(get_current_ssh_port)
+# 配置SSH端口（修复版）
+configure_ssh_ports() {
+    local new_ports="$1"
+    local current_ports=$(get_current_ssh_ports)
     
-    if [[ "$new_port" == "$current_port" ]]; then
+    if [[ "$new_ports" == "$current_ports" ]]; then
         return 0
     fi
     
-    log "更改SSH端口到 $new_port..." "info"
+    log "配置SSH端口: $new_ports" "info"
     
-    # 移除旧的Port配置
+    # 移除所有旧的Port配置
     sed -i '/^Port /d' "$SSH_CONFIG"
     sed -i '/^#Port /d' "$SSH_CONFIG"
     
-    # 在配置文件开头添加新端口
-    sed -i "1i Port $new_port" "$SSH_CONFIG"
+    # 添加新端口配置（使用更兼容的方法）
+    local temp_file=$(mktemp)
+    local port_array=($new_ports)
     
-    log "✓ SSH端口已配置为 $new_port" "info"
+    # 添加端口配置到临时文件
+    for port in "${port_array[@]}"; do
+        echo "Port $port" >> "$temp_file"
+    done
+    
+    # 添加原配置文件内容
+    cat "$SSH_CONFIG" >> "$temp_file"
+    
+    # 替换原配置文件
+    mv "$temp_file" "$SSH_CONFIG"
+    
+    log "✓ SSH端口已配置为: $new_ports" "info"
 }
 
 # 检查SSH密钥
 check_ssh_keys() {
-    log "检查SSH密钥..." "info"
-    
     # 检查authorized_keys文件
     if [[ -f "$AUTHORIZED_KEYS" && -s "$AUTHORIZED_KEYS" ]]; then
         local key_count=$(grep -c "^ssh-" "$AUTHORIZED_KEYS" 2>/dev/null || echo "0")
         if (( key_count > 0 )); then
-            log "✓ 找到 $key_count 个SSH密钥" "info"
             return 0
         fi
     fi
@@ -165,12 +214,10 @@ check_ssh_keys() {
     local key_files=("$HOME/.ssh/id_rsa.pub" "$HOME/.ssh/id_ed25519.pub" "$HOME/.ssh/id_ecdsa.pub")
     for key_file in "${key_files[@]}"; do
         if [[ -f "$key_file" ]]; then
-            log "找到密钥文件: $key_file" "info"
             return 0
         fi
     done
     
-    log "✗ 未找到SSH密钥" "warn"
     return 1
 }
 
@@ -222,6 +269,9 @@ configure_password_auth() {
     log "  禁用密码认证可提高安全性，但需要确保SSH密钥正常工作" "info"
     
     if check_ssh_keys; then
+        local key_count=$(grep -c "^ssh-" "$AUTHORIZED_KEYS" 2>/dev/null || echo "0")
+        log "✓ 找到 $key_count 个SSH密钥" "info"
+        
         echo
         read -p "是否禁用密码认证 (仅允许密钥登录)? [y/N] (默认: N): " -r disable_password
         
@@ -265,16 +315,24 @@ apply_ssh_config() {
 
 # 显示SSH安全提醒
 show_security_warnings() {
-    local new_port="$1"
-    local current_port=$(get_current_ssh_port)
+    local new_ports="$1"
+    local current_ports=$(get_current_ssh_ports)
     
     echo
     log "🔒 SSH安全提醒:" "warn"
     
-    if [[ "$new_port" != "$current_port" ]]; then
-        log "  ⚠ SSH端口已更改为 $new_port" "warn"
-        log "  ⚠ 请使用新端口连接: ssh -p $new_port user@server" "warn"
-        log "  ⚠ 请确保防火墙允许端口 $new_port" "warn"
+    if [[ "$new_ports" != "$current_ports" ]]; then
+        local port_array=($new_ports)
+        log "  ⚠ SSH端口已更改为: $new_ports" "warn"
+        if (( ${#port_array[@]} == 1 )); then
+            log "  ⚠ 请使用新端口连接: ssh -p ${port_array[0]} user@server" "warn"
+        else
+            log "  ⚠ 可使用任意配置的端口连接" "warn"
+            for port in "${port_array[@]}"; do
+                log "    ssh -p $port user@server" "warn"
+            done
+        fi
+        log "  ⚠ 请确保防火墙允许这些端口" "warn"
     fi
     
     if grep -q "PasswordAuthentication no" "$SSH_CONFIG"; then
@@ -293,8 +351,13 @@ show_ssh_summary() {
     log "🎯 SSH配置摘要:" "info"
     
     # SSH端口
-    local current_port=$(get_current_ssh_port)
-    log "  🔌 SSH端口: $current_port" "info"
+    local current_ports=$(get_current_ssh_ports)
+    local port_array=($current_ports)
+    if (( ${#port_array[@]} == 1 )); then
+        log "  🔌 SSH端口: $current_ports" "info"
+    else
+        log "  🔌 SSH端口: $current_ports (多端口)" "info"
+    fi
     
     # 认证方式
     if grep -q "PasswordAuthentication no" "$SSH_CONFIG"; then
@@ -322,8 +385,9 @@ show_ssh_summary() {
     fi
     
     # SSH密钥状态
-    if check_ssh_keys >/dev/null 2>&1; then
-        log "  🔐 SSH密钥: 已配置" "info"
+    if check_ssh_keys; then
+        local key_count=$(grep -c "^ssh-" "$AUTHORIZED_KEYS" 2>/dev/null || echo "0")
+        log "  🔐 SSH密钥: 已配置 ($key_count 个)" "info"
     else
         log "  🔐 SSH密钥: 未配置" "warn"
     fi
@@ -335,11 +399,11 @@ main() {
     
     echo
     # 选择SSH端口
-    local new_port=$(choose_ssh_port)
+    local new_ports=$(choose_ssh_ports)
     
     echo
     # 配置SSH端口
-    configure_ssh_port "$new_port"
+    configure_ssh_ports "$new_ports"
     
     echo
     # 配置安全设置
@@ -356,7 +420,7 @@ main() {
     fi
     
     # 显示安全提醒
-    show_security_warnings "$new_port"
+    show_security_warnings "$new_ports"
     
     # 显示配置摘要
     show_ssh_summary
@@ -365,9 +429,18 @@ main() {
     log "🎉 SSH安全配置完成!" "info"
     
     # 显示有用的命令
+    local final_ports=$(get_current_ssh_ports)
+    local port_array=($final_ports)
     echo
     log "常用命令:" "info"
-    log "  测试SSH连接: ssh -p $new_port -o ConnectTimeout=5 user@server" "info"
+    if (( ${#port_array[@]} == 1 )); then
+        log "  测试SSH连接: ssh -p ${port_array[0]} -o ConnectTimeout=5 user@server" "info"
+    else
+        log "  测试SSH连接 (任选端口):" "info"
+        for port in "${port_array[@]}"; do
+            log "    ssh -p $port -o ConnectTimeout=5 user@server" "info"
+        done
+    fi
     log "  查看SSH状态: systemctl status sshd" "info"
     log "  恢复配置: cp $SSH_CONFIG.backup $SSH_CONFIG" "info"
     log "  重启SSH: systemctl restart sshd" "info"
