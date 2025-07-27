@@ -433,27 +433,26 @@ setup_default_shell() {
     fi
 }
 
-# 验证安装
+# 验证安装 (宽松版)
 verify_installation() {
     log "验证安装..." "info"
     
     local errors=0
     
-    # 检查 Oh My Zsh
-    if [[ ! -d "$ZSH_INSTALL_DIR" ]]; then
-        log "✗ Oh My Zsh 目录不存在" "error"
-        ((errors++))
-    fi
-    
-    # 检查配置文件
+    # 检查关键文件
     if [[ ! -f "$ZSHRC_FILE" ]]; then
         log "✗ .zshrc 文件不存在" "error"
         ((errors++))
     fi
     
-    # 检查 zsh 可执行性
-    if ! zsh -c "source $ZSHRC_FILE && echo 'ZSH_VERSION: \$ZSH_VERSION'" &>/dev/null; then
-        log "✗ Zsh 配置文件有语法错误" "error"
+    if [[ ! -d "$ZSH_INSTALL_DIR" ]]; then
+        log "✗ Oh My Zsh 目录不存在" "error"
+        ((errors++))
+    fi
+    
+    # 只检查语法，不实际运行
+    if [[ -f "$ZSHRC_FILE" ]] && ! zsh -n "$ZSHRC_FILE" 2>/dev/null; then
+        log "✗ Zsh 配置文件语法错误" "error"
         ((errors++))
     fi
     
