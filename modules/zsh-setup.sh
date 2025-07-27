@@ -351,7 +351,7 @@ install_plugins() {
     return 0
 }
 
-# 生成 .zshrc 配置 (最终修复版)
+# 生成 .zshrc 配置 (防冲突版)
 generate_zshrc_config() {
     local theme="$1"
     local plugins="$2"
@@ -376,10 +376,16 @@ plugins=(PLUGINS_PLACEHOLDER)
 # 加载 Oh My Zsh
 source $ZSH/oh-my-zsh.sh
 autoload -U compinit && compinit
-export PATH="$HOME/.local/bin:$PATH"
 
-# mise 版本管理器配置
-command -v mise >/dev/null 2>&1 && eval "$(mise activate zsh)"
+# 防止重复设置 PATH
+if [[ ":$PATH:" != *":$HOME/.local/bin:"* ]]; then
+    export PATH="$HOME/.local/bin:$PATH"
+fi
+
+# mise 版本管理器配置 (防止重复激活)
+if [[ -z "$MISE_SHELL" ]] && command -v mise >/dev/null 2>&1; then
+    eval "$(mise activate zsh)"
+fi
 
 # 实用别名
 alias ll='ls -alF'
