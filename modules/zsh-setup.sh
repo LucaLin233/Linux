@@ -351,7 +351,7 @@ install_plugins() {
     return 0
 }
 
-# 生成 .zshrc 配置
+# 生成 .zshrc 配置 (保留自定义别名版)
 generate_zshrc_config() {
     local theme="$1"
     local plugins="$2"
@@ -361,33 +361,25 @@ generate_zshrc_config() {
     # 备份现有配置
     [[ -f "$ZSHRC_FILE" ]] && cp "$ZSHRC_FILE" "${ZSHRC_FILE}.backup.$(date +%Y%m%d_%H%M%S)"
     
-    cat > "$ZSHRC_FILE" << EOF
-# Oh My Zsh 配置 - 自动生成于 $(date)
-export ZSH="\$HOME/.oh-my-zsh"
-
-# 主题配置
-ZSH_THEME="$theme"
+    cat > "$ZSHRC_FILE" << 'ZSHRC_EOF'
+# Oh My Zsh 配置
+export ZSH="$HOME/.oh-my-zsh"
+ZSH_THEME="THEME_PLACEHOLDER"
 
 # 更新配置
 DISABLE_UPDATE_PROMPT="true"
 UPDATE_ZSH_DAYS=7
 
 # 插件配置
-plugins=(
-$(echo "$plugins" | tr ' ' '\n' | sed 's/^/    /' | sed 's/$//')
-)
+plugins=(PLUGINS_PLACEHOLDER)
 
 # 加载 Oh My Zsh
-source \$ZSH/oh-my-zsh.sh
-
-# 自动补全
+source $ZSH/oh-my-zsh.sh
 autoload -U compinit && compinit
-
-# 环境变量
-export PATH="\$HOME/.local/bin:\$PATH"
+export PATH="$HOME/.local/bin:$PATH"
 
 # mise 版本管理器配置
-command -v mise >/dev/null 2>&1 && eval "\$(mise activate zsh)"
+command -v mise >/dev/null 2>&1 && eval "$(mise activate zsh)"
 
 # Powerlevel10k 配置
 [[ ! -f ~/.p10k.zsh ]] || source ~/.p10k.zsh
@@ -398,15 +390,18 @@ alias la='ls -A'
 alias l='ls -CF'
 alias upgrade='apt update && apt full-upgrade -y'
 alias update='apt update -y'
+alias reproxy='cd /root/proxy && docker compose down && docker compose pull && docker compose up -d --remove-orphans'
 alias autodel='docker system prune -a -f && apt autoremove -y'
+alias copyall='cd /root/copy && ansible-playbook -i inventory.ini copyhk.yml && ansible-playbook -i inventory.ini copysg.yml && ansible-playbook -i inventory.ini copyother.yml'
 
-# 自定义配置 (在这里添加个人配置)
-# ===== 个人配置区域 =====
-
-# 如果存在个人配置文件，则加载
+# 个人配置
 [[ -f ~/.zshrc.local ]] && source ~/.zshrc.local
-EOF
+ZSHRC_EOF
 
+    # 替换占位符
+    sed -i "s/THEME_PLACEHOLDER/$theme/" "$ZSHRC_FILE"
+    sed -i "s/PLUGINS_PLACEHOLDER/$plugins/" "$ZSHRC_FILE"
+    
     log "✓ .zshrc 配置生成完成" "info"
     return 0
 }
