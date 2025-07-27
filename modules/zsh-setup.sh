@@ -189,7 +189,7 @@ get_theme_choice() {
     echo "$theme_name"
 }
 
-# 安装主题
+# 安装主题 (修复版)
 install_theme() {
     local theme_choice="$1"
     
@@ -351,7 +351,7 @@ install_plugins() {
     return 0
 }
 
-# 生成 .zshrc 配置 (修复 sed 问题版)
+# 生成 .zshrc 配置 (最终修复版)
 generate_zshrc_config() {
     local theme="$1"
     local plugins="$2"
@@ -361,7 +361,7 @@ generate_zshrc_config() {
     # 备份现有配置
     [[ -f "$ZSHRC_FILE" ]] && cp "$ZSHRC_FILE" "${ZSHRC_FILE}.backup.$(date +%Y%m%d_%H%M%S)"
     
-    cat > "$ZSHRC_FILE" << 'ZSHRC_EOF'
+    cat > "$ZSHRC_FILE" << 'EOF'
 # Oh My Zsh 配置
 export ZSH="$HOME/.oh-my-zsh"
 ZSH_THEME="THEME_PLACEHOLDER"
@@ -381,9 +381,6 @@ export PATH="$HOME/.local/bin:$PATH"
 # mise 版本管理器配置
 command -v mise >/dev/null 2>&1 && eval "$(mise activate zsh)"
 
-# Powerlevel10k 配置
-[[ ! -f ~/.p10k.zsh ]] || source ~/.p10k.zsh
-
 # 实用别名
 alias ll='ls -alF'
 alias la='ls -A'
@@ -394,11 +391,15 @@ alias reproxy='cd /root/proxy && docker compose down && docker compose pull && d
 alias autodel='docker system prune -a -f && apt autoremove -y'
 alias copyall='cd /root/copy && ansible-playbook -i inventory.ini copyhk.yml && ansible-playbook -i inventory.ini copysg.yml && ansible-playbook -i inventory.ini copyother.yml'
 
+# Powerlevel10k 配置
+POWERLEVEL9K_DISABLE_CONFIGURATION_WIZARD=true
+[[ ! -f ~/.p10k.zsh ]] || source ~/.p10k.zsh
+
 # 个人配置
 [[ -f ~/.zshrc.local ]] && source ~/.zshrc.local
-ZSHRC_EOF
+EOF
 
-    # 使用 | 作为分隔符避免冲突
+    # 替换占位符
     sed -i "s|THEME_PLACEHOLDER|$theme|" "$ZSHRC_FILE"
     sed -i "s|PLUGINS_PLACEHOLDER|$plugins|" "$ZSHRC_FILE"
     
@@ -439,14 +440,14 @@ verify_installation() {
     
     local errors=0
     
-    # 检查关键文件
-    if [[ ! -f "$ZSHRC_FILE" ]]; then
-        log "✗ .zshrc 文件不存在" "error"
+    # 检查关键文件和目录
+    if [[ ! -d "$ZSH_INSTALL_DIR" ]]; then
+        log "✗ Oh My Zsh 目录不存在" "error"
         ((errors++))
     fi
     
-    if [[ ! -d "$ZSH_INSTALL_DIR" ]]; then
-        log "✗ Oh My Zsh 目录不存在" "error"
+    if [[ ! -f "$ZSHRC_FILE" ]]; then
+        log "✗ .zshrc 文件不存在" "error"
         ((errors++))
     fi
     
@@ -456,8 +457,15 @@ verify_installation() {
         ((errors++))
     fi
     
+    # 检查基本功能 (不加载完整配置)
+    if ! zsh --no-rcs -c "echo 'test'" &>/dev/null; then
+        log "✗ Zsh 基本功能异常" "error"
+        ((errors++))
+    fi
+    
     if [[ $errors -eq 0 ]]; then
         log "✓ 安装验证通过" "info"
+        log "💡 运行 'exec zsh' 启动新环境" "info"
         return 0
     else
         log "安装验证失败，发现 $errors 个错误" "error"
