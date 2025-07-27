@@ -1,6 +1,6 @@
 #!/bin/bash
-# SSH 安全配置模块 v4.2
-# 修复配置重复问题，使用配置文件重新生成方案
+# SSH 安全配置模块 v4.3
+# 修复配置验证失败问题，添加调试信息
 
 set -euo pipefail
 
@@ -188,7 +188,7 @@ check_ssh_keys() {
     return 1
 }
 
-# 配置SSH安全设置（修复版 - 重新生成配置文件）
+# 配置SSH安全设置（修复版 - 更保守的过滤策略）
 configure_ssh_security() {
     local new_ports="$1"
     local password_auth="$2"
@@ -200,14 +200,34 @@ configure_ssh_security() {
     # 创建临时配置文件
     local temp_config=$(mktemp)
     
-    # 过滤掉我们要管理的参数，保留其他配置
-    # 使用更精确的正则表达式匹配
-    grep -v -E "^(Port |Protocol |PermitRootLogin |PasswordAuthentication |PubkeyAuthentication |AuthorizedKeysFile |MaxAuthTries |ClientAliveInterval |ClientAliveCountMax |LoginGraceTime |# SSH安全配置)" "$SSH_CONFIG" | \
-    grep -v -E "^# 安全配置$" > "$temp_config"
+    # 更保守的过滤策略：只删除我们明确要管理的行
+    # 保留所有注释和其他配置
+    cat "$SSH_CONFIG" | while read -r line; do
+        # 跳过我们要重新配置的参数行
+        if [[ "$line" =~ ^Port[[:space:]] ]] || \
+           [[ "$line" =~ ^Protocol[[:space:]] ]] || \
+           [[ "$line" =~ ^PermitRootLogin[[:space:]] ]] || \
+           [[ "$line" =~ ^PasswordAuthentication[[:space:]] ]] || \
+           [[ "$line" =~ ^PubkeyAuthentication[[:space:]] ]] || \
+           [[ "$line" =~ ^AuthorizedKeysFile[[:space:]] ]] || \
+           [[ "$line" =~ ^MaxAuthTries[[:space:]] ]] || \
+           [[ "$line" =~ ^ClientAliveInterval[[:space:]] ]] || \
+           [[ "$line" =~ ^ClientAliveCountMax[[:space:]] ]] || \
+           [[ "$line" =~ ^LoginGraceTime[[:space:]] ]] || \
+           [[ "$line" =~ ^#[[:space:]]*SSH安全配置 ]] || \
+           [[ "$line" =~ ^#[[:space:]]*安全配置$ ]]; then
+            continue
+        fi
+        
+        # 保留其他所有行
+        echo "$line"
+    done > "$temp_config"
     
-    # 添加端口配置
-    echo "" >> "$temp_config"
-    echo "# SSH安全配置 - 由脚本管理" >> "$temp_config"
+    # 添加我们的安全配置
+    cat >> "$temp_config" << EOF
+
+# SSH安全配置 - 由脚本管理
+EOF
     
     # 添加端口配置
     local port_array=($new_ports)
@@ -263,13 +283,25 @@ configure_password_auth() {
     fi
 }
 
-# 验证并应用SSH配置
+# 验证并应用SSH配置（增强版 - 添加详细错误信息）
 apply_ssh_config() {
     log "验证SSH配置..." "info"
     
     # 验证配置文件语法
-    if ! sshd -t 2>/dev/null; then
-        log "✗ SSH配置验证失败，恢复备份" "error"
+    local sshd_test_output
+    sshd_test_output=$(sshd -t 2>&1)
+    local sshd_test_result=$?
+    
+    if [[ $sshd_test_result -ne 0 ]]; then
+        log "✗ SSH配置验证失败" "error"
+        log "错误详情:" "error"
+        echo "$sshd_test_output" | sed 's/^/  /' >&2
+        
+        # 显示生成的配置文件（调试用）
+        log "生成的配置文件内容（最后20行）:" "warn"
+        tail -20 "$SSH_CONFIG" | sed 's/^/  /' >&2
+        
+        log "恢复备份配置..." "info"
         cp "$SSH_CONFIG.backup" "$SSH_CONFIG"
         systemctl reload sshd
         return 1
