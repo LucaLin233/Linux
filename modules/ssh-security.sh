@@ -1,6 +1,6 @@
 #!/bin/bash
-# SSH 安全配置模块 v4.1
-# 修复sed兼容性，添加多端口支持
+# SSH 安全配置模块 v4.2
+# 修复配置重复问题，使用配置文件重新生成方案
 
 set -euo pipefail
 
@@ -167,39 +167,6 @@ choose_ssh_ports() {
     esac
 }
 
-# 配置SSH端口（修复版）
-configure_ssh_ports() {
-    local new_ports="$1"
-    local current_ports=$(get_current_ssh_ports)
-    
-    if [[ "$new_ports" == "$current_ports" ]]; then
-        return 0
-    fi
-    
-    log "配置SSH端口: $new_ports" "info"
-    
-    # 移除所有旧的Port配置
-    sed -i '/^Port /d' "$SSH_CONFIG"
-    sed -i '/^#Port /d' "$SSH_CONFIG"
-    
-    # 添加新端口配置（使用更兼容的方法）
-    local temp_file=$(mktemp)
-    local port_array=($new_ports)
-    
-    # 添加端口配置到临时文件
-    for port in "${port_array[@]}"; do
-        echo "Port $port" >> "$temp_file"
-    done
-    
-    # 添加原配置文件内容
-    cat "$SSH_CONFIG" >> "$temp_file"
-    
-    # 替换原配置文件
-    mv "$temp_file" "$SSH_CONFIG"
-    
-    log "✓ SSH端口已配置为: $new_ports" "info"
-}
-
 # 检查SSH密钥
 check_ssh_keys() {
     # 检查authorized_keys文件
@@ -221,34 +188,35 @@ check_ssh_keys() {
     return 1
 }
 
-# 配置SSH安全设置
+# 配置SSH安全设置（修复版 - 重新生成配置文件）
 configure_ssh_security() {
+    local new_ports="$1"
+    local password_auth="$2"
+    
     log "配置SSH安全设置..." "info"
     
     backup_ssh_config
     
-    # 移除可能冲突的旧配置
-    local security_params=(
-        "PermitRootLogin"
-        "PasswordAuthentication"
-        "Protocol"
-        "MaxAuthTries"
-        "ClientAliveInterval"
-        "ClientAliveCountMax"
-        "LoginGraceTime"
-        "PubkeyAuthentication"
-        "AuthorizedKeysFile"
-    )
+    # 创建临时配置文件
+    local temp_config=$(mktemp)
     
-    for param in "${security_params[@]}"; do
-        sed -i "/^${param}/d" "$SSH_CONFIG"
-        sed -i "/^#${param}/d" "$SSH_CONFIG"
+    # 过滤掉我们要管理的参数，保留其他配置
+    # 使用更精确的正则表达式匹配
+    grep -v -E "^(Port |Protocol |PermitRootLogin |PasswordAuthentication |PubkeyAuthentication |AuthorizedKeysFile |MaxAuthTries |ClientAliveInterval |ClientAliveCountMax |LoginGraceTime |# SSH安全配置)" "$SSH_CONFIG" | \
+    grep -v -E "^# 安全配置$" > "$temp_config"
+    
+    # 添加端口配置
+    echo "" >> "$temp_config"
+    echo "# SSH安全配置 - 由脚本管理" >> "$temp_config"
+    
+    # 添加端口配置
+    local port_array=($new_ports)
+    for port in "${port_array[@]}"; do
+        echo "Port $port" >> "$temp_config"
     done
     
-    # 添加基础安全配置
-    cat >> "$SSH_CONFIG" << 'EOF'
-
-# SSH安全配置
+    # 添加安全配置
+    cat >> "$temp_config" << 'EOF'
 Protocol 2
 PermitRootLogin prohibit-password
 PubkeyAuthentication yes
@@ -259,7 +227,13 @@ ClientAliveCountMax 3
 LoginGraceTime 60
 EOF
     
-    log "✓ 基础安全设置已应用" "info"
+    # 添加密码认证配置
+    echo "PasswordAuthentication $password_auth" >> "$temp_config"
+    
+    # 替换原配置文件
+    mv "$temp_config" "$SSH_CONFIG"
+    
+    log "✓ SSH安全设置已应用" "info"
 }
 
 # 配置密码认证
@@ -276,17 +250,16 @@ configure_password_auth() {
         read -p "是否禁用密码认证 (仅允许密钥登录)? [y/N] (默认: N): " -r disable_password
         
         if [[ "$disable_password" =~ ^[Yy]$ ]]; then
-            echo "PasswordAuthentication no" >> "$SSH_CONFIG"
-            log "✓ 已禁用密码认证" "info"
-            log "⚠ 请确保SSH密钥工作正常!" "warn"
+            log "✓ 将禁用密码认证" "info"
+            echo "no"
         else
-            echo "PasswordAuthentication yes" >> "$SSH_CONFIG"
             log "保持密码认证启用" "info"
+            echo "yes"
         fi
     else
-        echo "PasswordAuthentication yes" >> "$SSH_CONFIG"
         log "⚠ 未找到SSH密钥，保持密码认证启用" "warn"
         log "建议先配置SSH密钥后再禁用密码认证" "warn"
+        echo "yes"
     fi
 }
 
@@ -316,26 +289,24 @@ apply_ssh_config() {
 # 显示SSH安全提醒
 show_security_warnings() {
     local new_ports="$1"
-    local current_ports=$(get_current_ssh_ports)
+    local password_auth="$2"
     
     echo
     log "🔒 SSH安全提醒:" "warn"
     
-    if [[ "$new_ports" != "$current_ports" ]]; then
-        local port_array=($new_ports)
-        log "  ⚠ SSH端口已更改为: $new_ports" "warn"
-        if (( ${#port_array[@]} == 1 )); then
-            log "  ⚠ 请使用新端口连接: ssh -p ${port_array[0]} user@server" "warn"
-        else
-            log "  ⚠ 可使用任意配置的端口连接" "warn"
-            for port in "${port_array[@]}"; do
-                log "    ssh -p $port user@server" "warn"
-            done
-        fi
-        log "  ⚠ 请确保防火墙允许这些端口" "warn"
+    local port_array=($new_ports)
+    log "  ⚠ 当前SSH端口: $new_ports" "warn"
+    if (( ${#port_array[@]} == 1 )); then
+        log "  ⚠ 请使用端口连接: ssh -p ${port_array[0]} user@server" "warn"
+    else
+        log "  ⚠ 可使用任意配置的端口连接" "warn"
+        for port in "${port_array[@]}"; do
+            log "    ssh -p $port user@server" "warn"
+        done
     fi
+    log "  ⚠ 请确保防火墙允许这些端口" "warn"
     
-    if grep -q "PasswordAuthentication no" "$SSH_CONFIG"; then
+    if [[ "$password_auth" == "no" ]]; then
         log "  🔑 密码认证已禁用，仅允许密钥登录" "warn"
         log "  🔑 请确保SSH密钥配置正确" "warn"
     fi
@@ -401,16 +372,12 @@ main() {
     # 选择SSH端口
     local new_ports=$(choose_ssh_ports)
     
-    echo
-    # 配置SSH端口
-    configure_ssh_ports "$new_ports"
-    
-    echo
-    # 配置安全设置
-    configure_ssh_security
-    
     # 配置密码认证
-    configure_password_auth
+    local password_auth=$(configure_password_auth)
+    
+    echo
+    # 配置SSH安全设置（统一处理，避免重复配置）
+    configure_ssh_security "$new_ports" "$password_auth"
     
     echo
     # 应用配置
@@ -420,7 +387,7 @@ main() {
     fi
     
     # 显示安全提醒
-    show_security_warnings "$new_ports"
+    show_security_warnings "$new_ports" "$password_auth"
     
     # 显示配置摘要
     show_ssh_summary
