@@ -1,118 +1,215 @@
 #!/bin/bash
-# Mise 版本管理器配置模块
+# Mise 版本管理器配置模块 v4.0
+# 功能: 安装Mise、配置Python、Shell集成
+# 统一代码风格，简化逻辑
 
+set -euo pipefail
+
+# === 常量定义 ===
+readonly MISE_PATH="$HOME/.local/bin/mise"
+readonly MISE_BIN_DIR="$HOME/.local/bin"
+readonly DEFAULT_PYTHON_VERSION="3.10"
+
+# === 日志函数 ===
 log() {
-    local color="\033[0;32m"
-    case "$2" in
-        "warn") color="\033[0;33m" ;;
-        "error") color="\033[0;31m" ;;
-        "info") color="\033[0;36m" ;;
-    esac
-    echo -e "${color}$1\033[0m"
+    local msg="$1" level="${2:-info}"
+    local -A colors=([info]="\033[0;36m" [warn]="\033[0;33m" [error]="\033[0;31m")
+    echo -e "${colors[$level]:-\033[0;32m}$msg\033[0m"
 }
 
-MISE_PATH="$HOME/.local/bin/mise"
+# === 核心函数 ===
 
-# 创建目录
-mkdir -p "$HOME/.local/bin"
-
-# 安装 Mise
-log "检查并安装 Mise..." "info"
-if [ ! -f "$MISE_PATH" ]; then
-    log "安装 Mise..." "info"
-    curl https://mise.run | sh
-    if [ ! -f "$MISE_PATH" ]; then
-        log "Mise 安装失败" "error"
-        exit 1
-    fi
-    log "Mise 安装完成" "info"
-else
-    MISE_VERSION=$($MISE_PATH --version 2>/dev/null || echo "未知")
-    log "Mise 已安装 ($MISE_VERSION)" "info"
+# 安装或更新Mise
+install_mise() {
+    log "检查并安装 Mise..." "info"
     
-    read -p "是否更新 Mise 到最新版本? (y/n): " update_mise
-    if [[ "$update_mise" =~ ^[Yy]$ ]]; then
-        curl https://mise.run | sh
-        log "Mise 已更新" "info"
-    fi
-fi
-
-# 配置 Python 3.10
-log "配置 Python 3.10..." "info"
-if $MISE_PATH list python 2>/dev/null | grep -q "3.10"; then
-    log "Python 3.10 已通过 Mise 配置" "info"
-    read -p "是否重新安装 Python 3.10? (y/n): " reinstall_python
-    if [[ "$reinstall_python" =~ ^[Yy]$ ]]; then
-        $MISE_PATH use -g python@3.10
-        log "Python 3.10 重新配置完成" "info"
-    fi
-else
-    log "安装 Python 3.10..." "info"
-    if $MISE_PATH use -g python@3.10; then
-        log "Python 3.10 安装完成" "info"
-    else
-        log "Python 3.10 安装失败" "warn"
-    fi
-fi
-
-# 把 mise 管理的 python 链接到 /usr/bin/python 和 /usr/bin/python3
-link_python_to_usr_bin() {
-    local mise_python_shim
-    mise_python_shim="$($MISE_PATH which python 2>/dev/null)"
-    # 不直接用shim，找到实际可执行文件
-    if [ -x "$mise_python_shim" ]; then
-        local real_python
-        real_python=$("$mise_python_shim" -c 'import sys; print(sys.executable)')
-        if [ -n "$real_python" ] && [ -x "$real_python" ]; then
-            log "sudo ln -sf $real_python /usr/bin/python" "warn"
-            sudo ln -sf "$real_python" /usr/bin/python
-            log "/usr/bin/python 已指向: $real_python" "info"
-            log "sudo ln -sf $real_python /usr/bin/python3" "warn"
-            sudo ln -sf "$real_python" /usr/bin/python3
-            log "/usr/bin/python3 已指向: $real_python" "info"
-        else
-            log "找不到实际可执行的 Python，未建立链接" "error"
+    # 确保目录存在
+    mkdir -p "$MISE_BIN_DIR"
+    
+    if [[ -f "$MISE_PATH" ]]; then
+        local mise_version=$("$MISE_PATH" --version 2>/dev/null | awk '{print $2}' || echo "未知")
+        log "Mise 已安装 (版本: $mise_version)" "info"
+        
+        echo
+        read -p "是否更新 Mise 到最新版本? [y/N] (默认: N): " -r update_choice
+        if [[ "$update_choice" =~ ^[Yy]$ ]]; then
+            log "更新 Mise..." "info"
+            curl -fsSL https://mise.run | sh
+            log "✓ Mise 已更新" "info"
         fi
     else
-        log "mise 的 python shim 不可执行，未建立链接" "error"
+        log "安装 Mise..." "info"
+        if curl -fsSL https://mise.run | sh; then
+            log "✓ Mise 安装完成" "info"
+        else
+            log "✗ Mise 安装失败" "error"
+            exit 1
+        fi
+    fi
+    
+    # 验证安装
+    if [[ ! -f "$MISE_PATH" ]]; then
+        log "✗ Mise 安装验证失败" "error"
+        exit 1
     fi
 }
 
-link_python_to_usr_bin
-
-# 配置 Shell 集成
-log "配置 Shell 集成..." "info"
-
-# 配置 .bashrc
-BASHRC_FILE="$HOME/.bashrc"
-[ ! -f "$BASHRC_FILE" ] && touch "$BASHRC_FILE"
-
-if ! grep -q "mise activate bash" "$BASHRC_FILE"; then
-    echo -e "\n# Mise version manager\neval \"\$(\$HOME/.local/bin/mise activate bash)\"" >> "$BASHRC_FILE"
-    log "Mise 已添加到 .bashrc" "info"
-else
-    log "Mise 已存在于 .bashrc" "info"
-fi
-
-# 配置 .zshrc (如果存在)
-if [ -f "$HOME/.zshrc" ] && command -v zsh &>/dev/null; then
-    if ! grep -q "mise activate zsh" "$HOME/.zshrc"; then
-        sed -i '/# mise 版本管理器配置/a eval "$(mise activate zsh)"' "$HOME/.zshrc"
-        log "Mise 已添加到 .zshrc" "info"
+# 配置Python
+setup_python() {
+    log "配置 Python $DEFAULT_PYTHON_VERSION..." "info"
+    
+    # 检查是否已安装
+    if "$MISE_PATH" list python 2>/dev/null | grep -q "$DEFAULT_PYTHON_VERSION"; then
+        log "Python $DEFAULT_PYTHON_VERSION 已通过 Mise 安装" "info"
+        
+        echo
+        read -p "是否重新安装 Python $DEFAULT_PYTHON_VERSION? [y/N] (默认: N): " -r reinstall_choice
+        if [[ ! "$reinstall_choice" =~ ^[Yy]$ ]]; then
+            return 0
+        fi
+    fi
+    
+    # 安装Python
+    log "安装 Python $DEFAULT_PYTHON_VERSION..." "info"
+    if "$MISE_PATH" use -g "python@$DEFAULT_PYTHON_VERSION"; then
+        log "✓ Python $DEFAULT_PYTHON_VERSION 安装完成" "info"
     else
-        log "Mise 已存在于 .zshrc" "info"
+        log "✗ Python $DEFAULT_PYTHON_VERSION 安装失败" "warn"
+        return 1
     fi
-fi
+}
 
-log "Mise 配置完成" "info"
-log "提示: 运行 'source ~/.bashrc' 或重新登录以激活 Mise" "info"
-
-if [ -f "$MISE_PATH" ]; then
-    log "提示: 查看已安装工具: $MISE_PATH list" "info"
-    if $MISE_PATH which python &>/dev/null; then
-        PYTHON_VERSION=$($($MISE_PATH which python) --version 2>/dev/null || echo "版本获取失败")
-        log "Python 状态: $PYTHON_VERSION" "info"
+# 创建系统Python链接
+link_python_globally() {
+    log "创建系统Python链接..." "info"
+    
+    local python_path
+    python_path=$("$MISE_PATH" which python 2>/dev/null || echo "")
+    
+    if [[ -x "$python_path" ]]; then
+        log "创建 /usr/bin/python 链接..." "info"
+        sudo ln -sf "$python_path" /usr/bin/python
+        
+        log "创建 /usr/bin/python3 链接..." "info"
+        sudo ln -sf "$python_path" /usr/bin/python3
+        
+        log "✓ Python链接已创建" "info"
+        log "  /usr/bin/python -> $python_path" "info"
+        log "  /usr/bin/python3 -> $python_path" "info"
+    else
+        log "✗ 无法找到Mise管理的Python，跳过链接创建" "warn"
     fi
-fi
+}
 
-exit 0
+# 配置Shell集成
+configure_shell_integration() {
+    log "配置 Shell 集成..." "info"
+    
+    # Shell配置数组: shell名称:配置文件:激活命令
+    local shells=(
+        "bash:$HOME/.bashrc:eval \"\$(\$HOME/.local/bin/mise activate bash)\""
+        "zsh:$HOME/.zshrc:eval \"\$(mise activate zsh)\""
+    )
+    
+    for shell_info in "${shells[@]}"; do
+        local shell_name="${shell_info%%:*}"
+        local config_file="${shell_info#*:}"
+        config_file="${config_file%%:*}"
+        local activate_cmd="${shell_info##*:}"
+        
+        # 检查shell是否可用
+        if ! command -v "$shell_name" &>/dev/null; then
+            continue
+        fi
+        
+        # 确保配置文件存在
+        [[ ! -f "$config_file" ]] && touch "$config_file"
+        
+        # 检查是否已配置
+        if grep -q "mise activate $shell_name" "$config_file"; then
+            log "$shell_name 集成已存在" "info"
+        else
+            # 添加配置
+            if [[ "$shell_name" == "bash" ]]; then
+                echo -e "\n# Mise version manager\n$activate_cmd" >> "$config_file"
+            else
+                # 对于zsh，插入到mise注释后面（zsh-setup模块已经添加了注释）
+                if grep -q "# mise 版本管理器配置" "$config_file"; then
+                    sed -i "/# mise 版本管理器配置/a $activate_cmd" "$config_file"
+                else
+                    echo -e "\n# Mise version manager\n$activate_cmd" >> "$config_file"
+                fi
+            fi
+            log "✓ Mise 已添加到 $config_file" "info"
+        fi
+    done
+}
+
+# 显示配置摘要
+show_mise_summary() {
+    echo
+    log "🎯 Mise 配置摘要:" "info"
+    
+    # Mise版本
+    if [[ -f "$MISE_PATH" ]]; then
+        local mise_version=$("$MISE_PATH" --version 2>/dev/null | awk '{print $2}' || echo "未知")
+        log "  ✓ Mise版本: $mise_version" "info"
+        
+        # Python状态
+        if "$MISE_PATH" which python &>/dev/null; then
+            local python_version=$("$MISE_PATH" which python | xargs -I {} {} --version 2>/dev/null || echo "版本获取失败")
+            log "  ✓ Python: $python_version" "info"
+        else
+            log "  ✗ Python: 未配置" "info"
+        fi
+        
+        # 全局工具列表
+        local tools_count=$("$MISE_PATH" list 2>/dev/null | wc -l || echo "0")
+        log "  📦 已安装工具: $tools_count 个" "info"
+    else
+        log "  ✗ Mise: 未安装" "error"
+    fi
+    
+    # Shell集成状态
+    if grep -q "mise activate" "$HOME/.bashrc" 2>/dev/null; then
+        log "  ✓ Bash集成: 已配置" "info"
+    fi
+    
+    if [[ -f "$HOME/.zshrc" ]] && grep -q "mise activate" "$HOME/.zshrc" 2>/dev/null; then
+        log "  ✓ Zsh集成: 已配置" "info"
+    fi
+}
+
+# === 主流程 ===
+main() {
+    log "🔧 配置 Mise 版本管理器..." "info"
+    
+    echo
+    install_mise
+    
+    echo
+    setup_python
+    
+    echo
+    link_python_globally
+    
+    echo
+    configure_shell_integration
+    
+    show_mise_summary
+    
+    echo
+    log "🎉 Mise 配置完成!" "info"
+    log "💡 提示: 运行 'source ~/.bashrc' 或重新登录以激活 Mise" "info"
+    
+    # 显示有用的命令
+    if [[ -f "$MISE_PATH" ]]; then
+        echo
+        log "常用命令:" "info"
+        log "  查看工具: $MISE_PATH list" "info"
+        log "  安装工具: $MISE_PATH use -g <tool>@<version>" "info"
+        log "  查看帮助: $MISE_PATH --help" "info"
+    fi
+}
+
+main "$@"
