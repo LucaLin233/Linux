@@ -1,6 +1,7 @@
 #!/bin/bash
-# 自动更新系统配置模块 (优化版 v3.0)
+# 自动更新系统配置模块 (优化版 v3.1 - 修复版)
 # 优化: 模块化设计、减少重复代码、更好的错误处理
+# 修复: cron选项显示、输入处理、表达式验证
 
 set -euo pipefail
 
@@ -28,13 +29,27 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Cron 表达式验证
+# Cron 表达式验证 (强化版)
 validate_cron_expression() {
     local expr="$1"
-    [[ "$expr" =~ ^([0-9*,-/]+[[:space:]]+){4}[0-9*,-/]+$ ]]
+    
+    # 基本格式检查：5个字段，用空格分隔
+    local field_count=$(echo "$expr" | wc -w)
+    if [[ "$field_count" -ne 5 ]]; then
+        log "错误: cron表达式必须包含5个字段 (分 时 日 月 周)" "error"
+        return 1
+    fi
+    
+    # 简单的字符检查
+    if [[ ! "$expr" =~ ^[0-9*,/-]+[[:space:]]+[0-9*,/-]+[[:space:]]+[0-9*,/-]+[[:space:]]+[0-9*,/-]+[[:space:]]+[0-9*,/-]+$ ]]; then
+        log "错误: cron表达式包含无效字符" "error"
+        return 1
+    fi
+    
+    return 0
 }
 
-# Cron 任务管理
+# Cron 任务管理 (修复版)
 manage_cron_job() {
     local action="$1" 
     local cron_expr="${2:-}"
@@ -44,13 +59,25 @@ manage_cron_job() {
     
     case "$action" in
         "add")
-            # 移除旧任务，添加新任务
-            crontab -l 2>/dev/null | grep -v "$UPDATE_SCRIPT" > "$temp_cron" || true
+            # 验证 cron 表达式
+            if [[ -z "$cron_expr" ]]; then
+                log "错误: cron表达式为空" "error"
+                rm -f "$temp_cron"
+                return 1
+            fi
+            
+            # 移除旧任务
+            crontab -l 2>/dev/null | grep -v "$UPDATE_SCRIPT" | grep -v "Auto-update managed" > "$temp_cron" || true
+            
+            # 添加新任务
             echo "$CRON_COMMENT" >> "$temp_cron"
             echo "$cron_expr $UPDATE_SCRIPT" >> "$temp_cron"
+            
+            # 调试输出
+            log "准备安装的cron任务: $cron_expr $UPDATE_SCRIPT" "info"
             ;;
         "remove")
-            crontab -l 2>/dev/null | grep -v "$UPDATE_SCRIPT" > "$temp_cron" || true
+            crontab -l 2>/dev/null | grep -v "$UPDATE_SCRIPT" | grep -v "Auto-update managed" > "$temp_cron" || true
             ;;
         "check")
             crontab -l 2>/dev/null | grep -q "$UPDATE_SCRIPT"
@@ -59,57 +86,86 @@ manage_cron_job() {
             ;;
     esac
     
-    if crontab "$temp_cron"; then
+    # 验证临时文件不为空 (对于add操作)
+    if [[ "$action" == "add" && ! -s "$temp_cron" ]]; then
+        echo "$CRON_COMMENT" > "$temp_cron"
+        echo "$cron_expr $UPDATE_SCRIPT" >> "$temp_cron"
+    fi
+    
+    # 安装 crontab
+    if crontab "$temp_cron" 2>/dev/null; then
         rm -f "$temp_cron"
         return 0
     else
+        log "crontab安装失败，临时文件内容:" "error"
+        cat "$temp_cron" | sed 's/^/  /' >&2
         rm -f "$temp_cron"
         return 1
     fi
 }
 
-# 显示 Cron 选项
+# 显示 Cron 选项 (修复版)
 show_cron_options() {
-    cat << 'EOF'
-
-⏰ 选择自动更新时间:
-  1) 每周日凌晨2点 (默认推荐)
-  2) 每周一凌晨3点
-  3) 每周六凌晨4点  
-  4) 每月1号凌晨1点
-  5) 自定义时间
-  
-EOF
+    echo
+    echo "⏰ 选择自动更新时间:"
+    echo "  1) 每周日凌晨2点 (默认推荐)"
+    echo "  2) 每周一凌晨3点"
+    echo "  3) 每周六凌晨4点"
+    echo "  4) 每月1号凌晨1点"
+    echo "  5) 自定义时间"
+    echo
 }
 
-# 获取用户选择的 Cron 时间
+# 获取用户选择的 Cron 时间 (修复版)
 get_cron_schedule() {
     local choice cron_expr custom_expr
     
     show_cron_options
     
     while true; do
-        read -p "请选择 [1-5]: " choice
+        read -p "请选择 [1-5] (默认: 1): " choice
+        
+        # 处理空输入，设置默认值
+        [[ -z "$choice" ]] && choice="1"
         
         case "$choice" in
-            1) cron_expr="0 2 * * 0"; break ;;
-            2) cron_expr="0 3 * * 1"; break ;;
-            3) cron_expr="0 4 * * 6"; break ;;
-            4) cron_expr="0 1 1 * *"; break ;;
+            1) 
+                cron_expr="0 2 * * 0"
+                log "已选择: 每周日凌晨2点" "info"
+                break 
+                ;;
+            2) 
+                cron_expr="0 3 * * 1"
+                log "已选择: 每周一凌晨3点" "info"
+                break 
+                ;;
+            3) 
+                cron_expr="0 4 * * 6"
+                log "已选择: 每周六凌晨4点" "info"
+                break 
+                ;;
+            4) 
+                cron_expr="0 1 1 * *"
+                log "已选择: 每月1号凌晨1点" "info"
+                break 
+                ;;
             5) 
                 echo
                 log "Cron格式: 分 时 日 月 周 (例: 0 2 * * 0)" "info"
                 while true; do
                     read -p "请输入Cron表达式: " custom_expr
-                    if validate_cron_expression "$custom_expr"; then
+                    if [[ -n "$custom_expr" ]] && validate_cron_expression "$custom_expr"; then
                         cron_expr="$custom_expr"
+                        log "已选择自定义时间: $custom_expr" "info"
                         break 2
                     else
-                        log "格式错误，请重新输入" "error"
+                        log "格式错误或为空，请重新输入" "error"
                     fi
                 done
                 ;;
-            *) log "无效选择，请输入1-5" "error" ;;
+            *) 
+                log "无效选择 '$choice'，请输入1-5" "error"
+                ;;
         esac
     done
     
@@ -128,13 +184,13 @@ explain_cron_time() {
     esac
 }
 
-# 创建优化的自动更新脚本
+# 创建优化的自动更新脚本 (修复重启逻辑)
 create_update_script() {
     log "创建自动更新脚本..." "info"
     
     cat > "$UPDATE_SCRIPT" << 'EOF'
 #!/bin/bash
-# 自动系统更新脚本 v3.0 (优化版)
+# 自动系统更新脚本 v3.1 (修复版)
 # 功能: 系统更新、内核检查、智能重启
 
 set -euo pipefail
@@ -167,7 +223,7 @@ check_kernel_update() {
     return 1
 }
 
-# 安全重启
+# 安全重启 (修复版)
 safe_reboot() {
     log_update "准备重启系统应用新内核..."
     
@@ -177,17 +233,20 @@ safe_reboot() {
     # 同步文件系统
     sync
     
-    log_update "系统将在30秒后重启..."
+    log_update "系统将在 30 秒后重启以应用新内核..."
     sleep 30
     
-    # 添加错误检查
-    if ! reboot; then
-        log_update "✗ 重启失败，请手动重启应用新内核"
-        exit 1
+    # 强制重启，添加错误处理
+    if ! systemctl reboot; then
+        log_update "systemctl reboot 失败，尝试 reboot 命令"
+        if ! reboot; then
+            log_update "✗ 重启失败，请手动重启系统应用新内核"
+            exit 1
+        fi
     fi
 }
 
-# 主更新流程
+# 主更新流程 (修复版)
 main() {
     # 初始化日志
     : > "$LOGFILE"
@@ -211,18 +270,19 @@ main() {
         exit 1
     fi
     
-    # 清理系统
+    # 检查内核更新 - 如果有新内核立即重启
+    if check_kernel_update; then
+        safe_reboot
+        # 注意：重启后脚本不会继续执行
+    fi
+    
+    # 只有没有内核更新时才执行清理
     log_update "清理系统缓存..."
     apt-get autoremove -y >> "$LOGFILE" 2>&1
     apt-get autoclean >> "$LOGFILE" 2>&1
     log_update "✓ 系统清理完成"
     
-    # 检查内核更新
-    if check_kernel_update; then
-        safe_reboot
-    else
-        log_update "=== 自动更新完成，无需重启 ==="
-    fi
+    log_update "=== 自动更新完成，无需重启 ==="
 }
 
 # 错误处理
@@ -246,22 +306,31 @@ show_current_cron() {
     fi
 }
 
-# 配置 Cron 任务
+# 配置 Cron 任务 (修复版)
 setup_cron_job() {
     local cron_expr
     
     log "配置定时任务..." "info"
-    echo
     
     # 检查现有任务
     if manage_cron_job "check"; then
+        echo
         log "检测到现有的自动更新任务" "warn"
         read -p "是否替换现有任务? [y/N]: " -r replace
-        [[ ! "$replace" =~ ^[Yy]$ ]] && { log "保持现有任务不变" "info"; return 0; }
+        if [[ ! "$replace" =~ ^[Yy]$ ]]; then
+            log "保持现有任务不变" "info"
+            return 0
+        fi
     fi
     
     # 获取用户选择
     cron_expr=$(get_cron_schedule)
+    
+    # 验证返回的表达式
+    if [[ -z "$cron_expr" ]]; then
+        log "✗ 获取cron表达式失败" "error"
+        return 1
+    fi
     
     # 配置任务
     if manage_cron_job "add" "$cron_expr"; then
@@ -273,6 +342,11 @@ setup_cron_job() {
         log "  脚本路径: $UPDATE_SCRIPT" "info"
         log "  日志文件: $UPDATE_LOG" "info"
         log "  手动执行: $UPDATE_SCRIPT" "info"
+        
+        # 验证安装结果
+        echo
+        log "当前cron任务:" "info"
+        crontab -l | grep -E "(Auto-update|$UPDATE_SCRIPT)" | sed 's/^/  /' || log "  (未找到相关任务)" "warn"
     else
         log "✗ Cron任务配置失败" "error"
         return 1
