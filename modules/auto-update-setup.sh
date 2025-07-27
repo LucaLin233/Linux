@@ -72,9 +72,6 @@ manage_cron_job() {
             # 添加新任务
             echo "$CRON_COMMENT" >> "$temp_cron"
             echo "$cron_expr $UPDATE_SCRIPT" >> "$temp_cron"
-            
-            # 调试输出
-            log "准备安装的cron任务: $cron_expr $UPDATE_SCRIPT" "info"
             ;;
         "remove")
             crontab -l 2>/dev/null | grep -v "$UPDATE_SCRIPT" | grep -v "Auto-update managed" > "$temp_cron" || true
@@ -85,12 +82,6 @@ manage_cron_job() {
             return $?
             ;;
     esac
-    
-    # 验证临时文件不为空 (对于add操作)
-    if [[ "$action" == "add" && ! -s "$temp_cron" ]]; then
-        echo "$CRON_COMMENT" > "$temp_cron"
-        echo "$cron_expr $UPDATE_SCRIPT" >> "$temp_cron"
-    fi
     
     # 安装 crontab
     if crontab "$temp_cron" 2>/dev/null; then
@@ -106,14 +97,14 @@ manage_cron_job() {
 
 # 显示 Cron 选项 (修复版)
 show_cron_options() {
-    echo
-    echo "⏰ 选择自动更新时间:"
-    echo "  1) 每周日凌晨2点 (默认推荐)"
-    echo "  2) 每周一凌晨3点"
-    echo "  3) 每周六凌晨4点"
-    echo "  4) 每月1号凌晨1点"
-    echo "  5) 自定义时间"
-    echo
+    echo >&2
+    echo "⏰ 选择自动更新时间:" >&2
+    echo "  1) 每周日凌晨2点 (默认推荐)" >&2
+    echo "  2) 每周一凌晨3点" >&2
+    echo "  3) 每周六凌晨4点" >&2
+    echo "  4) 每月1号凌晨1点" >&2
+    echo "  5) 自定义时间" >&2
+    echo >&2
 }
 
 # 获取用户选择的 Cron 时间 (修复版)
@@ -123,7 +114,7 @@ get_cron_schedule() {
     show_cron_options
     
     while true; do
-        read -p "请选择 [1-5] (默认: 1): " choice
+        read -p "请选择 [1-5] (默认: 1): " choice </dev/tty >&2
         
         # 处理空输入，设置默认值
         [[ -z "$choice" ]] && choice="1"
@@ -131,44 +122,45 @@ get_cron_schedule() {
         case "$choice" in
             1) 
                 cron_expr="0 2 * * 0"
-                log "已选择: 每周日凌晨2点" "info"
+                log "已选择: 每周日凌晨2点" "info" >&2
                 break 
                 ;;
             2) 
                 cron_expr="0 3 * * 1"
-                log "已选择: 每周一凌晨3点" "info"
+                log "已选择: 每周一凌晨3点" "info" >&2
                 break 
                 ;;
             3) 
                 cron_expr="0 4 * * 6"
-                log "已选择: 每周六凌晨4点" "info"
+                log "已选择: 每周六凌晨4点" "info" >&2
                 break 
                 ;;
             4) 
                 cron_expr="0 1 1 * *"
-                log "已选择: 每月1号凌晨1点" "info"
+                log "已选择: 每月1号凌晨1点" "info" >&2
                 break 
                 ;;
             5) 
-                echo
-                log "Cron格式: 分 时 日 月 周 (例: 0 2 * * 0)" "info"
+                echo >&2
+                log "Cron格式: 分 时 日 月 周 (例: 0 2 * * 0)" "info" >&2
                 while true; do
-                    read -p "请输入Cron表达式: " custom_expr
+                    read -p "请输入Cron表达式: " custom_expr </dev/tty >&2
                     if [[ -n "$custom_expr" ]] && validate_cron_expression "$custom_expr"; then
                         cron_expr="$custom_expr"
-                        log "已选择自定义时间: $custom_expr" "info"
+                        log "已选择自定义时间: $custom_expr" "info" >&2
                         break 2
                     else
-                        log "格式错误或为空，请重新输入" "error"
+                        log "格式错误或为空，请重新输入" "error" >&2
                     fi
                 done
                 ;;
             *) 
-                log "无效选择 '$choice'，请输入1-5" "error"
+                log "无效选择 '$choice'，请输入1-5" "error" >&2
                 ;;
         esac
     done
     
+    # 只输出 cron 表达式到 stdout
     echo "$cron_expr"
 }
 
