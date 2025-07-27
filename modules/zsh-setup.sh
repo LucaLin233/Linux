@@ -351,7 +351,7 @@ install_plugins() {
     return 0
 }
 
-# 生成 .zshrc 配置 (保留自定义别名版)
+# 生成 .zshrc 配置 (修复 sed 问题版)
 generate_zshrc_config() {
     local theme="$1"
     local plugins="$2"
@@ -398,9 +398,9 @@ alias copyall='cd /root/copy && ansible-playbook -i inventory.ini copyhk.yml && 
 [[ -f ~/.zshrc.local ]] && source ~/.zshrc.local
 ZSHRC_EOF
 
-    # 替换占位符
-    sed -i "s/THEME_PLACEHOLDER/$theme/" "$ZSHRC_FILE"
-    sed -i "s/PLUGINS_PLACEHOLDER/$plugins/" "$ZSHRC_FILE"
+    # 使用 | 作为分隔符避免冲突
+    sed -i "s|THEME_PLACEHOLDER|$theme|" "$ZSHRC_FILE"
+    sed -i "s|PLUGINS_PLACEHOLDER|$plugins|" "$ZSHRC_FILE"
     
     log "✓ .zshrc 配置生成完成" "info"
     return 0
