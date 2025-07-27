@@ -1,77 +1,127 @@
 #!/bin/bash
-# 网络性能优化模块: BBR + cake + sysctl 优化参数 + 自动tc队列，无多余空格
+# 网络性能优化模块 v4.0
+# 功能: BBR拥塞控制、cake队列调度、sysctl优化
+# 统一代码风格，智能备份策略
 
+set -euo pipefail
+
+# === 常量定义 ===
+readonly SYSCTL_CONFIG="/etc/sysctl.conf"
+
+# === 日志函数 ===
 log() {
-    local color="\033[0;32m"
-    case "$2" in
-        "warn") color="\033[0;33m" ;;
-        "error") color="\033[0;31m" ;;
-        "info") color="\033[0;36m" ;;
-    esac
-    echo -e "${color}$1\033[0m"
+    local msg="$1" level="${2:-info}"
+    local -A colors=([info]="\033[0;36m" [warn]="\033[0;33m" [error]="\033[0;31m")
+    echo -e "${colors[$level]:-\033[0;32m}$msg\033[0m"
 }
 
-# 自动检测主用出口网卡
-NET_IF=$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++){if($i=="dev"){print $(i+1);exit}}}')
-if [ -z "$NET_IF" ]; then
-    log "未检测到主用网卡名，请手动设置 NET_IF 变量！" "error"
-    exit 1
-else
-    log "检测到主用网卡: $NET_IF" "info"
-fi
+# === 核心函数 ===
 
-log "配置网络性能优化..." "info"
-
-read -p "是否启用 BBR + cake 网络拥塞控制及高级 sysctl 优化? (Y/n): " enable_bbr
-enable_bbr="${enable_bbr:-y}"
-
-if [[ ! "$enable_bbr" =~ ^[nN]$ ]]; then
-    log "启用 BBR 拥塞控制算法及批量优化参数..." "info"
-    
-    # 检查 BBR 模块
-    if ! modprobe tcp_bbr 2>/dev/null; then
-        log "警告: 无法加载 tcp_bbr 模块" "warn"
-        if [ -f "/proc/config.gz" ]; then
-            if zcat /proc/config.gz | grep -q CONFIG_TCP_BBR=y || zcat /proc/config.gz | grep -q CONFIG_TCP_BBR=m; then
-                log "BBR 模块编译在内核中" "info"
-            else
-                log "内核不支持 BBR，跳过配置" "error"
-                exit 1
-            fi
-        else
-            log "无法确定内核 BBR 支持状态" "warn"
+# 智能备份sysctl配置
+backup_sysctl_config() {
+    if [[ -f "$SYSCTL_CONFIG" ]]; then
+        # 首次备份：保存原始配置
+        if [[ ! -f "$SYSCTL_CONFIG.original" ]]; then
+            cp "$SYSCTL_CONFIG" "$SYSCTL_CONFIG.original"
+            log "已备份原始配置: sysctl.conf.original" "info"
         fi
-    else
-        log "BBR 模块加载成功" "info"
+        
+        # 最近备份：总是覆盖
+        cp "$SYSCTL_CONFIG" "$SYSCTL_CONFIG.backup"
+        log "已备份当前配置: sysctl.conf.backup" "info"
+    fi
+}
+
+# 检测主用网络接口
+detect_main_interface() {
+    local interface
+    interface=$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++){if($i=="dev"){print $(i+1);exit}}}' || echo "")
+    
+    if [[ -z "$interface" ]]; then
+        log "✗ 未检测到主用网卡" "error"
+        return 1
     fi
     
-    # 备份 sysctl 配置
-    [ ! -f /etc/sysctl.conf.backup ] && cp /etc/sysctl.conf /etc/sysctl.conf.backup
+    log "检测到主用网卡: $interface" "info"
+    echo "$interface"
+}
+
+# 检查BBR支持
+check_bbr_support() {
+    log "检查 BBR 支持..." "info"
     
-    # 配置 sysctl 参数
-    log "配置 sysctl 参数..." "info"
+    # 尝试加载BBR模块
+    if modprobe tcp_bbr 2>/dev/null; then
+        log "✓ BBR 模块加载成功" "info"
+        return 0
+    fi
     
-    # 移除旧配置（可能重复的优化项）
-    for param in \
-      "net.ipv4.tcp_congestion_control" "net.core.default_qdisc" \
-      "fs.file-max" "net.ipv4.tcp_max_syn_backlog" "net.core.somaxconn" \
-      "net.ipv4.tcp_tw_reuse" "net.ipv4.tcp_abort_on_overflow" \
-      "net.ipv4.tcp_no_metrics_save" "net.ipv4.tcp_ecn" "net.ipv4.tcp_frto" \
-      "net.ipv4.tcp_mtu_probing" "net.ipv4.tcp_rfc1337" "net.ipv4.tcp_sack" \
-      "net.ipv4.tcp_fack" "net.ipv4.tcp_window_scaling" "net.ipv4.tcp_adv_win_scale" \
-      "net.ipv4.tcp_moderate_rcvbuf" "net.ipv4.tcp_fin_timeout" \
-      "net.ipv4.tcp_rmem" "net.ipv4.tcp_wmem" "net.core.rmem_max" "net.core.wmem_max" \
-      "net.ipv4.udp_rmem_min" "net.ipv4.udp_wmem_min" "net.ipv4.ip_local_port_range" \
-      "net.ipv4.tcp_timestamps" "net.ipv4.conf.all.rp_filter" "net.ipv4.conf.default.rp_filter" \
-      "net.ipv4.ip_forward" "net.ipv4.conf.all.route_localnet"
-    do
-        sed -i "/^${param//./\\.}[[:space:]]*=.*/d" /etc/sysctl.conf
+    log "BBR 模块加载失败，检查内核支持..." "warn"
+    
+    # 检查内核配置
+    if [[ -f "/proc/config.gz" ]]; then
+        if zcat /proc/config.gz | grep -q "CONFIG_TCP_BBR=[ym]"; then
+            log "✓ BBR 模块编译在内核中" "info"
+            return 0
+        else
+            log "✗ 内核不支持 BBR" "error"
+            return 1
+        fi
+    else
+        log "⚠ 无法确定内核 BBR 支持状态" "warn"
+        return 0  # 假设支持，继续配置
+    fi
+}
+
+# 配置网络优化参数
+configure_network_parameters() {
+    log "配置网络优化参数..." "info"
+    
+    backup_sysctl_config
+    
+    # 需要移除的旧参数
+    local old_params=(
+        "net.ipv4.tcp_congestion_control"
+        "net.core.default_qdisc"
+        "fs.file-max"
+        "net.ipv4.tcp_max_syn_backlog"
+        "net.core.somaxconn"
+        "net.ipv4.tcp_tw_reuse"
+        "net.ipv4.tcp_abort_on_overflow"
+        "net.ipv4.tcp_no_metrics_save"
+        "net.ipv4.tcp_ecn"
+        "net.ipv4.tcp_frto"
+        "net.ipv4.tcp_mtu_probing"
+        "net.ipv4.tcp_rfc1337"
+        "net.ipv4.tcp_sack"
+        "net.ipv4.tcp_fack"
+        "net.ipv4.tcp_window_scaling"
+        "net.ipv4.tcp_adv_win_scale"
+        "net.ipv4.tcp_moderate_rcvbuf"
+        "net.ipv4.tcp_fin_timeout"
+        "net.ipv4.tcp_rmem"
+        "net.ipv4.tcp_wmem"
+        "net.core.rmem_max"
+        "net.core.wmem_max"
+        "net.ipv4.udp_rmem_min"
+        "net.ipv4.udp_wmem_min"
+        "net.ipv4.ip_local_port_range"
+        "net.ipv4.tcp_timestamps"
+        "net.ipv4.conf.all.rp_filter"
+        "net.ipv4.conf.default.rp_filter"
+        "net.ipv4.ip_forward"
+        "net.ipv4.conf.all.route_localnet"
+    )
+    
+    # 移除旧配置
+    for param in "${old_params[@]}"; do
+        sed -i "/^${param//./\\.}[[:space:]]*=.*/d" "$SYSCTL_CONFIG"
     done
+    
+    # 添加新的网络优化配置
+    cat >> "$SYSCTL_CONFIG" << 'EOF'
 
-    # 添加新配置（无多余空格）
-    cat >> /etc/sysctl.conf <<'EOF'
-
-# 网络性能优化 - BBR + cake + 高级 sysctl 参数
+# 网络性能优化 - BBR + cake + 高级参数
 net.ipv4.tcp_congestion_control = bbr
 net.core.default_qdisc = cake
 fs.file-max = 6815744
@@ -104,40 +154,169 @@ net.ipv4.ip_forward = 1
 net.ipv4.conf.all.route_localnet = 1
 
 EOF
-
-    # 应用配置
-    sysctl -p || log "警告: sysctl -p 执行失败" "warn"
     
-    # 强制切当前接口队列算法为 cake
-    if ! which tc >/dev/null 2>&1; then
-        log "未检测到 tc 命令，无法切换当前网卡队列。请手动安装 iproute2。" "warn"
+    # 应用配置
+    if sysctl -p >/dev/null 2>&1; then
+        log "✓ sysctl 参数已应用" "info"
     else
-        if tc qdisc show dev $NET_IF 2>/dev/null | grep -q "cake"; then
-            log "$NET_IF 已在使用 cake 队列" "info"
+        log "✗ sysctl 参数应用失败" "warn"
+    fi
+}
+
+# 配置网卡队列调度
+configure_interface_qdisc() {
+    local interface="$1"
+    
+    log "配置网卡队列调度..." "info"
+    
+    # 检查tc命令
+    if ! command -v tc &>/dev/null; then
+        log "✗ 未检测到 tc 命令，请安装 iproute2" "warn"
+        return 1
+    fi
+    
+    # 检查当前队列调度
+    if tc qdisc show dev "$interface" 2>/dev/null | grep -q "cake"; then
+        log "$interface 已使用 cake 队列" "info"
+        return 0
+    fi
+    
+    # 切换到cake队列
+    if tc qdisc replace dev "$interface" root cake 2>/dev/null; then
+        log "✓ $interface 队列已切换为 cake" "info"
+    else
+        log "✗ $interface 队列切换失败" "warn"
+    fi
+}
+
+# 验证网络优化配置
+verify_network_config() {
+    log "验证网络优化配置..." "info"
+    
+    local current_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "未知")
+    local current_qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "未知")
+    
+    log "当前拥塞控制算法: $current_cc" "info"
+    log "当前默认队列调度: $current_qdisc" "info"
+    
+    if [[ "$current_cc" == "bbr" && "$current_qdisc" == "cake" ]]; then
+        log "✓ BBR + cake 配置成功" "info"
+        return 0
+    else
+        log "⚠ 网络优化配置可能未完全生效" "warn"
+        log "建议重启系统以完全应用配置" "warn"
+        return 1
+    fi
+}
+
+# 显示当前网络状态
+show_current_network_status() {
+    log "当前网络状态:" "info"
+    
+    local current_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "未知")
+    local current_qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "未知")
+    
+    log "  拥塞控制算法: $current_cc" "info"
+    log "  队列调度算法: $current_qdisc" "info"
+}
+
+# 网络性能优化
+setup_network_optimization() {
+    echo
+    log "网络性能优化说明:" "info"
+    log "  BBR: 改进的TCP拥塞控制算法，提升网络吞吐量" "info"
+    log "  cake: 智能队列管理，减少网络延迟和抖动" "info"
+    
+    echo
+    read -p "是否启用网络性能优化 (BBR+cake)? [Y/n] (默认: Y): " -r optimize_choice
+    
+    if [[ "$optimize_choice" =~ ^[Nn]$ ]]; then
+        log "跳过网络优化配置" "info"
+        show_current_network_status
+        return 0
+    fi
+    
+    # 检测网络接口
+    local interface
+    if ! interface=$(detect_main_interface); then
+        return 1
+    fi
+    
+    # 检查BBR支持
+    if ! check_bbr_support; then
+        log "系统不支持BBR，无法继续配置" "error"
+        return 1
+    fi
+    
+    # 配置网络参数
+    configure_network_parameters
+    
+    # 配置网卡队列
+    configure_interface_qdisc "$interface"
+    
+    # 验证配置
+    verify_network_config
+}
+
+# 显示网络优化摘要
+show_network_summary() {
+    echo
+    log "🎯 网络优化摘要:" "info"
+    
+    # 拥塞控制状态
+    local current_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "未知")
+    if [[ "$current_cc" == "bbr" ]]; then
+        log "  ✓ 拥塞控制: BBR" "info"
+    else
+        log "  ✗ 拥塞控制: $current_cc" "info"
+    fi
+    
+    # 队列调度状态
+    local current_qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "未知")
+    if [[ "$current_qdisc" == "cake" ]]; then
+        log "  ✓ 队列调度: cake" "info"
+    else
+        log "  ✗ 队列调度: $current_qdisc" "info"
+    fi
+    
+    # 配置文件状态
+    if [[ -f "$SYSCTL_CONFIG.original" ]]; then
+        log "  ✓ 原始配置: 已备份" "info"
+    fi
+    
+    if [[ -f "$SYSCTL_CONFIG.backup" ]]; then
+        log "  ✓ 最近配置: 已备份" "info"
+    fi
+    
+    # 主网卡状态
+    local interface
+    if interface=$(detect_main_interface 2>/dev/null); then
+        if command -v tc &>/dev/null && tc qdisc show dev "$interface" 2>/dev/null | grep -q "cake"; then
+            log "  ✓ 网卡 $interface: 使用 cake 队列" "info"
         else
-            sudo tc qdisc replace dev $NET_IF root cake && log "$NET_IF 队列已切换为 cake" "info"
+            log "  ✗ 网卡 $interface: 未使用 cake 队列" "info"
         fi
     fi
+}
 
-    # 验证配置
-    CURRENT_CC=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "未知")
-    CURRENT_QDISC=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "未知")
-    log "当前拥塞控制算法: $CURRENT_CC" "info"
-    log "当前默认队列调度算法: $CURRENT_QDISC" "info"
-    if [ "$CURRENT_CC" = "bbr" ] && [ "$CURRENT_QDISC" = "cake" ]; then
-        log "BBR + cake sysctl 配置成功" "info"
-    else
-        log "网络优化配置可能未完全生效" "warn"
-        log "建议重启系统以完全应用配置" "warn"
-    fi
+# === 主流程 ===
+main() {
+    log "🚀 配置网络性能优化..." "info"
+    
+    setup_network_optimization
+    
+    show_network_summary
+    
+    echo
+    log "🎉 网络优化配置完成!" "info"
+    
+    # 显示有用的命令
+    echo
+    log "常用命令:" "info"
+    log "  查看拥塞控制: sysctl net.ipv4.tcp_congestion_control" "info"
+    log "  查看队列调度: sysctl net.core.default_qdisc" "info"
+    log "  查看网卡队列: tc qdisc show" "info"
+    log "  恢复配置: cp /etc/sysctl.conf.backup /etc/sysctl.conf" "info"
+}
 
-else
-    log "跳过网络优化配置" "info"
-    CURRENT_CC=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "未知")
-    CURRENT_QDISC=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "未知")
-    log "当前拥塞控制算法: $CURRENT_CC" "info"
-    log "当前队列调度算法: $CURRENT_QDISC" "info"
-fi
-
-log "网络优化配置完成" "info"
-exit 0
+main "$@"
