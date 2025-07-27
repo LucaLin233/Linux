@@ -179,7 +179,12 @@ safe_reboot() {
     
     log_update "系统将在30秒后重启..."
     sleep 30
-    reboot
+    
+    # 添加错误检查
+    if ! reboot; then
+        log_update "✗ 重启失败，请手动重启应用新内核"
+        exit 1
+    fi
 }
 
 # 主更新流程
