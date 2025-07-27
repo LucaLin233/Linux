@@ -1,7 +1,6 @@
 #!/bin/bash
-# Docker 容器化平台配置模块 v4.0
-# 功能: 安装Docker、NextTrace、容器管理
-# 统一代码风格，增强用户交互
+# Docker 容器化平台配置模块 v4.1
+# 修复服务检测和版本获取问题
 
 set -euo pipefail
 
@@ -24,9 +23,17 @@ get_docker_version() {
     docker --version 2>/dev/null | awk '{print $3}' | tr -d ',' || echo "未知"
 }
 
-# 获取NextTrace版本
+# 获取NextTrace版本（修复版）
 get_nexttrace_version() {
-    nexttrace -V 2>&1 | head -n1 | awk '{print $2}' 2>/dev/null || echo "未知"
+    local version_output
+    version_output=$(nexttrace -V 2>&1 | head -n1 2>/dev/null || echo "")
+    
+    # 提取版本号并去掉换行符
+    if [[ "$version_output" =~ v?([0-9]+\.[0-9]+\.[0-9]+) ]]; then
+        echo "${BASH_REMATCH[1]}"
+    else
+        echo "未知"
+    fi
 }
 
 # 获取Docker Compose命令
@@ -65,15 +72,24 @@ install_docker() {
     fi
 }
 
-# 启动Docker服务
+# 启动Docker服务（修复版）
 start_docker_service() {
     log "配置 Docker 服务..." "info"
     
-    if systemctl list-unit-files --type=service | grep -q "docker.service"; then
+    # 更健壮的服务检测方式
+    if systemctl status docker &>/dev/null; then
+        log "✓ Docker 服务已运行" "info"
+    elif systemctl list-unit-files docker.service &>/dev/null; then
         systemctl enable --now docker.service
         log "✓ Docker 服务已启动并设置为开机自启" "info"
     else
-        log "✗ 未找到 Docker 服务" "warn"
+        # 尝试启动服务，即使检测失败
+        if systemctl start docker &>/dev/null; then
+            systemctl enable docker &>/dev/null || true
+            log "✓ Docker 服务已启动" "info"
+        else
+            log "⚠ 无法管理Docker服务，但可能已运行" "warn"
+        fi
     fi
 }
 
@@ -248,7 +264,7 @@ show_docker_summary() {
         if systemctl is-active docker &>/dev/null; then
             log "  ✓ Docker服务: 运行中" "info"
         else
-            log "  ✗ Docker服务: 未运行" "warn"
+            log "  ⚠ Docker服务: 状态未知" "warn"
         fi
         
         # 容器统计
