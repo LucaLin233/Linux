@@ -1,7 +1,6 @@
 #!/bin/bash
-# Mise 版本管理器配置模块 v4.0
-# 功能: 安装Mise、配置Python、Shell集成
-# 统一代码风格，简化逻辑
+# Mise 版本管理器配置模块 v4.1
+# 修复版本获取问题
 
 set -euo pipefail
 
@@ -19,6 +18,37 @@ log() {
 
 # === 核心函数 ===
 
+# 获取Mise版本
+get_mise_version() {
+    local version_output
+    version_output=$("$MISE_PATH" --version 2>/dev/null || echo "")
+    
+    # mise --version 可能输出格式: "mise 2024.1.0" 或 "mise linux-x64 v2024.1.0"
+    if [[ "$version_output" =~ v?([0-9]+\.[0-9]+\.[0-9]+) ]]; then
+        echo "${BASH_REMATCH[1]}"
+    else
+        echo "未知"
+    fi
+}
+
+# 获取Python版本
+get_python_version() {
+    # 先确保mise环境已激活，然后获取Python版本
+    local python_path python_version
+    
+    # 方法1: 直接通过mise获取Python路径
+    python_path=$("$MISE_PATH" which python 2>/dev/null || echo "")
+    
+    if [[ -x "$python_path" ]]; then
+        python_version=$("$python_path" --version 2>/dev/null || echo "")
+        echo "$python_version"
+    else
+        # 方法2: 通过mise exec执行
+        python_version=$("$MISE_PATH" exec python -- --version 2>/dev/null || echo "版本获取失败")
+        echo "$python_version"
+    fi
+}
+
 # 安装或更新Mise
 install_mise() {
     log "检查并安装 Mise..." "info"
@@ -27,7 +57,7 @@ install_mise() {
     mkdir -p "$MISE_BIN_DIR"
     
     if [[ -f "$MISE_PATH" ]]; then
-        local mise_version=$("$MISE_PATH" --version 2>/dev/null | awk '{print $2}' || echo "未知")
+        local mise_version=$(get_mise_version)
         log "Mise 已安装 (版本: $mise_version)" "info"
         
         echo
@@ -152,12 +182,12 @@ show_mise_summary() {
     
     # Mise版本
     if [[ -f "$MISE_PATH" ]]; then
-        local mise_version=$("$MISE_PATH" --version 2>/dev/null | awk '{print $2}' || echo "未知")
+        local mise_version=$(get_mise_version)
         log "  ✓ Mise版本: $mise_version" "info"
         
         # Python状态
         if "$MISE_PATH" which python &>/dev/null; then
-            local python_version=$("$MISE_PATH" which python | xargs -I {} {} --version 2>/dev/null || echo "版本获取失败")
+            local python_version=$(get_python_version)
             log "  ✓ Python: $python_version" "info"
         else
             log "  ✗ Python: 未配置" "info"
