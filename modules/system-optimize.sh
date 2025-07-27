@@ -1,6 +1,7 @@
 #!/bin/bash
-# 系统优化模块 (优化版 v3.0)
+# 系统优化模块 v4.0
 # 功能: Zram配置、时区设置
+# 统一代码风格，简化交互逻辑
 
 set -euo pipefail
 
@@ -8,22 +9,25 @@ set -euo pipefail
 readonly ZRAM_CONFIG="/etc/default/zramswap"
 readonly DEFAULT_TIMEZONE="Asia/Shanghai"
 
-# === 兼容性日志函数 ===
-if ! command -v log &> /dev/null; then
-    log() {
-        local msg="$1" level="${2:-info}"
-        local -A colors=([info]="\033[0;36m" [warn]="\033[0;33m" [error]="\033[0;31m")
-        echo -e "${colors[$level]:-\033[0;32m}$msg\033[0m"
-    }
-fi
+# 时区选项数组
+readonly TIMEZONES=(
+    "Asia/Shanghai:中国标准时间"
+    "UTC:协调世界时"
+    "Asia/Tokyo:日本时间"
+    "Europe/London:伦敦时间"
+    "America/New_York:纽约时间"
+)
 
-# === 系统信息获取 ===
-get_memory_info() {
-    # 返回物理内存大小(MB)
-    awk '/MemTotal/ {print int($2/1024)}' /proc/meminfo
+# === 日志函数 ===
+log() {
+    local msg="$1" level="${2:-info}"
+    local -A colors=([info]="\033[0;36m" [warn]="\033[0;33m" [error]="\033[0;31m")
+    echo -e "${colors[$level]:-\033[0;32m}$msg\033[0m"
 }
 
-# === Zram 配置模块 ===
+# === 核心函数 ===
+
+# 计算Zram大小
 calculate_zram_size() {
     local mem_mb="$1"
     
@@ -38,24 +42,25 @@ calculate_zram_size() {
     fi
 }
 
+# 配置Zram
 setup_zram() {
-    local mem_mb zram_size
-    
     log "配置 Zram Swap..." "info"
     
     # 检查是否已有交换分区
     if swapon --show | grep -v zram | grep -q .; then
+        echo
         log "检测到现有交换分区:" "warn"
         swapon --show | grep -v zram
-        read -p "继续配置Zram? [Y/n]: " -r continue_zram
+        echo
+        read -p "继续配置Zram? [Y/n] (默认: Y): " -r continue_zram
         [[ "$continue_zram" =~ ^[Nn]$ ]] && return 0
     fi
     
-    # 计算Zram大小
-    mem_mb=$(get_memory_info)
-    zram_size=$(calculate_zram_size "$mem_mb")
+    # 获取内存信息并计算Zram大小
+    local mem_mb=$(awk '/MemTotal/ {print int($2/1024)}' /proc/meminfo)
+    local zram_size=$(calculate_zram_size "$mem_mb")
     
-    log "内存: ${mem_mb}MB, Zram大小: $zram_size" "info"
+    log "内存: ${mem_mb}MB, 建议Zram大小: $zram_size" "info"
     
     # 安装zram-tools
     if ! dpkg -l zram-tools &>/dev/null; then
@@ -72,10 +77,8 @@ setup_zram() {
     
     # 配置zram大小
     if [[ -f "$ZRAM_CONFIG" ]]; then
-        # 备份原配置
+        # 备份并更新配置
         cp "$ZRAM_CONFIG" "${ZRAM_CONFIG}.bak"
-        
-        # 更新配置
         if grep -q "^ZRAM_SIZE=" "$ZRAM_CONFIG"; then
             sed -i "s/^ZRAM_SIZE=.*/ZRAM_SIZE=\"$zram_size\"/" "$ZRAM_CONFIG"
         else
@@ -101,10 +104,25 @@ setup_zram() {
     fi
 }
 
-# === 时区配置模块 ===
-setup_timezone() {
-    local target_tz current_tz
+# 显示时区选项
+show_timezone_options() {
+    echo >&2
+    echo "常用时区选择:" >&2
     
+    for i in "${!TIMEZONES[@]}"; do
+        local tz_info="${TIMEZONES[$i]}"
+        local tz_name="${tz_info%%:*}"
+        local tz_desc="${tz_info##*:}"
+        echo "  $((i+1))) $tz_name ($tz_desc)" >&2
+    done
+    
+    echo "  6) 自定义时区" >&2
+    echo "  7) 保持当前时区" >&2
+    echo >&2
+}
+
+# 配置时区
+setup_timezone() {
     log "配置系统时区..." "info"
     
     if ! command -v timedatectl &>/dev/null; then
@@ -113,53 +131,39 @@ setup_timezone() {
     fi
     
     # 获取当前时区
-    current_tz=$(timedatectl show --property=Timezone --value)
-    
+    local current_tz=$(timedatectl show --property=Timezone --value)
     log "当前时区: $current_tz" "info"
     
-    # 询问用户
-    cat << 'EOF'
-
-常用时区选择:
-1) Asia/Shanghai (中国标准时间)
-2) UTC (协调世界时)
-3) Asia/Tokyo (日本时间)
-4) Europe/London (伦敦时间)
-5) America/New_York (纽约时间)
-6) 自定义时区
-7) 保持当前时区
-
-EOF
+    # 显示选项
+    show_timezone_options
     
-    read -p "请选择时区 [1-7, 默认1]: " -r tz_choice
-    tz_choice=${tz_choice:-1}
+    local choice target_tz
+    read -p "请选择时区 [1-7] (默认: 1): " choice </dev/tty >&2
+    choice=${choice:-1}
     
-    case "$tz_choice" in
-        1) target_tz="Asia/Shanghai" ;;
-        2) target_tz="UTC" ;;
-        3) target_tz="Asia/Tokyo" ;;
-        4) target_tz="Europe/London" ;;
-        5) target_tz="America/New_York" ;;
-        6) 
-            while true; do
-                read -p "请输入时区 (如: Asia/Shanghai): " -r desired_tz
-                if timedatectl list-timezones | grep -q "^$desired_tz$"; then
-                    target_tz="$desired_tz"
-                    break
-                else
-                    log "无效时区，请重新输入" "error"
-                fi
-            done
-            ;;
-        7) 
-            log "保持当前时区: $current_tz" "info"
-            return 0
-            ;;
-        *) 
-            log "无效选择，使用默认时区: $DEFAULT_TIMEZONE" "warn"
-            target_tz="$DEFAULT_TIMEZONE"
-            ;;
-    esac
+    if [[ "$choice" =~ ^[1-5]$ ]]; then
+        # 选择预设时区
+        local tz_info="${TIMEZONES[$((choice-1))]}"
+        target_tz="${tz_info%%:*}"
+    elif [[ "$choice" == "6" ]]; then
+        # 自定义时区
+        while true; do
+            read -p "请输入时区 (如: Asia/Shanghai): " target_tz </dev/tty >&2
+            if timedatectl list-timezones | grep -q "^$target_tz$"; then
+                break
+            else
+                log "无效时区，请重新输入" "error" >&2
+            fi
+        done
+    elif [[ "$choice" == "7" ]]; then
+        # 保持当前时区
+        log "保持当前时区: $current_tz" "info"
+        return 0
+    else
+        # 无效选择，使用默认
+        log "无效选择，使用默认时区: $DEFAULT_TIMEZONE" "warn"
+        target_tz="$DEFAULT_TIMEZONE"
+    fi
     
     # 设置时区
     if [[ "$current_tz" != "$target_tz" ]]; then
@@ -171,65 +175,60 @@ EOF
     fi
 }
 
-# === 显示优化摘要 ===
+# 显示系统信息
+show_system_info() {
+    local mem_mb=$(awk '/MemTotal/ {print int($2/1024)}' /proc/meminfo)
+    
+    log "系统信息:" "info"
+    log "  内存: ${mem_mb}MB" "info" 
+    log "  CPU核心: $(nproc)" "info"
+    log "  内核: $(uname -r)" "info"
+}
+
+# 显示优化摘要
 show_optimization_summary() {
     echo
     log "🎯 系统优化摘要:" "info"
     
     # Zram状态
     if systemctl is-active zramswap.service &>/dev/null; then
-        local zram_info
-        zram_info=$(swapon --show | grep zram | awk '{print $3}' | head -1)
+        local zram_info=$(swapon --show | grep zram | awk '{print $3}' | head -1)
         log "  ✓ Zram: ${zram_info:-已启用}" "info"
     else
         log "  ✗ Zram: 未配置" "info"
     fi
     
     # 时区状态
-    local current_tz
-    current_tz=$(timedatectl show --property=Timezone --value 2>/dev/null || echo "未知")
+    local current_tz=$(timedatectl show --property=Timezone --value 2>/dev/null || echo "未知")
     log "  ✓ 时区: $current_tz" "info"
     
-    # 内存使用情况
-    local mem_usage
-    mem_usage=$(free -h | awk '/^Mem:/ {printf "使用:%s/%s", $3, $2}')
+    # 内存和交换使用情况
+    local mem_usage=$(free -h | awk '/^Mem:/ {printf "使用:%s/%s", $3, $2}')
     log "  📊 内存: $mem_usage" "info"
     
-    # 交换空间使用情况
-    local swap_usage
-    swap_usage=$(free -h | awk '/^Swap:/ {printf "使用:%s/%s", $3, $2}')
+    local swap_usage=$(free -h | awk '/^Swap:/ {printf "使用:%s/%s", $3, $2}')
     if [[ "$swap_usage" != "使用:0B/0B" ]]; then
         log "  💾 交换: $swap_usage" "info"
     fi
 }
 
-# === 主执行流程 ===
+# === 主流程 ===
 main() {
     log "🔧 开始系统优化配置..." "info"
     
-    # 显示系统信息
-    local mem_mb
-    mem_mb=$(get_memory_info)
+    echo
+    show_system_info
     
     echo
-    log "系统信息:" "info"
-    log "  内存: ${mem_mb}MB" "info" 
-    log "  CPU核心: $(nproc)" "info"
-    log "  内核: $(uname -r)" "info"
-    
-    echo
-    
-    # 执行优化模块
     setup_zram
+    
     echo
+    setup_timezone
     
-    setup_timezone  
-    
-    # 显示摘要
     show_optimization_summary
     
+    echo
     log "🎉 系统优化配置完成!" "info"
 }
 
-# 执行主流程
 main "$@"
