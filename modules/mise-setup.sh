@@ -205,7 +205,7 @@ setup_system_python_links() {
     fi
 }
 
-# === Shell 集成配置 (修复版) ===
+# === Shell 集成配置 (防冲突版) ===
 setup_shell_integration() {
     log "配置 Shell 集成..." "info"
     
@@ -228,28 +228,25 @@ setup_shell_integration() {
         bash_success=true
     fi
     
-    # 配置 Zsh (如果可用)
+    # 配置 Zsh (检查是否已有mise配置，避免重复)
     if command -v zsh &>/dev/null && [[ -f "$HOME/.zshrc" ]]; then
-        if ! grep -q "mise activate zsh" "$HOME/.zshrc"; then
-            if echo -e "\n# Mise version manager\neval \"\$($MISE_PATH activate zsh)\"" >> "$HOME/.zshrc"; then
+        if ! grep -q "mise activate" "$HOME/.zshrc"; then
+            if echo -e "\n# Mise version manager\nif [[ -z \"\$MISE_SHELL\" ]]; then\n    eval \"\$($MISE_PATH activate zsh)\"\nfi" >> "$HOME/.zshrc"; then
                 log "  ✓ Zsh 集成已添加" "info"
                 zsh_success=true
             else
                 log "  ✗ Zsh 集成添加失败" "error"
             fi
         else
-            log "  ✓ Zsh: 已配置" "info"
+            log "  ✓ Zsh: 已配置 (跳过重复配置)" "info"
             zsh_success=true
         fi
     else
-        # Zsh不可用或配置文件不存在，算作成功
         zsh_success=true
     fi
     
-    # 只要Bash配置成功就算整体成功
     if $bash_success; then
         log "✓ Shell 集成配置完成" "info"
-        log "  请运行 'source ~/.bashrc' 或重新登录以激活" "warn"
         return 0
     else
         log "✗ Shell 集成配置失败" "error"
