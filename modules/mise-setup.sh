@@ -1,13 +1,13 @@
 #!/bin/bash
-# Mise 版本管理器配置模块 v4.1
-# 修复版本获取问题
+# Mise 版本管理器配置模块 v4.2
+# 功能: 安装Mise、智能选择Python版本、Shell集成
+# 统一代码风格，智能版本选择
 
 set -euo pipefail
 
 # === 常量定义 ===
 readonly MISE_PATH="$HOME/.local/bin/mise"
 readonly MISE_BIN_DIR="$HOME/.local/bin"
-readonly DEFAULT_PYTHON_VERSION="3.10"
 
 # === 日志函数 ===
 log() {
@@ -33,17 +33,16 @@ get_mise_version() {
 
 # 获取Python版本
 get_python_version() {
-    # 先确保mise环境已激活，然后获取Python版本
     local python_path python_version
     
-    # 方法1: 直接通过mise获取Python路径
+    # 通过mise获取Python路径
     python_path=$("$MISE_PATH" which python 2>/dev/null || echo "")
     
     if [[ -x "$python_path" ]]; then
         python_version=$("$python_path" --version 2>/dev/null || echo "")
         echo "$python_version"
     else
-        # 方法2: 通过mise exec执行
+        # 备用方法: 通过mise exec执行
         python_version=$("$MISE_PATH" exec python -- --version 2>/dev/null || echo "版本获取失败")
         echo "$python_version"
     fi
@@ -84,27 +83,123 @@ install_mise() {
     fi
 }
 
-# 配置Python
-setup_python() {
-    log "配置 Python $DEFAULT_PYTHON_VERSION..." "info"
+# 获取最新的三个Python主版本
+get_top3_python_versions() {
+    # 获取所有标准版本，提取主版本号，去重并排序，取最新3个
+    local major_versions
+    major_versions=$("$MISE_PATH" ls-remote python | \
+        grep -E "^[0-9]+\.[0-9]+\.[0-9]+$" | \
+        sed -E 's/^([0-9]+\.[0-9]+)\.[0-9]+$/\1/' | \
+        sort -V -u | \
+        tail -3)
     
-    # 检查是否已安装
-    if "$MISE_PATH" list python 2>/dev/null | grep -q "$DEFAULT_PYTHON_VERSION"; then
-        log "Python $DEFAULT_PYTHON_VERSION 已通过 Mise 安装" "info"
+    # 对每个主版本获取最新的patch版本
+    echo "$major_versions" | while read -r major; do
+        "$MISE_PATH" ls-remote python | \
+            grep -E "^${major}\.[0-9]+$" | \
+            sort -V | tail -1
+    done
+}
+
+# 让用户选择Python版本
+choose_python_version() {
+    local versions=($(get_top3_python_versions))
+    local latest_version=$("$MISE_PATH" latest python 2>/dev/null || echo "")
+    
+    echo >&2
+    echo "Python版本选择:" >&2
+    
+    # 显示版本选项
+    for i in "${!versions[@]}"; do
+        local version="${versions[$i]}"
+        local label=""
+        [[ "$version" == "$latest_version" ]] && label=" (latest)"
+        echo "  $((i+1))) Python $version$label" >&2
+    done
+    
+    echo "  4) 保持当前配置" >&2
+    echo >&2
+    
+    # 获取用户选择
+    local choice
+    read -p "请选择 [1-4] (默认: 2): " choice </dev/tty >&2
+    choice=${choice:-2}
+    
+    # 返回选择的版本
+    case "$choice" in
+        1|2|3) 
+            local selected_version="${versions[$((choice-1))]}"
+            [[ -n "$selected_version" ]] && echo "$selected_version" || echo "${versions[1]}"
+            ;;
+        4) echo "current" ;;
+        *) echo "${versions[1]}" ;;  # 默认第2个
+    esac
+}
+
+# 获取已安装的Python版本列表
+get_installed_python_versions() {
+    "$MISE_PATH" ls python 2>/dev/null | awk '/^python/ {print $2}' | grep -E "^[0-9]+\.[0-9]+\.[0-9]+$" || true
+}
+
+# 清理旧版本Python
+cleanup_old_python_versions() {
+    local current_version="$1"
+    local installed_versions
+    
+    installed_versions=$(get_installed_python_versions | grep -v "^$current_version$" || true)
+    
+    if [[ -n "$installed_versions" ]]; then
+        echo
+        log "检测到其他Python版本:" "info"
+        echo "$installed_versions" | sed 's/^/  - Python /'
         
         echo
-        read -p "是否重新安装 Python $DEFAULT_PYTHON_VERSION? [y/N] (默认: N): " -r reinstall_choice
-        if [[ ! "$reinstall_choice" =~ ^[Yy]$ ]]; then
-            return 0
+        read -p "是否删除其他版本? [y/N] (默认: N): " -r cleanup_choice
+        
+        if [[ "$cleanup_choice" =~ ^[Yy]$ ]]; then
+            echo "$installed_versions" | while read -r version; do
+                if [[ -n "$version" ]]; then
+                    log "删除 Python $version..." "info"
+                    if "$MISE_PATH" uninstall "python@$version" 2>/dev/null; then
+                        log "✓ Python $version 已删除" "info"
+                    else
+                        log "✗ 删除 Python $version 失败" "warn"
+                    fi
+                fi
+            done
         fi
+    else
+        log "没有其他Python版本需要清理" "info"
+    fi
+}
+
+# 配置Python
+setup_python() {
+    log "配置 Python..." "info"
+    
+    # 检查当前配置
+    local current_version=$("$MISE_PATH" current python 2>/dev/null || echo "")
+    
+    if [[ -n "$current_version" ]]; then
+        log "当前Python版本: $current_version" "info"
     fi
     
-    # 安装Python
-    log "安装 Python $DEFAULT_PYTHON_VERSION..." "info"
-    if "$MISE_PATH" use -g "python@$DEFAULT_PYTHON_VERSION"; then
-        log "✓ Python $DEFAULT_PYTHON_VERSION 安装完成" "info"
+    # 让用户选择版本
+    local selected_version=$(choose_python_version)
+    
+    if [[ "$selected_version" == "current" ]]; then
+        log "保持当前Python配置" "info"
+        return 0
+    fi
+    
+    log "安装 Python $selected_version..." "info"
+    if "$MISE_PATH" use -g "python@$selected_version"; then
+        log "✓ Python $selected_version 安装完成" "info"
+        
+        # 询问是否清理旧版本
+        cleanup_old_python_versions "$selected_version"
     else
-        log "✗ Python $DEFAULT_PYTHON_VERSION 安装失败" "warn"
+        log "✗ Python $selected_version 安装失败" "error"
         return 1
     fi
 }
@@ -188,7 +283,8 @@ show_mise_summary() {
         # Python状态
         if "$MISE_PATH" which python &>/dev/null; then
             local python_version=$(get_python_version)
-            log "  ✓ Python: $python_version" "info"
+            local current_version=$("$MISE_PATH" current python 2>/dev/null || echo "未知")
+            log "  ✓ Python: $python_version (当前: $current_version)" "info"
         else
             log "  ✗ Python: 未配置" "info"
         fi
