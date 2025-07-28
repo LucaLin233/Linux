@@ -81,14 +81,14 @@ install_zsh_plugins() {
     mkdir -p "$PLUGINS_DIR"
     
     local plugins=(
-        "zsh-autosuggestions:https://github.com/zsh-users/zsh-autosuggestions"
-        "zsh-syntax-highlighting:https://github.com/zsh-users/zsh-syntax-highlighting.git"
-        "zsh-completions:https://github.com/zsh-users/zsh-completions"
+        "zsh-autosuggestions|https://github.com/zsh-users/zsh-autosuggestions"
+        "zsh-syntax-highlighting|https://github.com/zsh-users/zsh-syntax-highlighting.git"
+        "zsh-completions|https://github.com/zsh-users/zsh-completions"
     )
     
     for plugin_info in "${plugins[@]}"; do
-        local plugin_name="${plugin_info%%:*}"
-        local plugin_url="${plugin_info##*:}"
+        local plugin_name="${plugin_info%%|*}"
+        local plugin_url="${plugin_info##*|}"
         
         if [[ ! -d "$PLUGINS_DIR/$plugin_name" ]]; then
             if git clone "$plugin_url" "$PLUGINS_DIR/$plugin_name"; then
