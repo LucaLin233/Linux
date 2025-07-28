@@ -60,6 +60,29 @@ setup_zram() {
     local mem_mb=$(awk '/MemTotal/ {print int($2/1024)}' /proc/meminfo)
     local zram_size=$(calculate_zram_size "$mem_mb")
     
+    # 检查是否已有合适大小的zram
+    if swapon --show | grep -q zram; then
+        local current_zram_size=$(swapon --show | grep zram | awk '{print $3}' | head -1)
+        log "检测到现有zram: $current_zram_size" "info"
+        
+        # 简单的大小比较（如果当前大小合理就跳过）
+        if [[ "$current_zram_size" =~ [0-9.]+G ]] && [[ "$zram_size" =~ [0-9]+G ]]; then
+            log "Zram大小已合适，跳过配置" "info"
+            return 0
+        elif [[ "$current_zram_size" =~ [0-9.]+G ]] && [[ "$zram_size" =~ [0-9]+M ]]; then
+            # 当前是G级别，目标是M级别，需要重配
+            :
+        else
+            # 其他情况简单检查数值
+            local current_num=$(echo "$current_zram_size" | grep -o '[0-9.]*')
+            local target_num=$(echo "$zram_size" | grep -o '[0-9]*')
+            if (( $(echo "$current_num >= $target_num * 0.9" | bc -l 2>/dev/null || echo 0) )); then
+                log "Zram大小已合适，跳过配置" "info"
+                return 0
+            fi
+        fi
+    fi
+    
     log "内存: ${mem_mb}MB, 建议Zram大小: $zram_size" "info"
     
     # 安装zram-tools
@@ -79,14 +102,39 @@ setup_zram() {
     if [[ -f "$ZRAM_CONFIG" ]]; then
         # 备份并更新配置
         cp "$ZRAM_CONFIG" "${ZRAM_CONFIG}.bak"
-        if grep -q "^ZRAM_SIZE=" "$ZRAM_CONFIG"; then
-            sed -i "s/^ZRAM_SIZE=.*/ZRAM_SIZE=\"$zram_size\"/" "$ZRAM_CONFIG"
+        
+        # 转换大小格式: 1920M -> 1920, 2G -> 2048
+        local size_mib
+        case "$zram_size" in
+            *G) size_mib=$((${zram_size%G} * 1024)) ;;
+            *M) size_mib=${zram_size%M} ;;
+            *) size_mib=$zram_size ;;
+        esac
+        
+        # 更新或添加SIZE参数
+        if grep -q "^SIZE=" "$ZRAM_CONFIG"; then
+            sed -i "s/^SIZE=.*/SIZE=$size_mib/" "$ZRAM_CONFIG"
+        elif grep -q "^#SIZE=" "$ZRAM_CONFIG"; then
+            sed -i "s/^#SIZE=.*/SIZE=$size_mib/" "$ZRAM_CONFIG"
         else
-            echo "ZRAM_SIZE=\"$zram_size\"" >> "$ZRAM_CONFIG"
+            echo "SIZE=$size_mib" >> "$ZRAM_CONFIG"
         fi
+        
+        # 移除错误的 ZRAM_SIZE 参数（如果存在）
+        sed -i '/^ZRAM_SIZE=/d' "$ZRAM_CONFIG"
+        
+        # 确保注释掉PERCENT参数，避免覆盖SIZE
+        sed -i 's/^PERCENT=/#PERCENT=/' "$ZRAM_CONFIG"
+        
     else
         # 创建新配置文件
-        echo "ZRAM_SIZE=\"$zram_size\"" > "$ZRAM_CONFIG"
+        local size_mib
+        case "$zram_size" in
+            *G) size_mib=$((${zram_size%G} * 1024)) ;;
+            *M) size_mib=${zram_size%M} ;;
+            *) size_mib=$zram_size ;;
+        esac
+        echo "SIZE=$size_mib" > "$ZRAM_CONFIG"
     fi
     
     # 启用并启动服务
@@ -95,11 +143,21 @@ setup_zram() {
     
     # 验证配置
     if systemctl is-active zramswap.service &>/dev/null; then
-        log "✓ Zram配置成功" "info"
-        log "  当前交换状态:" "info"
-        swapon --show | sed 's/^/    /'
+        # 等待一下让服务完全启动
+        sleep 1
+        
+        if swapon --show | grep -q zram0; then
+            local actual_size=$(swapon --show | grep zram0 | awk '{print $3}')
+            log "✓ Zram配置成功，实际大小: $actual_size" "info"
+            log "  当前交换状态:" "info"
+            swapon --show | sed 's/^/    /'
+        else
+            log "✗ Zram启动成功但交换设备未激活" "warn"
+            systemctl status zramswap.service --no-pager -l
+        fi
     else
         log "✗ Zram配置失败" "error"
+        systemctl status zramswap.service --no-pager -l
         return 1
     fi
 }
