@@ -46,7 +46,7 @@ calculate_zram_size() {
     fi
 }
 
-# 配置Zram (修复版)
+# 配置Zram (修复浮点数问题)
 setup_zram() {
     log "配置 Zram Swap..." "info"
     
@@ -73,36 +73,39 @@ setup_zram() {
         local current_size=$(echo "$current_zram_info" | awk '{print $3}')
         log "检测到现有zram: $current_size" "info"
         
-        # 比较大小决定是否重新配置
-        local should_reconfigure=false
-        
-        # 转换目标大小为数字便于比较
+        # 转换目标大小为MB（整数）
         local target_mb
         case "$target_zram_size" in
             *G) target_mb=$((${target_zram_size%G} * 1024)) ;;
             *M) target_mb=${target_zram_size%M} ;;
         esac
         
-        # 转换当前大小为数字
+        # 转换当前大小为MB（整数，去掉小数部分）
         local current_mb
         case "$current_size" in
-            *G) current_mb=$(echo "${current_size%G} * 1024" | bc 2>/dev/null || echo $((${current_size%.*} * 1024))) ;;
-            *M) current_mb=${current_size%.*} ;;
-            *) current_mb=$(echo "$current_size" | grep -o '[0-9]*') ;;
+            *G) 
+                local gb_value=${current_size%G}
+                # 去掉小数部分，转换为整数MB
+                current_mb=$(printf "%.0f\n" $(echo "$gb_value * 1024" | bc 2>/dev/null || echo "$((${gb_value%.*} * 1024))"))
+                ;;
+            *M) 
+                # 去掉小数部分
+                current_mb=${current_size%.*}
+                ;;
+            *) 
+                current_mb=$(echo "$current_size" | grep -o '[0-9]*')
+                ;;
         esac
         
-        # 如果差异超过20%就重新配置
-        if (( current_mb < target_mb * 80 / 100 )) || (( current_mb > target_mb * 120 / 100 )); then
-            log "当前大小与目标差异较大，重新配置..." "info"
-            should_reconfigure=true
-        else
-            log "✓ Zram大小合适，跳过配置" "info"
-            return 0
-        fi
+        # 计算差异百分比（允许15%误差）
+        local diff_percent=$((current_mb * 100 / target_mb))
         
-        if [[ "$should_reconfigure" == "true" ]]; then
-            log "停止现有zram服务..." "info"
+        if (( diff_percent < 85 )) || (( diff_percent > 115 )); then
+            log "当前${current_mb}MB与目标${target_mb}MB差异${diff_percent}%，重新配置..." "info"
             systemctl stop zramswap.service 2>/dev/null || true
+        else
+            log "✓ Zram大小合适 (${current_mb}MB ≈ ${target_mb}MB)，跳过配置" "info"
+            return 0
         fi
     fi
     
@@ -118,7 +121,7 @@ setup_zram() {
         # 备份并更新配置
         cp "$ZRAM_CONFIG" "${ZRAM_CONFIG}.bak"
         
-        # 转换大小格式: 1920M -> 1920, 2G -> 2048
+        # 转换大小格式: 1866M -> 1866, 2G -> 2048
         local size_mib
         case "$target_zram_size" in
             *G) size_mib=$((${target_zram_size%G} * 1024)) ;;
@@ -135,9 +138,8 @@ setup_zram() {
             echo "SIZE=$size_mib" >> "$ZRAM_CONFIG"
         fi
         
-        # 移除错误的参数
+        # 清理错误参数
         sed -i '/^ZRAM_SIZE=/d' "$ZRAM_CONFIG"
-        # 确保注释掉PERCENT参数
         sed -i 's/^PERCENT=/#PERCENT=/' "$ZRAM_CONFIG"
         
     else
@@ -157,9 +159,7 @@ setup_zram() {
     
     # 验证配置
     if systemctl is-active zramswap.service &>/dev/null; then
-        # 等待服务完全启动
         sleep 2
-        
         if swapon --show | grep -q zram0; then
             local actual_size=$(swapon --show | grep zram0 | awk '{print $3}')
             log "✓ Zram配置成功，实际大小: $actual_size" "info"
@@ -170,7 +170,6 @@ setup_zram() {
         fi
     else
         log "✗ Zram配置失败" "error"
-        systemctl status zramswap.service --no-pager -l
         return 1
     fi
 }
