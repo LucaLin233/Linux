@@ -1,11 +1,12 @@
 #!/bin/bash
-# 网络性能优化模块 v4.1
-# 修复网卡检测和tc命令问题
+# 网络性能优化模块 v4.2
+# 集成第一个脚本的完整参数配置
 
 set -euo pipefail
 
 # === 常量定义 ===
 readonly SYSCTL_CONFIG="/etc/sysctl.conf"
+readonly LIMITS_CONFIG="/etc/security/limits.conf"
 
 # === 日志函数 ===
 log() {
@@ -16,22 +17,34 @@ log() {
 
 # === 核心函数 ===
 
-# 智能备份sysctl配置
-backup_sysctl_config() {
+# 智能备份配置文件
+backup_configs() {
+    # 备份 sysctl 配置
     if [[ -f "$SYSCTL_CONFIG" ]]; then
         # 首次备份：保存原始配置
         if [[ ! -f "$SYSCTL_CONFIG.original" ]]; then
             cp "$SYSCTL_CONFIG" "$SYSCTL_CONFIG.original"
-            log "已备份原始配置: sysctl.conf.original" "info"
+            log "已备份原始 sysctl 配置: sysctl.conf.original" "info"
         fi
         
         # 最近备份：总是覆盖
         cp "$SYSCTL_CONFIG" "$SYSCTL_CONFIG.backup"
-        log "已备份当前配置: sysctl.conf.backup" "info"
+        log "已备份当前 sysctl 配置: sysctl.conf.backup" "info"
+    fi
+    
+    # 备份 limits 配置
+    if [[ -f "$LIMITS_CONFIG" ]]; then
+        if [[ ! -f "$LIMITS_CONFIG.original" ]]; then
+            cp "$LIMITS_CONFIG" "$LIMITS_CONFIG.original"
+            log "已备份原始 limits 配置: limits.conf.original" "info"
+        fi
+        
+        cp "$LIMITS_CONFIG" "$LIMITS_CONFIG.backup"
+        log "已备份当前 limits 配置: limits.conf.backup" "info"
     fi
 }
 
-# 检测主用网络接口（修复版）
+# 检测主用网络接口
 detect_main_interface() {
     local interface
     interface=$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++){if($i=="dev"){print $(i+1);exit}}}' || echo "")
@@ -70,21 +83,83 @@ check_bbr_support() {
     fi
 }
 
-# 配置网络优化参数
+# 配置系统资源限制
+configure_system_limits() {
+    log "配置系统资源限制..." "info"
+    
+    # 处理 nproc 配置文件重命名（修复版）
+    if compgen -G "/etc/security/limits.d/*nproc.conf" > /dev/null 2>&1; then
+        for file in /etc/security/limits.d/*nproc.conf; do
+            if [[ -f "$file" ]]; then
+                mv "$file" "${file%.conf}.conf_bk" 2>/dev/null || true
+                log "已重命名 nproc 配置文件: $(basename "$file")" "info"
+            fi
+        done
+    fi
+    
+    # 配置 PAM 限制
+    if [[ -f /etc/pam.d/common-session ]] && ! grep -q 'session required pam_limits.so' /etc/pam.d/common-session; then
+        echo "session required pam_limits.so" >> /etc/pam.d/common-session
+        log "已配置 PAM limits 模块" "info"
+    fi
+    
+    # 更新 limits.conf
+    sed -i '/^# End of file/,$d' "$LIMITS_CONFIG"
+    cat >> "$LIMITS_CONFIG" << 'EOF'
+# End of file
+*     soft   nofile    1048576
+*     hard   nofile    1048576
+*     soft   nproc     1048576
+*     hard   nproc     1048576
+*     soft   core      1048576
+*     hard   core      1048576
+*     hard   memlock   unlimited
+*     soft   memlock   unlimited
+
+root     soft   nofile    1048576
+root     hard   nofile    1048576
+root     soft   nproc     1048576
+root     hard   nproc     1048576
+root     soft   core      1048576
+root     hard   core      1048576
+root     hard   memlock   unlimited
+root     soft   memlock   unlimited
+EOF
+    
+    log "✓ 系统资源限制配置完成" "info"
+}
+
+# 配置网络优化参数（使用第一个脚本的完整参数）
 configure_network_parameters() {
     log "配置网络优化参数..." "info"
     
-    backup_sysctl_config
+    backup_configs
     
-    # 需要移除的旧参数
+    # 需要移除的旧参数（第一个脚本的完整参数列表）
     local old_params=(
-        "net.ipv4.tcp_congestion_control"
-        "net.core.default_qdisc"
         "fs.file-max"
-        "net.ipv4.tcp_max_syn_backlog"
+        "fs.inotify.max_user_instances"
         "net.core.somaxconn"
+        "net.core.netdev_max_backlog"
+        "net.core.rmem_max"
+        "net.core.wmem_max"
+        "net.ipv4.udp_rmem_min"
+        "net.ipv4.udp_wmem_min"
+        "net.ipv4.tcp_rmem"
+        "net.ipv4.tcp_wmem"
+        "net.ipv4.tcp_mem"
+        "net.ipv4.udp_mem"
+        "net.ipv4.tcp_syncookies"
+        "net.ipv4.tcp_fin_timeout"
         "net.ipv4.tcp_tw_reuse"
-        "net.ipv4.tcp_abort_on_overflow"
+        "net.ipv4.ip_local_port_range"
+        "net.ipv4.tcp_max_syn_backlog"
+        "net.ipv4.tcp_max_tw_buckets"
+        "net.ipv4.route.gc_timeout"
+        "net.ipv4.tcp_syn_retries"
+        "net.ipv4.tcp_synack_retries"
+        "net.ipv4.tcp_timestamps"
+        "net.ipv4.tcp_max_orphans"
         "net.ipv4.tcp_no_metrics_save"
         "net.ipv4.tcp_ecn"
         "net.ipv4.tcp_frto"
@@ -95,19 +170,17 @@ configure_network_parameters() {
         "net.ipv4.tcp_window_scaling"
         "net.ipv4.tcp_adv_win_scale"
         "net.ipv4.tcp_moderate_rcvbuf"
-        "net.ipv4.tcp_fin_timeout"
-        "net.ipv4.tcp_rmem"
-        "net.ipv4.tcp_wmem"
-        "net.core.rmem_max"
-        "net.core.wmem_max"
-        "net.ipv4.udp_rmem_min"
-        "net.ipv4.udp_wmem_min"
-        "net.ipv4.ip_local_port_range"
-        "net.ipv4.tcp_timestamps"
+        "net.ipv4.tcp_keepalive_time"
+        "net.ipv4.tcp_notsent_lowat"
+        "net.ipv4.conf.all.route_localnet"
+        "net.ipv4.ip_forward"
+        "net.ipv4.conf.all.forwarding"
+        "net.ipv4.conf.default.forwarding"
+        "net.core.default_qdisc"
+        "net.ipv4.tcp_congestion_control"
+        "net.ipv4.tcp_abort_on_overflow"
         "net.ipv4.conf.all.rp_filter"
         "net.ipv4.conf.default.rp_filter"
-        "net.ipv4.ip_forward"
-        "net.ipv4.conf.all.route_localnet"
     )
     
     # 移除旧配置
@@ -115,40 +188,51 @@ configure_network_parameters() {
         sed -i "/^${param//./\\.}[[:space:]]*=.*/d" "$SYSCTL_CONFIG"
     done
     
-    # 添加新的网络优化配置
+    # 添加第一个脚本的完整网络优化配置
     cat >> "$SYSCTL_CONFIG" << 'EOF'
 
-# 网络性能优化 - BBR + cake + 高级参数
-net.ipv4.tcp_congestion_control = bbr
-net.core.default_qdisc = cake
-fs.file-max = 6815744
-net.ipv4.tcp_max_syn_backlog = 8192
-net.core.somaxconn = 8192
+# 网络性能优化 - 完整参数配置
+fs.file-max = 1048576
+fs.inotify.max_user_instances = 8192
+net.core.somaxconn = 32768
+net.core.netdev_max_backlog = 32768
+net.core.rmem_max = 33554432
+net.core.wmem_max = 33554432
+net.ipv4.udp_rmem_min = 16384
+net.ipv4.udp_wmem_min = 16384
+net.ipv4.tcp_rmem = 4096 87380 33554432
+net.ipv4.tcp_wmem = 4096 16384 33554432
+net.ipv4.tcp_mem = 786432 1048576 26777216
+net.ipv4.udp_mem = 65536 131072 262144
+net.ipv4.tcp_syncookies = 1
+net.ipv4.tcp_fin_timeout = 30
 net.ipv4.tcp_tw_reuse = 1
-net.ipv4.tcp_abort_on_overflow = 1
+net.ipv4.ip_local_port_range = 1024 65000
+net.ipv4.tcp_max_syn_backlog = 16384
+net.ipv4.tcp_max_tw_buckets = 6000
+net.ipv4.route.gc_timeout = 100
+net.ipv4.tcp_syn_retries = 1
+net.ipv4.tcp_synack_retries = 1
+net.ipv4.tcp_timestamps = 0
+net.ipv4.tcp_max_orphans = 131072
 net.ipv4.tcp_no_metrics_save = 1
 net.ipv4.tcp_ecn = 0
 net.ipv4.tcp_frto = 0
 net.ipv4.tcp_mtu_probing = 0
-net.ipv4.tcp_rfc1337 = 1
+net.ipv4.tcp_rfc1337 = 0
 net.ipv4.tcp_sack = 1
 net.ipv4.tcp_fack = 1
 net.ipv4.tcp_window_scaling = 1
-net.ipv4.tcp_adv_win_scale = 2
+net.ipv4.tcp_adv_win_scale = 1
 net.ipv4.tcp_moderate_rcvbuf = 1
-net.ipv4.tcp_fin_timeout = 30
-net.ipv4.tcp_rmem = 4096 87380 67108864
-net.ipv4.tcp_wmem = 4096 65536 67108864
-net.core.rmem_max = 67108864
-net.core.wmem_max = 67108864
-net.ipv4.udp_rmem_min = 8192
-net.ipv4.udp_wmem_min = 8192
-net.ipv4.ip_local_port_range = 1024 65535
-net.ipv4.tcp_timestamps = 1
-net.ipv4.conf.all.rp_filter = 0
-net.ipv4.conf.default.rp_filter = 0
-net.ipv4.ip_forward = 1
+net.ipv4.tcp_keepalive_time = 600
+net.ipv4.tcp_notsent_lowat = 16384
 net.ipv4.conf.all.route_localnet = 1
+net.ipv4.ip_forward = 1
+net.ipv4.conf.all.forwarding = 1
+net.ipv4.conf.default.forwarding = 1
+net.core.default_qdisc = cake
+net.ipv4.tcp_congestion_control = bbr
 
 EOF
     
@@ -160,7 +244,7 @@ EOF
     fi
 }
 
-# 配置网卡队列调度（修复版）
+# 配置网卡队列调度
 configure_interface_qdisc() {
     local interface="$1"
     
@@ -227,9 +311,10 @@ setup_network_optimization() {
     log "网络性能优化说明:" "info"
     log "  BBR: 改进的TCP拥塞控制算法，提升网络吞吐量" "info"
     log "  cake: 智能队列管理，减少网络延迟和抖动" "info"
+    log "  完整参数: 包含系统资源限制和全面的TCP优化" "info"
     
     echo
-    read -p "是否启用网络性能优化 (BBR+cake)? [Y/n] (默认: Y): " -r optimize_choice
+    read -p "是否启用网络性能优化 (BBR+cake+完整参数)? [Y/n] (默认: Y): " -r optimize_choice
     
     if [[ "$optimize_choice" =~ ^[Nn]$ ]]; then
         log "跳过网络优化配置" "info"
@@ -250,6 +335,9 @@ setup_network_optimization() {
         return 1
     fi
     
+    # 配置系统资源限制
+    configure_system_limits
+    
     # 配置网络参数
     configure_network_parameters
     
@@ -260,7 +348,7 @@ setup_network_optimization() {
     verify_network_config
 }
 
-# 显示网络优化摘要（修复版）
+# 显示网络优化摘要
 show_network_summary() {
     echo
     log "🎯 网络优化摘要:" "info"
@@ -281,16 +369,23 @@ show_network_summary() {
         log "  ✗ 队列调度: $current_qdisc" "info"
     fi
     
+    # 系统资源限制状态（修复版检查）
+    if grep -q "nofile.*1048576" "$LIMITS_CONFIG" 2>/dev/null; then
+        log "  ✓ 系统资源限制: 已配置 (重新登录后生效)" "info"
+    else
+        log "  ✗ 系统资源限制: 未配置" "warn"
+    fi
+    
     # 配置文件状态
     if [[ -f "$SYSCTL_CONFIG.original" ]]; then
-        log "  ✓ 原始配置: 已备份" "info"
+        log "  ✓ sysctl 原始配置: 已备份" "info"
     fi
     
-    if [[ -f "$SYSCTL_CONFIG.backup" ]]; then
-        log "  ✓ 最近配置: 已备份" "info"
+    if [[ -f "$LIMITS_CONFIG.original" ]]; then
+        log "  ✓ limits 原始配置: 已备份" "info"
     fi
     
-    # 主网卡状态（修复版）
+    # 主网卡状态
     local interface
     if interface=$(detect_main_interface 2>/dev/null); then
         if command -v tc &>/dev/null && tc qdisc show dev "$interface" 2>/dev/null | grep -q "cake"; then
@@ -320,7 +415,8 @@ main() {
     log "  查看拥塞控制: sysctl net.ipv4.tcp_congestion_control" "info"
     log "  查看队列调度: sysctl net.core.default_qdisc" "info"
     log "  查看网卡队列: tc qdisc show" "info"
-    log "  恢复配置: cp /etc/sysctl.conf.backup /etc/sysctl.conf" "info"
+    log "  恢复 sysctl: cp /etc/sysctl.conf.backup /etc/sysctl.conf" "info"
+    log "  恢复 limits: cp /etc/security/limits.conf.backup /etc/security/limits.conf" "info"
 }
 
 main "$@"
