@@ -46,7 +46,7 @@ calculate_zram_size() {
     fi
 }
 
-# 配置Zram (修复浮点数问题)
+# 配置Zram (修复单位后缀问题)
 setup_zram() {
     log "配置 Zram Swap..." "info"
     
@@ -80,32 +80,33 @@ setup_zram() {
             *M) target_mb=${target_zram_size%M} ;;
         esac
         
-        # 转换当前大小为MB（整数，去掉小数部分）
+        # 转换当前大小为MB（整数）- 修复版
         local current_mb
         case "$current_size" in
             *G) 
-                local gb_value=${current_size%G}
-                # 去掉小数部分，转换为整数MB
-                current_mb=$(printf "%.0f\n" $(echo "$gb_value * 1024" | bc 2>/dev/null || echo "$((${gb_value%.*} * 1024))"))
+                local gb_value=${current_size%G}  # 去掉G后缀
+                local gb_int=${gb_value%.*}       # 去掉小数部分
+                current_mb=$((gb_int * 1024))
                 ;;
             *M) 
-                # 去掉小数部分
-                current_mb=${current_size%.*}
+                local mb_value=${current_size%M}  # 先去掉M后缀
+                current_mb=${mb_value%.*}         # 再去掉小数部分
                 ;;
             *) 
                 current_mb=$(echo "$current_size" | grep -o '[0-9]*')
                 ;;
         esac
         
-        # 计算差异百分比（允许15%误差）
-        local diff_percent=$((current_mb * 100 / target_mb))
+        # 简单的差异检查（允许20%误差）
+        local min_acceptable=$((target_mb * 80 / 100))
+        local max_acceptable=$((target_mb * 120 / 100))
         
-        if (( diff_percent < 85 )) || (( diff_percent > 115 )); then
-            log "当前${current_mb}MB与目标${target_mb}MB差异${diff_percent}%，重新配置..." "info"
-            systemctl stop zramswap.service 2>/dev/null || true
-        else
+        if (( current_mb >= min_acceptable && current_mb <= max_acceptable )); then
             log "✓ Zram大小合适 (${current_mb}MB ≈ ${target_mb}MB)，跳过配置" "info"
             return 0
+        else
+            log "当前${current_mb}MB与目标${target_mb}MB差异较大，重新配置..." "info"
+            systemctl stop zramswap.service 2>/dev/null || true
         fi
     fi
     
@@ -121,7 +122,7 @@ setup_zram() {
         # 备份并更新配置
         cp "$ZRAM_CONFIG" "${ZRAM_CONFIG}.bak"
         
-        # 转换大小格式: 1866M -> 1866, 2G -> 2048
+        # 转换大小格式: 3921M -> 3921, 4G -> 4096
         local size_mib
         case "$target_zram_size" in
             *G) size_mib=$((${target_zram_size%G} * 1024)) ;;
