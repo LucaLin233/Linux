@@ -1,6 +1,6 @@
 #!/bin/bash
-# Zsh Shell 环境配置模块 v4.1
-# 统一代码风格，优化备份策略，增加主题选择功能
+# Zsh Shell 环境配置模块 v4.0
+# 统一代码风格，优化备份策略
 
 set -euo pipefail
 
@@ -100,57 +100,6 @@ install_zsh_plugins() {
     done
 }
 
-# 选择主题
-choose_theme() {
-    echo
-    log "选择 Powerlevel10k 配置方式:" "info"
-    echo
-    echo "  1) 使用配置向导 (推荐) - 交互式配置，功能最全"
-    echo "  2) 使用 Rainbow 预设 - 彩虹主题，丰富多彩"  
-    echo "  3) 使用 Lean 预设 - 精简主题，简洁清爽"
-    echo "  4) 使用 Classic 预设 - 经典主题，传统外观"
-    echo "  5) 使用 Pure 预设 - 纯净主题，极简风格"
-    echo
-    
-    while true; do
-        read -p "请选择配置方式 [1-5] (默认: 1): " choice
-        
-        # 如果用户直接回车，使用默认选择
-        [[ -z "$choice" ]] && choice="1"
-        
-        case "$choice" in
-            1)
-                log "已选择: 配置向导模式" "info"
-                echo "wizard"
-                return 0
-                ;;
-            2)
-                log "已选择: Rainbow 预设主题" "info"
-                echo "rainbow"
-                return 0
-                ;;
-            3)
-                log "已选择: Lean 预设主题" "info"
-                echo "lean"
-                return 0
-                ;;
-            4)
-                log "已选择: Classic 预设主题" "info"
-                echo "classic"
-                return 0
-                ;;
-            5)
-                log "已选择: Pure 预设主题" "info"
-                echo "pure"
-                return 0
-                ;;
-            *)
-                log "无效选择，请输入 1-5 之间的数字" "warn"
-                ;;
-        esac
-    done
-}
-
 # 配置zshrc文件
 configure_zshrc() {
     log "配置 .zshrc 文件..." "info"
@@ -201,59 +150,84 @@ EOF
     log "✓ .zshrc 配置完成" "info"
 }
 
-# 设置预设主题
-setup_preset_theme() {
-    local preset_name="$1"
-    local local_config="$THEME_DIR/config/p10k-${preset_name}.zsh"
-    local github_url="https://raw.githubusercontent.com/romkatv/powerlevel10k/master/config/p10k-${preset_name}.zsh"
+# 选择主题
+select_theme() {
+    echo
+    log "请选择 Powerlevel10k 主题:" "info"
+    echo
+    echo "  1) Rainbow 主题 (默认) - 彩虹主题，丰富多彩"
+    echo "  2) Lean 主题 - 精简主题，简洁清爽"
+    echo "  3) Classic 主题 - 经典主题，传统外观"
+    echo "  4) Pure 主题 - 纯净主题，极简风格"
+    echo "  5) 配置向导 - 交互式配置，功能最全"
+    echo
     
-    # 优先使用本地配置文件（如原脚本）
-    if [[ -f "$local_config" ]]; then
-        log "使用本地 $preset_name 预设配置..." "info"
-        cp "$local_config" "$HOME/.p10k.zsh"
-        log "✓ $preset_name 预设主题配置完成" "info"
-        return 0
+    local choice
+    read -p "请输入选项 [1-5] (默认: 1): " choice
+    
+    # 如果用户直接回车，使用默认选择
+    if [[ -z "$choice" ]]; then
+        choice="1"
     fi
     
-    # 如果本地没有，则从GitHub下载
-    log "从GitHub下载 $preset_name 预设配置..." "info"
-    if curl -fsSL "$github_url" -o "$HOME/.p10k.zsh"; then
-        log "✓ $preset_name 预设配置下载完成" "info"
-        return 0
-    else
-        log "✗ $preset_name 预设配置下载失败，将回退到配置向导模式" "warn"
-        cat > "$HOME/.p10k.zsh" << 'EOF'
-# Powerlevel10k 配置文件
-# 预设配置获取失败，首次启动时会运行配置向导
-# 如需重新配置，请运行: p10k configure
-
-# 启用即时提示模式  
-typeset -g POWERLEVEL9K_INSTANT_PROMPT=verbose
-EOF
-        return 1
-    fi
+    case "$choice" in
+        1)
+            log "已选择: Rainbow 主题" "info"
+            SELECTED_THEME="rainbow"
+            ;;
+        2)
+            log "已选择: Lean 主题" "info"
+            SELECTED_THEME="lean"
+            ;;
+        3)
+            log "已选择: Classic 主题" "info"
+            SELECTED_THEME="classic"
+            ;;
+        4)
+            log "已选择: Pure 主题" "info"
+            SELECTED_THEME="pure"
+            ;;
+        5)
+            log "已选择: 配置向导" "info"
+            SELECTED_THEME="wizard"
+            ;;
+        *)
+            log "无效选择，使用默认 Rainbow 主题" "warn"
+            SELECTED_THEME="rainbow"
+            ;;
+    esac
 }
 
 # 配置Powerlevel10k主题
 configure_powerlevel10k() {
-    local theme_choice="$1"
+    local theme_name="$1"
     
-    if [[ "$theme_choice" == "wizard" ]]; then
-        # 配置向导模式
-        log "配置 Powerlevel10k 配置向导模式..." "info"
-        cat > "$HOME/.p10k.zsh" << 'EOF'
-# Powerlevel10k 配置文件
-# 首次启动 zsh 时会自动运行配置向导
-# 如需重新配置，请运行: p10k configure
-
-# 启用即时提示模式
-typeset -g POWERLEVEL9K_INSTANT_PROMPT=verbose
-EOF
-        log "✓ 配置向导模式设置完成" "info"
+    if [[ "$theme_name" == "wizard" ]]; then
+        log "配置 Powerlevel10k 配置向导..." "info"
+        log "首次启动 zsh 时会自动运行配置向导" "info"
+        # 不创建配置文件，让p10k自动运行向导
+        return 0
+    fi
+    
+    log "配置 Powerlevel10k $theme_name 主题..." "info"
+    
+    local p10k_config="$THEME_DIR/config/p10k-$theme_name.zsh"
+    
+    # 优先使用本地配置文件
+    if [[ -f "$p10k_config" ]]; then
+        cp "$p10k_config" "$HOME/.p10k.zsh"
+        log "✓ $theme_name 主题配置完成" "info"
     else
-        # 预设主题模式
-        log "配置 Powerlevel10k $theme_choice 预设主题..." "info"
-        setup_preset_theme "$theme_choice" || log "预设配置设置失败，已回退到配置向导模式" "warn"
+        # 本地没有，从GitHub下载
+        log "本地配置不存在，从GitHub下载 $theme_name 主题配置..." "info"
+        local github_url="https://raw.githubusercontent.com/romkatv/powerlevel10k/master/config/p10k-$theme_name.zsh"
+        
+        if curl -fsSL "$github_url" -o "$HOME/.p10k.zsh"; then
+            log "✓ $theme_name 主题配置下载完成" "info"
+        else
+            log "✗ $theme_name 主题配置下载失败，将使用配置向导" "warn"
+            log "首次启动 zsh 时会自动运行配置向导" "info"
+        fi
     fi
 }
 
@@ -264,7 +238,7 @@ setup_default_shell() {
     
     if [[ "$current_shell" != "$zsh_path" ]]; then
         echo
-        read -p "是否将 Zsh 设置为默认 Shell? [y/N]: " set_default
+        read -p "是否将 Zsh 设置为默认 Shell? [y/N]: " -r set_default
         if [[ "$set_default" =~ ^[Yy]$ ]]; then
             chsh -s "$zsh_path" root
             log "✓ Zsh 已设置为默认 Shell (重新登录后生效)" "info"
@@ -284,21 +258,16 @@ main() {
     install_zsh_plugins
     configure_zshrc
     
-    # 主题配置选择
-    local theme_choice
-    theme_choice=$(choose_theme)
-    configure_powerlevel10k "$theme_choice"
+    # 选择主题
+    select_theme
+    configure_powerlevel10k "$SELECTED_THEME"
     
     setup_default_shell
     
     echo
     log "🎉 Zsh 环境配置完成!" "info"
     log "💡 提示: 运行 'exec zsh' 立即体验新环境" "info"
-    
-    if [[ "$theme_choice" == "wizard" ]]; then
-        log "🎨 主题: 首次启动会自动运行配置向导" "info"
-    fi
-    log "🔧 配置: 如需重新配置主题，请运行 'p10k configure'" "info"
+    log "🎨 主题: 如需重新配置主题，请运行 'p10k configure'" "info"
 }
 
 main "$@"
