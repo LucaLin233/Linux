@@ -1,6 +1,6 @@
 #!/bin/bash
 # 网络性能优化模块 v4.2
-# 集成第一个脚本的完整参数配置
+# 集成第一个脚本的完整参数配置 - 使用fq_codel队列调度
 
 set -euo pipefail
 
@@ -188,7 +188,7 @@ configure_network_parameters() {
         sed -i "/^${param//./\\.}[[:space:]]*=.*/d" "$SYSCTL_CONFIG"
     done
     
-    # 添加第一个脚本的完整网络优化配置
+    # 添加第一个脚本的完整网络优化配置（使用fq_codel队列调度）
     cat >> "$SYSCTL_CONFIG" << 'EOF'
 
 # 网络性能优化 - 完整参数配置
@@ -231,7 +231,7 @@ net.ipv4.conf.all.route_localnet = 1
 net.ipv4.ip_forward = 1
 net.ipv4.conf.all.forwarding = 1
 net.ipv4.conf.default.forwarding = 1
-net.core.default_qdisc = cake
+net.core.default_qdisc = fq_codel
 net.ipv4.tcp_congestion_control = bbr
 
 EOF
@@ -258,15 +258,15 @@ configure_interface_qdisc() {
     fi
     
     # 检查当前队列调度
-    if tc qdisc show dev "$interface" 2>/dev/null | grep -q "cake"; then
-        log "$interface 已使用 cake 队列" "info"
+    if tc qdisc show dev "$interface" 2>/dev/null | grep -q "fq_codel"; then
+        log "$interface 已使用 fq_codel 队列" "info"
         return 0
     fi
     
-    # 切换到cake队列
-    log "切换 $interface 队列为 cake..." "info"
-    if tc qdisc replace dev "$interface" root cake 2>/dev/null; then
-        log "✓ $interface 队列已切换为 cake" "info"
+    # 切换到fq_codel队列
+    log "切换 $interface 队列为 fq_codel..." "info"
+    if tc qdisc replace dev "$interface" root fq_codel 2>/dev/null; then
+        log "✓ $interface 队列已切换为 fq_codel" "info"
         return 0
     else
         log "✗ $interface 队列切换失败 (可能需要管理员权限或硬件不支持)" "warn"
@@ -284,8 +284,8 @@ verify_network_config() {
     log "当前拥塞控制算法: $current_cc" "info"
     log "当前默认队列调度: $current_qdisc" "info"
     
-    if [[ "$current_cc" == "bbr" && "$current_qdisc" == "cake" ]]; then
-        log "✓ BBR + cake 配置成功" "info"
+    if [[ "$current_cc" == "bbr" && "$current_qdisc" == "fq_codel" ]]; then
+        log "✓ BBR + fq_codel 配置成功" "info"
         return 0
     else
         log "⚠ 网络优化配置可能未完全生效" "warn"
@@ -310,11 +310,11 @@ setup_network_optimization() {
     echo
     log "网络性能优化说明:" "info"
     log "  BBR: 改进的TCP拥塞控制算法，提升网络吞吐量" "info"
-    log "  cake: 智能队列管理，减少网络延迟和抖动" "info"
+    log "  fq_codel: 公平队列+延迟控制，平衡吞吐量和延迟" "info"
     log "  完整参数: 包含系统资源限制和全面的TCP优化" "info"
     
     echo
-    read -p "是否启用网络性能优化 (BBR+cake+完整参数)? [Y/n] (默认: Y): " -r optimize_choice
+    read -p "是否启用网络性能优化 (BBR+fq_codel+完整参数)? [Y/n] (默认: Y): " -r optimize_choice
     
     if [[ "$optimize_choice" =~ ^[Nn]$ ]]; then
         log "跳过网络优化配置" "info"
@@ -363,8 +363,8 @@ show_network_summary() {
     
     # 队列调度状态
     local current_qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "未知")
-    if [[ "$current_qdisc" == "cake" ]]; then
-        log "  ✓ 队列调度: cake" "info"
+    if [[ "$current_qdisc" == "fq_codel" ]]; then
+        log "  ✓ 队列调度: fq_codel" "info"
     else
         log "  ✗ 队列调度: $current_qdisc" "info"
     fi
@@ -388,10 +388,10 @@ show_network_summary() {
     # 主网卡状态
     local interface
     if interface=$(detect_main_interface 2>/dev/null); then
-        if command -v tc &>/dev/null && tc qdisc show dev "$interface" 2>/dev/null | grep -q "cake"; then
-            log "  ✓ 网卡 $interface: 使用 cake 队列" "info"
+        if command -v tc &>/dev/null && tc qdisc show dev "$interface" 2>/dev/null | grep -q "fq_codel"; then
+            log "  ✓ 网卡 $interface: 使用 fq_codel 队列" "info"
         else
-            log "  ✗ 网卡 $interface: 未使用 cake 队列" "info"
+            log "  ✗ 网卡 $interface: 未使用 fq_codel 队列" "info"
         fi
     else
         log "  ✗ 网卡检测: 失败" "warn"
