@@ -1,5 +1,5 @@
 #!/bin/bash
-# 系统优化模块 v4.1 - 修复zram大小检测问题
+# 系统优化模块 v4.2 - 修复交换分区显示问题
 # 功能: Zram配置、时区设置
 # 统一代码风格，简化交互逻辑
 
@@ -83,7 +83,7 @@ calculate_zram_size() {
     fi
 }
 
-# 配置Zram (修复数值转换问题)
+# 配置Zram (修复交换分区显示和数值转换问题)
 setup_zram() {
     log "配置 Zram Swap..." "info"
     
@@ -93,13 +93,19 @@ setup_zram() {
     
     log "内存: ${mem_mb}MB, 目标Zram大小: $target_zram_size" "info"
     
-    # 检查非zram交换分区
+    # 显示所有现有交换分区状态
+    local all_swap=$(swapon --show | tail -n +2)  # 去掉表头
+    if [[ -n "$all_swap" ]]; then
+        echo
+        log "当前交换状态:" "info"
+        swapon --show | sed 's/^/    /'
+        echo
+    fi
+    
+    # 检查非zram交换分区并警告
     local non_zram_swap=$(swapon --show | grep -v zram | tail -n +2)
     if [[ -n "$non_zram_swap" ]]; then
-        echo
-        log "检测到现有交换分区:" "warn"
-        echo "$non_zram_swap"
-        echo
+        log "⚠️  检测到传统交换分区，建议关闭以避免冲突" "warn"
         read -p "继续配置Zram? [Y/n] (默认: Y): " -r continue_zram </dev/tty >&2
         [[ "$continue_zram" =~ ^[Nn]$ ]] && return 0
     fi
@@ -189,7 +195,8 @@ setup_zram() {
         if swapon --show | grep -q zram0; then
             local actual_size=$(swapon --show | grep zram0 | awk '{print $3}')
             log "✓ Zram配置成功，实际大小: $actual_size" "info"
-            log "  当前交换状态:" "info"
+            echo
+            log "最终交换状态:" "info"
             swapon --show | sed 's/^/    /'
         else
             log "✗ Zram启动成功但交换设备未激活" "warn"
