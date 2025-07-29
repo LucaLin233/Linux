@@ -121,23 +121,28 @@ choose_theme() {
         case "$choice" in
             1)
                 log "已选择: 配置向导模式" "info"
-                return 1
+                echo "wizard"
+                return 0
                 ;;
             2)
                 log "已选择: Rainbow 预设主题" "info"
-                return 2
+                echo "rainbow"
+                return 0
                 ;;
             3)
                 log "已选择: Lean 预设主题" "info"
-                return 3
+                echo "lean"
+                return 0
                 ;;
             4)
                 log "已选择: Classic 预设主题" "info"
-                return 4
+                echo "classic"
+                return 0
                 ;;
             5)
                 log "已选择: Pure 预设主题" "info"
-                return 5
+                echo "pure"
+                return 0
                 ;;
             *)
                 log "无效选择，请输入 1-5 之间的数字" "warn"
@@ -196,55 +201,6 @@ EOF
     log "✓ .zshrc 配置完成" "info"
 }
 
-# 配置Powerlevel10k主题
-configure_powerlevel10k() {
-    local theme_choice=$1
-    
-    case $theme_choice in
-        1)
-            # 配置向导模式
-            log "配置 Powerlevel10k 配置向导模式..." "info"
-            cat > "$HOME/.p10k.zsh" << 'EOF'
-# Powerlevel10k 配置文件
-# 首次启动 zsh 时会自动运行配置向导
-# 如需重新配置，请运行: p10k configure
-
-# 启用即时提示模式
-typeset -g POWERLEVEL9K_INSTANT_PROMPT=verbose
-EOF
-            log "✓ 配置向导模式设置完成" "info"
-            ;;
-        2)
-            # Rainbow 主题
-            log "配置 Powerlevel10k Rainbow 预设主题..." "info"
-            if setup_preset_theme "rainbow"; then
-                log "✓ Rainbow 预设主题配置完成" "info"
-            fi
-            ;;
-        3)
-            # Lean 主题  
-            log "配置 Powerlevel10k Lean 预设主题..." "info"
-            if setup_preset_theme "lean"; then
-                log "✓ Lean 预设主题配置完成" "info"
-            fi
-            ;;
-        4)
-            # Classic 主题
-            log "配置 Powerlevel10k Classic 预设主题..." "info"
-            if setup_preset_theme "classic"; then
-                log "✓ Classic 预设主题配置完成" "info"
-            fi
-            ;;
-        5)
-            # Pure 主题
-            log "配置 Powerlevel10k Pure 预设主题..." "info"
-            if setup_preset_theme "pure"; then
-                log "✓ Pure 预设主题配置完成" "info"
-            fi
-            ;;
-    esac
-}
-
 # 设置预设主题
 setup_preset_theme() {
     local preset_name="$1"
@@ -255,6 +211,7 @@ setup_preset_theme() {
     if [[ -f "$local_config" ]]; then
         log "使用本地 $preset_name 预设配置..." "info"
         cp "$local_config" "$HOME/.p10k.zsh"
+        log "✓ $preset_name 预设主题配置完成" "info"
         return 0
     fi
     
@@ -274,6 +231,29 @@ setup_preset_theme() {
 typeset -g POWERLEVEL9K_INSTANT_PROMPT=verbose
 EOF
         return 1
+    fi
+}
+
+# 配置Powerlevel10k主题
+configure_powerlevel10k() {
+    local theme_choice="$1"
+    
+    if [[ "$theme_choice" == "wizard" ]]; then
+        # 配置向导模式
+        log "配置 Powerlevel10k 配置向导模式..." "info"
+        cat > "$HOME/.p10k.zsh" << 'EOF'
+# Powerlevel10k 配置文件
+# 首次启动 zsh 时会自动运行配置向导
+# 如需重新配置，请运行: p10k configure
+
+# 启用即时提示模式
+typeset -g POWERLEVEL9K_INSTANT_PROMPT=verbose
+EOF
+        log "✓ 配置向导模式设置完成" "info"
+    else
+        # 预设主题模式
+        log "配置 Powerlevel10k $theme_choice 预设主题..." "info"
+        setup_preset_theme "$theme_choice" || log "预设配置设置失败，已回退到配置向导模式" "warn"
     fi
 }
 
@@ -305,9 +285,9 @@ main() {
     configure_zshrc
     
     # 主题配置选择
-    choose_theme
-    local theme_choice=$?
-    configure_powerlevel10k $theme_choice
+    local theme_choice
+    theme_choice=$(choose_theme)
+    configure_powerlevel10k "$theme_choice"
     
     setup_default_shell
     
@@ -315,7 +295,7 @@ main() {
     log "🎉 Zsh 环境配置完成!" "info"
     log "💡 提示: 运行 'exec zsh' 立即体验新环境" "info"
     
-    if [[ $theme_choice -eq 1 ]]; then
+    if [[ "$theme_choice" == "wizard" ]]; then
         log "🎨 主题: 首次启动会自动运行配置向导" "info"
     fi
     log "🔧 配置: 如需重新配置主题，请运行 'p10k configure'" "info"
