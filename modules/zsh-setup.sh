@@ -1,6 +1,6 @@
 #!/bin/bash
-# Zsh Shell 环境配置模块 v4.0
-# 统一代码风格，优化备份策略
+# Zsh Shell 环境配置模块 v4.1
+# 统一代码风格，优化备份策略，增加主题选择功能
 
 set -euo pipefail
 
@@ -9,6 +9,14 @@ readonly ZSH_DIR="$HOME/.oh-my-zsh"
 readonly CUSTOM_DIR="${ZSH_CUSTOM:-$ZSH_DIR/custom}"
 readonly THEME_DIR="$CUSTOM_DIR/themes/powerlevel10k"
 readonly PLUGINS_DIR="$CUSTOM_DIR/plugins"
+
+# 支持的主题列表
+readonly -A THEMES=(
+    ["1"]="rainbow|彩虹主题 - 丰富多彩的显示效果"
+    ["2"]="lean|精简主题 - 简洁清爽的界面"
+    ["3"]="classic|经典主题 - 传统的命令行外观"  
+    ["4"]="pure|纯净主题 - 极简风格"
+)
 
 # === 日志函数 ===
 log() {
@@ -100,6 +108,50 @@ install_zsh_plugins() {
     done
 }
 
+# 显示主题选择菜单
+show_theme_menu() {
+    echo
+    log "请选择 Powerlevel10k 主题:" "info"
+    echo
+    
+    for key in $(printf '%s\n' "${!THEMES[@]}" | sort -n); do
+        local theme_info="${THEMES[$key]}"
+        local theme_name="${theme_info%%|*}"
+        local theme_desc="${theme_info##*|}"
+        echo "  $key) $theme_desc"
+    done
+    
+    echo
+}
+
+# 选择主题
+select_theme() {
+    local selected_theme="rainbow"  # 默认主题
+    
+    show_theme_menu
+    
+    while true; do
+        read -p "请输入选项 [1-${#THEMES[@]}] (默认: 1-彩虹主题): " -r choice
+        
+        # 如果用户直接回车，使用默认选择
+        if [[ -z "$choice" ]]; then
+            choice="1"
+        fi
+        
+        # 验证输入
+        if [[ "${THEMES[$choice]}" ]]; then
+            selected_theme="${THEMES[$choice]%%|*}"
+            local theme_desc="${THEMES[$choice]##*|}"
+            log "已选择: $theme_desc" "info"
+            break
+        else
+            log "无效选择，请输入 1-${#THEMES[@]} 之间的数字" "warn"
+        fi
+    done
+    
+    echo "$selected_theme"
+}
+
 # 配置zshrc文件
 configure_zshrc() {
     log "配置 .zshrc 文件..." "info"
@@ -152,15 +204,24 @@ EOF
 
 # 配置Powerlevel10k主题
 configure_powerlevel10k() {
-    log "配置 Powerlevel10k Rainbow 主题..." "info"
+    local theme_name="$1"
+    log "配置 Powerlevel10k $theme_name 主题..." "info"
     
-    local p10k_config="$THEME_DIR/config/p10k-rainbow.zsh"
+    local p10k_config="$THEME_DIR/config/p10k-$theme_name.zsh"
     
     if [[ -f "$p10k_config" ]]; then
         cp "$p10k_config" "$HOME/.p10k.zsh"
-        log "✓ Rainbow 主题配置完成" "info"
+        log "✓ $theme_name 主题配置完成" "info"
     else
-        log "Rainbow 主题配置文件不存在，将使用默认配置" "warn"
+        log "$theme_name 主题配置文件不存在，将运行配置向导" "warn"
+        log "首次启动 zsh 时会自动启动 Powerlevel10k 配置向导" "info"
+        
+        # 创建一个标记文件，提示用户首次启动时会运行配置向导
+        cat > "$HOME/.p10k.zsh" << 'EOF'
+# Powerlevel10k 配置文件
+# 首次启动 zsh 时会自动运行配置向导
+# 如需重新配置，请运行: p10k configure
+EOF
     fi
 }
 
@@ -190,12 +251,17 @@ main() {
     install_powerlevel10k
     install_zsh_plugins
     configure_zshrc
-    configure_powerlevel10k
+    
+    # 主题选择
+    local selected_theme=$(select_theme)
+    configure_powerlevel10k "$selected_theme"
+    
     setup_default_shell
     
     echo
     log "🎉 Zsh 环境配置完成!" "info"
     log "💡 提示: 运行 'exec zsh' 立即体验新环境" "info"
+    log "🎨 主题: 如需重新配置主题，请运行 'p10k configure'" "info"
 }
 
 main "$@"
