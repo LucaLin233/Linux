@@ -106,10 +106,11 @@ install_zsh_plugins() {
 # 下载预设配置文件
 download_preset_config() {
     local preset_name="$1"
-    local config_url="$P10K_CONFIGS_BASE_URL/p10k-$preset_name.zsh"
+    local config_url="${P10K_CONFIGS_BASE_URL}/p10k-${preset_name}.zsh"
     local local_path="$HOME/.p10k.zsh"
     
     log "下载 $preset_name 预设配置..." "info"
+    log "URL: $config_url" "info"
     
     if curl -fsSL "$config_url" -o "$local_path"; then
         log "✓ $preset_name 预设配置下载完成" "info"
@@ -120,29 +121,36 @@ download_preset_config() {
     fi
 }
 
-# 显示主题配置选项
-show_theme_options() {
-    echo ""
-    log "选择 Powerlevel10k 配置方式:" "info"
-    echo ""
-    printf "  1) 使用配置向导 (推荐) - 交互式配置，功能最全\n"
-    printf "  2) 使用 Rainbow 预设 - 彩虹主题，丰富多彩\n"  
-    printf "  3) 使用 Lean 预设 - 精简主题，简洁清爽\n"
-    printf "  4) 使用 Classic 预设 - 经典主题，传统外观\n"
-    printf "  5) 使用 Pure 预设 - 纯净主题，极简风格\n"
-    echo ""
-    # 强制刷新输出缓冲
-    exec 1>&1
+# 使用本地预设配置文件（如果存在）
+use_local_preset_config() {
+    local preset_name="$1"
+    local local_config="$THEME_DIR/config/p10k-${preset_name}.zsh"
+    
+    if [[ -f "$local_config" ]]; then
+        log "使用本地 $preset_name 预设配置..." "info"
+        cp "$local_config" "$HOME/.p10k.zsh"
+        log "✓ $preset_name 预设配置设置完成" "info"
+        return 0
+    else
+        return 1
+    fi
 }
 
 # 选择主题配置方式
 select_theme_option() {
+    echo ""
+    log "选择 Powerlevel10k 配置方式:" "info"
+    echo ""
+    echo "  1) 使用配置向导 (推荐) - 交互式配置，功能最全"
+    echo "  2) 使用 Rainbow 预设 - 彩虹主题，丰富多彩"  
+    echo "  3) 使用 Lean 预设 - 精简主题，简洁清爽"
+    echo "  4) 使用 Classic 预设 - 经典主题，传统外观"
+    echo "  5) 使用 Pure 预设 - 纯净主题，极简风格"
+    echo ""
+    
     local choice=""
-    
-    show_theme_options
-    
     while true; do
-        printf "请选择配置方式 [1-5] (默认: 1): "
+        echo -n "请选择配置方式 [1-5] (默认: 1): "
         read -r choice
         
         # 如果用户直接回车，使用默认选择
@@ -154,27 +162,27 @@ select_theme_option() {
             1)
                 log "已选择: 配置向导模式" "info"
                 echo "wizard"
-                break
+                return 0
                 ;;
             2)
                 log "已选择: Rainbow 预设主题" "info"
                 echo "rainbow"
-                break
+                return 0
                 ;;
             3)
                 log "已选择: Lean 预设主题" "info"
                 echo "lean"
-                break
+                return 0
                 ;;
             4)
                 log "已选择: Classic 预设主题" "info"
                 echo "classic"
-                break
+                return 0
                 ;;
             5)
                 log "已选择: Pure 预设主题" "info"
                 echo "pure"
-                break
+                return 0
                 ;;
             *)
                 log "无效选择，请输入 1-5 之间的数字" "warn"
@@ -254,16 +262,19 @@ EOF
     else
         log "配置 Powerlevel10k $config_mode 预设主题..." "info"
         
-        # 直接从GitHub下载预设配置
-        if download_preset_config "$config_mode"; then
-            log "✓ $config_mode 预设主题配置完成" "info"
+        # 首先尝试使用本地配置文件（原脚本的方式）
+        if use_local_preset_config "$config_mode"; then
+            log "✓ 使用本地预设配置完成" "info"
+        # 如果本地没有，则从GitHub下载
+        elif download_preset_config "$config_mode"; then
+            log "✓ 从GitHub下载预设配置完成" "info"
         else
-            log "预设配置下载失败，将回退到配置向导模式" "warn"
+            log "预设配置获取失败，将回退到配置向导模式" "warn"
             
             # 回退到配置向导模式
             cat > "$HOME/.p10k.zsh" << 'EOF'
 # Powerlevel10k 配置文件
-# 预设配置文件下载失败，首次启动时会运行配置向导
+# 预设配置获取失败，首次启动时会运行配置向导
 # 如需重新配置，请运行: p10k configure
 
 # 启用即时提示模式  
@@ -280,7 +291,7 @@ setup_default_shell() {
     
     if [[ "$current_shell" != "$zsh_path" ]]; then
         echo
-        printf "是否将 Zsh 设置为默认 Shell? [y/N]: "
+        echo -n "是否将 Zsh 设置为默认 Shell? [y/N]: "
         read -r set_default
         if [[ "$set_default" =~ ^[Yy]$ ]]; then
             chsh -s "$zsh_path" root
@@ -302,7 +313,8 @@ main() {
     configure_zshrc
     
     # 主题配置选择
-    local theme_option=$(select_theme_option)
+    local theme_option
+    theme_option=$(select_theme_option)
     configure_powerlevel10k "$theme_option"
     
     setup_default_shell
