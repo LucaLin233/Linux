@@ -10,6 +10,9 @@ readonly CUSTOM_DIR="${ZSH_CUSTOM:-$ZSH_DIR/custom}"
 readonly THEME_DIR="$CUSTOM_DIR/themes/powerlevel10k"
 readonly PLUGINS_DIR="$CUSTOM_DIR/plugins"
 
+# 预设配置下载URL
+readonly P10K_CONFIGS_BASE_URL="https://raw.githubusercontent.com/romkatv/powerlevel10k/master/config"
+
 # === 日志函数 ===
 log() {
     local msg="$1" level="${2:-info}"
@@ -100,17 +103,36 @@ install_zsh_plugins() {
     done
 }
 
+# 下载预设配置文件
+download_preset_config() {
+    local preset_name="$1"
+    local config_url="$P10K_CONFIGS_BASE_URL/p10k-$preset_name.zsh"
+    local local_path="$HOME/.p10k.zsh"
+    
+    log "下载 $preset_name 预设配置..." "info"
+    
+    if curl -fsSL "$config_url" -o "$local_path"; then
+        log "✓ $preset_name 预设配置下载完成" "info"
+        return 0
+    else
+        log "✗ $preset_name 预设配置下载失败" "warn"
+        return 1
+    fi
+}
+
 # 显示主题配置选项
 show_theme_options() {
-    echo
+    echo ""
     log "选择 Powerlevel10k 配置方式:" "info"
-    echo
-    echo "  1) 使用配置向导 (推荐) - 交互式配置，功能最全"
-    echo "  2) 使用 Rainbow 预设 - 彩虹主题，丰富多彩"
-    echo "  3) 使用 Lean 预设 - 精简主题，简洁清爽"
-    echo "  4) 使用 Classic 预设 - 经典主题，传统外观"
-    echo "  5) 使用 Pure 预设 - 纯净主题，极简风格"
-    echo
+    echo ""
+    printf "  1) 使用配置向导 (推荐) - 交互式配置，功能最全\n"
+    printf "  2) 使用 Rainbow 预设 - 彩虹主题，丰富多彩\n"  
+    printf "  3) 使用 Lean 预设 - 精简主题，简洁清爽\n"
+    printf "  4) 使用 Classic 预设 - 经典主题，传统外观\n"
+    printf "  5) 使用 Pure 预设 - 纯净主题，极简风格\n"
+    echo ""
+    # 强制刷新输出缓冲
+    exec 1>&1
 }
 
 # 选择主题配置方式
@@ -120,7 +142,8 @@ select_theme_option() {
     show_theme_options
     
     while true; do
-        read -p "请选择配置方式 [1-5] (默认: 1): " -r choice
+        printf "请选择配置方式 [1-5] (默认: 1): "
+        read -r choice
         
         # 如果用户直接回车，使用默认选择
         if [[ -z "$choice" ]]; then
@@ -231,19 +254,16 @@ EOF
     else
         log "配置 Powerlevel10k $config_mode 预设主题..." "info"
         
-        local preset_file="$THEME_DIR/config/p10k-$config_mode.zsh"
-        
-        if [[ -f "$preset_file" ]]; then
-            cp "$preset_file" "$HOME/.p10k.zsh"
+        # 直接从GitHub下载预设配置
+        if download_preset_config "$config_mode"; then
             log "✓ $config_mode 预设主题配置完成" "info"
         else
-            log "$config_mode 预设配置文件不存在: $preset_file" "warn"
-            log "将回退到配置向导模式" "info"
+            log "预设配置下载失败，将回退到配置向导模式" "warn"
             
             # 回退到配置向导模式
             cat > "$HOME/.p10k.zsh" << 'EOF'
 # Powerlevel10k 配置文件
-# 预设配置文件不存在，首次启动时会运行配置向导
+# 预设配置文件下载失败，首次启动时会运行配置向导
 # 如需重新配置，请运行: p10k configure
 
 # 启用即时提示模式  
@@ -260,7 +280,8 @@ setup_default_shell() {
     
     if [[ "$current_shell" != "$zsh_path" ]]; then
         echo
-        read -p "是否将 Zsh 设置为默认 Shell? [y/N]: " -r set_default
+        printf "是否将 Zsh 设置为默认 Shell? [y/N]: "
+        read -r set_default
         if [[ "$set_default" =~ ^[Yy]$ ]]; then
             chsh -s "$zsh_path" root
             log "✓ Zsh 已设置为默认 Shell (重新登录后生效)" "info"
