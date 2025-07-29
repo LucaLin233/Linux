@@ -1,5 +1,5 @@
 #!/bin/bash
-# 系统优化模块 v4.0
+# 系统优化模块 v4.1 - 修复zram大小检测问题
 # 功能: Zram配置、时区设置
 # 统一代码风格，简化交互逻辑
 
@@ -25,6 +25,43 @@ log() {
     echo -e "${colors[$level]:-\033[0;32m}$msg\033[0m"
 }
 
+# === 辅助函数 ===
+
+# 将各种大小格式转换为MB (修复版)
+convert_to_mb() {
+    local size="$1"
+    
+    # 移除所有空格
+    size=$(echo "$size" | tr -d ' ')
+    
+    case "${size^^}" in  # 转大写处理
+        *G|*GB)
+            # 提取数值部分，支持小数
+            local value=$(echo "$size" | sed 's/[^0-9.]//g')
+            # 使用awk处理小数运算，更可靠
+            echo "$value * 1024" | awk '{printf "%.0f", $1 * $3}'
+            ;;
+        *M|*MB)
+            # 提取数值部分
+            local value=$(echo "$size" | sed 's/[^0-9.]//g')
+            # 转换为整数
+            echo "$value" | awk '{printf "%.0f", $1}'
+            ;;
+        *K|*KB)
+            local value=$(echo "$size" | sed 's/[^0-9.]//g')
+            echo "$value / 1024" | awk '{printf "%.0f", $1 / $3}'
+            ;;
+        *B)
+            local value=$(echo "$size" | sed 's/[^0-9.]//g')
+            echo "$value / 1024 / 1024" | awk '{printf "%.0f", $1 / $3 / $5}'
+            ;;
+        *)
+            # 纯数字，假设为字节
+            echo "$size / 1024 / 1024" | awk '{printf "%.0f", $1 / $3 / $5}'
+            ;;
+    esac
+}
+
 # === 核心函数 ===
 
 # 计算Zram大小 (改进版)
@@ -46,7 +83,7 @@ calculate_zram_size() {
     fi
 }
 
-# 配置Zram (修复单位后缀问题)
+# 配置Zram (修复数值转换问题)
 setup_zram() {
     log "配置 Zram Swap..." "info"
     
@@ -80,26 +117,14 @@ setup_zram() {
             *M) target_mb=${target_zram_size%M} ;;
         esac
         
-        # 转换当前大小为MB（整数）- 修复版
-        local current_mb
-        case "$current_size" in
-            *G) 
-                local gb_value=${current_size%G}  # 去掉G后缀
-                local gb_int=${gb_value%.*}       # 去掉小数部分
-                current_mb=$((gb_int * 1024))
-                ;;
-            *M) 
-                local mb_value=${current_size%M}  # 先去掉M后缀
-                current_mb=${mb_value%.*}         # 再去掉小数部分
-                ;;
-            *) 
-                current_mb=$(echo "$current_size" | grep -o '[0-9]*')
-                ;;
-        esac
+        # 使用修复后的转换函数
+        local current_mb=$(convert_to_mb "$current_size")
         
-        # 简单的差异检查（允许20%误差）
-        local min_acceptable=$((target_mb * 80 / 100))
-        local max_acceptable=$((target_mb * 120 / 100))
+        log "当前大小: ${current_mb}MB, 目标大小: ${target_mb}MB" "info"
+        
+        # 简单的差异检查（允许5%误差，更严格一些）
+        local min_acceptable=$((target_mb * 95 / 100))
+        local max_acceptable=$((target_mb * 105 / 100))
         
         if (( current_mb >= min_acceptable && current_mb <= max_acceptable )); then
             log "✓ Zram大小合适 (${current_mb}MB ≈ ${target_mb}MB)，跳过配置" "info"
