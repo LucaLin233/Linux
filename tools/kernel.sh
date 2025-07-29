@@ -124,7 +124,7 @@ declare -A PARAMS=(
     [net.ipv4.ip_forward]="1"
     [net.ipv4.conf.all.forwarding]="1"
     [net.ipv4.conf.default.forwarding]="1"
-    [net.core.default_qdisc]="cake"
+    [net.core.default_qdisc]="fq_codel"
     [net.ipv4.tcp_congestion_control]="bbr"
 )
 
@@ -238,14 +238,14 @@ if ! which tc >/dev/null 2>&1; then
     echo "⚠️  未找到 tc 命令，跳过队列调度器配置"
     echo "   请手动安装 iproute2 软件包"
 else
-    if tc qdisc show dev $NET_IF 2>/dev/null | grep -q "cake"; then
-        echo "✅ $NET_IF 已在使用 CAKE 队列调度器"
+    if tc qdisc show dev $NET_IF 2>/dev/null | grep -q "fq_codel"; then
+        echo "✅ $NET_IF 已在使用 fq_codel 队列调度器"
     else
-        if sudo tc qdisc replace dev $NET_IF root cake 2>/dev/null; then
-            echo "🚀 $NET_IF 队列调度器已切换至 CAKE"
+        if sudo tc qdisc replace dev $NET_IF root fq_codel 2>/dev/null; then
+            echo "🚀 $NET_IF 队列调度器已切换至 fq_codel"
         else
-            echo "⚠️  切换至 CAKE 队列调度器失败"
-            echo "   内核可能不支持 CAKE，尝试: modprobe sch_cake"
+            echo "⚠️  切换至 fq_codel 队列调度器失败"
+            echo "   内核可能不支持 fq_codel，检查内核版本: uname -r"
         fi
     fi
 fi
