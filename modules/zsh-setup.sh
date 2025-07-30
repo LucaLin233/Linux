@@ -155,15 +155,16 @@ select_theme() {
     echo
     log "请选择 Powerlevel10k 主题:" "info"
     echo
-    echo "  1) Rainbow 主题 (默认) - 彩虹主题，丰富多彩"
-    echo "  2) Lean 主题 - 精简主题，简洁清爽"
-    echo "  3) Classic 主题 - 经典主题，传统外观"
-    echo "  4) Pure 主题 - 纯净主题，极简风格"
-    echo "  5) 配置向导 - 交互式配置，功能最全"
+    echo "  1) LucaLin 主题 (推荐) - 精心调配的个人主题"
+    echo "  2) Rainbow 主题 - 彩虹主题，丰富多彩"
+    echo "  3) Lean 主题 - 精简主题，简洁清爽"
+    echo "  4) Classic 主题 - 经典主题，传统外观"
+    echo "  5) Pure 主题 - 纯净主题，极简风格"
+    echo "  6) 配置向导 - 交互式配置，功能最全"
     echo
     
     local choice
-    read -p "请输入选项 [1-5] (默认: 1): " choice
+    read -p "请输入选项 [1-6] (默认: 1): " choice
     
     # 如果用户直接回车，使用默认选择
     if [[ -z "$choice" ]]; then
@@ -172,28 +173,32 @@ select_theme() {
     
     case "$choice" in
         1)
+            log "已选择: LucaLin 主题" "info"
+            SELECTED_THEME="lucalin"
+            ;;
+        2)
             log "已选择: Rainbow 主题" "info"
             SELECTED_THEME="rainbow"
             ;;
-        2)
+        3)
             log "已选择: Lean 主题" "info"
             SELECTED_THEME="lean"
             ;;
-        3)
+        4)
             log "已选择: Classic 主题" "info"
             SELECTED_THEME="classic"
             ;;
-        4)
+        5)
             log "已选择: Pure 主题" "info"
             SELECTED_THEME="pure"
             ;;
-        5)
+        6)
             log "已选择: 配置向导" "info"
             SELECTED_THEME="wizard"
             ;;
         *)
-            log "无效选择，使用默认 Rainbow 主题" "warn"
-            SELECTED_THEME="rainbow"
+            log "无效选择，使用默认 LucaLin 主题" "warn"
+            SELECTED_THEME="lucalin"
             ;;
     esac
 }
@@ -206,6 +211,19 @@ configure_powerlevel10k() {
         log "配置 Powerlevel10k 配置向导..." "info"
         log "首次启动 zsh 时会自动运行配置向导" "info"
         # 不创建配置文件，让p10k自动运行向导
+        return 0
+    fi
+    
+    if [[ "$theme_name" == "lucalin" ]]; then
+        log "配置 LucaLin 自定义主题..." "info"
+        local custom_url="https://raw.githubusercontent.com/LucaLin233/Linux/refs/heads/main/p10k-config.zsh"
+        
+        if curl -fsSL "$custom_url" -o "$HOME/.p10k.zsh"; then
+            log "✓ LucaLin 主题配置下载完成" "info"
+        else
+            log "✗ LucaLin 主题配置下载失败，将使用配置向导" "warn"
+            log "首次启动 zsh 时会自动运行配置向导" "info"
+        fi
         return 0
     fi
     
