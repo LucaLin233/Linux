@@ -1,6 +1,6 @@
 #!/bin/bash
-# 自动更新系统配置模块 v4.1
-# 优化用户体验，统一交互风格
+# 自动更新系统配置模块 v4.2
+# 优化用户体验，统一交互风格，添加cron依赖检查
 
 set -euo pipefail
 
@@ -15,6 +15,62 @@ log() {
     local msg="$1" level="${2:-info}"
     local -A colors=([info]="\033[0;36m" [warn]="\033[0;33m" [error]="\033[0;31m")
     echo -e "${colors[$level]:-\033[0;32m}$msg\033[0m"
+}
+
+# === 依赖检查函数 ===
+
+# 检查并安装cron
+ensure_cron_installed() {
+    log "检查cron服务..." "info"
+    
+    # 检查crontab命令是否存在
+    if ! command -v crontab >/dev/null 2>&1; then
+        log "未检测到cron服务，正在安装..." "warn"
+        
+        # 更新包列表
+        if ! apt-get update >/dev/null 2>&1; then
+            log "✗ 无法更新软件包列表" "error"
+            return 1
+        fi
+        
+        # 安装cron
+        if apt-get install -y cron >/dev/null 2>&1; then
+            log "✓ cron安装成功" "info"
+        else
+            log "✗ cron安装失败" "error"
+            return 1
+        fi
+    else
+        log "✓ cron服务已安装" "info"
+    fi
+    
+    # 检查cron服务状态
+    if systemctl is-enabled cron >/dev/null 2>&1; then
+        log "✓ cron服务已启用" "info"
+    else
+        log "启用cron服务..." "info"
+        if systemctl enable cron >/dev/null 2>&1; then
+            log "✓ cron服务已启用" "info"
+        else
+            log "✗ 无法启用cron服务" "error"
+            return 1
+        fi
+    fi
+    
+    # 检查cron服务运行状态
+    if systemctl is-active cron >/dev/null 2>&1; then
+        log "✓ cron服务正在运行" "info"
+    else
+        log "启动cron服务..." "info"
+        if systemctl start cron >/dev/null 2>&1; then
+            log "✓ cron服务已启动" "info"
+        else
+            log "✗ 无法启动cron服务" "error"
+            return 1
+        fi
+    fi
+    
+    return 0
 }
 
 # === 核心函数 ===
@@ -97,7 +153,7 @@ create_update_script() {
     
     cat > "$UPDATE_SCRIPT" << 'EOF'
 #!/bin/bash
-# 自动系统更新脚本 v4.1
+# 自动系统更新脚本 v4.2
 
 set -euo pipefail
 
@@ -258,6 +314,13 @@ show_update_summary() {
     # 系统信息
     local last_update=$(stat -c %y /var/lib/apt/lists 2>/dev/null | cut -d' ' -f1 || echo "未知")
     log "  🔄 上次apt更新: $last_update" "info"
+    
+    # Cron服务状态
+    if systemctl is-active cron >/dev/null 2>&1; then
+        log "  ✓ Cron服务: 运行中" "info"
+    else
+        log "  ✗ Cron服务: 未运行" "warn"
+    fi
 }
 
 # === 主流程 ===
@@ -270,6 +333,13 @@ main() {
     log "  • 检测内核更新并智能重启" "info"
     log "  • 清理无用的软件包和缓存" "info"
     log "  • 记录详细的更新日志" "info"
+    
+    echo
+    # 首先确保cron已安装并运行
+    if ! ensure_cron_installed; then
+        log "✗ cron服务配置失败，无法继续" "error"
+        return 1
+    fi
     
     echo
     create_update_script
@@ -292,6 +362,7 @@ main() {
     log "  查看cron任务: crontab -l" "info"
     log "  编辑cron任务: crontab -e" "info"
     log "  删除自动更新: crontab -l | grep -v '$UPDATE_SCRIPT' | crontab -" "info"
+    log "  查看cron服务状态: systemctl status cron" "info"
 }
 
 main "$@"
