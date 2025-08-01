@@ -282,8 +282,8 @@ setup_timezone() {
 setup_chrony() {
     log "配置 Chrony 时间同步..." "info"
     
-    # 检查是否已安装并正常工作
-    if command -v chronyd &>/dev/null && systemctl is-active chrony &>/dev/null; then
+    # 更准确的检测：同时检查命令和服务
+    if command -v chronyd &>/dev/null && systemctl is-active chrony &>/dev/null 2>&1; then
         local sync_status=$(chronyc tracking 2>/dev/null | grep "System clock synchronized" | awk '{print $4}' || echo "Unknown")
         if [[ "$sync_status" == "yes" ]]; then
             log "✓ Chrony 已安装且正常工作，跳过配置" "info"
@@ -306,17 +306,45 @@ setup_chrony() {
         [[ "$continue_chrony" =~ ^[Nn]$ ]] && return 0
     fi
     
-    # 安装 chrony (跳过更新以避免网络问题)
+    # 强制安装/重新配置 chrony
     log "安装 Chrony..." "info"
-    if ! dpkg -l chrony &>/dev/null; then
-        # 只在 chrony 未安装时才尝试安装
-        if ! apt-get install -y chrony; then
-            log "✗ Chrony 安装失败，可能是网络问题" "error"
-            log "尝试跳过网络更新..." "info"
-            # 如果安装失败，可能chrony已存在但被标记为需要配置
+    
+    # 检查是否真正可用
+    if ! command -v chronyd &>/dev/null; then
+        log "Chrony 未正确安装，开始安装..." "info"
+        
+        # 尝试安装，即使网络有问题也继续
+        if apt-get install -y chrony 2>/dev/null; then
+            log "✓ Chrony 安装成功" "info"
+        else
+            log "⚠️  apt安装失败，检查是否已有安装包..." "warn"
+            
+            # 检查包状态
+            local package_status=$(dpkg -l chrony 2>/dev/null | tail -1 | awk '{print $1}' || echo "none")
+            
+            case "$package_status" in
+                "ii")
+                    log "Chrony 包已安装，尝试重新配置..." "info"
+                    dpkg-reconfigure -f noninteractive chrony 2>/dev/null || true
+                    ;;
+                "iU"|"iF")
+                    log "Chrony 包未配置，尝试配置..." "info"
+                    dpkg --configure chrony 2>/dev/null || true
+                    ;;
+                *)
+                    log "✗ Chrony 安装失败，可能是网络问题" "error"
+                    return 1
+                    ;;
+            esac
         fi
     else
-        log "Chrony 已安装，跳过安装步骤" "info"
+        log "Chrony 二进制文件已存在" "info"
+    fi
+    
+    # 再次检查是否安装成功
+    if ! command -v chronyd &>/dev/null; then
+        log "✗ Chrony 安装验证失败" "error"
+        return 1
     fi
     
     # 停用冲突服务
@@ -326,45 +354,68 @@ setup_chrony() {
         systemctl disable "$service" 2>/dev/null || true
     done
     
-    # 启用并启动 chrony (修复服务名)
+    # 确保 chrony 服务文件存在
+    if [[ ! -f "/lib/systemd/system/chrony.service" ]] && [[ ! -f "/etc/systemd/system/chrony.service" ]]; then
+        log "✗ Chrony 服务文件不存在" "error"
+        log "尝试重新生成systemd服务..." "info"
+        systemctl daemon-reload
+    fi
+    
+    # 启用并启动 chrony
     log "启用 Chrony 服务..." "info"
+    
+    # 先尝试启用
     if systemctl enable chrony 2>/dev/null; then
-        systemctl start chrony 2>/dev/null || true
+        log "✓ Chrony 服务已启用" "info"
     else
-        log "⚠️  systemctl enable 失败，尝试手动启动" "warn"
-        systemctl start chrony 2>/dev/null || true
+        log "⚠️  enable 失败，但继续尝试启动" "warn"
+    fi
+    
+    # 再尝试启动
+    if systemctl start chrony 2>/dev/null; then
+        log "✓ Chrony 服务已启动" "info"
+    else
+        log "启动失败，检查服务状态..." "warn"
+        
+        # 诊断信息
+        local service_status=$(systemctl is-failed chrony 2>/dev/null || echo "unknown")
+        log "服务状态: $service_status" "info"
+        
+        # 查看错误日志
+        local error_log=$(systemctl status chrony 2>/dev/null | tail -5 | grep -E "(failed|error|Error)" || echo "")
+        if [[ -n "$error_log" ]]; then
+            log "错误信息: $error_log" "error"
+        fi
+        
+        # 尝试重新加载并启动
+        log "尝试重新加载systemd并启动..." "info"
+        systemctl daemon-reload
+        sleep 2
+        
+        if systemctl start chrony 2>/dev/null; then
+            log "✓ 重新启动成功" "info"
+        else
+            log "✗ Chrony 服务启动失败" "error"
+            return 1
+        fi
     fi
     
     # 等待服务稳定
     sleep 3
     
-    # 验证安装
+    # 最终验证
     if systemctl is-active chrony &>/dev/null; then
-        log "✓ Chrony 服务已启动" "info"
+        log "✓ Chrony 服务运行正常" "info"
         
-        # 检查同步状态（可能需要几分钟）
-        local sync_check=0
-        local max_attempts=3  # 减少等待时间
-        
-        while (( sync_check < max_attempts )); do
-            if chronyc tracking &>/dev/null; then
-                local sources_count=$(chronyc sources 2>/dev/null | grep -c "^\^" || echo "0")
-                log "Chrony 配置成功，发现 $sources_count 个时间源" "info"
-                break
-            fi
-            sync_check=$((sync_check + 1))
-            if (( sync_check < max_attempts )); then
-                log "等待 Chrony 同步... ($sync_check/$max_attempts)" "info"
-                sleep 2
-            fi
-        done
-        
-        if (( sync_check >= max_attempts )); then
-            log "⚠️  Chrony 已启动但同步状态未确认，这是正常的" "warn"
-            log "时间同步可能需要几分钟才能完成" "info"
+        # 简单检查同步状态
+        if chronyc tracking &>/dev/null 2>&1; then
+            local sources_count=$(chronyc sources 2>/dev/null | grep -c "^\^" || echo "0")
+            log "✓ Chrony 配置成功，时间源: $sources_count 个" "info"
+        else
+            log "⚠️  Chrony 已启动，同步状态检查中..." "info"
         fi
     else
-        log "✗ Chrony 服务启动失败" "error"
+        log "✗ Chrony 服务最终验证失败" "error"
         return 1
     fi
 }
