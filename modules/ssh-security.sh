@@ -263,7 +263,7 @@ configure_ssh_security() {
         echo "PermitRootLogin prohibit-password"
         echo "PubkeyAuthentication yes"
         echo "AuthorizedKeysFile .ssh/authorized_keys"
-        echo "MaxAuthTries 3"
+        echo "MaxAuthTries 6"
         echo "ClientAliveInterval 600"
         echo "ClientAliveCountMax 3"
         echo "LoginGraceTime 60"
@@ -334,7 +334,7 @@ show_security_warnings() {
     
     log "  🛡 root用户仅允许密钥登录" "info"
     log "  ⏱ 连接超时时间: 10分钟" "info"
-    log "  🔢 最大认证尝试: 3次" "info"
+    log "  🔢 最大认证尝试: 6次" "info"
 }
 
 # 显示SSH配置摘要
