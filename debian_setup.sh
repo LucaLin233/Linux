@@ -17,7 +17,7 @@ readonly SUMMARY_FILE="/root/deployment_summary.txt"
 
 #--- 模块定义 ---
 declare -A MODULES=(
-    ["system-optimize"]="系统优化 (Zram, 时区)"
+    ["system-optimize"]="系统优化 (Zram, 时区, 时间同步)"
     ["zsh-setup"]="Zsh Shell 环境"
     ["mise-setup"]="Mise 版本管理器"
     ["docker-setup"]="Docker 容器化平台"
