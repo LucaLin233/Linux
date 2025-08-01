@@ -1,6 +1,6 @@
 #!/bin/bash
-# 系统优化模块 v4.2 - 修复交换分区显示问题
-# 功能: Zram配置、时区设置
+# 系统优化模块 v4.3 - 新增 Chrony 时间同步
+# 功能: Zram配置、时区设置、时间同步
 # 统一代码风格，简化交互逻辑
 
 set -euo pipefail
@@ -278,6 +278,86 @@ setup_timezone() {
     fi
 }
 
+# 配置 Chrony 时间同步
+setup_chrony() {
+    log "配置 Chrony 时间同步..." "info"
+    
+    # 检查是否已安装并正常工作
+    if command -v chronyd &>/dev/null && systemctl is-active chronyd &>/dev/null; then
+        local sync_status=$(chronyc tracking 2>/dev/null | grep "System clock synchronized" | awk '{print $4}' || echo "Unknown")
+        if [[ "$sync_status" == "yes" ]]; then
+            log "✓ Chrony 已安装且正常工作，跳过配置" "info"
+            return 0
+        fi
+    fi
+    
+    # 检查现有时间同步服务
+    local conflicting_services=()
+    if systemctl is-active systemd-timesyncd &>/dev/null; then
+        conflicting_services+=("systemd-timesyncd")
+    fi
+    if command -v ntpd &>/dev/null && systemctl is-active ntp &>/dev/null; then
+        conflicting_services+=("ntp")
+    fi
+    
+    if (( ${#conflicting_services[@]} > 0 )); then
+        log "检测到现有时间同步服务: ${conflicting_services[*]}" "warn"
+        read -p "安装 Chrony 将停用这些服务，继续? [Y/n] (默认: Y): " -r continue_chrony </dev/tty >&2
+        [[ "$continue_chrony" =~ ^[Nn]$ ]] && return 0
+    fi
+    
+    # 安装 chrony
+    log "安装 Chrony..." "info"
+    if ! apt-get update -qq || ! apt-get install -y chrony; then
+        log "✗ Chrony 安装失败" "error"
+        return 1
+    fi
+    
+    # 停用冲突服务
+    for service in "${conflicting_services[@]}"; do
+        log "停用服务: $service" "info"
+        systemctl stop "$service" 2>/dev/null || true
+        systemctl disable "$service" 2>/dev/null || true
+    done
+    
+    # 启用并启动 chronyd
+    systemctl enable chronyd
+    systemctl start chronyd
+    
+    # 等待服务稳定
+    sleep 3
+    
+    # 验证安装
+    if systemctl is-active chronyd &>/dev/null; then
+        # 检查同步状态（可能需要几分钟）
+        local sync_check=0
+        local max_attempts=5
+        
+        while (( sync_check < max_attempts )); do
+            if chronyc tracking &>/dev/null; then
+                local sources_count=$(chronyc sources 2>/dev/null | grep -c "^\^" || echo "0")
+                if (( sources_count > 0 )); then
+                    log "✓ Chrony 配置成功，发现 $sources_count 个时间源" "info"
+                    log "  同步状态: $(chronyc tracking 2>/dev/null | grep "System clock synchronized" | cut -d: -f2 | xargs || echo "检查中...")" "info"
+                    break
+                fi
+            fi
+            sync_check=$((sync_check + 1))
+            if (( sync_check < max_attempts )); then
+                log "等待 Chrony 同步... ($sync_check/$max_attempts)" "info"
+                sleep 2
+            fi
+        done
+        
+        if (( sync_check >= max_attempts )); then
+            log "⚠️  Chrony 已启动但同步状态未确认，可能需要更多时间" "warn"
+        fi
+    else
+        log "✗ Chrony 服务启动失败" "error"
+        return 1
+    fi
+}
+
 # 显示系统信息
 show_system_info() {
     local mem_mb=$(awk '/MemTotal/ {print int($2/1024)}' /proc/meminfo)
@@ -305,6 +385,18 @@ show_optimization_summary() {
     local current_tz=$(timedatectl show --property=Timezone --value 2>/dev/null || echo "未知")
     log "  ✓ 时区: $current_tz" "info"
     
+    # Chrony 状态
+    if systemctl is-active chronyd &>/dev/null; then
+        local sync_status=$(timedatectl show --property=NTPSynchronized --value 2>/dev/null || echo "unknown")
+        if [[ "$sync_status" == "yes" ]]; then
+            log "  ✓ 时间同步: Chrony (已同步)" "info"
+        else
+            log "  ⏳ 时间同步: Chrony (同步中...)" "info"
+        fi
+    else
+        log "  ✗ 时间同步: 未配置" "info"
+    fi
+    
     # 内存和交换使用情况
     local mem_usage=$(free -h | awk '/^Mem:/ {printf "使用:%s/%s", $3, $2}')
     log "  📊 内存: $mem_usage" "info"
@@ -327,6 +419,9 @@ main() {
     
     echo
     setup_timezone
+    
+    echo
+    setup_chrony
     
     show_optimization_summary
     
