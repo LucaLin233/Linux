@@ -160,7 +160,7 @@ check_network() {
 install_dependencies() {
     log "检查系统依赖" "title"
     
-    local required_deps=(curl wget git jq rsync sudo)
+    local required_deps=(curl wget git jq rsync sudo dnsutils)
     local missing_deps=()
     local current=0
     
