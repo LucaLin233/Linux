@@ -160,25 +160,40 @@ check_network() {
 install_dependencies() {
     log "检查系统依赖" "title"
     
-    local required_deps=(curl wget git jq rsync sudo dnsutils)
-    local missing_deps=()
+    # 定义依赖：格式为 "检查命令:安装包名"
+    local required_deps=(
+        "curl:curl"
+        "wget:wget" 
+        "git:git"
+        "jq:jq"
+        "rsync:rsync"
+        "sudo:sudo"
+        "dig:dnsutils"  # 检查dig命令，但安装dnsutils包
+    )
+    
+    local missing_packages=()
     local current=0
     
-    for dep in "${required_deps[@]}"; do
+    for dep_pair in "${required_deps[@]}"; do
         current=$((current + 1))
-        show_progress "$current" "${#required_deps[@]}" "检查 $dep"
         
-        if ! command -v "$dep" >/dev/null 2>&1; then
-            missing_deps+=("$dep")
+        # 分割检查命令和包名
+        local check_cmd="${dep_pair%:*}"
+        local package_name="${dep_pair#*:}"
+        
+        show_progress "$current" "${#required_deps[@]}" "检查 $package_name"
+        
+        if ! command -v "$check_cmd" >/dev/null 2>&1; then
+            missing_packages+=("$package_name")
         fi
     done
     
-    if (( ${#missing_deps[@]} > 0 )); then
-        log "安装缺失依赖: ${missing_deps[*]} 📦" "highlight"
+    if (( ${#missing_packages[@]} > 0 )); then
+        log "安装缺失依赖: ${missing_packages[*]} 📦" "highlight"
         if ! apt-get update -qq; then
             log "软件包列表更新失败" "warn"
         fi
-        if ! apt-get install -y "${missing_deps[@]}"; then
+        if ! apt-get install -y "${missing_packages[@]}"; then
             log "依赖安装失败" "error"
             exit 1
         fi
