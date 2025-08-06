@@ -1,5 +1,5 @@
 #!/bin/bash
-# 网络性能优化模块 v4.2
+# 网络性能优化模块 v4.3 - 增加TCP Fast Open支持
 # 集成第一个脚本的完整参数配置 - 使用fq_codel队列调度
 
 set -euo pipefail
@@ -181,6 +181,7 @@ configure_network_parameters() {
         "net.ipv4.tcp_abort_on_overflow"
         "net.ipv4.conf.all.rp_filter"
         "net.ipv4.conf.default.rp_filter"
+        "net.ipv4.tcp_fastopen"
     )
     
     # 移除旧配置
@@ -233,6 +234,7 @@ net.ipv4.conf.all.forwarding = 1
 net.ipv4.conf.default.forwarding = 1
 net.core.default_qdisc = fq_codel
 net.ipv4.tcp_congestion_control = bbr
+net.ipv4.tcp_fastopen = 3
 
 EOF
     
@@ -280,12 +282,14 @@ verify_network_config() {
     
     local current_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "未知")
     local current_qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "未知")
+    local current_tfo=$(sysctl -n net.ipv4.tcp_fastopen 2>/dev/null || echo "0")
     
     log "当前拥塞控制算法: $current_cc" "info"
     log "当前默认队列调度: $current_qdisc" "info"
+    log "当前TCP Fast Open: $current_tfo (0=禁用,1=客户端,2=服务端,3=全部)" "info"
     
-    if [[ "$current_cc" == "bbr" && "$current_qdisc" == "fq_codel" ]]; then
-        log "✓ BBR + fq_codel 配置成功" "info"
+    if [[ "$current_cc" == "bbr" && "$current_qdisc" == "fq_codel" && "$current_tfo" == "3" ]]; then
+        log "✓ BBR + fq_codel + TFO 配置成功" "info"
         return 0
     else
         log "⚠ 网络优化配置可能未完全生效" "warn"
@@ -300,9 +304,11 @@ show_current_network_status() {
     
     local current_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "未知")
     local current_qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "未知")
+    local current_tfo=$(sysctl -n net.ipv4.tcp_fastopen 2>/dev/null || echo "0")
     
     log "  拥塞控制算法: $current_cc" "info"
     log "  队列调度算法: $current_qdisc" "info"
+    log "  TCP Fast Open: $current_tfo" "info"
 }
 
 # 网络性能优化
@@ -311,10 +317,11 @@ setup_network_optimization() {
     log "网络性能优化说明:" "info"
     log "  BBR: 改进的TCP拥塞控制算法，提升网络吞吐量" "info"
     log "  fq_codel: 公平队列+延迟控制，平衡吞吐量和延迟" "info"
+    log "  TCP Fast Open: 减少连接建立延迟，提升短连接性能" "info"
     log "  完整参数: 包含系统资源限制和全面的TCP优化" "info"
     
     echo
-    read -p "是否启用网络性能优化 (BBR+fq_codel+完整参数)? [Y/n] (默认: Y): " -r optimize_choice
+    read -p "是否启用网络性能优化 (BBR+fq_codel+TFO+完整参数)? [Y/n] (默认: Y): " -r optimize_choice
     
     if [[ "$optimize_choice" =~ ^[Nn]$ ]]; then
         log "跳过网络优化配置" "info"
@@ -369,6 +376,14 @@ show_network_summary() {
         log "  ✗ 队列调度: $current_qdisc" "info"
     fi
     
+    # TFO状态
+    local current_tfo=$(sysctl -n net.ipv4.tcp_fastopen 2>/dev/null || echo "0")
+    if [[ "$current_tfo" == "3" ]]; then
+        log "  ✓ TCP Fast Open: 启用 (客户端+服务端)" "info"
+    else
+        log "  ✗ TCP Fast Open: $current_tfo (0=禁用,1=客户端,2=服务端,3=全部)" "info"
+    fi
+    
     # 系统资源限制状态（修复版检查）
     if grep -q "nofile.*1048576" "$LIMITS_CONFIG" 2>/dev/null; then
         log "  ✓ 系统资源限制: 已配置 (重新登录后生效)" "info"
@@ -414,6 +429,7 @@ main() {
     log "常用命令:" "info"
     log "  查看拥塞控制: sysctl net.ipv4.tcp_congestion_control" "info"
     log "  查看队列调度: sysctl net.core.default_qdisc" "info"
+    log "  查看TCP Fast Open: sysctl net.ipv4.tcp_fastopen" "info"
     log "  查看网卡队列: tc qdisc show" "info"
     log "  恢复 sysctl: cp /etc/sysctl.conf.backup /etc/sysctl.conf" "info"
     log "  恢复 limits: cp /etc/security/limits.conf.backup /etc/security/limits.conf" "info"
