@@ -3,7 +3,7 @@
 # Linux 网络和内核优化脚本
 # 整合智能框架与全面参数配置
 # 支持自动网卡检测和备份恢复功能
-# v1.1 - 新增TCP Fast Open支持
+# v1.2 - 新增MPTCP支持
 # 作者: LucaLin233
 # 仓库: https://github.com/LucaLin233/Linux
 
@@ -128,6 +128,10 @@ declare -A PARAMS=(
     [net.core.default_qdisc]="fq_codel"
     [net.ipv4.tcp_congestion_control]="bbr"
     [net.ipv4.tcp_fastopen]="3"
+    [net.mptcp.enabled]="1"
+    [net.mptcp.add_addr_accepted]="8"
+    [net.mptcp.checksum_enabled]="1"
+    [net.mptcp.allow_join_initial_addr_port]="1"
 )
 
 # 配置系统资源限制
@@ -182,6 +186,18 @@ if ! grep -wq bbr /proc/sys/net/ipv4/tcp_available_congestion_control; then
     unset PARAMS[net.core.default_qdisc]
 fi
 
+# 检查 MPTCP 支持
+echo "🔍 正在检查 MPTCP 支持..."
+if [ -f "/proc/sys/net/mptcp/enabled" ]; then
+    echo "✅ 系统支持 MPTCP"
+else
+    echo "⚠️  系统不支持 MPTCP，跳过相关配置"
+    unset PARAMS[net.mptcp.enabled]
+    unset PARAMS[net.mptcp.add_addr_accepted]
+    unset PARAMS[net.mptcp.checksum_enabled]
+    unset PARAMS[net.mptcp.allow_join_initial_addr_port]
+fi
+
 # 验证参数支持性
 declare -A SUPPORTED_PARAMS
 for param in "${!PARAMS[@]}"; do
@@ -211,7 +227,7 @@ if ! grep -q "# 网络优化配置 - 由 LucaLin233/Linux 生成" "$TEMP_FILE"; 
     {
         echo ""
         echo "# 网络优化配置 - 由 LucaLin233/Linux 生成"
-        echo "# v1.1 - 包含TCP Fast Open支持"
+        echo "# v1.2 - 包含TCP Fast Open和MPTCP支持"
         echo "# 生成时间: $(date)"
         echo "# 项目地址: https://github.com/LucaLin233/Linux"
     } >> "$TEMP_FILE"
@@ -277,6 +293,23 @@ case "$current_tfo" in
     *) echo "⚠️  TCP Fast Open 状态未知: $current_tfo" ;;
 esac
 
+# 验证 MPTCP 状态
+if [ -f "/proc/sys/net/mptcp/enabled" ]; then
+    current_mptcp=$(sysctl -n net.mptcp.enabled 2>/dev/null)
+    if [ "$current_mptcp" = "1" ]; then
+        echo "✅ MPTCP (Multipath TCP): 已启用"
+        # 显示MPTCP详细配置
+        mptcp_add_addr=$(sysctl -n net.mptcp.add_addr_accepted 2>/dev/null || echo "N/A")
+        mptcp_checksum=$(sysctl -n net.mptcp.checksum_enabled 2>/dev/null || echo "N/A")
+        echo "   └── 允许附加地址数量: $mptcp_add_addr"
+        echo "   └── 校验和启用: $mptcp_checksum"
+    else
+        echo "❌ MPTCP (Multipath TCP): 禁用"
+    fi
+else
+    echo "⚠️  MPTCP: 系统不支持"
+fi
+
 # 验证队列调度器
 current_qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null)
 if [ "$current_qdisc" = "fq_codel" ]; then
@@ -295,8 +328,10 @@ echo ""
 echo "🔧 验证命令:"
 echo "   查看拥塞控制: sysctl net.ipv4.tcp_congestion_control"
 echo "   查看TCP Fast Open: sysctl net.ipv4.tcp_fastopen"
+echo "   查看MPTCP状态: sysctl net.mptcp.enabled"
 echo "   查看队列调度: sysctl net.core.default_qdisc"
 echo "   查看网卡队列: tc qdisc show dev $NET_IF"
+echo "   查看MPTCP连接: ss -M"
 echo ""
 echo "🔄 建议: 重启系统以确保所有配置生效"
 echo "📖 更多信息请访问: https://github.com/LucaLin233/Linux"
