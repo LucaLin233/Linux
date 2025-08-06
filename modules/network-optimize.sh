@@ -1,5 +1,5 @@
 #!/bin/bash
-# 网络性能优化模块 v4.3 - 增加TCP Fast Open支持
+# 网络性能优化模块 v4.4 - 增加TCP Fast Open和MPTCP支持
 # 集成第一个脚本的完整参数配置 - 使用fq_codel队列调度
 
 set -euo pipefail
@@ -80,6 +80,20 @@ check_bbr_support() {
     else
         log "⚠ 无法确定内核 BBR 支持状态" "warn"
         return 0  # 假设支持，继续配置
+    fi
+}
+
+# 检查MPTCP支持
+check_mptcp_support() {
+    log "检查 MPTCP 支持..." "info"
+    
+    # 检查MPTCP内核支持
+    if [[ -f "/proc/sys/net/mptcp/enabled" ]]; then
+        log "✓ 系统支持 MPTCP" "info"
+        return 0
+    else
+        log "⚠ 系统不支持 MPTCP，将跳过相关配置" "warn"
+        return 1
     fi
 }
 
@@ -182,6 +196,10 @@ configure_network_parameters() {
         "net.ipv4.conf.all.rp_filter"
         "net.ipv4.conf.default.rp_filter"
         "net.ipv4.tcp_fastopen"
+        "net.mptcp.enabled"
+        "net.mptcp.add_addr_accepted"
+        "net.mptcp.checksum_enabled"
+        "net.mptcp.allow_join_initial_addr_port"
     )
     
     # 移除旧配置
@@ -189,8 +207,19 @@ configure_network_parameters() {
         sed -i "/^${param//./\\.}[[:space:]]*=.*/d" "$SYSCTL_CONFIG"
     done
     
+    # 检查MPTCP支持并设置MPTCP参数
+    local mptcp_config=""
+    if check_mptcp_support; then
+        mptcp_config="
+# MPTCP (Multipath TCP) 优化配置
+net.mptcp.enabled = 1
+net.mptcp.add_addr_accepted = 8
+net.mptcp.checksum_enabled = 1
+net.mptcp.allow_join_initial_addr_port = 1"
+    fi
+    
     # 添加第一个脚本的完整网络优化配置（使用fq_codel队列调度）
-    cat >> "$SYSCTL_CONFIG" << 'EOF'
+    cat >> "$SYSCTL_CONFIG" << EOF
 
 # 网络性能优化 - 完整参数配置
 fs.file-max = 1048576
@@ -234,7 +263,7 @@ net.ipv4.conf.all.forwarding = 1
 net.ipv4.conf.default.forwarding = 1
 net.core.default_qdisc = fq_codel
 net.ipv4.tcp_congestion_control = bbr
-net.ipv4.tcp_fastopen = 3
+net.ipv4.tcp_fastopen = 3${mptcp_config}
 
 EOF
     
@@ -288,8 +317,19 @@ verify_network_config() {
     log "当前默认队列调度: $current_qdisc" "info"
     log "当前TCP Fast Open: $current_tfo (0=禁用,1=客户端,2=服务端,3=全部)" "info"
     
-    if [[ "$current_cc" == "bbr" && "$current_qdisc" == "fq_codel" && "$current_tfo" == "3" ]]; then
-        log "✓ BBR + fq_codel + TFO 配置成功" "info"
+    # 检查MPTCP状态
+    if [[ -f "/proc/sys/net/mptcp/enabled" ]]; then
+        local current_mptcp=$(sysctl -n net.mptcp.enabled 2>/dev/null || echo "0")
+        log "当前MPTCP状态: $current_mptcp (0=禁用,1=启用)" "info"
+    fi
+    
+    local success_conditions=0
+    [[ "$current_cc" == "bbr" ]] && ((success_conditions++))
+    [[ "$current_qdisc" == "fq_codel" ]] && ((success_conditions++))
+    [[ "$current_tfo" == "3" ]] && ((success_conditions++))
+    
+    if [[ $success_conditions -ge 2 ]]; then
+        log "✓ 网络优化配置成功应用" "info"
         return 0
     else
         log "⚠ 网络优化配置可能未完全生效" "warn"
@@ -309,6 +349,12 @@ show_current_network_status() {
     log "  拥塞控制算法: $current_cc" "info"
     log "  队列调度算法: $current_qdisc" "info"
     log "  TCP Fast Open: $current_tfo" "info"
+    
+    # 显示MPTCP状态
+    if [[ -f "/proc/sys/net/mptcp/enabled" ]]; then
+        local current_mptcp=$(sysctl -n net.mptcp.enabled 2>/dev/null || echo "0")
+        log "  MPTCP状态: $current_mptcp" "info"
+    fi
 }
 
 # 网络性能优化
@@ -318,10 +364,11 @@ setup_network_optimization() {
     log "  BBR: 改进的TCP拥塞控制算法，提升网络吞吐量" "info"
     log "  fq_codel: 公平队列+延迟控制，平衡吞吐量和延迟" "info"
     log "  TCP Fast Open: 减少连接建立延迟，提升短连接性能" "info"
+    log "  MPTCP: 多路径TCP，支持带宽聚合和链路冗余" "info"
     log "  完整参数: 包含系统资源限制和全面的TCP优化" "info"
     
     echo
-    read -p "是否启用网络性能优化 (BBR+fq_codel+TFO+完整参数)? [Y/n] (默认: Y): " -r optimize_choice
+    read -p "是否启用网络性能优化 (BBR+fq_codel+TFO+MPTCP+完整参数)? [Y/n] (默认: Y): " -r optimize_choice
     
     if [[ "$optimize_choice" =~ ^[Nn]$ ]]; then
         log "跳过网络优化配置" "info"
@@ -384,6 +431,23 @@ show_network_summary() {
         log "  ✗ TCP Fast Open: $current_tfo (0=禁用,1=客户端,2=服务端,3=全部)" "info"
     fi
     
+    # MPTCP状态
+    if [[ -f "/proc/sys/net/mptcp/enabled" ]]; then
+        local current_mptcp=$(sysctl -n net.mptcp.enabled 2>/dev/null || echo "0")
+        if [[ "$current_mptcp" == "1" ]]; then
+            log "  ✓ MPTCP: 启用 (多路径TCP)" "info"
+            # 显示MPTCP详细配置
+            local mptcp_add_addr=$(sysctl -n net.mptcp.add_addr_accepted 2>/dev/null || echo "N/A")
+            local mptcp_checksum=$(sysctl -n net.mptcp.checksum_enabled 2>/dev/null || echo "N/A")
+            log "    └── 附加地址数量: $mptcp_add_addr" "info"
+            log "    └── 校验和启用: $mptcp_checksum" "info"
+        else
+            log "  ✗ MPTCP: $current_mptcp (0=禁用,1=启用)" "info"
+        fi
+    else
+        log "  ⚠ MPTCP: 系统不支持" "warn"
+    fi
+    
     # 系统资源限制状态（修复版检查）
     if grep -q "nofile.*1048576" "$LIMITS_CONFIG" 2>/dev/null; then
         log "  ✓ 系统资源限制: 已配置 (重新登录后生效)" "info"
@@ -430,6 +494,8 @@ main() {
     log "  查看拥塞控制: sysctl net.ipv4.tcp_congestion_control" "info"
     log "  查看队列调度: sysctl net.core.default_qdisc" "info"
     log "  查看TCP Fast Open: sysctl net.ipv4.tcp_fastopen" "info"
+    log "  查看MPTCP状态: sysctl net.mptcp.enabled" "info"
+    log "  查看MPTCP连接: ss -M" "info"
     log "  查看网卡队列: tc qdisc show" "info"
     log "  恢复 sysctl: cp /etc/sysctl.conf.backup /etc/sysctl.conf" "info"
     log "  恢复 limits: cp /etc/security/limits.conf.backup /etc/security/limits.conf" "info"
