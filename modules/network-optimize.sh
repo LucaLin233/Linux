@@ -1,5 +1,5 @@
 #!/bin/bash
-# 网络性能优化模块 v4.4 - 增加TCP Fast Open和MPTCP支持
+# 网络性能优化模块 v4.5 - 修正配置清理逻辑
 # 集成第一个脚本的完整参数配置 - 使用fq_codel队列调度
 
 set -euo pipefail
@@ -143,14 +143,29 @@ EOF
     log "✓ 系统资源限制配置完成" "info"
 }
 
-# 配置网络优化参数（使用第一个脚本的完整参数）
+# 配置网络优化参数（修正清理逻辑版本）
 configure_network_parameters() {
     log "配置网络优化参数..." "info"
     
     backup_configs
     
-    # 需要移除的旧参数（第一个脚本的完整参数列表）
-    local old_params=(
+    # 清理旧的完整配置块（包括注释和参数）
+    log "清理旧的网络优化配置..." "info"
+    
+    # 移除所有可能的旧配置标记区域
+    sed -i '/^# === 网络性能优化配置开始 ===/,/^# === 网络性能优化配置结束 ===/d' "$SYSCTL_CONFIG"
+    
+    # 也清理可能的其他旧标记
+    sed -i '/^# 网络性能优化.*BBR.*fq_codel/d' "$SYSCTL_CONFIG"
+    sed -i '/^# Network optimization for VPS/d' "$SYSCTL_CONFIG"
+    sed -i '/^# 网络性能优化.*完整参数配置/d' "$SYSCTL_CONFIG"
+    sed -i '/^# 网络性能优化.*cake.*高级/d' "$SYSCTL_CONFIG"
+    
+    # 清理可能重复的MPTCP配置注释
+    sed -i '/^# MPTCP (Multipath TCP) 优化配置/d' "$SYSCTL_CONFIG"
+    
+    # 清理所有相关参数（确保没有重复）
+    local params_to_clean=(
         "fs.file-max"
         "fs.inotify.max_user_instances"
         "net.core.somaxconn"
@@ -201,12 +216,12 @@ configure_network_parameters() {
         "net.mptcp.allow_join_initial_addr_port"
     )
     
-    # 移除旧配置
-    for param in "${old_params[@]}"; do
-        sed -i "/^${param//./\\.}[[:space:]]*=.*/d" "$SYSCTL_CONFIG"
+    # 清理所有相关参数的重复行
+    for param in "${params_to_clean[@]}"; do
+        sed -i "/^[[:space:]]*${param//./\\.}[[:space:]]*=.*/d" "$SYSCTL_CONFIG"
     done
     
-    # 检查MPTCP支持并设置MPTCP参数（使用正确的参数）
+    # 检查MPTCP支持并设置MPTCP参数
     local mptcp_config=""
     if check_mptcp_support; then
         mptcp_config="
@@ -216,22 +231,35 @@ net.mptcp.checksum_enabled = 1
 net.mptcp.allow_join_initial_addr_port = 1"
     fi
     
-    # 添加第一个脚本的完整网络优化配置（使用fq_codel队列调度）
+    # 添加新的配置块（带明确标记，防止重复）
     cat >> "$SYSCTL_CONFIG" << EOF
 
-# 网络性能优化 - 完整参数配置
+# === 网络性能优化配置开始 ===
+# 网络性能优化模块 v4.5 - 完整参数配置
+# 生成时间: $(date)
+# 包含: BBR + fq_codel + TFO + MPTCP + 完整TCP优化
+
+# 文件系统优化
 fs.file-max = 1048576
 fs.inotify.max_user_instances = 8192
+
+# 网络核心参数
 net.core.somaxconn = 32768
 net.core.netdev_max_backlog = 32768
 net.core.rmem_max = 33554432
 net.core.wmem_max = 33554432
+
+# UDP 优化
 net.ipv4.udp_rmem_min = 16384
 net.ipv4.udp_wmem_min = 16384
+net.ipv4.udp_mem = 65536 131072 262144
+
+# TCP 缓冲区优化
 net.ipv4.tcp_rmem = 4096 87380 33554432
 net.ipv4.tcp_wmem = 4096 16384 33554432
 net.ipv4.tcp_mem = 786432 1048576 26777216
-net.ipv4.udp_mem = 65536 131072 262144
+
+# TCP 连接优化
 net.ipv4.tcp_syncookies = 1
 net.ipv4.tcp_fin_timeout = 30
 net.ipv4.tcp_tw_reuse = 1
@@ -244,6 +272,8 @@ net.ipv4.tcp_synack_retries = 1
 net.ipv4.tcp_timestamps = 0
 net.ipv4.tcp_max_orphans = 131072
 net.ipv4.tcp_no_metrics_save = 1
+
+# TCP 高级参数
 net.ipv4.tcp_ecn = 0
 net.ipv4.tcp_frto = 0
 net.ipv4.tcp_mtu_probing = 0
@@ -255,17 +285,24 @@ net.ipv4.tcp_adv_win_scale = 1
 net.ipv4.tcp_moderate_rcvbuf = 1
 net.ipv4.tcp_keepalive_time = 600
 net.ipv4.tcp_notsent_lowat = 16384
+
+# 路由和转发
 net.ipv4.conf.all.route_localnet = 1
 net.ipv4.ip_forward = 1
 net.ipv4.conf.all.forwarding = 1
 net.ipv4.conf.default.forwarding = 1
+
+# 拥塞控制和队列调度
 net.core.default_qdisc = fq_codel
 net.ipv4.tcp_congestion_control = bbr
+
+# TCP Fast Open
 net.ipv4.tcp_fastopen = 3${mptcp_config}
+# === 网络性能优化配置结束 ===
 
 EOF
     
-    # 应用配置（简化版）
+    # 应用配置
     if sysctl -p >/dev/null 2>&1; then
         log "✓ sysctl 参数已应用" "info"
     else
