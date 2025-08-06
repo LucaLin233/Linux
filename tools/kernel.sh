@@ -3,7 +3,7 @@
 # Linux 网络和内核优化脚本
 # 整合智能框架与全面参数配置
 # 支持自动网卡检测和备份恢复功能
-# v1.2 - 新增MPTCP支持
+# v1.2 - 新增MPTCP支持（修正版）
 # 作者: LucaLin233
 # 仓库: https://github.com/LucaLin233/Linux
 
@@ -84,7 +84,7 @@ else
     echo "✅ limits 配置备份已存在"
 fi
 
-# 网络和系统参数配置
+# 网络和系统参数配置（修正MPTCP参数）
 declare -A PARAMS=(
     [fs.file-max]="1048576"
     [fs.inotify.max_user_instances]="8192"
@@ -129,7 +129,6 @@ declare -A PARAMS=(
     [net.ipv4.tcp_congestion_control]="bbr"
     [net.ipv4.tcp_fastopen]="3"
     [net.mptcp.enabled]="1"
-    [net.mptcp.add_addr_accepted]="8"
     [net.mptcp.checksum_enabled]="1"
     [net.mptcp.allow_join_initial_addr_port]="1"
 )
@@ -193,7 +192,6 @@ if [ -f "/proc/sys/net/mptcp/enabled" ]; then
 else
     echo "⚠️  系统不支持 MPTCP，跳过相关配置"
     unset PARAMS[net.mptcp.enabled]
-    unset PARAMS[net.mptcp.add_addr_accepted]
     unset PARAMS[net.mptcp.checksum_enabled]
     unset PARAMS[net.mptcp.allow_join_initial_addr_port]
 fi
@@ -227,7 +225,7 @@ if ! grep -q "# 网络优化配置 - 由 LucaLin233/Linux 生成" "$TEMP_FILE"; 
     {
         echo ""
         echo "# 网络优化配置 - 由 LucaLin233/Linux 生成"
-        echo "# v1.2 - 包含TCP Fast Open和MPTCP支持"
+        echo "# v1.2 - 包含TCP Fast Open和MPTCP支持（修正版）"
         echo "# 生成时间: $(date)"
         echo "# 项目地址: https://github.com/LucaLin233/Linux"
     } >> "$TEMP_FILE"
@@ -299,10 +297,10 @@ if [ -f "/proc/sys/net/mptcp/enabled" ]; then
     if [ "$current_mptcp" = "1" ]; then
         echo "✅ MPTCP (Multipath TCP): 已启用"
         # 显示MPTCP详细配置
-        mptcp_add_addr=$(sysctl -n net.mptcp.add_addr_accepted 2>/dev/null || echo "N/A")
         mptcp_checksum=$(sysctl -n net.mptcp.checksum_enabled 2>/dev/null || echo "N/A")
-        echo "   └── 允许附加地址数量: $mptcp_add_addr"
+        mptcp_join=$(sysctl -n net.mptcp.allow_join_initial_addr_port 2>/dev/null || echo "N/A")
         echo "   └── 校验和启用: $mptcp_checksum"
+        echo "   └── 允许初始地址连接: $mptcp_join"
     else
         echo "❌ MPTCP (Multipath TCP): 禁用"
     fi
