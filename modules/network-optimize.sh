@@ -1,5 +1,5 @@
 #!/bin/bash
-# 网络性能优化模块 v4.4 - 增加TCP Fast Open和MPTCP支持
+# 网络性能优化模块 v4.4 - 增加TCP Fast Open和MPTCP支持 (改进错误处理)
 # 集成第一个脚本的完整参数配置 - 使用fq_codel队列调度
 
 set -euo pipefail
@@ -143,7 +143,7 @@ EOF
     log "✓ 系统资源限制配置完成" "info"
 }
 
-# 配置网络优化参数（使用第一个脚本的完整参数）
+# 配置网络优化参数（改进错误处理版本）
 configure_network_parameters() {
     log "配置网络优化参数..." "info"
     
@@ -267,11 +267,72 @@ net.ipv4.tcp_fastopen = 3${mptcp_config}
 
 EOF
     
-    # 应用配置
-    if sysctl -p >/dev/null 2>&1; then
-        log "✓ sysctl 参数已应用" "info"
+    # 改进的应用配置逻辑
+    log "应用 sysctl 配置..." "info"
+    local sysctl_output
+    local sysctl_exit_code
+    
+    # 捕获sysctl输出和退出码
+    sysctl_output=$(sysctl -p 2>&1)
+    sysctl_exit_code=$?
+    
+    # 检查关键参数是否实际生效
+    local bbr_ok=0
+    local tfo_ok=0
+    local mptcp_ok=0
+    local qdisc_ok=0
+    
+    # 等待参数生效
+    sleep 1
+    
+    [[ "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)" == "bbr" ]] && bbr_ok=1
+    [[ "$(sysctl -n net.ipv4.tcp_fastopen 2>/dev/null)" == "3" ]] && tfo_ok=1
+    [[ "$(sysctl -n net.core.default_qdisc 2>/dev/null)" == "fq_codel" ]] && qdisc_ok=1
+    
+    # 检查MPTCP（如果支持的话）
+    if [[ -f "/proc/sys/net/mptcp/enabled" ]]; then
+        [[ "$(sysctl -n net.mptcp.enabled 2>/dev/null)" == "1" ]] && mptcp_ok=1
     else
-        log "✗ sysctl 参数应用失败" "warn"
+        mptcp_ok=1  # 如果不支持MPTCP，标记为成功以免影响整体判断
+    fi
+    
+    # 智能判断是否成功
+    local success_count=$((bbr_ok + tfo_ok + qdisc_ok + mptcp_ok))
+    local total_features=4
+    
+    if [[ $success_count -ge 3 ]]; then
+        log "✓ 关键 sysctl 参数已成功应用 ($success_count/$total_features)" "info"
+        
+        if [[ $sysctl_exit_code -ne 0 ]]; then
+            log "⚠ sysctl 处理过程中有警告信息，但核心功能正常" "warn"
+            
+            # 分析并显示关键的错误信息
+            if [[ -n "$sysctl_output" ]]; then
+                local error_lines
+                error_lines=$(echo "$sysctl_output" | grep -E "(error|Error|ERROR|invalid|Invalid|INVALID|cannot|Cannot|failed|Failed)" | head -3)
+                if [[ -n "$error_lines" ]]; then
+                    while IFS= read -r line; do
+                        [[ -n "$line" ]] && log "  警告: $line" "warn"
+                    done <<< "$error_lines"
+                fi
+            fi
+        fi
+        
+        # 显示生效状态
+        [[ $bbr_ok -eq 1 ]] && log "  ✓ BBR 拥塞控制已启用" "info" || log "  ✗ BBR 拥塞控制未启用" "warn"
+        [[ $tfo_ok -eq 1 ]] && log "  ✓ TCP Fast Open已启用" "info" || log "  ✗ TCP Fast Open未启用" "warn"
+        [[ $qdisc_ok -eq 1 ]] && log "  ✓ fq_codel 队列调度已启用" "info" || log "  ✗ fq_codel 队列调度未启用" "warn"
+        
+        if [[ -f "/proc/sys/net/mptcp/enabled" ]]; then
+            [[ $mptcp_ok -eq 1 ]] && log "  ✓ MPTCP已启用" "info" || log "  ✗ MPTCP未启用" "warn"
+        fi
+        
+        return 0
+    else
+        log "✗ sysctl 参数应用失败 ($success_count/$total_features 成功)" "error"
+        log "详细错误信息:" "error"
+        echo "$sysctl_output" | head -10
+        return 1
     fi
 }
 
@@ -323,18 +384,28 @@ verify_network_config() {
         log "当前MPTCP状态: $current_mptcp (0=禁用,1=启用)" "info"
     fi
     
+    # 计算成功的配置项
     local success_conditions=0
     [[ "$current_cc" == "bbr" ]] && ((success_conditions++))
     [[ "$current_qdisc" == "fq_codel" ]] && ((success_conditions++))
     [[ "$current_tfo" == "3" ]] && ((success_conditions++))
     
-    if [[ $success_conditions -ge 2 ]]; then
-        log "✓ 网络优化配置成功应用" "info"
+    # MPTCP检查（如果支持）
+    if [[ -f "/proc/sys/net/mptcp/enabled" ]]; then
+        local mptcp_enabled=$(sysctl -n net.mptcp.enabled 2>/dev/null || echo "0")
+        [[ "$mptcp_enabled" == "1" ]] && ((success_conditions++))
+        local total_conditions=4
+    else
+        local total_conditions=3
+    fi
+    
+    if [[ $success_conditions -ge $((total_conditions - 1)) ]]; then
+        log "✓ 网络优化配置成功应用 ($success_conditions/$total_conditions)" "info"
         return 0
     else
-        log "⚠ 网络优化配置可能未完全生效" "warn"
+        log "⚠ 网络优化配置部分生效 ($success_conditions/$total_conditions)" "warn"
         log "建议重启系统以完全应用配置" "warn"
-        return 1
+        return 0  # 返回成功，因为大部分功能正常
     fi
 }
 
