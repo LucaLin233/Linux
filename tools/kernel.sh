@@ -3,6 +3,7 @@
 # Linux 网络和内核优化脚本
 # 整合智能框架与全面参数配置
 # 支持自动网卡检测和备份恢复功能
+# v1.1 - 新增TCP Fast Open支持
 # 作者: LucaLin233
 # 仓库: https://github.com/LucaLin233/Linux
 
@@ -126,6 +127,7 @@ declare -A PARAMS=(
     [net.ipv4.conf.default.forwarding]="1"
     [net.core.default_qdisc]="fq_codel"
     [net.ipv4.tcp_congestion_control]="bbr"
+    [net.ipv4.tcp_fastopen]="3"
 )
 
 # 配置系统资源限制
@@ -209,6 +211,7 @@ if ! grep -q "# 网络优化配置 - 由 LucaLin233/Linux 生成" "$TEMP_FILE"; 
     {
         echo ""
         echo "# 网络优化配置 - 由 LucaLin233/Linux 生成"
+        echo "# v1.1 - 包含TCP Fast Open支持"
         echo "# 生成时间: $(date)"
         echo "# 项目地址: https://github.com/LucaLin233/Linux"
     } >> "$TEMP_FILE"
@@ -250,6 +253,10 @@ else
     fi
 fi
 
+# 验证关键优化功能状态
+echo ""
+echo "🔍 验证关键优化功能:"
+
 # 验证 BBR 拥塞控制状态
 current_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
 if [ "$current_cc" = "bbr" ]; then
@@ -260,12 +267,36 @@ else
     echo "   或重启系统使更改生效"
 fi
 
+# 验证 TCP Fast Open 状态
+current_tfo=$(sysctl -n net.ipv4.tcp_fastopen 2>/dev/null)
+case "$current_tfo" in
+    "0") echo "❌ TCP Fast Open: 禁用" ;;
+    "1") echo "🔵 TCP Fast Open: 仅客户端启用" ;;
+    "2") echo "🔵 TCP Fast Open: 仅服务端启用" ;;
+    "3") echo "✅ TCP Fast Open: 客户端+服务端均启用" ;;
+    *) echo "⚠️  TCP Fast Open 状态未知: $current_tfo" ;;
+esac
+
+# 验证队列调度器
+current_qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null)
+if [ "$current_qdisc" = "fq_codel" ]; then
+    echo "✅ 默认队列调度器: fq_codel"
+else
+    echo "⚠️  默认队列调度器: $current_qdisc"
+fi
+
 echo ""
 echo "🎉 网络和内核优化完成！"
 echo ""
 echo "📋 使用说明:"
 echo "   恢复原始配置:"
 echo "   curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/refs/heads/main/tools/kernel.sh | bash -s restore"
+echo ""
+echo "🔧 验证命令:"
+echo "   查看拥塞控制: sysctl net.ipv4.tcp_congestion_control"
+echo "   查看TCP Fast Open: sysctl net.ipv4.tcp_fastopen"
+echo "   查看队列调度: sysctl net.core.default_qdisc"
+echo "   查看网卡队列: tc qdisc show dev $NET_IF"
 echo ""
 echo "🔄 建议: 重启系统以确保所有配置生效"
 echo "📖 更多信息请访问: https://github.com/LucaLin233/Linux"
