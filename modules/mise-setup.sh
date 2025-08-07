@@ -1,7 +1,7 @@
 #!/bin/bash
-# Mise 版本管理器配置模块 v4.5
+# Mise 版本管理器配置模块 v4.6
 # 功能: 安装Mise、智能选择Python版本、Shell集成、智能链接管理
-# 修复: 解决PATH劫持导致的系统模块检测失败问题
+# 修复: PATH修复立即生效，解决系统模块检测问题
 
 set -euo pipefail
 
@@ -70,7 +70,7 @@ detect_python_status() {
     log "  系统链接: $status_info" "info"  
     log "  PATH优先: $path_status" "info"
     
-    # 安全获取当前Python版本
+    # 安全获取Python版本
     local current_python_version=""
     current_python_version=$(python3 --version 2>/dev/null || echo '无法获取版本')
     log "  当前版本: $current_python_version" "info"
@@ -105,7 +105,7 @@ detect_python_status() {
     fi
 }
 
-# 修复系统Python链接和PATH
+# 修复系统Python链接和PATH（增强版 - 立即生效）
 fix_python_system_priority() {
     log "🔧 修复系统Python优先级..." "info"
     
@@ -134,19 +134,48 @@ fix_python_system_priority() {
         fi
     fi
     
-    # 确保PATH顺序正确
+    # 确保PATH顺序正确（写入配置文件）
     log "配置PATH优先级..." "info"
     configure_path_priority
+    
+    # **关键新增：立即在当前shell中应用PATH修复**
+    log "立即应用PATH修复..." "info"
+    export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$HOME/.local/bin"
+    
+    # 清空command缓存，强制重新查找
+    hash -r 2>/dev/null || true
     
     # 验证修复结果
     log "验证修复结果..." "info"
     local new_which_python=""
-    new_which_python=$(PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$HOME/.local/bin" which python3 2>/dev/null || echo "")
+    new_which_python=$(which python3 2>/dev/null || echo "")
+    
     if [[ "$new_which_python" == "/usr/bin/python3" ]]; then
-        log "✓ PATH优先级修复成功" "info"
+        log "✓ PATH优先级修复成功，立即生效" "info"
+        
+        # 验证系统模块（现在应该可以直接用python3了）
+        if python3 -c "import apt_pkg" &>/dev/null 2>&1; then
+            log "✓ 系统模块现在可用" "info"
+        else
+            log "⚠️ 系统模块仍有问题，可能需要重新安装python3-apt" "warn"
+            # 给出修复建议
+            echo "    建议运行: sudo apt install --reinstall python3-apt python3-debconf"
+        fi
+        
+        if python3 -c "import debconf" &>/dev/null 2>&1; then
+            log "✓ debconf模块现在可用" "info"
+        fi
     else
-        log "⚠️ PATH修复可能需要重新登录生效" "warn"
+        log "⚠️ PATH修复异常，当前指向：$new_which_python" "warn"
+        log "手动修复命令: export PATH=\"/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:\$HOME/.local/bin\"" "info"
     fi
+    
+    # 显示当前状态
+    echo
+    log "修复后状态:" "info"
+    log "  系统链接: $(readlink /usr/bin/python3 2>/dev/null || echo '直接文件')" "info"
+    log "  当前python3: $(which python3)" "info"
+    log "  版本: $(python3 --version)" "info"
 }
 
 # 配置PATH优先级
@@ -163,9 +192,9 @@ configure_path_priority() {
         
         [[ ! -f "$config_file" ]] && touch "$config_file"
         
-        # 移除旧的PATH配置
-        sed -i '/# Mise PATH priority/,/^export PATH.*mise.*$/d' "$config_file" 2>/dev/null || true
-        sed -i '/# Mise global mode PATH/,/^export PATH.*mise.*$/d' "$config_file" 2>/dev/null || true
+        # 移除旧的PATH配置（更精确的匹配）
+        sed -i '/# Mise PATH priority/,+1d' "$config_file" 2>/dev/null || true
+        sed -i '/# Mise global mode PATH/,+1d' "$config_file" 2>/dev/null || true
         
         # 添加新的PATH配置，确保系统路径优先
         cat >> "$config_file" << 'EOF'
@@ -193,8 +222,8 @@ configure_path_for_global_mode() {
         [[ ! -f "$config_file" ]] && touch "$config_file"
         
         # 移除旧的PATH配置
-        sed -i '/# Mise PATH priority/,/^export PATH.*$/d' "$config_file" 2>/dev/null || true
-        sed -i '/# Mise global mode PATH/,/^export PATH.*$/d' "$config_file" 2>/dev/null || true
+        sed -i '/# Mise PATH priority/,+1d' "$config_file" 2>/dev/null || true
+        sed -i '/# Mise global mode PATH/,+1d' "$config_file" 2>/dev/null || true
         
         # 为全局模式配置不同的PATH（mise优先）
         cat >> "$config_file" << 'EOF'
@@ -204,6 +233,11 @@ export PATH="$HOME/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:
 EOF
         log "✓ 已配置 $shell_name 全局模式PATH" "info"
     done
+    
+    # **立即应用全局模式PATH**
+    log "立即应用全局模式PATH..." "info"
+    export PATH="$HOME/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+    hash -r 2>/dev/null || true
 }
 
 # 显示项目使用指南
@@ -516,7 +550,7 @@ setup_python_usage() {
     if [[ $needs_fix -eq 0 ]]; then
         echo "  3) 修复系统Python配置"
         echo "     - 🔧 检测到系统被劫持，推荐选择此项立即修复"
-        echo "     - 恢复系统工具的正常运行"
+        echo "     - 恢复系统工具的正常运行，修复立即生效"
         echo
     fi
     
@@ -603,7 +637,7 @@ configure_shell_integration() {
     done
 }
 
-# 显示配置摘要
+# 显示配置摘要（增强版 - 实时状态）
 show_mise_summary() {
     echo
     log "🎯 Mise 配置摘要:" "info"
@@ -641,13 +675,15 @@ show_mise_summary() {
             fi
         fi
         
-        # 检查PATH优先级
+        # **实时检查PATH优先级**
         local which_python=""
         which_python=$(which python3 2>/dev/null || echo "")
         if [[ "$which_python" == *"mise"* ]]; then
-            log "  🛤️  PATH优先: mise Python" "info"
-        else
+            log "  🛤️  PATH优先: mise Python" "warn"
+        elif [[ "$which_python" == "/usr/bin/python3" ]]; then
             log "  🛤️  PATH优先: 系统Python (推荐)" "info"
+        else
+            log "  🛤️  PATH优先: 异常 ($which_python)" "error"
         fi
         
         # 全局工具列表
@@ -655,11 +691,20 @@ show_mise_summary() {
         tools_count=$("$MISE_PATH" list 2>/dev/null | wc -l || echo "0")
         log "  📦 已安装工具: $tools_count 个" "info"
         
-        # 系统模块状态（使用绝对路径）
-        if /usr/bin/python3 -c "import apt_pkg" &>/dev/null; then
-            log "  🧩 系统模块: 正常可用 ✓" "info"
-        else
-            log "  🧩 系统模块: 可能有问题 ⚠️" "warn"
+        # **实时检查系统模块状态**
+        local system_module_status="正常可用 ✓"
+        if ! python3 -c "import apt_pkg" &>/dev/null 2>&1; then
+            system_module_status="有问题 ⚠️ (当前Python无法导入apt_pkg)"
+        fi
+        log "  🧩 系统模块: $system_module_status" "info"
+        
+        # 如果系统模块有问题，给出诊断
+        if [[ "$system_module_status" == *"有问题"* ]]; then
+            if /usr/bin/python3 -c "import apt_pkg" &>/dev/null 2>&1; then
+                log "    → 系统Python模块正常，问题是PATH优先级" "warn"
+            else
+                log "    → 系统Python模块也有问题，建议重装python3-apt" "warn"
+            fi
         fi
         
     else
@@ -723,6 +768,15 @@ main() {
     log "  • 如遇apt工具报错，重新运行此脚本选择'修复系统配置'" "info"
     log "  • 推荐使用项目级模式，避免影响系统工具" "info"
     log "  • 手动修复PATH: export PATH=\"/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:\$HOME/.local/bin\"" "info"
+    
+    # 如果检测到PATH问题，额外提醒
+    local final_which_python=""
+    final_which_python=$(which python3 2>/dev/null || echo "")
+    if [[ "$final_which_python" == *"mise"* ]] && [[ ! "$1" == "allow_global" ]]; then
+        echo
+        log "🔄 检测到PATH可能需要手动生效，请运行:" "warn"
+        log "   source ~/.bashrc  # 或重新登录" "info"
+    fi
 }
 
 main "$@"
