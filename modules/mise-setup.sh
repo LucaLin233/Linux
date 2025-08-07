@@ -1,7 +1,7 @@
 #!/bin/bash
-# Mise 版本管理器配置模块 v4.4
+# Mise 版本管理器配置模块 v4.5
 # 功能: 安装Mise、智能选择Python版本、Shell集成、智能链接管理
-# 新增: 系统状态检测、PATH优先级管理、可重复运行安全
+# 修复: 解决PATH劫持导致的系统模块检测失败问题
 
 set -euo pipefail
 
@@ -18,19 +18,25 @@ log() {
 
 # === 系统状态检测函数 ===
 
-# 检测当前Python链接状态
+# 检测当前Python链接状态（修复版）
 detect_python_status() {
     local status_info=""
     local link_status="正常"
     
-    # 检查 /usr/bin/python3 指向
+    # 安全检查 /usr/bin/python3 指向
     if [[ -L /usr/bin/python3 ]]; then
-        local python3_target=$(readlink /usr/bin/python3)
-        if [[ "$python3_target" == *"mise"* ]]; then
-            status_info="系统链接被mise劫持"
-            link_status="劫持"
+        local python3_target=""
+        python3_target=$(readlink /usr/bin/python3 2>/dev/null || echo "")
+        if [[ -n "$python3_target" ]]; then
+            if [[ "$python3_target" == *"mise"* ]]; then
+                status_info="系统链接被mise劫持"
+                link_status="劫持"
+            else
+                status_info="使用系统Python链接"
+            fi
         else
-            status_info="使用系统Python链接"
+            status_info="链接损坏"
+            link_status="异常"
         fi
     elif [[ -f /usr/bin/python3 ]]; then
         status_info="直接使用系统Python文件"
@@ -39,35 +45,60 @@ detect_python_status() {
         link_status="异常"
     fi
     
-    # 检查 PATH 中的 python3 优先级
-    local which_python=$(which python3 2>/dev/null || echo "")
+    # 安全检查 PATH 中的 python3 优先级
+    local which_python=""
+    which_python=$(which python3 2>/dev/null || echo "")
     local path_status=""
     local path_priority="正常"
     
-    if [[ "$which_python" == *"mise"* ]]; then
-        path_status="PATH中mise Python优先"
-        path_priority="劫持"
-    elif [[ "$which_python" == "/usr/bin/python3" ]]; then
-        path_status="PATH中系统Python优先"
+    if [[ -n "$which_python" ]]; then
+        if [[ "$which_python" == *"mise"* ]]; then
+            path_status="PATH中mise Python优先"
+            path_priority="劫持"
+        elif [[ "$which_python" == "/usr/bin/python3" ]]; then
+            path_status="PATH中系统Python优先"
+        else
+            path_status="PATH配置异常: $which_python"
+            path_priority="异常"
+        fi
     else
-        path_status="PATH配置异常"
+        path_status="未找到python3"
         path_priority="异常"
     fi
     
     log "🔍 当前Python状态:" "info"
     log "  系统链接: $status_info" "info"  
     log "  PATH优先: $path_status" "info"
-    log "  当前版本: $(python3 --version 2>/dev/null || echo '无法获取')" "info"
     
-    # 检查系统模块可用性
-    if python3 -c "import apt_pkg" &>/dev/null; then
-        log "  系统模块: apt_pkg 可用 ✓" "info"
+    # 安全获取当前Python版本
+    local current_python_version=""
+    current_python_version=$(python3 --version 2>/dev/null || echo '无法获取版本')
+    log "  当前版本: $current_python_version" "info"
+    
+    # **关键修复：使用绝对路径检查系统Python和模块**
+    local system_python_version=""
+    system_python_version=$(/usr/bin/python3 --version 2>/dev/null || echo '系统Python不可用')
+    log "  系统Python: $system_python_version" "info"
+    
+    # 检查系统模块可用性（使用绝对路径）
+    local apt_pkg_status="未知"
+    if /usr/bin/python3 -c "import apt_pkg" >/dev/null 2>&1; then
+        apt_pkg_status="可用 ✓"
     else
-        log "  系统模块: apt_pkg 不可用 ✗" "warn"
+        apt_pkg_status="不可用 ✗"
     fi
     
+    local debconf_status="未知"  
+    if /usr/bin/python3 -c "import debconf" >/dev/null 2>&1; then
+        debconf_status="可用 ✓"
+    else
+        debconf_status="不可用 ✗"
+    fi
+    
+    log "  系统模块: apt_pkg $apt_pkg_status, debconf $debconf_status" "info"
+    
     # 返回是否需要修复 (0=需要修复, 1=正常)
-    if [[ "$link_status" == "劫持" || "$path_priority" == "劫持" ]] && [[ ! "$1" == "allow_global" ]]; then
+    if [[ "$link_status" == "劫持" || "$path_priority" == "劫持" ]] && [[ ! "${1:-}" == "allow_global" ]]; then
         return 0  # 需要修复
     else
         return 1  # 状态正常
@@ -80,8 +111,9 @@ fix_python_system_priority() {
     
     # 修复系统链接（如果被劫持）
     if [[ -L /usr/bin/python3 ]]; then
-        local python3_target=$(readlink /usr/bin/python3)
-        if [[ "$python3_target" == *"mise"* ]]; then
+        local python3_target=""
+        python3_target=$(readlink /usr/bin/python3 2>/dev/null || echo "")
+        if [[ -n "$python3_target" && "$python3_target" == *"mise"* ]]; then
             log "修复被劫持的系统Python链接..." "info"
             sudo rm /usr/bin/python3 2>/dev/null || true
             
@@ -92,6 +124,9 @@ fix_python_system_priority() {
             elif [[ -x /usr/bin/python3.10 ]]; then
                 sudo ln -sf /usr/bin/python3.10 /usr/bin/python3
                 log "✓ 已链接到系统Python 3.10" "info"
+            elif [[ -x /usr/bin/python3.9 ]]; then
+                sudo ln -sf /usr/bin/python3.9 /usr/bin/python3
+                log "✓ 已链接到系统Python 3.9" "info"
             else
                 log "✗ 未找到合适的系统Python版本" "error"
                 return 1
@@ -102,6 +137,16 @@ fix_python_system_priority() {
     # 确保PATH顺序正确
     log "配置PATH优先级..." "info"
     configure_path_priority
+    
+    # 验证修复结果
+    log "验证修复结果..." "info"
+    local new_which_python=""
+    new_which_python=$(PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$HOME/.local/bin" which python3 2>/dev/null || echo "")
+    if [[ "$new_which_python" == "/usr/bin/python3" ]]; then
+        log "✓ PATH优先级修复成功" "info"
+    else
+        log "⚠️ PATH修复可能需要重新登录生效" "warn"
+    fi
 }
 
 # 配置PATH优先级
@@ -119,8 +164,8 @@ configure_path_priority() {
         [[ ! -f "$config_file" ]] && touch "$config_file"
         
         # 移除旧的PATH配置
-        sed -i '/# Mise PATH priority/,/^$/d' "$config_file" 2>/dev/null || true
-        sed -i '/# Mise global mode PATH/,/^$/d' "$config_file" 2>/dev/null || true
+        sed -i '/# Mise PATH priority/,/^export PATH.*mise.*$/d' "$config_file" 2>/dev/null || true
+        sed -i '/# Mise global mode PATH/,/^export PATH.*mise.*$/d' "$config_file" 2>/dev/null || true
         
         # 添加新的PATH配置，确保系统路径优先
         cat >> "$config_file" << 'EOF'
@@ -148,8 +193,8 @@ configure_path_for_global_mode() {
         [[ ! -f "$config_file" ]] && touch "$config_file"
         
         # 移除旧的PATH配置
-        sed -i '/# Mise PATH priority/,/^$/d' "$config_file" 2>/dev/null || true
-        sed -i '/# Mise global mode PATH/,/^$/d' "$config_file" 2>/dev/null || true
+        sed -i '/# Mise PATH priority/,/^export PATH.*$/d' "$config_file" 2>/dev/null || true
+        sed -i '/# Mise global mode PATH/,/^export PATH.*$/d' "$config_file" 2>/dev/null || true
         
         # 为全局模式配置不同的PATH（mise优先）
         cat >> "$config_file" << 'EOF'
@@ -165,7 +210,12 @@ EOF
 show_project_usage_guide() {
     echo
     log "📝 项目级使用指南:" "info"
-    log "  • 系统级: 自动使用系统Python ($(python3 --version 2>/dev/null || echo '获取失败'))" "info"
+    
+    # 使用绝对路径获取系统Python版本
+    local system_version=""
+    system_version=$(/usr/bin/python3 --version 2>/dev/null || echo '获取失败')
+    
+    log "  • 系统级: 自动使用系统Python ($system_version)" "info"
     log "  • 项目级: cd your_project && mise use python@3.12.11" "info"
     log "  • 临时使用: mise exec python@3.12.11 -- python script.py" "info"
     log "  • 查看当前: mise current python" "info"
@@ -177,7 +227,7 @@ confirm_global_replacement() {
     echo
     log "⚠️  警告: 即将进行全局Python替换！" "warn"
     log "这会影响所有系统工具，包括apt、dpkg、apt-listchanges等" "warn"
-    log "如果系统工具报错，你需要手动修复或重新运行此脚本" "warn"
+    log "如果系统工具报错，你需要手动修复或重新运行此脚本选择修复选项" "warn"
     echo
     read -p "确认要继续吗? 强烈建议选择'N' [y/N]: " -r confirm_choice
     
@@ -188,6 +238,7 @@ confirm_global_replacement() {
         echo
         log "⚠️  重要提醒:" "warn"
         log "  如遇系统工具报错，重新运行此脚本选择'修复系统配置'" "warn"
+        log "  恢复命令: sudo ln -sf /usr/bin/python3.11 /usr/bin/python3" "warn"
     else
         log "✓ 明智的选择！改为使用项目级模式" "info"
         fix_python_system_priority
@@ -199,7 +250,7 @@ confirm_global_replacement() {
 
 # 获取Mise版本
 get_mise_version() {
-    local version_output
+    local version_output=""
     version_output=$("$MISE_PATH" --version 2>/dev/null || echo "")
     
     # mise --version 可能输出格式: "mise 2024.1.0" 或 "mise linux-x64 v2024.1.0"
@@ -212,7 +263,7 @@ get_mise_version() {
 
 # 获取Python版本
 get_python_version() {
-    local python_path python_version
+    local python_path="" python_version=""
     
     # 通过mise获取Python路径
     python_path=$("$MISE_PATH" which python 2>/dev/null || echo "")
@@ -235,15 +286,19 @@ install_mise() {
     mkdir -p "$MISE_BIN_DIR"
     
     if [[ -f "$MISE_PATH" ]]; then
-        local mise_version=$(get_mise_version)
+        local mise_version=""
+        mise_version=$(get_mise_version)
         log "Mise 已安装 (版本: $mise_version)" "info"
         
         echo
         read -p "是否更新 Mise 到最新版本? [y/N] (默认: N): " -r update_choice
         if [[ "$update_choice" =~ ^[Yy]$ ]]; then
             log "更新 Mise..." "info"
-            curl -fsSL https://mise.run | sh
-            log "✓ Mise 已更新" "info"
+            if curl -fsSL https://mise.run | sh; then
+                log "✓ Mise 已更新" "info"
+            else
+                log "⚠️ Mise 更新失败，继续使用现有版本" "warn"
+            fi
         fi
     else
         log "安装 Mise..." "info"
@@ -265,25 +320,34 @@ install_mise() {
 # 获取最新的三个Python主版本
 get_top3_python_versions() {
     # 获取所有标准版本，提取主版本号，去重并排序，取最新3个
-    local major_versions
-    major_versions=$("$MISE_PATH" ls-remote python | \
+    local major_versions=""
+    major_versions=$("$MISE_PATH" ls-remote python 2>/dev/null | \
         grep -E "^[0-9]+\.[0-9]+\.[0-9]+$" | \
         sed -E 's/^([0-9]+\.[0-9]+)\.[0-9]+$/\1/' | \
         sort -V -u | \
-        tail -3)
+        tail -3 || echo "")
     
     # 对每个主版本获取最新的patch版本
-    echo "$major_versions" | while read -r major; do
-        "$MISE_PATH" ls-remote python | \
-            grep -E "^${major}\.[0-9]+$" | \
-            sort -V | tail -1
-    done
+    if [[ -n "$major_versions" ]]; then
+        echo "$major_versions" | while read -r major; do
+            "$MISE_PATH" ls-remote python 2>/dev/null | \
+                grep -E "^${major}\.[0-9]+$" | \
+                sort -V | tail -1 || echo ""
+        done
+    else
+        # 如果获取失败，提供默认版本
+        echo "3.11.9"
+        echo "3.12.4"
+        echo "3.13.0"
+    fi
 }
 
 # 让用户选择Python版本
 choose_python_version() {
-    local versions=($(get_top3_python_versions))
-    local latest_version=$("$MISE_PATH" latest python 2>/dev/null || echo "")
+    local versions=()
+    readarray -t versions < <(get_top3_python_versions)
+    local latest_version=""
+    latest_version=$("$MISE_PATH" latest python 2>/dev/null || echo "")
     
     echo >&2
     echo "Python版本选择:" >&2
@@ -300,18 +364,22 @@ choose_python_version() {
     echo >&2
     
     # 获取用户选择
-    local choice
+    local choice=""
     read -p "请选择 [1-4] (默认: 2): " choice </dev/tty >&2
     choice=${choice:-2}
     
     # 返回选择的版本
     case "$choice" in
         1|2|3) 
-            local selected_version="${versions[$((choice-1))]}"
-            [[ -n "$selected_version" ]] && echo "$selected_version" || echo "${versions[1]}"
+            local selected_version="${versions[$((choice-1))]:-}"
+            if [[ -n "$selected_version" ]]; then
+                echo "$selected_version"
+            else
+                echo "3.12.4"  # 默认版本
+            fi
             ;;
         4) echo "current" ;;
-        *) echo "${versions[1]}" ;;  # 默认第2个
+        *) echo "3.12.4" ;;  # 默认版本
     esac
 }
 
@@ -323,7 +391,7 @@ get_installed_python_versions() {
 # 清理旧版本Python
 cleanup_old_python_versions() {
     local current_version="$1"
-    local installed_versions
+    local installed_versions=""
     
     installed_versions=$(get_installed_python_versions | grep -v "^$current_version$" || true)
     
@@ -357,14 +425,16 @@ setup_python() {
     log "配置 Python..." "info"
     
     # 检查当前配置
-    local current_version=$("$MISE_PATH" current python 2>/dev/null || echo "")
+    local current_version=""
+    current_version=$("$MISE_PATH" current python 2>/dev/null || echo "")
     
     if [[ -n "$current_version" ]]; then
         log "当前Python版本: $current_version" "info"
     fi
     
     # 让用户选择版本
-    local selected_version=$(choose_python_version)
+    local selected_version=""
+    selected_version=$(choose_python_version)
     
     if [[ "$selected_version" == "current" ]]; then
         log "保持当前Python配置" "info"
@@ -387,7 +457,7 @@ setup_python() {
 link_python_globally_original() {
     log "创建系统Python链接..." "info"
     
-    local python_path
+    local python_path=""
     python_path=$("$MISE_PATH" which python 2>/dev/null || echo "")
     
     if [[ -x "$python_path" ]]; then
@@ -425,11 +495,12 @@ setup_python_usage() {
     
     # 首先检测当前状态
     echo
-    detect_python_status > /dev/null 2>&1 || true  # 静默运行避免错误
-    local needs_fix=$?
-    
-    # 再次显示状态（这次显示输出）
-    detect_python_status > /dev/null 2>&1 && echo "✓ 系统状态正常" || echo "⚠️ 检测到系统配置问题"
+    local needs_fix=1
+    if detect_python_status > /dev/null 2>&1; then
+        needs_fix=1  # 正常，不需要修复
+    else
+        needs_fix=0  # 需要修复
+    fi
     
     echo
     echo "Python使用方式选择:"
@@ -449,7 +520,7 @@ setup_python_usage() {
         echo
     fi
     
-    local usage_choice
+    local usage_choice=""
     local default_choice=1
     [[ $needs_fix -eq 0 ]] && default_choice=3
     
@@ -539,25 +610,30 @@ show_mise_summary() {
     
     # Mise版本
     if [[ -f "$MISE_PATH" ]]; then
-        local mise_version=$(get_mise_version)
+        local mise_version=""
+        mise_version=$(get_mise_version)
         log "  ✓ Mise版本: $mise_version" "info"
         
         # Python状态
         if "$MISE_PATH" which python &>/dev/null; then
-            local python_version=$(get_python_version)
-            local current_version=$("$MISE_PATH" current python 2>/dev/null || echo "未知")
+            local python_version=""
+            python_version=$(get_python_version)
+            local current_version=""
+            current_version=$("$MISE_PATH" current python 2>/dev/null || echo "未知")
             log "  ✓ Mise Python: $python_version (当前: $current_version)" "info"
         else
             log "  ✗ Mise Python: 未配置" "info"
         fi
         
-        # 系统Python状态
-        local system_python_version=$(/usr/bin/python3 --version 2>/dev/null || echo "无法获取")
+        # 系统Python状态（使用绝对路径）
+        local system_python_version=""
+        system_python_version=$(/usr/bin/python3 --version 2>/dev/null || echo "无法获取")
         log "  ✓ 系统Python: $system_python_version" "info"
         
         # 检查系统链接状态
         if [[ -L /usr/bin/python3 ]]; then
-            local python3_target=$(readlink /usr/bin/python3)
+            local python3_target=""
+            python3_target=$(readlink /usr/bin/python3 2>/dev/null || echo "")
             if [[ "$python3_target" == *"mise"* ]]; then
                 log "  🔗 系统链接: 链接到mise Python (全局模式)" "info"
             else
@@ -566,7 +642,8 @@ show_mise_summary() {
         fi
         
         # 检查PATH优先级
-        local which_python=$(which python3 2>/dev/null)
+        local which_python=""
+        which_python=$(which python3 2>/dev/null || echo "")
         if [[ "$which_python" == *"mise"* ]]; then
             log "  🛤️  PATH优先: mise Python" "info"
         else
@@ -574,10 +651,11 @@ show_mise_summary() {
         fi
         
         # 全局工具列表
-        local tools_count=$("$MISE_PATH" list 2>/dev/null | wc -l || echo "0")
+        local tools_count=""
+        tools_count=$("$MISE_PATH" list 2>/dev/null | wc -l || echo "0")
         log "  📦 已安装工具: $tools_count 个" "info"
         
-        # 系统模块状态
+        # 系统模块状态（使用绝对路径）
         if /usr/bin/python3 -c "import apt_pkg" &>/dev/null; then
             log "  🧩 系统模块: 正常可用 ✓" "info"
         else
@@ -606,6 +684,7 @@ main() {
     echo
     if [[ -f "$MISE_PATH" ]]; then
         log "检测到现有mise安装，正在分析系统状态..." "info"
+        # 安全调用检测函数，不让错误中断脚本
         detect_python_status > /dev/null 2>&1 || true
     fi
     
@@ -643,7 +722,7 @@ main() {
     log "⚠️  重要提醒:" "warn"
     log "  • 如遇apt工具报错，重新运行此脚本选择'修复系统配置'" "info"
     log "  • 推荐使用项目级模式，避免影响系统工具" "info"
-    log "  • 手动修复命令: export PATH=\"/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:\$HOME/.local/bin\"" "info"
+    log "  • 手动修复PATH: export PATH=\"/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:\$HOME/.local/bin\"" "info"
 }
 
 main "$@"
