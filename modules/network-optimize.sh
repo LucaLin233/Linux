@@ -1,5 +1,5 @@
 #!/bin/bash
-# 网络性能优化模块 v4.7 - 中等精简版
+# 网络性能优化模块 v4.7 - 修复版
 # BBR + fq_codel + TFO + MPTCP优化
 
 set -euo pipefail
@@ -46,6 +46,12 @@ check_mptcp_support() {
     [[ -f "/proc/sys/net/mptcp/enabled" ]]
 }
 
+check_mptcp_param() {
+    local param="$1"
+    local param_file="/proc/sys/${param//./\/}"
+    [[ -f "$param_file" ]]
+}
+
 # === 配置函数 ===
 backup_configs() {
     if [[ -f "$SYSCTL_CONFIG" ]]; then
@@ -74,32 +80,82 @@ configure_mptcp_params() {
     
     log "检测 MPTCP 参数支持..." "info"
     
-    local -A mptcp_params=(
-        ["net.mptcp.enabled"]="1"
-        ["net.mptcp.allow_join_initial_addr_port"]="1"
-        ["net.mptcp.pm_type"]="0"
-        ["net.mptcp.checksum_enabled"]="0"
-        ["net.mptcp.stale_loss_cnt"]="4"
-        ["net.mptcp.add_addr_timeout"]="60000"
-        ["net.mptcp.close_timeout"]="30000"
-        ["net.mptcp.scheduler"]="default"
-    )
-    
     MPTCP_CONFIG_TEXT="
 
 # MPTCP 优化配置"
     
-    for param in "${!mptcp_params[@]}"; do
-        local param_file="/proc/sys/${param//./\/}"
-        if [[ -f "$param_file" ]]; then
-            MPTCP_CONFIG_TEXT+="
-${param} = ${mptcp_params[$param]}"
-            log "  ✓ 支持: $param" "info"
-            ((MPTCP_SUPPORTED_COUNT++))
-        else
-            log "  ✗ 跳过: $param (内核不支持)" "warn"
-        fi
-    done
+    # 逐个检测参数（使用更稳定的方式，避免关联数组）
+    if check_mptcp_param "net.mptcp.enabled"; then
+        MPTCP_CONFIG_TEXT+="
+net.mptcp.enabled = 1"
+        log "  ✓ 支持: net.mptcp.enabled" "info"
+        MPTCP_SUPPORTED_COUNT=$((MPTCP_SUPPORTED_COUNT + 1))
+    else
+        log "  ✗ 跳过: net.mptcp.enabled" "warn"
+    fi
+    
+    if check_mptcp_param "net.mptcp.allow_join_initial_addr_port"; then
+        MPTCP_CONFIG_TEXT+="
+net.mptcp.allow_join_initial_addr_port = 1"
+        log "  ✓ 支持: net.mptcp.allow_join_initial_addr_port" "info"
+        MPTCP_SUPPORTED_COUNT=$((MPTCP_SUPPORTED_COUNT + 1))
+    else
+        log "  ✗ 跳过: net.mptcp.allow_join_initial_addr_port" "warn"
+    fi
+    
+    if check_mptcp_param "net.mptcp.pm_type"; then
+        MPTCP_CONFIG_TEXT+="
+net.mptcp.pm_type = 0"
+        log "  ✓ 支持: net.mptcp.pm_type" "info"
+        MPTCP_SUPPORTED_COUNT=$((MPTCP_SUPPORTED_COUNT + 1))
+    else
+        log "  ✗ 跳过: net.mptcp.pm_type" "warn"
+    fi
+    
+    if check_mptcp_param "net.mptcp.checksum_enabled"; then
+        MPTCP_CONFIG_TEXT+="
+net.mptcp.checksum_enabled = 0"
+        log "  ✓ 支持: net.mptcp.checksum_enabled" "info"
+        MPTCP_SUPPORTED_COUNT=$((MPTCP_SUPPORTED_COUNT + 1))
+    else
+        log "  ✗ 跳过: net.mptcp.checksum_enabled" "warn"
+    fi
+    
+    if check_mptcp_param "net.mptcp.stale_loss_cnt"; then
+        MPTCP_CONFIG_TEXT+="
+net.mptcp.stale_loss_cnt = 4"
+        log "  ✓ 支持: net.mptcp.stale_loss_cnt" "info"
+        MPTCP_SUPPORTED_COUNT=$((MPTCP_SUPPORTED_COUNT + 1))
+    else
+        log "  ✗ 跳过: net.mptcp.stale_loss_cnt" "warn"
+    fi
+    
+    if check_mptcp_param "net.mptcp.add_addr_timeout"; then
+        MPTCP_CONFIG_TEXT+="
+net.mptcp.add_addr_timeout = 60000"
+        log "  ✓ 支持: net.mptcp.add_addr_timeout" "info"
+        MPTCP_SUPPORTED_COUNT=$((MPTCP_SUPPORTED_COUNT + 1))
+    else
+        log "  ✗ 跳过: net.mptcp.add_addr_timeout" "warn"
+    fi
+    
+    if check_mptcp_param "net.mptcp.close_timeout"; then
+        MPTCP_CONFIG_TEXT+="
+net.mptcp.close_timeout = 30000"
+        log "  ✓ 支持: net.mptcp.close_timeout" "info"
+        MPTCP_SUPPORTED_COUNT=$((MPTCP_SUPPORTED_COUNT + 1))
+    else
+        log "  ✗ 跳过: net.mptcp.close_timeout" "warn"
+    fi
+    
+    if check_mptcp_param "net.mptcp.scheduler"; then
+        MPTCP_CONFIG_TEXT+="
+net.mptcp.scheduler = default"
+        log "  ✓ 支持: net.mptcp.scheduler" "info"
+        MPTCP_SUPPORTED_COUNT=$((MPTCP_SUPPORTED_COUNT + 1))
+    else
+        log "  ✗ 跳过: net.mptcp.scheduler" "warn"
+    fi
     
     log "MPTCP 参数检测完成: $MPTCP_SUPPORTED_COUNT/$MPTCP_TOTAL_COUNT" "info"
 }
@@ -108,9 +164,11 @@ configure_system_limits() {
     log "配置系统资源限制..." "info"
     
     # 处理 nproc 配置文件
-    for file in /etc/security/limits.d/*nproc.conf; do
-        [[ -f "$file" ]] && mv "$file" "${file%.conf}.conf_bk" 2>/dev/null || true
-    done
+    if compgen -G "/etc/security/limits.d/*nproc.conf" > /dev/null 2>&1; then
+        for file in /etc/security/limits.d/*nproc.conf; do
+            [[ -f "$file" ]] && mv "$file" "${file%.conf}.conf_bk" 2>/dev/null || true
+        done
+    fi
     
     # 配置 PAM 限制
     if [[ -f /etc/pam.d/common-session ]] && ! grep -q 'session required pam_limits.so' /etc/pam.d/common-session; then
@@ -257,9 +315,14 @@ EOF
         log "✓ 所有 sysctl 参数应用成功" "info"
     else
         local total_params failed_params success_params
-        total_params=$(echo "$sysctl_output" | grep -c "=" || echo "0")
-        failed_params=$(echo "$sysctl_output" | grep -c "cannot stat" || echo "0")
-        success_params=$((total_params > failed_params ? total_params - failed_params : 0))
+        total_params=$(echo "$sysctl_output" | grep -c "=" 2>/dev/null || echo "0")
+        failed_params=$(echo "$sysctl_output" | grep -c "cannot stat" 2>/dev/null || echo "0")
+        
+        if [[ $total_params -ge $failed_params ]]; then
+            success_params=$((total_params - failed_params))
+        else
+            success_params=0
+        fi
         
         if [[ $failed_params -eq 0 ]]; then
             log "✓ 所有 $total_params 个参数应用成功" "info"
@@ -267,12 +330,12 @@ EOF
             log "⚠ sysctl 应用完成: $success_params 个成功, $failed_params 个不支持" "warn"
             
             # 显示不支持的参数
-            echo "$sysctl_output" | grep "cannot stat" | while read -r line; do
+            echo "$sysctl_output" | grep "cannot stat" 2>/dev/null | while read -r line; do
                 if [[ "$line" =~ /proc/sys/([^:]+) ]]; then
                     local param="${BASH_REMATCH[1]//\//.}"
                     log "  ✗ 不支持: $param" "warn"
                 fi
-            done
+            done || true
         fi
     fi
 }
