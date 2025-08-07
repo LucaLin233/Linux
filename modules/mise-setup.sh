@@ -1,7 +1,7 @@
 #!/bin/bash
-# Mise 版本管理器配置模块 v4.7
+# Mise 版本管理器配置模块 v4.7.1
 # 功能: 安装Mise、智能选择Python版本、Shell集成、智能链接管理、自动修复系统模块
-# 优化: 保留完整功能，加上自动修复，适当简化代码结构
+# 修复: 解决readarray和输入重定向问题
 
 set -euo pipefail
 
@@ -94,7 +94,7 @@ detect_python_status() {
     fi
 }
 
-# 自动修复系统模块（新增功能）
+# 自动修复系统模块
 fix_system_modules() {
     local apt_pkg_ok=false
     local debconf_ok=false
@@ -177,7 +177,7 @@ fix_python_system_priority() {
         log "✓ PATH优先级修复成功，立即生效" "info"
         
         # 自动修复系统模块
-        fix_system_modules
+        fix_system_modules || true  # 不让修复失败中断脚本
         
         # 验证系统模块
         if python3 -c "import apt_pkg" &>/dev/null 2>&1; then
@@ -282,7 +282,7 @@ install_mise() {
         log "Mise 已安装 (版本: $mise_version)" "info"
         
         echo
-        read -p "是否更新 Mise 到最新版本? [y/N] (默认: N): " -r update_choice
+        read -p "是否更新 Mise 到最新版本? [y/N] (默认: N): " -r update_choice || update_choice="N"
         if [[ "$update_choice" =~ ^[Yy]$ ]]; then
             log "更新 Mise..." "info"
             if curl -fsSL https://mise.run | sh; then
@@ -304,29 +304,46 @@ install_mise() {
     [[ ! -f "$MISE_PATH" ]] && { log "✗ 安装验证失败" "error"; exit 1; }
 }
 
-# 获取最新的三个Python主版本
+# 获取最新的三个Python主版本（修复版）
 get_top3_python_versions() {
-    local major_versions=$("$MISE_PATH" ls-remote python 2>/dev/null | \
+    # 尝试获取远程版本，失败时使用默认版本
+    local major_versions=""
+    major_versions=$("$MISE_PATH" ls-remote python 2>/dev/null | \
         grep -E "^[0-9]+\.[0-9]+\.[0-9]+$" | \
         sed -E 's/^([0-9]+\.[0-9]+)\.[0-9]+$/\1/' | \
-        sort -V -u | tail -3 || echo "")
+        sort -V -u | tail -3 2>/dev/null || echo "")
     
     if [[ -n "$major_versions" ]]; then
-        echo "$major_versions" | while read -r major; do
-            "$MISE_PATH" ls-remote python 2>/dev/null | \
+        # 获取每个主版本的最新patch版本
+        local versions=""
+        while IFS= read -r major; do
+            local latest_patch=$("$MISE_PATH" ls-remote python 2>/dev/null | \
                 grep -E "^${major}\.[0-9]+$" | \
-                sort -V | tail -1 || echo ""
-        done
+                sort -V | tail -1 2>/dev/null || echo "")
+            [[ -n "$latest_patch" ]] && versions="$versions$latest_patch"$'\n'
+        done <<< "$major_versions"
+        echo "$versions"
     else
         # 默认版本
         echo -e "3.11.9\n3.12.4\n3.13.0"
     fi
 }
 
-# 让用户选择Python版本
+# 让用户选择Python版本（修复版）
 choose_python_version() {
+    # 修复：使用while循环代替readarray
     local versions=()
-    readarray -t versions < <(get_top3_python_versions)
+    local version_str=$(get_top3_python_versions)
+    
+    while IFS= read -r line; do
+        [[ -n "$line" ]] && versions+=("$line")
+    done <<< "$version_str"
+    
+    # 如果获取失败，使用默认版本
+    if [[ ${#versions[@]} -eq 0 ]]; then
+        versions=("3.11.9" "3.12.4" "3.13.0")
+    fi
+    
     local latest_version=$("$MISE_PATH" latest python 2>/dev/null || echo "")
     
     echo >&2
@@ -342,8 +359,9 @@ choose_python_version() {
     echo "  4) 保持当前配置" >&2
     echo >&2
     
+    # 修复：移除输入重定向
     local choice=""
-    read -p "请选择 [1-4] (默认: 2): " choice </dev/tty >&2
+    read -p "请选择 [1-4] (默认: 2): " choice || choice="2"
     choice=${choice:-2}
     
     case "$choice" in
@@ -372,10 +390,10 @@ cleanup_old_python_versions() {
         echo "$installed_versions" | sed 's/^/  - Python /'
         
         echo
-        read -p "是否删除其他版本? [y/N] (默认: N): " -r cleanup_choice
+        read -p "是否删除其他版本? [y/N] (默认: N): " -r cleanup_choice || cleanup_choice="N"
         
         if [[ "$cleanup_choice" =~ ^[Yy]$ ]]; then
-            echo "$installed_versions" | while read -r version; do
+            while IFS= read -r version; do
                 if [[ -n "$version" ]]; then
                     log "删除 Python $version..." "info"
                     if "$MISE_PATH" uninstall "python@$version" 2>/dev/null; then
@@ -384,7 +402,7 @@ cleanup_old_python_versions() {
                         log "✗ 删除 Python $version 失败" "warn"
                     fi
                 fi
-            done
+            done <<< "$installed_versions"
         fi
     else
         log "没有其他Python版本需要清理" "info"
@@ -458,7 +476,7 @@ confirm_global_replacement() {
     log "这会影响所有系统工具，包括apt、dpkg、apt-listchanges等" "warn"
     log "如果系统工具报错，你需要手动修复或重新运行此脚本选择修复选项" "warn"
     echo
-    read -p "确认要继续吗? 强烈建议选择'N' [y/N]: " -r confirm_choice
+    read -p "确认要继续吗? 强烈建议选择'N' [y/N]: " -r confirm_choice || confirm_choice="N"
     
     if [[ "$confirm_choice" =~ ^[Yy]$ ]]; then
         log "执行全局替换..." "info"
@@ -513,7 +531,7 @@ setup_python_usage() {
     local max_choice=2
     [[ $needs_fix -eq 0 ]] && max_choice=3
     
-    read -p "请选择 [1-$max_choice] (默认: $default_choice): " -r usage_choice
+    read -p "请选择 [1-$max_choice] (默认: $default_choice): " -r usage_choice || usage_choice="$default_choice"
     usage_choice=${usage_choice:-$default_choice}
     
     case "$usage_choice" in
