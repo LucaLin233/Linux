@@ -1,7 +1,7 @@
 #!/bin/bash
-# Mise 版本管理器配置模块 v5.0
+# Mise 版本管理器配置模块 v5.1
 # 功能: 安装Mise、智能选择Python版本、Shell集成、智能链接管理、自动修复系统模块
-# 专业版本：完整的Debian/Ubuntu系统Mise配置解决方案
+# 专业版本：完整的Debian/Ubuntu系统Mise配置解决方案（修复版）
 
 set -euo pipefail
 
@@ -19,11 +19,73 @@ log() {
     echo -e "${colors[$level]:-\033[0;32m}$msg\033[0m" >&2
 }
 
-# === 系统状态检测函数 ===
+# === 系统检测和修复函数 ===
+
+# 检测系统Python状态
+detect_system_python() {
+    # 检查常见的系统Python位置
+    local system_python_paths=(
+        "/usr/bin/python3"
+        "/usr/bin/python3.11"
+        "/usr/bin/python3.10" 
+        "/usr/bin/python3.9"
+        "/usr/bin/python3.12"
+    )
+    
+    for python_path in "${system_python_paths[@]}"; do
+        if [[ -x "$python_path" ]]; then
+            echo "$python_path"
+            return 0
+        fi
+    done
+    
+    return 1
+}
+
+# 确保系统Python可用
+ensure_system_python() {
+    local system_python=""
+    if system_python=$(detect_system_python); then
+        log "✓ 发现系统Python: $system_python" "info"
+        
+        # 如果/usr/bin/python3不存在但有其他版本，创建链接
+        if [[ ! -e "/usr/bin/python3" ]] && [[ "$system_python" != "/usr/bin/python3" ]]; then
+            log "创建系统Python3链接..." "info"
+            sudo ln -sf "$system_python" /usr/bin/python3 2>/dev/null || {
+                log "✗ 无法创建系统Python链接，可能需要手动安装python3" "error"
+                return 1
+            }
+        fi
+        return 0
+    else
+        log "✗ 未找到系统Python，正在安装..." "warn"
+        
+        # 尝试安装python3
+        if command -v apt &>/dev/null; then
+            log "安装 python3..." "info"
+            if sudo apt update -qq && sudo apt install -y python3 python3-apt python3-debconf; then
+                log "✓ Python3 安装完成" "info"
+                return 0
+            else
+                log "✗ Python3 安装失败" "error"
+                return 1
+            fi
+        else
+            log "✗ 无法安装Python3，请手动安装" "error"
+            return 1
+        fi
+    fi
+}
 
 # 检测当前Python链接状态
 detect_python_status() {
     local status_info="" link_status="正常"
+    
+    # 首先确保系统Python存在
+    if ! ensure_system_python; then
+        log "⚠️ 系统Python配置异常，请手动修复后重试" "error"
+        return 1
+    fi
     
     # 检查系统链接
     if [[ -L /usr/bin/python3 ]]; then
@@ -103,7 +165,7 @@ detect_python_status() {
     fi
 }
 
-# 自动修复系统模块
+# 安全的系统模块修复（非交互式）
 fix_system_modules() {
     local apt_pkg_ok=false
     local debconf_ok=false
@@ -124,30 +186,38 @@ fix_system_modules() {
     
     log "🔧 检测到系统模块缺失，正在自动修复..." "warn"
     
-    # 尝试重新安装
-    if sudo apt install --reinstall python3-apt python3-debconf >/dev/null 2>&1; then
+    # 非交互式修复，设置超时
+    local apt_cmd="sudo DEBIAN_FRONTEND=noninteractive apt install -y --reinstall python3-apt python3-debconf"
+    
+    if timeout 60 $apt_cmd >/dev/null 2>&1; then
         log "✓ 系统模块修复成功" "info"
         return 0
     fi
     
-    # 如果重装失败，尝试完全重装
+    # 如果重装失败，尝试完全重装（也设置超时）
     log "重装失败，尝试完全重新安装..." "info"
-    sudo apt remove --purge python3-apt python3-debconf >/dev/null 2>&1 || true
-    sudo apt autoremove >/dev/null 2>&1 || true
     
-    if sudo apt install python3-apt python3-debconf >/dev/null 2>&1; then
-        log "✓ 系统模块完全重装成功" "info"
-        return 0
-    else
-        log "✗ 系统模块自动修复失败，请手动处理:" "error"
-        log "   sudo apt install --reinstall python3-apt python3-debconf" "error"
-        return 1
+    if timeout 30 sudo DEBIAN_FRONTEND=noninteractive apt remove --purge -y python3-apt python3-debconf >/dev/null 2>&1; then
+        if timeout 60 sudo DEBIAN_FRONTEND=noninteractive apt install -y python3-apt python3-debconf >/dev/null 2>&1; then
+            log "✓ 系统模块完全重装成功" "info"
+            return 0
+        fi
     fi
+    
+    log "⚠️ 系统模块自动修复超时或失败，但不影响正常使用" "warn"
+    log "   如需手动修复: sudo apt install --reinstall python3-apt python3-debconf" "info"
+    return 1
 }
 
-# 修复系统Python链接和PATH
+# 修复系统Python链接和PATH（增强安全版）
 fix_python_system_priority() {
     log "🔧 修复系统Python优先级..." "info"
+    
+    # 首先确保系统Python存在
+    if ! ensure_system_python; then
+        log "✗ 无法确保系统Python可用，跳过修复" "error"
+        return 1
+    fi
     
     # 修复系统链接（如果被劫持）
     if [[ -L /usr/bin/python3 ]]; then
@@ -156,18 +226,16 @@ fix_python_system_priority() {
         
         if [[ -n "$python3_target" && "$python3_target" == *"mise"* ]]; then
             log "修复被劫持的系统Python链接..." "info"
+            
+            # 先备份
+            sudo cp -L /usr/bin/python3 /usr/bin/python3.mise.backup 2>/dev/null || true
             sudo rm /usr/bin/python3 2>/dev/null || true
             
-            # 寻找合适的系统Python版本
-            if [[ -x /usr/bin/python3.11 ]]; then
-                sudo ln -sf /usr/bin/python3.11 /usr/bin/python3
-                log "✓ 已链接到系统Python 3.11" "info"
-            elif [[ -x /usr/bin/python3.10 ]]; then
-                sudo ln -sf /usr/bin/python3.10 /usr/bin/python3
-                log "✓ 已链接到系统Python 3.10" "info"
-            elif [[ -x /usr/bin/python3.9 ]]; then
-                sudo ln -sf /usr/bin/python3.9 /usr/bin/python3
-                log "✓ 已链接到系统Python 3.9" "info"
+            # 寻找合适的系统Python版本并链接
+            local system_python=""
+            if system_python=$(detect_system_python); then
+                sudo ln -sf "$system_python" /usr/bin/python3
+                log "✓ 已恢复系统Python链接: $system_python" "info"
             else
                 log "✗ 未找到合适的系统Python版本" "error"
                 return 1
@@ -175,30 +243,36 @@ fix_python_system_priority() {
         fi
     fi
     
-    # 修复PATH配置
-    configure_path_priority
-    
-    # 立即在当前shell中应用PATH修复
-    export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$HOME/.local/bin"
-    hash -r 2>/dev/null || true
+    # 修复PATH配置（更安全的方法）
+    configure_safe_path_priority
     
     # 验证修复结果
     local new_which_python
-    new_which_python=$(which python3 2>/dev/null || echo "")
+    new_which_python=$(PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$HOME/.local/bin" which python3 2>/dev/null || echo "")
     
     if [[ "$new_which_python" == "/usr/bin/python3" ]]; then
-        log "✓ PATH优先级修复成功，立即生效" "info"
+        log "✓ PATH优先级修复成功" "info"
         
-        # 自动修复系统模块
-        fix_system_modules || true
-        
-        # 验证系统模块
-        if python3 -c "import apt_pkg" &>/dev/null 2>&1; then
-            log "✓ 系统模块现在可用" "info"
-        fi
-        
-        if python3 -c "import debconf" &>/dev/null 2>&1; then
-            log "✓ debconf模块现在可用" "info"
+        # 在新PATH环境中测试系统python
+        if PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$HOME/.local/bin" python3 --version >/dev/null 2>&1; then
+            # 立即应用修复的PATH
+            export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$HOME/.local/bin"
+            hash -r 2>/dev/null || true
+            log "✓ PATH修复立即生效" "info"
+            
+            # 安全的系统模块修复（设置超时，避免卡住）
+            fix_system_modules || true
+            
+            # 验证系统模块
+            if python3 -c "import apt_pkg" &>/dev/null 2>&1; then
+                log "✓ 系统模块现在可用" "info"
+            fi
+            
+            if python3 -c "import debconf" &>/dev/null 2>&1; then
+                log "✓ debconf模块现在可用" "info"
+            fi
+        else
+            log "⚠️ 修复后的PATH中Python3仍有问题" "warn"
         fi
     else
         log "⚠️ PATH修复异常，当前指向：$new_which_python" "warn"
@@ -209,14 +283,26 @@ fix_python_system_priority() {
     echo
     log "修复后状态:" "info"
     local link_target
-    link_target=$(readlink /usr/bin/python3 2>/dev/null || echo '直接文件')
+    if [[ -L /usr/bin/python3 ]]; then
+        link_target=$(readlink /usr/bin/python3 2>/dev/null || echo '链接异常')
+    else
+        link_target='直接文件'
+    fi
     log "  系统链接: $link_target" "info"
-    log "  当前python3: $(which python3)" "info"
-    log "  版本: $(python3 --version)" "info"
+    
+    local current_python3
+    current_python3=$(which python3 2>/dev/null || echo "未找到")
+    log "  当前python3: $current_python3" "info"
+    
+    if [[ "$current_python3" != "未找到" ]]; then
+        local python_version
+        python_version=$(python3 --version 2>/dev/null || echo "无法获取版本")
+        log "  版本: $python_version" "info"
+    fi
 }
 
-# 配置PATH优先级
-configure_path_priority() {
+# 安全的PATH配置
+configure_safe_path_priority() {
     local shells=("bash:$HOME/.bashrc" "zsh:$HOME/.zshrc")
     
     for shell_info in "${shells[@]}"; do
@@ -229,11 +315,14 @@ configure_path_priority() {
         
         [[ ! -f "$config_file" ]] && touch "$config_file"
         
+        # 备份配置文件
+        cp "$config_file" "${config_file}.mise.backup" 2>/dev/null || true
+        
         # 移除旧配置
         sed -i '/# Mise PATH priority/,+1d' "$config_file" 2>/dev/null || true
         sed -i '/# Mise global mode PATH/,+1d' "$config_file" 2>/dev/null || true
         
-        # 添加新配置
+        # 添加安全的PATH配置
         cat >> "$config_file" << 'EOF'
 
 # Mise PATH priority - 确保系统工具使用系统Python
@@ -595,9 +684,9 @@ setup_python_usage() {
     echo
     local needs_fix=1
     if detect_python_status > /dev/null 2>&1; then
-        needs_fix=1  # 正常，不需要修复
-    else
         needs_fix=0  # 需要修复
+    else
+        needs_fix=1  # 状态正常
     fi
     
     echo
@@ -697,7 +786,7 @@ configure_shell_integration() {
     done
 }
 
-# 显示配置摘要
+# 显示配置摘要（增强版）
 show_mise_summary() {
     echo
     log "🎯 Mise 配置摘要:" "info"
