@@ -1,5 +1,5 @@
 #!/bin/bash
-# 网络性能优化模块 v4.6 - 稳定版
+# 网络性能优化模块 v4.6 - 修复算术表达式版
 # 集成完整参数配置 - 使用fq_codel队列调度 + 稳定MPTCP优化
 
 set -euo pipefail
@@ -284,7 +284,24 @@ EOF
     log "✓ 系统资源限制配置完成" "info"
 }
 
-# 配置网络优化参数（稳定版）
+# 安全计数函数
+safe_count() {
+    local input="$1"
+    local pattern="$2"
+    local result
+    
+    # 使用更安全的方式计数
+    result=$(echo "$input" | grep -c "$pattern" 2>/dev/null || echo "0")
+    
+    # 确保结果是纯数字
+    if [[ "$result" =~ ^[0-9]+$ ]]; then
+        echo "$result"
+    else
+        echo "0"
+    fi
+}
+
+# 配置网络优化参数（修复算术表达式版本）
 configure_network_parameters() {
     log "配置网络优化参数..." "info"
     
@@ -303,6 +320,7 @@ configure_network_parameters() {
     sed -i '/^# 网络性能优化.*cake.*高级/d' "$SYSCTL_CONFIG"
     sed -i '/^# 网络性能优化.*智能.*检测/d' "$SYSCTL_CONFIG"
     sed -i '/^# 网络性能优化.*稳定版/d' "$SYSCTL_CONFIG"
+    sed -i '/^# 网络性能优化.*修复算术表达式版/d' "$SYSCTL_CONFIG"
     
     # 清理可能重复的MPTCP配置注释
     sed -i '/^# MPTCP.*优化配置/d' "$SYSCTL_CONFIG"
@@ -378,7 +396,7 @@ configure_network_parameters() {
     cat >> "$SYSCTL_CONFIG" << EOF
 
 # === 网络性能优化配置开始 ===
-# 网络性能优化模块 v4.6 - 稳定版
+# 网络性能优化模块 v4.6 - 修复算术表达式版
 # 生成时间: $(date)
 # 包含: BBR + fq_codel + TFO + MPTCP稳定优化 + 完整TCP优化
 # MPTCP兼容性: $MPTCP_SUPPORTED_COUNT/$MPTCP_TOTAL_COUNT 个参数可用
@@ -446,10 +464,10 @@ net.ipv4.tcp_fastopen = 3${MPTCP_CONFIG_TEXT}
 
 EOF
     
-    # 应用配置，智能处理错误
+    # 应用配置，使用更安全的错误处理
     log "应用 sysctl 配置..." "info"
     
-    local sysctl_output
+    local sysctl_output=""
     local sysctl_exitcode=0
     
     # 捕获sysctl输出和退出码
@@ -458,28 +476,36 @@ EOF
     if [[ $sysctl_exitcode -eq 0 ]]; then
         log "✓ 所有 sysctl 参数已成功应用" "info"
     else
-        # 分析输出，统计成功和失败的参数
+        # 使用安全的计数方式
         local total_params
         local failed_params
         local success_params
         
-        total_params=$(echo "$sysctl_output" | grep -c "=" || echo "0")
-        failed_params=$(echo "$sysctl_output" | grep -c "cannot stat" || echo "0")
-        success_params=$((total_params - failed_params))
+        total_params=$(safe_count "$sysctl_output" "=")
+        failed_params=$(safe_count "$sysctl_output" "cannot stat")
+        
+        # 安全的算术计算
+        if [[ $total_params -ge $failed_params ]]; then
+            success_params=$((total_params - failed_params))
+        else
+            success_params=0
+        fi
         
         if [[ $failed_params -eq 0 ]]; then
             log "✓ 所有 $total_params 个 sysctl 参数已成功应用" "info"
         else
             log "⚠ sysctl 应用完成: $success_params 个成功, $failed_params 个不支持" "warn"
             
-            # 显示不支持的参数
-            echo "$sysctl_output" | while read -r line; do
-                if [[ "$line" =~ "cannot stat" ]]; then
-                    local param
-                    param=$(echo "$line" | grep -o "/proc/sys/[^:]*" | sed 's|/proc/sys/||' | sed 's|/|.|g')
-                    log "  ✗ 不支持的参数: $param (内核版本限制)" "warn"
-                fi
-            done
+            # 显示不支持的参数（更安全的方式）
+            if [[ $failed_params -gt 0 ]]; then
+                echo "$sysctl_output" | grep "cannot stat" | while read -r line; do
+                    if [[ "$line" =~ /proc/sys/([^:]+) ]]; then
+                        local param="${BASH_REMATCH[1]}"
+                        param="${param//\//.}"
+                        log "  ✗ 不支持的参数: $param (内核版本限制)" "warn"
+                    fi
+                done
+            fi
             
             if [[ $success_params -gt 0 ]]; then
                 log "✓ 核心网络优化参数已正常应用" "info"
@@ -786,7 +812,7 @@ show_network_summary() {
 
 # === 主流程 ===
 main() {
-    log "🚀 配置网络性能优化 (稳定版本)..." "info"
+    log "🚀 配置网络性能优化 (修复版本)..." "info"
     
     setup_network_optimization
     
