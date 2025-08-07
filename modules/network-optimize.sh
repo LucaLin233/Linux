@@ -1,6 +1,6 @@
 #!/bin/bash
 # 网络性能优化模块 v4.5 - 修正配置清理逻辑
-# 集成第一个脚本的完整参数配置 - 使用fq_codel队列调度
+# 集成第一个脚本的完整参数配置 - 使用fq_codel队列调度 + 完整MPTCP优化
 
 set -euo pipefail
 
@@ -164,7 +164,7 @@ configure_network_parameters() {
     # 清理可能重复的MPTCP配置注释
     sed -i '/^# MPTCP (Multipath TCP) 优化配置/d' "$SYSCTL_CONFIG"
     
-    # 清理所有相关参数（确保没有重复）
+    # 清理所有相关参数（确保没有重复）- 包含新增的MPTCP参数
     local params_to_clean=(
         "fs.file-max"
         "fs.inotify.max_user_instances"
@@ -214,6 +214,13 @@ configure_network_parameters() {
         "net.mptcp.enabled"
         "net.mptcp.checksum_enabled"
         "net.mptcp.allow_join_initial_addr_port"
+        "net.mptcp.pm_type"
+        "net.mptcp.stale_loss_cnt"
+        "net.mptcp.syn_retries"
+        "net.mptcp.add_addr_timeout"
+        "net.mptcp.close_timeout"
+        "net.mptcp.scheduler"
+        "net.mptcp.blackhole_detection"
     )
     
     # 清理所有相关参数的重复行
@@ -221,23 +228,31 @@ configure_network_parameters() {
         sed -i "/^[[:space:]]*${param//./\\.}[[:space:]]*=.*/d" "$SYSCTL_CONFIG"
     done
     
-    # 检查MPTCP支持并设置MPTCP参数
+    # 检查MPTCP支持并设置完整的MPTCP参数
     local mptcp_config=""
     if check_mptcp_support; then
         mptcp_config="
-# MPTCP (Multipath TCP) 优化配置
+
+# MPTCP (Multipath TCP) 完整优化配置 - 专为代理场景优化
 net.mptcp.enabled = 1
-net.mptcp.checksum_enabled = 1
-net.mptcp.allow_join_initial_addr_port = 1"
+net.mptcp.allow_join_initial_addr_port = 1
+net.mptcp.pm_type = 0
+net.mptcp.stale_loss_cnt = 4
+net.mptcp.syn_retries = 5
+net.mptcp.add_addr_timeout = 60000
+net.mptcp.close_timeout = 30000
+net.mptcp.scheduler = default
+net.mptcp.checksum_enabled = 0
+net.mptcp.blackhole_detection = 1"
     fi
     
     # 添加新的配置块（带明确标记，防止重复）
     cat >> "$SYSCTL_CONFIG" << EOF
 
 # === 网络性能优化配置开始 ===
-# 网络性能优化模块 v4.5 - 完整参数配置
+# 网络性能优化模块 v4.5 - 完整参数配置 + 完整MPTCP优化
 # 生成时间: $(date)
-# 包含: BBR + fq_codel + TFO + MPTCP + 完整TCP优化
+# 包含: BBR + fq_codel + TFO + MPTCP完整参数 + 完整TCP优化
 
 # 文件系统优化
 fs.file-max = 1048576
@@ -356,10 +371,21 @@ verify_network_config() {
     if [[ -f "/proc/sys/net/mptcp/enabled" ]]; then
         local current_mptcp=$(sysctl -n net.mptcp.enabled 2>/dev/null || echo "0")
         log "当前MPTCP状态: $current_mptcp (0=禁用,1=启用)" "info"
+        
+        if [[ "$current_mptcp" == "1" ]]; then
+            # 验证MPTCP详细参数
+            local mptcp_pm_type=$(sysctl -n net.mptcp.pm_type 2>/dev/null || echo "N/A")
+            local mptcp_stale_loss=$(sysctl -n net.mptcp.stale_loss_cnt 2>/dev/null || echo "N/A")
+            local mptcp_scheduler=$(sysctl -n net.mptcp.scheduler 2>/dev/null || echo "N/A")
+            
+            log "  └── 路径管理器类型: $mptcp_pm_type" "info"
+            log "  └── 故障检测阈值: $mptcp_stale_loss" "info"
+            log "  └── 调度器类型: $mptcp_scheduler" "info"
+        fi
     fi
     
     if [[ "$current_cc" == "bbr" && "$current_qdisc" == "fq_codel" && "$current_tfo" == "3" ]]; then
-        log "✓ BBR + fq_codel + TFO 配置成功" "info"
+        log "✓ BBR + fq_codel + TFO + MPTCP 配置成功" "info"
         return 0
     else
         log "⚠ 网络优化配置可能未完全生效" "warn"
@@ -394,11 +420,11 @@ setup_network_optimization() {
     log "  BBR: 改进的TCP拥塞控制算法，提升网络吞吐量" "info"
     log "  fq_codel: 公平队列+延迟控制，平衡吞吐量和延迟" "info"
     log "  TCP Fast Open: 减少连接建立延迟，提升短连接性能" "info"
-    log "  MPTCP: 多路径TCP，支持带宽聚合和链路冗余" "info"
+    log "  MPTCP完整优化: 多路径TCP，专为代理转发场景优化" "info"
     log "  完整参数: 包含系统资源限制和全面的TCP优化" "info"
     
     echo
-    read -p "是否启用网络性能优化 (BBR+fq_codel+TFO+MPTCP+完整参数)? [Y/n] (默认: Y): " -r optimize_choice
+    read -p "是否启用网络性能优化 (BBR+fq_codel+TFO+MPTCP完整优化+完整参数)? [Y/n] (默认: Y): " -r optimize_choice
     
     if [[ "$optimize_choice" =~ ^[Nn]$ ]]; then
         log "跳过网络优化配置" "info"
@@ -461,7 +487,7 @@ show_network_summary() {
         log "  ✗ TCP Fast Open: $current_tfo (0=禁用,1=客户端,2=服务端,3=全部)" "info"
     fi
     
-    # MPTCP状态
+    # MPTCP详细状态
     if [[ -f "/proc/sys/net/mptcp/enabled" ]]; then
         local current_mptcp=$(sysctl -n net.mptcp.enabled 2>/dev/null || echo "0")
         if [[ "$current_mptcp" == "1" ]]; then
@@ -469,8 +495,23 @@ show_network_summary() {
             # 显示MPTCP详细配置
             local mptcp_checksum=$(sysctl -n net.mptcp.checksum_enabled 2>/dev/null || echo "N/A")
             local mptcp_join=$(sysctl -n net.mptcp.allow_join_initial_addr_port 2>/dev/null || echo "N/A")
-            log "    └── 校验和启用: $mptcp_checksum" "info"
-            log "    └── 允许初始地址连接: $mptcp_join" "info"
+            local mptcp_pm_type=$(sysctl -n net.mptcp.pm_type 2>/dev/null || echo "N/A")
+            local mptcp_stale_loss=$(sysctl -n net.mptcp.stale_loss_cnt 2>/dev/null || echo "N/A")
+            local mptcp_syn_retries=$(sysctl -n net.mptcp.syn_retries 2>/dev/null || echo "N/A")
+            local mptcp_add_timeout=$(sysctl -n net.mptcp.add_addr_timeout 2>/dev/null || echo "N/A")
+            local mptcp_close_timeout=$(sysctl -n net.mptcp.close_timeout 2>/dev/null || echo "N/A")
+            local mptcp_scheduler=$(sysctl -n net.mptcp.scheduler 2>/dev/null || echo "N/A")
+            local mptcp_blackhole=$(sysctl -n net.mptcp.blackhole_detection 2>/dev/null || echo "N/A")
+            
+            log "    ├── 校验和启用: $mptcp_checksum (代理推荐:0)" "info"
+            log "    ├── 允许初始地址连接: $mptcp_join" "info"
+            log "    ├── 路径管理器类型: $mptcp_pm_type (0=内核)" "info"
+            log "    ├── 故障检测阈值: $mptcp_stale_loss (推荐:4)" "info"
+            log "    ├── SYN重传次数: $mptcp_syn_retries (推荐:5)" "info"
+            log "    ├── ADD_ADDR超时: ${mptcp_add_timeout}ms (推荐:60000)" "info"
+            log "    ├── 关闭超时: ${mptcp_close_timeout}ms (推荐:30000)" "info"
+            log "    ├── 调度器类型: $mptcp_scheduler (推荐:default)" "info"
+            log "    └── 黑洞检测: $mptcp_blackhole (推荐:1)" "info"
         else
             log "  ✗ MPTCP: $current_mptcp (0=禁用,1=启用)" "info"
         fi
@@ -526,6 +567,7 @@ main() {
     log "  查看TCP Fast Open: sysctl net.ipv4.tcp_fastopen" "info"
     log "  查看MPTCP状态: sysctl net.mptcp.enabled" "info"
     log "  查看MPTCP连接: ss -M" "info"
+    log "  查看MPTCP统计: cat /proc/net/mptcp_net/stats" "info"
     log "  查看网卡队列: tc qdisc show" "info"
     log "  恢复 sysctl: cp /etc/sysctl.conf.backup /etc/sysctl.conf" "info"
     log "  恢复 limits: cp /etc/security/limits.conf.backup /etc/security/limits.conf" "info"
