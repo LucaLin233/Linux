@@ -1,5 +1,5 @@
 #!/bin/bash
-# 网络性能优化模块 v4.6 - 智能MPTCP参数检测版
+# 网络性能优化模块 v4.6 - 智能MPTCP参数检测版（修复版）
 # 集成完整参数配置 - 使用fq_codel队列调度 + 智能MPTCP优化
 
 set -euo pipefail
@@ -7,6 +7,11 @@ set -euo pipefail
 # === 常量定义 ===
 readonly SYSCTL_CONFIG="/etc/sysctl.conf"
 readonly LIMITS_CONFIG="/etc/security/limits.conf"
+
+# === 全局变量初始化 ===
+MPTCP_SUPPORTED_COUNT=0
+MPTCP_TOTAL_COUNT=0
+MPTCP_CONFIG_TEXT=""
 
 # === 日志函数 ===
 log() {
@@ -99,9 +104,13 @@ check_mptcp_support() {
 
 # 智能配置MPTCP参数
 configure_mptcp_params() {
-    local mptcp_config=""
+    # 重置全局变量
+    MPTCP_SUPPORTED_COUNT=0
+    MPTCP_TOTAL_COUNT=0
+    MPTCP_CONFIG_TEXT=""
     
     if ! check_mptcp_support; then
+        MPTCP_CONFIG_TEXT="# MPTCP 不被当前系统支持"
         return 0
     fi
     
@@ -135,13 +144,13 @@ configure_mptcp_params() {
         ["net.mptcp.blackhole_detection"]="黑洞检测"
     )
     
+    # 设置总参数数量
+    MPTCP_TOTAL_COUNT=${#mptcp_params[@]}
+    
     # 检测每个参数是否存在并构建配置
-    mptcp_config="
+    MPTCP_CONFIG_TEXT="
 
 # MPTCP (Multipath TCP) 智能优化配置 - 专为代理场景优化"
-    
-    local supported_count=0
-    local total_count=${#mptcp_params[@]}
     
     # 按照优先级顺序检测参数
     local priority_order=(
@@ -161,22 +170,16 @@ configure_mptcp_params() {
         local param_file="/proc/sys/${param//./\/}"
         
         if [[ -f "$param_file" ]]; then
-            mptcp_config+="
+            MPTCP_CONFIG_TEXT+="
 ${param} = ${mptcp_params[$param]}  # ${param_descriptions[$param]}"
             log "  ✓ 支持参数: $param (${param_descriptions[$param]})" "info"
-            ((supported_count++))
+            ((MPTCP_SUPPORTED_COUNT++))
         else
             log "  ✗ 跳过参数: $param (内核不支持)" "warn"
         fi
     done
     
-    log "MPTCP参数检测完成: $supported_count/$total_count 个参数可用" "info"
-    
-    # 保存支持的参数信息供后续使用
-    export MPTCP_SUPPORTED_COUNT=$supported_count
-    export MPTCP_TOTAL_COUNT=$total_count
-    
-    echo "$mptcp_config"
+    log "MPTCP参数检测完成: $MPTCP_SUPPORTED_COUNT/$MPTCP_TOTAL_COUNT 个参数可用" "info"
 }
 
 # 配置系统资源限制
@@ -225,7 +228,7 @@ EOF
     log "✓ 系统资源限制配置完成" "info"
 }
 
-# 配置网络优化参数（智能MPTCP参数检测版本）
+# 配置网络优化参数（修复变量作用域版本）
 configure_network_parameters() {
     log "配置网络优化参数..." "info"
     
@@ -323,15 +326,14 @@ configure_network_parameters() {
         fi
     done
     
-    # 智能配置MPTCP参数
-    local mptcp_config
-    mptcp_config=$(configure_mptcp_params)
+    # 智能配置MPTCP参数（现在MPTCP_CONFIG_TEXT已经被设置）
+    configure_mptcp_params
     
     # 添加新的配置块（带明确标记，防止重复）
     cat >> "$SYSCTL_CONFIG" << EOF
 
 # === 网络性能优化配置开始 ===
-# 网络性能优化模块 v4.6 - 智能MPTCP参数检测版
+# 网络性能优化模块 v4.6 - 智能MPTCP参数检测版（修复版）
 # 生成时间: $(date)
 # 包含: BBR + fq_codel + TFO + MPTCP智能优化 + 完整TCP优化
 # MPTCP兼容性: $MPTCP_SUPPORTED_COUNT/$MPTCP_TOTAL_COUNT 个参数可用
@@ -394,7 +396,7 @@ net.core.default_qdisc = fq_codel
 net.ipv4.tcp_congestion_control = bbr
 
 # TCP Fast Open
-net.ipv4.tcp_fastopen = 3${mptcp_config}
+net.ipv4.tcp_fastopen = 3${MPTCP_CONFIG_TEXT}
 # === 网络性能优化配置结束 ===
 
 EOF
@@ -635,7 +637,7 @@ show_network_summary() {
         if [[ "$current_mptcp" == "1" ]]; then
             # 显示兼容性信息
             local compat_info=""
-            if [[ -n "${MPTCP_SUPPORTED_COUNT:-}" ]]; then
+            if [[ $MPTCP_SUPPORTED_COUNT -gt 0 ]]; then
                 compat_info=" (${MPTCP_SUPPORTED_COUNT}/${MPTCP_TOTAL_COUNT} 参数可用)"
             fi
             
@@ -663,7 +665,7 @@ show_network_summary() {
             [[ "$mptcp_blackhole" != "N/A" ]] && log "    └── 黑洞检测: $mptcp_blackhole (推荐:1)" "info"
             
             # 如果有不支持的参数，显示提示
-            if [[ -n "${MPTCP_SUPPORTED_COUNT:-}" && "${MPTCP_SUPPORTED_COUNT}" -lt "${MPTCP_TOTAL_COUNT}" ]]; then
+            if [[ $MPTCP_SUPPORTED_COUNT -lt $MPTCP_TOTAL_COUNT ]]; then
                 local missing_count=$((MPTCP_TOTAL_COUNT - MPTCP_SUPPORTED_COUNT))
                 log "    └── ⚠ $missing_count 个高级参数不被当前内核支持 (不影响基本功能)" "warn"
             fi
@@ -729,7 +731,7 @@ main() {
     log "  恢复 limits: cp /etc/security/limits.conf.backup /etc/security/limits.conf" "info"
     
     # 如果有MPTCP参数不支持，给出建议
-    if [[ -n "${MPTCP_SUPPORTED_COUNT:-}" && "${MPTCP_SUPPORTED_COUNT}" -lt "${MPTCP_TOTAL_COUNT}" ]]; then
+    if [[ $MPTCP_SUPPORTED_COUNT -lt $MPTCP_TOTAL_COUNT ]]; then
         echo
         log "💡 内核兼容性提示:" "info"
         log "  当前内核版本: $(uname -r)" "info"
