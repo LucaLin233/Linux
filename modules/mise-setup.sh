@@ -1,7 +1,7 @@
 #!/bin/bash
-# Mise 版本管理器配置模块 v4.2
-# 功能: 安装Mise、智能选择Python版本、Shell集成
-# 统一代码风格，智能版本选择
+# Mise 版本管理器配置模块 v4.3
+# 功能: 安装Mise、智能选择Python版本、Shell集成、可选系统级链接
+# 统一代码风格，智能版本选择，避免系统级劫持
 
 set -euo pipefail
 
@@ -204,14 +204,23 @@ setup_python() {
     fi
 }
 
-# 创建系统Python链接
-link_python_globally() {
+# 原创建系统Python链接函数（重命名，仅在用户选择时调用）
+link_python_globally_original() {
     log "创建系统Python链接..." "info"
     
     local python_path
     python_path=$("$MISE_PATH" which python 2>/dev/null || echo "")
     
     if [[ -x "$python_path" ]]; then
+        # 备份现有系统Python链接
+        if [[ -L /usr/bin/python3 ]]; then
+            log "备份现有系统Python链接..." "info"
+            sudo cp -L /usr/bin/python3 /usr/bin/python3.backup 2>/dev/null || true
+        fi
+        if [[ -L /usr/bin/python ]]; then
+            sudo cp -L /usr/bin/python /usr/bin/python.backup 2>/dev/null || true
+        fi
+        
         log "创建 /usr/bin/python 链接..." "info"
         sudo ln -sf "$python_path" /usr/bin/python
         
@@ -221,9 +230,72 @@ link_python_globally() {
         log "✓ Python链接已创建" "info"
         log "  /usr/bin/python -> $python_path" "info"
         log "  /usr/bin/python3 -> $python_path" "info"
+        
+        # 如果有备份，提醒用户
+        if [[ -f /usr/bin/python3.backup ]]; then
+            log "💡 原系统Python已备份为 python3.backup" "info"
+        fi
     else
         log "✗ 无法找到Mise管理的Python，跳过链接创建" "warn"
     fi
+}
+
+# 配置Python使用方式（新函数，替代原link_python_globally）
+setup_python_usage() {
+    log "配置 Python 使用方式..." "info"
+    
+    echo
+    echo "Python使用方式:"
+    echo "  1) 仅项目级使用 (推荐)"
+    echo "     - 系统工具(apt、系统脚本等)不受影响"
+    echo "     - 在项目中使用: mise use python@版本号"
+    echo "     - 保持系统Python独立运行"
+    echo
+    echo "  2) 全局替换系统Python"
+    echo "     - ⚠️  可能影响apt、dpkg等系统工具"
+    echo "     - mise Python将成为系统默认Python"
+    echo "     - 需要确保mise Python兼容系统需求"
+    echo
+    
+    local usage_choice
+    read -p "请选择 [1-2] (默认: 1): " -r usage_choice
+    usage_choice=${usage_choice:-1}
+    
+    case "$usage_choice" in
+        1)
+            log "✓ 配置为项目级使用模式（推荐）" "info"
+            echo
+            log "📝 使用说明:" "info"
+            log "  • 系统级: 继续使用原系统Python" "info"
+            log "  • 项目级: cd your_project && mise use python@3.12.11" "info"
+            log "  • 临时使用: mise exec python@3.12.11 -- python script.py" "info"
+            log "  • 查看版本: mise current python" "info"
+            ;;
+        2)
+            echo
+            log "⚠️  警告: 即将替换系统级Python链接！" "warn"
+            log "这可能影响系统工具的正常运行，如 apt-listchanges 等" "warn"
+            echo
+            read -p "确认要继续吗? 建议选择'N'除非你完全理解风险 [y/N]: " -r confirm_choice
+            
+            if [[ "$confirm_choice" =~ ^[Yy]$ ]]; then
+                log "正在创建全局Python链接..." "info"
+                link_python_globally_original
+                echo
+                log "⚠️  重要提醒:" "warn"
+                log "  • 如遇系统工具报错，可运行以下命令恢复:" "warn"
+                log "    sudo ln -sf /usr/bin/python3.backup /usr/bin/python3" "warn"
+                log "    sudo ln -sf /usr/bin/python.backup /usr/bin/python" "warn"
+            else
+                log "✓ 已取消全局链接创建，使用项目级模式" "info"
+                log "这是更安全的选择，推荐使用此模式" "info"
+            fi
+            ;;
+        *)
+            log "无效选择，默认使用项目级模式" "warn"
+            log "✓ 配置为项目级使用模式" "info"
+            ;;
+    esac
 }
 
 # 配置Shell集成
@@ -292,6 +364,16 @@ show_mise_summary() {
         # 全局工具列表
         local tools_count=$("$MISE_PATH" list 2>/dev/null | wc -l || echo "0")
         log "  📦 已安装工具: $tools_count 个" "info"
+        
+        # 检查系统链接状态
+        if [[ -L /usr/bin/python3 ]]; then
+            local python3_target=$(readlink /usr/bin/python3)
+            if [[ "$python3_target" == *"mise"* ]]; then
+                log "  🔗 系统链接: 已链接到mise Python" "info"
+            else
+                log "  🔗 系统链接: 使用系统Python（推荐）" "info"
+            fi
+        fi
     else
         log "  ✗ Mise: 未安装" "error"
     fi
@@ -317,7 +399,7 @@ main() {
     setup_python
     
     echo
-    link_python_globally
+    setup_python_usage  # 替换原来的 link_python_globally
     
     echo
     configure_shell_integration
@@ -333,7 +415,9 @@ main() {
         echo
         log "常用命令:" "info"
         log "  查看工具: $MISE_PATH list" "info"
-        log "  安装工具: $MISE_PATH use -g <tool>@<version>" "info"
+        log "  项目使用: $MISE_PATH use python@3.12.11" "info"
+        log "  全局设置: $MISE_PATH use -g python@3.12.11" "info"
+        log "  查看当前: $MISE_PATH current" "info"
         log "  查看帮助: $MISE_PATH --help" "info"
     fi
 }
