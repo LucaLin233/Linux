@@ -1,7 +1,7 @@
 #!/bin/bash
-# Mise 版本管理器配置模块 v5.1
+# Mise 版本管理器配置模块 v5.2
 # 功能: 安装Mise、智能选择Python版本、Shell集成、智能链接管理、自动修复系统模块
-# 专业版本：完整的Debian/Ubuntu系统Mise配置解决方案（修复版）
+# 专业版本：完整的Debian/Ubuntu系统Mise配置解决方案（增强修复版）
 
 set -euo pipefail
 
@@ -19,7 +19,65 @@ log() {
     echo -e "${colors[$level]:-\033[0;32m}$msg\033[0m" >&2
 }
 
-# === 系统检测和修复函数 ===
+# === 系统诊断和修复函数 ===
+
+# 诊断系统包管理状态
+diagnose_apt_system() {
+    log "🔍 诊断系统包管理状态..." "info"
+    
+    # 1. 检查dpkg状态
+    local broken_packages=""
+    broken_packages=$(dpkg -l | grep -E '^[hi] [^i]|^.[^i]' | wc -l 2>/dev/null || echo "0")
+    if [[ "$broken_packages" -gt 0 ]]; then
+        log "⚠️ 发现 $broken_packages 个异常包状态" "warn"
+        dpkg -l | grep -E '^[hi] [^i]|^.[^i]' | head -5 || true
+    fi
+    
+    # 2. 检查apt锁
+    if [[ -f /var/lib/dpkg/lock-frontend ]] || [[ -f /var/lib/apt/lists/lock ]]; then
+        if lsof /var/lib/dpkg/lock-frontend >/dev/null 2>&1 || lsof /var/lib/apt/lists/lock >/dev/null 2>&1; then
+            log "⚠️ 检测到apt进程锁，可能有其他apt进程在运行" "warn"
+            return 1
+        fi
+    fi
+    
+    # 3. 检查python3链接状态
+    local python3_issues=""
+    if ! which python3 &>/dev/null; then
+        python3_issues+="python3命令不可用; "
+    fi
+    
+    if [[ ! -x /usr/bin/python3 ]]; then
+        python3_issues+="/usr/bin/python3不存在或不可执行; "
+    fi
+    
+    if [[ -n "$python3_issues" ]]; then
+        log "⚠️ Python3问题: $python3_issues" "warn"
+        return 1
+    fi
+    
+    return 0
+}
+
+# 修复dpkg状态
+fix_dpkg_state() {
+    log "🔧 修复dpkg状态..." "info"
+    
+    # 1. 尝试配置所有未完成的包
+    if timeout 30 sudo dpkg --configure -a >/dev/null 2>&1; then
+        log "✓ dpkg状态修复成功" "info"
+        return 0
+    fi
+    
+    # 2. 尝试修复依赖
+    if timeout 45 sudo DEBIAN_FRONTEND=noninteractive apt-get -f install -y >/dev/null 2>&1; then
+        log "✓ 依赖问题修复成功" "info"
+        return 0
+    fi
+    
+    log "⚠️ dpkg状态修复超时，但继续执行" "warn"
+    return 1
+}
 
 # 检测系统Python状态
 detect_system_python() {
@@ -63,11 +121,11 @@ ensure_system_python() {
         # 尝试安装python3
         if command -v apt &>/dev/null; then
             log "安装 python3..." "info"
-            if sudo apt update -qq && sudo apt install -y python3 python3-apt python3-debconf; then
+            if timeout 120 sudo DEBIAN_FRONTEND=noninteractive apt update -qq && timeout 120 sudo DEBIAN_FRONTEND=noninteractive apt install -y python3 python3-apt python3-debconf; then
                 log "✓ Python3 安装完成" "info"
                 return 0
             else
-                log "✗ Python3 安装失败" "error"
+                log "✗ Python3 安装失败或超时" "error"
                 return 1
             fi
         else
@@ -165,7 +223,7 @@ detect_python_status() {
     fi
 }
 
-# 安全的系统模块修复（非交互式）
+# 智能的系统模块修复（多策略）
 fix_system_modules() {
     local apt_pkg_ok=false
     local debconf_ok=false
@@ -184,28 +242,58 @@ fix_system_modules() {
         return 0
     fi
     
-    log "🔧 检测到系统模块缺失，正在自动修复..." "warn"
+    log "🔧 检测到系统模块缺失，正在智能修复..." "warn"
     
-    # 非交互式修复，设置超时
-    local apt_cmd="sudo DEBIAN_FRONTEND=noninteractive apt install -y --reinstall python3-apt python3-debconf"
-    
-    if timeout 60 $apt_cmd >/dev/null 2>&1; then
-        log "✓ 系统模块修复成功" "info"
-        return 0
-    fi
-    
-    # 如果重装失败，尝试完全重装（也设置超时）
-    log "重装失败，尝试完全重新安装..." "info"
-    
-    if timeout 30 sudo DEBIAN_FRONTEND=noninteractive apt remove --purge -y python3-apt python3-debconf >/dev/null 2>&1; then
-        if timeout 60 sudo DEBIAN_FRONTEND=noninteractive apt install -y python3-apt python3-debconf >/dev/null 2>&1; then
-            log "✓ 系统模块完全重装成功" "info"
+    # 策略1: 诊断并修复基础系统状态
+    if ! diagnose_apt_system; then
+        log "发现系统问题，尝试修复..." "info"
+        fix_dpkg_state || true
+        
+        # 再次检查模块
+        if /usr/bin/python3 -c "import apt_pkg" >/dev/null 2>&1 && /usr/bin/python3 -c "import debconf" >/dev/null 2>&1; then
+            log "✓ 系统修复后模块可用" "info"
             return 0
         fi
     fi
     
-    log "⚠️ 系统模块自动修复超时或失败，但不影响正常使用" "warn"
-    log "   如需手动修复: sudo apt install --reinstall python3-apt python3-debconf" "info"
+    # 策略2: 清理apt缓存并重装
+    log "清理apt缓存..." "info"
+    sudo apt clean >/dev/null 2>&1 || true
+    
+    if timeout 60 sudo DEBIAN_FRONTEND=noninteractive apt update >/dev/null 2>&1; then
+        if timeout 60 sudo DEBIAN_FRONTEND=noninteractive apt install --reinstall -y python3-apt python3-debconf >/dev/null 2>&1; then
+            log "✓ 系统模块重装成功" "info"
+            return 0
+        fi
+    fi
+    
+    # 策略3: 强制重装相关python3包
+    log "尝试强制修复python3相关包..." "info"
+    local python_packages=("python3-minimal" "python3" "python3-apt" "python3-debconf")
+    
+    for pkg in "${python_packages[@]}"; do
+        if timeout 30 sudo DEBIAN_FRONTEND=noninteractive apt install --reinstall -y "$pkg" >/dev/null 2>&1; then
+            log "✓ $pkg 重装成功" "info"
+        fi
+    done
+    
+    # 最终检查
+    if /usr/bin/python3 -c "import apt_pkg; import debconf" >/dev/null 2>&1; then
+        log "✓ 系统模块最终修复成功" "info"
+        return 0
+    fi
+    
+    # 策略4: 提供详细的手动修复指导
+    log "⚠️ 自动修复未完全成功，提供手动修复方案" "warn"
+    log "  这不影响mise的正常使用，只是系统包管理可能有问题" "info"
+    echo
+    log "🔧 手动修复步骤：" "info"
+    log "  1. sudo dpkg --configure -a" "info"
+    log "  2. sudo apt-get -f install" "info"
+    log "  3. sudo apt update && sudo apt upgrade" "info"
+    log "  4. sudo apt install --reinstall python3-apt python3-debconf" "info"
+    echo
+    
     return 1
 }
 
@@ -260,16 +348,28 @@ fix_python_system_priority() {
             hash -r 2>/dev/null || true
             log "✓ PATH修复立即生效" "info"
             
-            # 安全的系统模块修复（设置超时，避免卡住）
-            fix_system_modules || true
+            # 智能的系统模块修复
+            fix_system_modules || {
+                log "系统模块修复未完全成功，但不影响mise正常使用" "info"
+            }
             
             # 验证系统模块
+            local modules_ok=true
             if python3 -c "import apt_pkg" &>/dev/null 2>&1; then
                 log "✓ 系统模块现在可用" "info"
+            else
+                modules_ok=false
             fi
             
             if python3 -c "import debconf" &>/dev/null 2>&1; then
                 log "✓ debconf模块现在可用" "info"
+            else
+                modules_ok=false
+            fi
+            
+            if ! $modules_ok; then
+                log "💡 虽然部分系统模块仍有问题，但这不影响mise的正常使用" "info"
+                log "   系统包管理功能可能受限，如需修复请参考上面的手动步骤" "info"
             fi
         else
             log "⚠️ 修复后的PATH中Python3仍有问题" "warn"
@@ -840,19 +940,29 @@ show_mise_summary() {
         tools_count=$("$MISE_PATH" list 2>/dev/null | wc -l || echo "0")
         log "  📦 已安装工具: $tools_count 个" "info"
         
-        # 实时检查系统模块状态
-        local system_module_status="正常可用 ✓"
-        if ! python3 -c "import apt_pkg" &>/dev/null 2>&1; then
-            system_module_status="有问题 ⚠️ (当前Python无法导入apt_pkg)"
-        fi
-        log "  🧩 系统模块: $system_module_status" "info"
+        # 智能的系统模块状态检查
+        local apt_pkg_ok=false
+        local debconf_ok=false
         
-        # 如果系统模块有问题，给出诊断
-        if [[ "$system_module_status" == *"有问题"* ]]; then
+        if python3 -c "import apt_pkg" &>/dev/null 2>&1; then
+            apt_pkg_ok=true
+        fi
+        
+        if python3 -c "import debconf" &>/dev/null 2>&1; then
+            debconf_ok=true
+        fi
+        
+        if $apt_pkg_ok && $debconf_ok; then
+            log "  🧩 系统模块: 完全正常 ✓" "info"
+        elif $apt_pkg_ok || $debconf_ok; then
+            log "  🧩 系统模块: 部分可用 ⚠️ (apt_pkg: $($apt_pkg_ok && echo "✓" || echo "✗"), debconf: $($debconf_ok && echo "✓" || echo "✗"))" "warn"
+            log "    → 这不影响mise正常使用，系统包管理可能受限" "info"
+        else
+            log "  🧩 系统模块: 有问题 ⚠️ (apt_pkg ✗, debconf ✗)" "warn"
             if /usr/bin/python3 -c "import apt_pkg" &>/dev/null 2>&1; then
                 log "    → 系统Python模块正常，问题是PATH优先级" "warn"
             else
-                log "    → 系统Python模块也有问题，已尝试自动修复" "warn"
+                log "    → 系统包管理有问题，但不影响mise使用" "info"
             fi
         fi
         
@@ -920,7 +1030,7 @@ main() {
     log "⚠️  重要提醒:" "warn"
     log "  • 如遇apt工具报错，重新运行此脚本选择'修复系统配置'" "info"
     log "  • 推荐使用项目级模式，避免影响系统工具" "info"
-    log "  • 手动修复PATH: export PATH=\"/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:\$HOME/.local/bin\"" "info"
+    log "  • 系统模块问题不影响mise正常使用，只是包管理可能受限" "info"
     
     # 检查是否需要重新登录
     local final_which_python=""
