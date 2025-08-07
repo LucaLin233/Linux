@@ -1,6 +1,6 @@
 #!/bin/bash
-# 网络性能优化模块 v4.6 - 智能MPTCP参数检测版（修复版）
-# 集成完整参数配置 - 使用fq_codel队列调度 + 智能MPTCP优化
+# 网络性能优化模块 v4.6 - 稳定版
+# 集成完整参数配置 - 使用fq_codel队列调度 + 稳定MPTCP优化
 
 set -euo pipefail
 
@@ -10,7 +10,7 @@ readonly LIMITS_CONFIG="/etc/security/limits.conf"
 
 # === 全局变量初始化 ===
 MPTCP_SUPPORTED_COUNT=0
-MPTCP_TOTAL_COUNT=0
+MPTCP_TOTAL_COUNT=10
 MPTCP_CONFIG_TEXT=""
 
 # === 日志函数 ===
@@ -102,82 +102,138 @@ check_mptcp_support() {
     fi
 }
 
-# 智能配置MPTCP参数
+# 检查单个MPTCP参数
+check_mptcp_param() {
+    local param="$1"
+    local param_file="/proc/sys/${param//./\/}"
+    
+    if [[ -f "$param_file" ]]; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+# 稳定版MPTCP参数配置
 configure_mptcp_params() {
     # 重置全局变量
     MPTCP_SUPPORTED_COUNT=0
-    MPTCP_TOTAL_COUNT=0
     MPTCP_CONFIG_TEXT=""
     
     if ! check_mptcp_support; then
-        MPTCP_CONFIG_TEXT="# MPTCP 不被当前系统支持"
+        MPTCP_CONFIG_TEXT="
+# MPTCP 不被当前系统支持"
         return 0
     fi
     
     log "检测MPTCP参数支持情况..." "info"
     
-    # 定义所有可能的MPTCP参数及其推荐值（针对代理场景优化）
-    local -A mptcp_params=(
-        ["net.mptcp.enabled"]="1"
-        ["net.mptcp.allow_join_initial_addr_port"]="1"
-        ["net.mptcp.pm_type"]="0"
-        ["net.mptcp.stale_loss_cnt"]="4"
-        ["net.mptcp.syn_retries"]="5"
-        ["net.mptcp.add_addr_timeout"]="60000"
-        ["net.mptcp.close_timeout"]="30000"
-        ["net.mptcp.scheduler"]="default"
-        ["net.mptcp.checksum_enabled"]="0"
-        ["net.mptcp.blackhole_detection"]="1"
-    )
-    
-    # 参数说明
-    local -A param_descriptions=(
-        ["net.mptcp.enabled"]="启用MPTCP"
-        ["net.mptcp.allow_join_initial_addr_port"]="允许初始地址连接"
-        ["net.mptcp.pm_type"]="路径管理器类型(0=内核)"
-        ["net.mptcp.stale_loss_cnt"]="故障检测阈值"
-        ["net.mptcp.syn_retries"]="SYN重传次数"
-        ["net.mptcp.add_addr_timeout"]="ADD_ADDR超时(ms)"
-        ["net.mptcp.close_timeout"]="连接关闭超时(ms)"
-        ["net.mptcp.scheduler"]="数据包调度器"
-        ["net.mptcp.checksum_enabled"]="校验和(代理推荐关闭)"
-        ["net.mptcp.blackhole_detection"]="黑洞检测"
-    )
-    
-    # 设置总参数数量
-    MPTCP_TOTAL_COUNT=${#mptcp_params[@]}
-    
-    # 检测每个参数是否存在并构建配置
+    # 开始构建配置文本
     MPTCP_CONFIG_TEXT="
 
 # MPTCP (Multipath TCP) 智能优化配置 - 专为代理场景优化"
     
-    # 按照优先级顺序检测参数
-    local priority_order=(
-        "net.mptcp.enabled"
-        "net.mptcp.allow_join_initial_addr_port" 
-        "net.mptcp.pm_type"
-        "net.mptcp.checksum_enabled"
-        "net.mptcp.stale_loss_cnt"
-        "net.mptcp.add_addr_timeout"
-        "net.mptcp.close_timeout"
-        "net.mptcp.scheduler"
-        "net.mptcp.syn_retries"
-        "net.mptcp.blackhole_detection"
-    )
+    # 逐个检测参数（使用更稳定的方式）
     
-    for param in "${priority_order[@]}"; do
-        local param_file="/proc/sys/${param//./\/}"
-        
-        if [[ -f "$param_file" ]]; then
-            MPTCP_CONFIG_TEXT+="
-${param} = ${mptcp_params[$param]}  # ${param_descriptions[$param]}"
-            log "  ✓ 支持参数: $param (${param_descriptions[$param]})" "info"
-            ((MPTCP_SUPPORTED_COUNT++))
-        else
-            log "  ✗ 跳过参数: $param (内核不支持)" "warn"
-        fi
-    done
+    # 1. net.mptcp.enabled
+    if check_mptcp_param "net.mptcp.enabled"; then
+        MPTCP_CONFIG_TEXT="${MPTCP_CONFIG_TEXT}
+net.mptcp.enabled = 1  # 启用MPTCP"
+        log "  ✓ 支持参数: net.mptcp.enabled" "info"
+        MPTCP_SUPPORTED_COUNT=$((MPTCP_SUPPORTED_COUNT + 1))
+    else
+        log "  ✗ 跳过参数: net.mptcp.enabled (内核不支持)" "warn"
+    fi
+    
+    # 2. net.mptcp.allow_join_initial_addr_port
+    if check_mptcp_param "net.mptcp.allow_join_initial_addr_port"; then
+        MPTCP_CONFIG_TEXT="${MPTCP_CONFIG_TEXT}
+net.mptcp.allow_join_initial_addr_port = 1  # 允许初始地址连接"
+        log "  ✓ 支持参数: net.mptcp.allow_join_initial_addr_port" "info"
+        MPTCP_SUPPORTED_COUNT=$((MPTCP_SUPPORTED_COUNT + 1))
+    else
+        log "  ✗ 跳过参数: net.mptcp.allow_join_initial_addr_port (内核不支持)" "warn"
+    fi
+    
+    # 3. net.mptcp.pm_type
+    if check_mptcp_param "net.mptcp.pm_type"; then
+        MPTCP_CONFIG_TEXT="${MPTCP_CONFIG_TEXT}
+net.mptcp.pm_type = 0  # 路径管理器类型(0=内核)"
+        log "  ✓ 支持参数: net.mptcp.pm_type" "info"
+        MPTCP_SUPPORTED_COUNT=$((MPTCP_SUPPORTED_COUNT + 1))
+    else
+        log "  ✗ 跳过参数: net.mptcp.pm_type (内核不支持)" "warn"
+    fi
+    
+    # 4. net.mptcp.checksum_enabled
+    if check_mptcp_param "net.mptcp.checksum_enabled"; then
+        MPTCP_CONFIG_TEXT="${MPTCP_CONFIG_TEXT}
+net.mptcp.checksum_enabled = 0  # 校验和(代理推荐关闭)"
+        log "  ✓ 支持参数: net.mptcp.checksum_enabled" "info"
+        MPTCP_SUPPORTED_COUNT=$((MPTCP_SUPPORTED_COUNT + 1))
+    else
+        log "  ✗ 跳过参数: net.mptcp.checksum_enabled (内核不支持)" "warn"
+    fi
+    
+    # 5. net.mptcp.stale_loss_cnt
+    if check_mptcp_param "net.mptcp.stale_loss_cnt"; then
+        MPTCP_CONFIG_TEXT="${MPTCP_CONFIG_TEXT}
+net.mptcp.stale_loss_cnt = 4  # 故障检测阈值"
+        log "  ✓ 支持参数: net.mptcp.stale_loss_cnt" "info"
+        MPTCP_SUPPORTED_COUNT=$((MPTCP_SUPPORTED_COUNT + 1))
+    else
+        log "  ✗ 跳过参数: net.mptcp.stale_loss_cnt (内核不支持)" "warn"
+    fi
+    
+    # 6. net.mptcp.add_addr_timeout
+    if check_mptcp_param "net.mptcp.add_addr_timeout"; then
+        MPTCP_CONFIG_TEXT="${MPTCP_CONFIG_TEXT}
+net.mptcp.add_addr_timeout = 60000  # ADD_ADDR超时(ms)"
+        log "  ✓ 支持参数: net.mptcp.add_addr_timeout" "info"
+        MPTCP_SUPPORTED_COUNT=$((MPTCP_SUPPORTED_COUNT + 1))
+    else
+        log "  ✗ 跳过参数: net.mptcp.add_addr_timeout (内核不支持)" "warn"
+    fi
+    
+    # 7. net.mptcp.close_timeout
+    if check_mptcp_param "net.mptcp.close_timeout"; then
+        MPTCP_CONFIG_TEXT="${MPTCP_CONFIG_TEXT}
+net.mptcp.close_timeout = 30000  # 连接关闭超时(ms)"
+        log "  ✓ 支持参数: net.mptcp.close_timeout" "info"
+        MPTCP_SUPPORTED_COUNT=$((MPTCP_SUPPORTED_COUNT + 1))
+    else
+        log "  ✗ 跳过参数: net.mptcp.close_timeout (内核不支持)" "warn"
+    fi
+    
+    # 8. net.mptcp.scheduler
+    if check_mptcp_param "net.mptcp.scheduler"; then
+        MPTCP_CONFIG_TEXT="${MPTCP_CONFIG_TEXT}
+net.mptcp.scheduler = default  # 数据包调度器"
+        log "  ✓ 支持参数: net.mptcp.scheduler" "info"
+        MPTCP_SUPPORTED_COUNT=$((MPTCP_SUPPORTED_COUNT + 1))
+    else
+        log "  ✗ 跳过参数: net.mptcp.scheduler (内核不支持)" "warn"
+    fi
+    
+    # 9. net.mptcp.syn_retries
+    if check_mptcp_param "net.mptcp.syn_retries"; then
+        MPTCP_CONFIG_TEXT="${MPTCP_CONFIG_TEXT}
+net.mptcp.syn_retries = 5  # SYN重传次数"
+        log "  ✓ 支持参数: net.mptcp.syn_retries" "info"
+        MPTCP_SUPPORTED_COUNT=$((MPTCP_SUPPORTED_COUNT + 1))
+    else
+        log "  ✗ 跳过参数: net.mptcp.syn_retries (内核不支持)" "warn"
+    fi
+    
+    # 10. net.mptcp.blackhole_detection
+    if check_mptcp_param "net.mptcp.blackhole_detection"; then
+        MPTCP_CONFIG_TEXT="${MPTCP_CONFIG_TEXT}
+net.mptcp.blackhole_detection = 1  # 黑洞检测"
+        log "  ✓ 支持参数: net.mptcp.blackhole_detection" "info"
+        MPTCP_SUPPORTED_COUNT=$((MPTCP_SUPPORTED_COUNT + 1))
+    else
+        log "  ✗ 跳过参数: net.mptcp.blackhole_detection (内核不支持)" "warn"
+    fi
     
     log "MPTCP参数检测完成: $MPTCP_SUPPORTED_COUNT/$MPTCP_TOTAL_COUNT 个参数可用" "info"
 }
@@ -228,7 +284,7 @@ EOF
     log "✓ 系统资源限制配置完成" "info"
 }
 
-# 配置网络优化参数（修复变量作用域版本）
+# 配置网络优化参数（稳定版）
 configure_network_parameters() {
     log "配置网络优化参数..." "info"
     
@@ -246,11 +302,12 @@ configure_network_parameters() {
     sed -i '/^# 网络性能优化.*完整参数配置/d' "$SYSCTL_CONFIG"
     sed -i '/^# 网络性能优化.*cake.*高级/d' "$SYSCTL_CONFIG"
     sed -i '/^# 网络性能优化.*智能.*检测/d' "$SYSCTL_CONFIG"
+    sed -i '/^# 网络性能优化.*稳定版/d' "$SYSCTL_CONFIG"
     
     # 清理可能重复的MPTCP配置注释
     sed -i '/^# MPTCP.*优化配置/d' "$SYSCTL_CONFIG"
     
-    # 清理所有相关参数（确保没有重复）- 基础TCP参数
+    # 清理所有相关参数（确保没有重复）
     local params_to_clean=(
         "fs.file-max"
         "fs.inotify.max_user_instances"
@@ -297,10 +354,6 @@ configure_network_parameters() {
         "net.ipv4.conf.all.rp_filter"
         "net.ipv4.conf.default.rp_filter"
         "net.ipv4.tcp_fastopen"
-    )
-    
-    # 动态清理MPTCP参数（只清理存在的）
-    local mptcp_params_to_check=(
         "net.mptcp.enabled"
         "net.mptcp.checksum_enabled" 
         "net.mptcp.allow_join_initial_addr_port"
@@ -313,29 +366,21 @@ configure_network_parameters() {
         "net.mptcp.blackhole_detection"
     )
     
-    # 清理基础参数
+    # 清理参数
     for param in "${params_to_clean[@]}"; do
-        sed -i "/^[[:space:]]*${param//./\\.}[[:space:]]*=.*/d" "$SYSCTL_CONFIG"
+        sed -i "/^[[:space:]]*${param//./\\.}[[:space:]]*=.*/d" "$SYSCTL_CONFIG" || true
     done
     
-    # 清理存在的MPTCP参数
-    for param in "${mptcp_params_to_check[@]}"; do
-        local param_file="/proc/sys/${param//./\/}"
-        if [[ -f "$param_file" ]]; then
-            sed -i "/^[[:space:]]*${param//./\\.}[[:space:]]*=.*/d" "$SYSCTL_CONFIG"
-        fi
-    done
-    
-    # 智能配置MPTCP参数（现在MPTCP_CONFIG_TEXT已经被设置）
+    # 配置MPTCP参数
     configure_mptcp_params
     
-    # 添加新的配置块（带明确标记，防止重复）
+    # 添加新的配置块
     cat >> "$SYSCTL_CONFIG" << EOF
 
 # === 网络性能优化配置开始 ===
-# 网络性能优化模块 v4.6 - 智能MPTCP参数检测版（修复版）
+# 网络性能优化模块 v4.6 - 稳定版
 # 生成时间: $(date)
-# 包含: BBR + fq_codel + TFO + MPTCP智能优化 + 完整TCP优化
+# 包含: BBR + fq_codel + TFO + MPTCP稳定优化 + 完整TCP优化
 # MPTCP兼容性: $MPTCP_SUPPORTED_COUNT/$MPTCP_TOTAL_COUNT 个参数可用
 
 # 文件系统优化
@@ -405,18 +450,22 @@ EOF
     log "应用 sysctl 配置..." "info"
     
     local sysctl_output
-    local sysctl_exitcode
+    local sysctl_exitcode=0
     
     # 捕获sysctl输出和退出码
     sysctl_output=$(sysctl -p 2>&1) || sysctl_exitcode=$?
     
-    if [[ -z "${sysctl_exitcode:-}" ]]; then
+    if [[ $sysctl_exitcode -eq 0 ]]; then
         log "✓ 所有 sysctl 参数已成功应用" "info"
     else
         # 分析输出，统计成功和失败的参数
-        local total_params=$(echo "$sysctl_output" | grep -c "=" || echo "0")
-        local failed_params=$(echo "$sysctl_output" | grep -c "cannot stat" || echo "0")
-        local success_params=$((total_params - failed_params))
+        local total_params
+        local failed_params
+        local success_params
+        
+        total_params=$(echo "$sysctl_output" | grep -c "=" || echo "0")
+        failed_params=$(echo "$sysctl_output" | grep -c "cannot stat" || echo "0")
+        success_params=$((total_params - failed_params))
         
         if [[ $failed_params -eq 0 ]]; then
             log "✓ 所有 $total_params 个 sysctl 参数已成功应用" "info"
@@ -424,12 +473,13 @@ EOF
             log "⚠ sysctl 应用完成: $success_params 个成功, $failed_params 个不支持" "warn"
             
             # 显示不支持的参数
-            while read -r line; do
+            echo "$sysctl_output" | while read -r line; do
                 if [[ "$line" =~ "cannot stat" ]]; then
-                    local param=$(echo "$line" | grep -o "/proc/sys/[^:]*" | sed 's|/proc/sys/||' | sed 's|/|.|g')
+                    local param
+                    param=$(echo "$line" | grep -o "/proc/sys/[^:]*" | sed 's|/proc/sys/||' | sed 's|/|.|g')
                     log "  ✗ 不支持的参数: $param (内核版本限制)" "warn"
                 fi
-            done <<< "$sysctl_output"
+            done
             
             if [[ $success_params -gt 0 ]]; then
                 log "✓ 核心网络优化参数已正常应用" "info"
@@ -484,9 +534,13 @@ get_mptcp_param() {
 verify_network_config() {
     log "验证网络优化配置..." "info"
     
-    local current_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "未知")
-    local current_qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "未知")
-    local current_tfo=$(sysctl -n net.ipv4.tcp_fastopen 2>/dev/null || echo "0")
+    local current_cc
+    local current_qdisc
+    local current_tfo
+    
+    current_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "未知")
+    current_qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "未知")
+    current_tfo=$(sysctl -n net.ipv4.tcp_fastopen 2>/dev/null || echo "0")
     
     log "当前拥塞控制算法: $current_cc" "info"
     log "当前默认队列调度: $current_qdisc" "info"
@@ -494,14 +548,19 @@ verify_network_config() {
     
     # 检查MPTCP状态
     if [[ -f "/proc/sys/net/mptcp/enabled" ]]; then
-        local current_mptcp=$(get_mptcp_param "net.mptcp.enabled")
+        local current_mptcp
+        current_mptcp=$(get_mptcp_param "net.mptcp.enabled")
         log "当前MPTCP状态: $current_mptcp (0=禁用,1=启用)" "info"
         
         if [[ "$current_mptcp" == "1" ]]; then
             # 验证MPTCP详细参数
-            local mptcp_pm_type=$(get_mptcp_param "net.mptcp.pm_type")
-            local mptcp_stale_loss=$(get_mptcp_param "net.mptcp.stale_loss_cnt")
-            local mptcp_scheduler=$(get_mptcp_param "net.mptcp.scheduler")
+            local mptcp_pm_type
+            local mptcp_stale_loss
+            local mptcp_scheduler
+            
+            mptcp_pm_type=$(get_mptcp_param "net.mptcp.pm_type")
+            mptcp_stale_loss=$(get_mptcp_param "net.mptcp.stale_loss_cnt")
+            mptcp_scheduler=$(get_mptcp_param "net.mptcp.scheduler")
             
             log "  └── 路径管理器类型: $mptcp_pm_type" "info"
             log "  └── 故障检测阈值: $mptcp_stale_loss" "info"
@@ -541,9 +600,13 @@ verify_network_config() {
 show_current_network_status() {
     log "当前网络状态:" "info"
     
-    local current_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "未知")
-    local current_qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "未知")
-    local current_tfo=$(sysctl -n net.ipv4.tcp_fastopen 2>/dev/null || echo "0")
+    local current_cc
+    local current_qdisc  
+    local current_tfo
+    
+    current_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "未知")
+    current_qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "未知")
+    current_tfo=$(sysctl -n net.ipv4.tcp_fastopen 2>/dev/null || echo "0")
     
     log "  拥塞控制算法: $current_cc" "info"
     log "  队列调度算法: $current_qdisc" "info"
@@ -551,7 +614,8 @@ show_current_network_status() {
     
     # 显示MPTCP状态
     if [[ -f "/proc/sys/net/mptcp/enabled" ]]; then
-        local current_mptcp=$(get_mptcp_param "net.mptcp.enabled")
+        local current_mptcp
+        current_mptcp=$(get_mptcp_param "net.mptcp.enabled")
         log "  MPTCP状态: $current_mptcp" "info"
     fi
 }
@@ -563,12 +627,12 @@ setup_network_optimization() {
     log "  BBR: 改进的TCP拥塞控制算法，提升网络吞吐量" "info"
     log "  fq_codel: 公平队列+延迟控制，平衡吞吐量和延迟" "info"
     log "  TCP Fast Open: 减少连接建立延迟，提升短连接性能" "info"
-    log "  MPTCP智能优化: 多路径TCP，专为代理转发场景优化" "info"
+    log "  MPTCP稳定优化: 多路径TCP，专为代理转发场景优化" "info"
     log "  智能参数检测: 自动适配内核版本，跳过不支持的参数" "info"
     log "  完整参数: 包含系统资源限制和全面的TCP优化" "info"
     
     echo
-    read -p "是否启用网络性能优化 (BBR+fq_codel+TFO+MPTCP智能优化+完整参数)? [Y/n] (默认: Y): " -r optimize_choice
+    read -p "是否启用网络性能优化 (BBR+fq_codel+TFO+MPTCP稳定优化+完整参数)? [Y/n] (默认: Y): " -r optimize_choice
     
     if [[ "$optimize_choice" =~ ^[Nn]$ ]]; then
         log "跳过网络优化配置" "info"
@@ -608,7 +672,8 @@ show_network_summary() {
     log "🎯 网络优化摘要:" "info"
     
     # 拥塞控制状态
-    local current_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "未知")
+    local current_cc
+    current_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "未知")
     if [[ "$current_cc" == "bbr" ]]; then
         log "  ✓ 拥塞控制: BBR" "info"
     else
@@ -616,7 +681,8 @@ show_network_summary() {
     fi
     
     # 队列调度状态
-    local current_qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "未知")
+    local current_qdisc
+    current_qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "未知")
     if [[ "$current_qdisc" == "fq_codel" ]]; then
         log "  ✓ 队列调度: fq_codel" "info"
     else
@@ -624,7 +690,8 @@ show_network_summary() {
     fi
     
     # TFO状态
-    local current_tfo=$(sysctl -n net.ipv4.tcp_fastopen 2>/dev/null || echo "0")
+    local current_tfo
+    current_tfo=$(sysctl -n net.ipv4.tcp_fastopen 2>/dev/null || echo "0")
     if [[ "$current_tfo" == "3" ]]; then
         log "  ✓ TCP Fast Open: 启用 (客户端+服务端)" "info"
     else
@@ -633,7 +700,8 @@ show_network_summary() {
     
     # MPTCP详细状态
     if [[ -f "/proc/sys/net/mptcp/enabled" ]]; then
-        local current_mptcp=$(get_mptcp_param "net.mptcp.enabled")
+        local current_mptcp
+        current_mptcp=$(get_mptcp_param "net.mptcp.enabled")
         if [[ "$current_mptcp" == "1" ]]; then
             # 显示兼容性信息
             local compat_info=""
@@ -644,15 +712,25 @@ show_network_summary() {
             log "  ✓ MPTCP: 启用 (多路径TCP)${compat_info}" "info"
             
             # 显示MPTCP详细配置（只显示支持的参数）
-            local mptcp_checksum=$(get_mptcp_param "net.mptcp.checksum_enabled")
-            local mptcp_join=$(get_mptcp_param "net.mptcp.allow_join_initial_addr_port")
-            local mptcp_pm_type=$(get_mptcp_param "net.mptcp.pm_type")
-            local mptcp_stale_loss=$(get_mptcp_param "net.mptcp.stale_loss_cnt")
-            local mptcp_syn_retries=$(get_mptcp_param "net.mptcp.syn_retries")
-            local mptcp_add_timeout=$(get_mptcp_param "net.mptcp.add_addr_timeout")
-            local mptcp_close_timeout=$(get_mptcp_param "net.mptcp.close_timeout")
-            local mptcp_scheduler=$(get_mptcp_param "net.mptcp.scheduler")
-            local mptcp_blackhole=$(get_mptcp_param "net.mptcp.blackhole_detection")
+            local mptcp_checksum
+            local mptcp_join
+            local mptcp_pm_type
+            local mptcp_stale_loss
+            local mptcp_syn_retries
+            local mptcp_add_timeout
+            local mptcp_close_timeout
+            local mptcp_scheduler
+            local mptcp_blackhole
+            
+            mptcp_checksum=$(get_mptcp_param "net.mptcp.checksum_enabled")
+            mptcp_join=$(get_mptcp_param "net.mptcp.allow_join_initial_addr_port")
+            mptcp_pm_type=$(get_mptcp_param "net.mptcp.pm_type")
+            mptcp_stale_loss=$(get_mptcp_param "net.mptcp.stale_loss_cnt")
+            mptcp_syn_retries=$(get_mptcp_param "net.mptcp.syn_retries")
+            mptcp_add_timeout=$(get_mptcp_param "net.mptcp.add_addr_timeout")
+            mptcp_close_timeout=$(get_mptcp_param "net.mptcp.close_timeout")
+            mptcp_scheduler=$(get_mptcp_param "net.mptcp.scheduler")
+            mptcp_blackhole=$(get_mptcp_param "net.mptcp.blackhole_detection")
             
             [[ "$mptcp_checksum" != "N/A" ]] && log "    ├── 校验和启用: $mptcp_checksum (代理推荐:0)" "info"
             [[ "$mptcp_join" != "N/A" ]] && log "    ├── 允许初始地址连接: $mptcp_join" "info"
@@ -666,7 +744,8 @@ show_network_summary() {
             
             # 如果有不支持的参数，显示提示
             if [[ $MPTCP_SUPPORTED_COUNT -lt $MPTCP_TOTAL_COUNT ]]; then
-                local missing_count=$((MPTCP_TOTAL_COUNT - MPTCP_SUPPORTED_COUNT))
+                local missing_count
+                missing_count=$((MPTCP_TOTAL_COUNT - MPTCP_SUPPORTED_COUNT))
                 log "    └── ⚠ $missing_count 个高级参数不被当前内核支持 (不影响基本功能)" "warn"
             fi
         else
@@ -676,7 +755,7 @@ show_network_summary() {
         log "  ⚠ MPTCP: 系统不支持" "warn"
     fi
     
-    # 系统资源限制状态（修复版检查）
+    # 系统资源限制状态
     if grep -q "nofile.*1048576" "$LIMITS_CONFIG" 2>/dev/null; then
         log "  ✓ 系统资源限制: 已配置 (重新登录后生效)" "info"
     else
@@ -707,7 +786,7 @@ show_network_summary() {
 
 # === 主流程 ===
 main() {
-    log "🚀 配置网络性能优化 (智能版本)..." "info"
+    log "🚀 配置网络性能优化 (稳定版本)..." "info"
     
     setup_network_optimization
     
@@ -726,7 +805,6 @@ main() {
     log "  查看MPTCP连接: ss -M" "info"
     log "  查看MPTCP统计: cat /proc/net/mptcp_net/stats 2>/dev/null || echo '统计不可用'" "info"
     log "  查看网卡队列: tc qdisc show" "info"
-    log "  测试MPTCP: curl -v --interface eth0 http://example.com (如果支持)" "info"
     log "  恢复 sysctl: cp /etc/sysctl.conf.backup /etc/sysctl.conf && sysctl -p" "info"
     log "  恢复 limits: cp /etc/security/limits.conf.backup /etc/security/limits.conf" "info"
     
