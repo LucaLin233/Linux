@@ -305,7 +305,7 @@ show_tools_summary() {
         local check_cmd=$(echo "$tool_info" | cut -d: -f2)
         local description="${tool_info##*:}"
         
-        local status=$(check_tool_status "$tool_name" "$check_cmd")
+        local status=$(check_tool_status "$tool_name" "$check_cmd" || echo "missing:")
         if [[ "$status" == installed:* ]]; then
             local version="${status#installed:}"
             installed_tools+=("$tool_name($version)")
@@ -322,16 +322,18 @@ show_tools_summary() {
         echo "  ✗ 未安装: ${missing_tools[*]}"
     fi
     
-    # 显示常用命令
+    # 显示常用命令 - 添加错误处理
     local available_commands=()
-    command -v nexttrace >/dev/null && available_commands+=("nexttrace ip.sb")
-    command -v speedtest >/dev/null && available_commands+=("speedtest")
-    command -v htop >/dev/null && available_commands+=("htop")
-    command -v tree >/dev/null && available_commands+=("tree /path")
+    command -v nexttrace >/dev/null 2>&1 && available_commands+=("nexttrace ip.sb")
+    command -v speedtest >/dev/null 2>&1 && available_commands+=("speedtest")
+    command -v htop >/dev/null 2>&1 && available_commands+=("htop")
+    command -v tree >/dev/null 2>&1 && available_commands+=("tree /path")
     
     if [[ ${#available_commands[@]} -gt 0 ]]; then
         echo "  💡 常用命令: ${available_commands[*]}"
     fi
+    
+    return 0  # 确保这个函数总是成功返回
 }
 
 # === 主流程 ===
@@ -354,13 +356,15 @@ main() {
             "update") echo "更新模式: 检查更新已安装工具" ;;
         esac
         
-        install_selected_tools "$choice"
+        install_selected_tools "$choice" || true  # 确保不会因为工具安装失败而退出
     fi
     
-    show_tools_summary
+    show_tools_summary || true  # 确保摘要显示不会导致脚本失败
     
     echo
     log "✅ 系统工具配置完成!" "info"
+    
+    return 0  # 显式返回成功
 }
 
 main "$@"
