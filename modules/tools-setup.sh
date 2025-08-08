@@ -1,5 +1,5 @@
 #!/bin/bash
-# 系统工具配置模块 v1.1
+# 系统工具配置模块 v1.2 - 修正版
 # 功能: 安装常用系统和网络工具
 
 set -euo pipefail
@@ -25,7 +25,7 @@ readonly TOOLS=(
 
 # === 核心函数 ===
 
-# 获取工具版本
+# 获取工具版本 - 修复版本检测
 get_tool_version() {
     local tool_name="$1"
     local check_cmd="$2"
@@ -33,11 +33,17 @@ get_tool_version() {
     case "$tool_name" in
         "nexttrace")
             local version_output
-            version_output=$($check_cmd 2>&1 | head -n1 2>/dev/null || echo "")
-            if [[ "$version_output" =~ v?([0-9]+\.[0-9]+\.[0-9]+) ]]; then
+            version_output=$($check_cmd 2>/dev/null | head -n1 || echo "")
+            
+            # 尝试多种可能的版本格式
+            if [[ "$version_output" =~ NextTrace[[:space:]]+v([0-9]+\.[0-9]+\.[0-9]+) ]]; then
+                echo "${BASH_REMATCH[1]}"
+            elif [[ "$version_output" =~ v([0-9]+\.[0-9]+\.[0-9]+) ]]; then
+                echo "${BASH_REMATCH[1]}"
+            elif [[ "$version_output" =~ ([0-9]+\.[0-9]+\.[0-9]+) ]]; then
                 echo "${BASH_REMATCH[1]}"
             else
-                echo "未知"
+                echo "已安装"
             fi
             ;;
         "speedtest")
@@ -46,7 +52,7 @@ get_tool_version() {
             if [[ "$version_output" =~ ([0-9]+\.[0-9]+\.[0-9]+) ]]; then
                 echo "${BASH_REMATCH[1]}"
             else
-                echo "未知"
+                echo "已安装"
             fi
             ;;
         *)
@@ -78,7 +84,7 @@ check_tool_status() {
     fi
 }
 
-# 安装单个工具
+# 安装单个工具 - 修复apt输出问题
 install_single_tool() {
     local tool_name="$1"
     local install_source="$2"
@@ -91,8 +97,8 @@ install_single_tool() {
             return 1
         fi
     else
-        # 通过包管理器安装
-        if apt update -qq && apt install -y "$install_source" >/dev/null 2>&1; then
+        # 通过包管理器安装 - 完全静默
+        if apt update -qq >/dev/null 2>&1 && apt install -y "$install_source" >/dev/null 2>&1; then
             return 0
         else
             return 1
@@ -214,7 +220,7 @@ install_selected_tools() {
                 local check_cmd=$(echo "$tool_info" | cut -d: -f2)
                 local install_source=$(echo "$tool_info" | cut -d: -f3)
                 
-                local status=$(check_tool_status "$tool_name" "$check_cmd")
+                local status=$(check_tool_status "$tool_name" "$check_cmd" || echo "missing:")
                 local was_installed=false
                 
                 if [[ "$status" == installed:* ]]; then
@@ -233,7 +239,7 @@ install_selected_tools() {
                 if install_single_tool "$tool_name" "$install_source"; then
                     # 重新检查版本
                     sleep 1
-                    local new_status=$(check_tool_status "$tool_name" "$check_cmd")
+                    local new_status=$(check_tool_status "$tool_name" "$check_cmd" || echo "installed:已安装")
                     if [[ "$new_status" == installed:* ]]; then
                         local new_version="${new_status#installed:}"
                         
@@ -292,7 +298,7 @@ install_selected_tools() {
     fi
 }
 
-# 显示配置摘要
+# 显示配置摘要 - 改进常用命令显示
 show_tools_summary() {
     echo
     log "🎯 系统工具摘要:" "info"
@@ -322,18 +328,35 @@ show_tools_summary() {
         echo "  ✗ 未安装: ${missing_tools[*]}"
     fi
     
-    # 显示常用命令 - 添加错误处理
-    local available_commands=()
-    command -v nexttrace >/dev/null 2>&1 && available_commands+=("nexttrace ip.sb")
-    command -v speedtest >/dev/null 2>&1 && available_commands+=("speedtest")
-    command -v htop >/dev/null 2>&1 && available_commands+=("htop")
-    command -v tree >/dev/null 2>&1 && available_commands+=("tree /path")
-    
-    if [[ ${#available_commands[@]} -gt 0 ]]; then
-        echo "  💡 常用命令: ${available_commands[*]}"
+    # 显示常用命令 - 改进格式
+    local has_commands=false
+    echo "  💡 常用命令:"
+    if command -v nexttrace >/dev/null 2>&1; then
+        echo "    网络追踪: nexttrace ip.sb"
+        has_commands=true
+    fi
+    if command -v speedtest >/dev/null 2>&1; then
+        echo "    网速测试: speedtest"
+        has_commands=true
+    fi
+    if command -v htop >/dev/null 2>&1; then
+        echo "    系统监控: htop"
+        has_commands=true
+    fi
+    if command -v tree >/dev/null 2>&1; then
+        echo "    目录树: tree /path/to/dir"
+        has_commands=true
+    fi
+    if command -v jq >/dev/null 2>&1; then
+        echo "    JSON处理: echo '{}' | jq ."
+        has_commands=true
     fi
     
-    return 0  # 确保这个函数总是成功返回
+    if ! $has_commands; then
+        echo "    暂无可用工具"
+    fi
+    
+    return 0
 }
 
 # === 主流程 ===
