@@ -184,7 +184,8 @@ configure_password_auth() {
         echo "SSH密钥状态: 已配置 ($key_count 个)" >&2
         
         local disable_password
-        read -p "是否禁用密码认证 (仅允许密钥登录)? [y/N]: " -r disable_password >&2
+        read -p "是否禁用密码认证 (仅允许密钥登录)? [y/N] (默认: N): " -r disable_password >&2
+        disable_password=${disable_password:-N}
         
         if [[ "$disable_password" =~ ^[Yy]$ ]]; then
             echo "密码认证: 将禁用" >&2
