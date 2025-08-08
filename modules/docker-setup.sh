@@ -199,7 +199,8 @@ manage_containers() {
     fi
     
     echo "Docker Compose: 检测到 ($compose_cmd)"
-    read -p "是否检查并启动容器? [Y/n]: " -r manage_choice
+    read -p "是否检查并启动容器? [Y/n] (默认: Y): " -r manage_choice
+    manage_choice=${manage_choice:-Y}
     
     if [[ "$manage_choice" =~ ^[Nn]$ ]]; then
         echo "容器管理: 跳过"
