@@ -102,25 +102,145 @@ check_tool_status() {
     fi
 }
 
-# 安装单个工具 - 修复apt输出问题
-install_single_tool() {
-    local tool_name="$1"
-    local install_source="$2"
+# 安装选定的工具 - 修复更新逻辑
+install_selected_tools() {
+    local category="$1"
+    local tools_to_install
+    local force_install=false
     
-    if [[ "$install_source" == https://* ]]; then
-        # 通过脚本安装
-        if curl -fsSL "$install_source" | bash >/dev/null 2>&1; then
-            return 0
-        else
-            return 1
-        fi
+    if [[ "$category" == "update" ]]; then
+        force_install=true
+        tools_to_install=$(get_tools_by_category "$category")
+    elif [[ "$category" == "custom" ]]; then
+        tools_to_install=$(custom_tool_selection)
     else
-        # 通过包管理器安装 - 完全静默
-        if apt update -qq >/dev/null 2>&1 && apt install -y "$install_source" >/dev/null 2>&1; then
-            return 0
-        else
-            return 1
+        tools_to_install=$(get_tools_by_category "$category")
+    fi
+    
+    if [[ -z "$tools_to_install" ]]; then
+        return 0
+    fi
+    
+    local installed_count=0
+    local failed_count=0
+    local updated_count=0
+    local skipped_count=0
+    local installed_tools=()
+    local failed_tools=()
+    local updated_tools=()
+    local skipped_tools=()
+    
+    for tool_name in $tools_to_install; do
+        # 查找工具信息
+        local tool_found=false
+        for tool_info in "${TOOLS[@]}"; do
+            local info_name="${tool_info%%:*}"
+            if [[ "$info_name" == "$tool_name" ]]; then
+                local check_cmd=$(echo "$tool_info" | cut -d: -f2)
+                local install_source=$(echo "$tool_info" | cut -d: -f3)
+                
+                local status=$(check_tool_status "$tool_name" "$check_cmd" || echo "missing:")
+                local was_installed=false
+                local old_version=""
+                
+                if [[ "$status" == installed:* ]]; then
+                    old_version="${status#installed:}"
+                    was_installed=true
+                    
+                    if ! $force_install; then
+                        # 普通安装模式：跳过已安装的工具
+                        installed_tools+=("$tool_name($old_version)")
+                        tool_found=true
+                        break
+                    fi
+                fi
+                
+                # 执行安装（新安装或强制重装）
+                if install_single_tool "$tool_name" "$install_source"; then
+                    # 重新检查版本
+                    sleep 2
+                    local new_status=$(check_tool_status "$tool_name" "$check_cmd" || echo "installed:已安装")
+                    if [[ "$new_status" == installed:* ]]; then
+                        local new_version="${new_status#installed:}"
+                        
+                        if $was_installed; then
+                            # 比较版本是否真正更新了
+                            if [[ "$new_version" != "$old_version" ]]; then
+                                updated_tools+=("$tool_name($old_version→$new_version)")
+                                ((updated_count++))
+                            else
+                                skipped_tools+=("$tool_name($new_version)")
+                                ((skipped_count++))
+                            fi
+                        else
+                            # 这是新安装
+                            installed_tools+=("$tool_name($new_version)")
+                            ((installed_count++))
+                        fi
+                    else
+                        if $was_installed; then
+                            # 重新安装失败，但原版本还在
+                            skipped_tools+=("$tool_name($old_version)")
+                            ((skipped_count++))
+                        else
+                            failed_tools+=("$tool_name")
+                            ((failed_count++))
+                        fi
+                    fi
+                else
+                    if $was_installed; then
+                        # 重新安装失败，但原版本还在
+                        skipped_tools+=("$tool_name($old_version)")
+                        ((skipped_count++))
+                    else
+                        failed_tools+=("$tool_name")
+                        ((failed_count++))
+                    fi
+                fi
+                
+                tool_found=true
+                break
+            fi
+        done
+        
+        if ! $tool_found; then
+            failed_tools+=("$tool_name")
+            ((failed_count++))
         fi
+    done
+    
+    # 输出结果
+    if [[ ${#installed_tools[@]} -gt 0 ]]; then
+        if $force_install; then
+            echo "新安装工具: ${installed_tools[*]}"
+        else
+            echo "工具状态: ${installed_tools[*]}"
+        fi
+    fi
+    
+    if [[ ${#updated_tools[@]} -gt 0 ]]; then
+        echo "版本更新: ${updated_tools[*]}"
+    fi
+    
+    if [[ ${#skipped_tools[@]} -gt 0 ]]; then
+        echo "保持现状: ${skipped_tools[*]}"
+    fi
+    
+    if [[ ${#failed_tools[@]} -gt 0 ]]; then
+        echo "安装失败: ${failed_tools[*]}"
+    fi
+    
+    # 统计输出
+    if [[ $installed_count -gt 0 ]]; then
+        echo "新安装: ${installed_count}个"
+    fi
+    
+    if [[ $updated_count -gt 0 ]]; then
+        echo "真实更新: ${updated_count}个"
+    fi
+    
+    if [[ $skipped_count -gt 0 ]]; then
+        echo "无需更新: ${skipped_count}个"
     fi
 }
 
