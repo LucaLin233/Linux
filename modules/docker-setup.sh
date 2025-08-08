@@ -1,6 +1,6 @@
 #!/bin/bash
-# Docker 容器化平台配置模块 v4.1
-# 修复服务检测和版本获取问题
+# Docker 容器化平台配置模块 v4.2 - 简化修正版
+# 功能: 安装Docker、优化配置、管理容器
 
 set -euo pipefail
 
@@ -18,22 +18,37 @@ log() {
 
 # === 核心函数 ===
 
+# 获取内存大小（改进版）
+get_memory_mb() {
+    local mem_mb=""
+    
+    # 方法1：使用 /proc/meminfo（最可靠）
+    if [[ -f /proc/meminfo ]]; then
+        mem_mb=$(awk '/^MemTotal:/ {print int($2/1024)}' /proc/meminfo 2>/dev/null || echo "")
+    fi
+    
+    # 方法2：使用 free 命令作为备选
+    if [[ -z "$mem_mb" ]] && command -v free >/dev/null; then
+        # 尝试不同的 free 命令格式
+        mem_mb=$(free -m 2>/dev/null | awk 'NR==2{print $2}' || echo "")
+        
+        # 如果上面失败，尝试其他格式
+        if [[ -z "$mem_mb" ]]; then
+            mem_mb=$(free -m 2>/dev/null | awk '/^Mem:/{print $2}' || echo "")
+        fi
+    fi
+    
+    # 验证结果是否为有效数字
+    if [[ "$mem_mb" =~ ^[0-9]+$ ]] && [[ "$mem_mb" -gt 0 ]]; then
+        echo "$mem_mb"
+    else
+        echo "0"
+    fi
+}
+
 # 获取Docker版本
 get_docker_version() {
     docker --version 2>/dev/null | awk '{print $3}' | tr -d ',' || echo "未知"
-}
-
-# 获取NextTrace版本（修复版）
-get_nexttrace_version() {
-    local version_output
-    version_output=$(nexttrace -V 2>&1 | head -n1 2>/dev/null || echo "")
-    
-    # 提取版本号并去掉换行符
-    if [[ "$version_output" =~ v?([0-9]+\.[0-9]+\.[0-9]+) ]]; then
-        echo "${BASH_REMATCH[1]}"
-    else
-        echo "未知"
-    fi
 }
 
 # 获取Docker Compose命令
@@ -49,78 +64,73 @@ get_compose_command() {
 
 # 安装Docker
 install_docker() {
-    log "检查并安装 Docker..." "info"
-    
     if command -v docker &>/dev/null; then
         local docker_version=$(get_docker_version)
-        log "Docker 已安装 (版本: $docker_version)" "info"
+        echo "Docker状态: 已安装 v$docker_version"
         return 0
     fi
     
-    log "安装 Docker..." "info"
-    if curl -fsSL https://get.docker.com | sh; then
-        log "✓ Docker 安装完成" "info"
+    echo "安装Docker中..."
+    if curl -fsSL https://get.docker.com | sh >/dev/null 2>&1; then
+        echo "Docker安装: 成功"
     else
-        log "✗ Docker 安装失败" "error"
+        log "✗ Docker安装失败" "error"
         exit 1
     fi
     
-    # 验证安装
     if ! command -v docker &>/dev/null; then
-        log "✗ Docker 安装验证失败" "error"
+        log "✗ Docker安装验证失败" "error"
         exit 1
     fi
 }
 
-# 启动Docker服务（修复版）
+# 启动Docker服务
 start_docker_service() {
-    log "配置 Docker 服务..." "info"
-    
-    # 更健壮的服务检测方式
-    if systemctl status docker &>/dev/null; then
-        log "✓ Docker 服务已运行" "info"
+    if systemctl is-active docker &>/dev/null; then
+        echo "Docker服务: 已运行"
     elif systemctl list-unit-files docker.service &>/dev/null; then
-        systemctl enable --now docker.service
-        log "✓ Docker 服务已启动并设置为开机自启" "info"
+        systemctl enable --now docker.service >/dev/null 2>&1
+        echo "Docker服务: 已启动并设置开机自启"
     else
-        # 尝试启动服务，即使检测失败
-        if systemctl start docker &>/dev/null; then
-            systemctl enable docker &>/dev/null || true
-            log "✓ Docker 服务已启动" "info"
+        if systemctl start docker >/dev/null 2>&1; then
+            systemctl enable docker >/dev/null 2>&1 || true
+            echo "Docker服务: 已启动"
         else
-            log "⚠ 无法管理Docker服务，但可能已运行" "warn"
+            echo "Docker服务: 状态未知，但可能已运行"
         fi
     fi
 }
 
-# 优化Docker配置(低内存环境)
+# 优化Docker配置 - 1GB阈值版
 optimize_docker_config() {
-    local mem_total=$(free -m | awk '/^Mem:/ {print $2}')
+    local mem_mb=$(get_memory_mb)
     
-    if (( mem_total >= 1024 )); then
-        log "内存充足 (${mem_total}MB)，无需优化Docker配置" "info"
+    if [[ "$mem_mb" -eq 0 ]]; then
+        echo "内存检测: 失败，跳过优化配置"
         return 0
     fi
     
-    echo
-    log "检测到低内存环境 (${mem_total}MB)" "warn"
-    read -p "是否优化Docker配置以降低内存使用? [Y/n] (默认: Y): " -r optimize_choice
+    # 1GB以下才需要优化
+    if (( mem_mb >= 1024 )); then
+        echo "内存状态: ${mem_mb}MB (充足，无需优化)"
+        return 0
+    fi
+    
+    echo "内存状态: ${mem_mb}MB (偏低)"
+    read -p "是否优化Docker配置以降低内存使用? [Y/n]: " -r optimize_choice
     
     if [[ "$optimize_choice" =~ ^[Nn]$ ]]; then
-        log "跳过Docker优化配置" "info"
+        echo "Docker优化: 跳过"
         return 0
     fi
     
-    log "优化 Docker 配置..." "info"
     mkdir -p "$DOCKER_CONFIG_DIR"
     
-    # 检查是否已经配置过
     if [[ -f "$DOCKER_DAEMON_CONFIG" ]] && grep -q "max-size" "$DOCKER_DAEMON_CONFIG"; then
-        log "Docker优化配置已存在" "info"
+        echo "Docker优化: 已存在"
         return 0
     fi
     
-    # 创建优化配置
     cat > "$DOCKER_DAEMON_CONFIG" << 'EOF'
 {
   "storage-driver": "overlay2",
@@ -132,49 +142,18 @@ optimize_docker_config() {
 }
 EOF
     
-    # 重启Docker服务应用配置
     if systemctl is-active docker &>/dev/null; then
-        log "重启Docker服务以应用配置..." "info"
-        systemctl restart docker
+        systemctl restart docker >/dev/null 2>&1
     fi
     
-    log "✓ Docker日志配置已优化" "info"
+    echo "Docker优化: 已配置并重启"
 }
 
-# 安装NextTrace
-install_nexttrace() {
-    echo
-    read -p "是否安装 NextTrace 网络追踪工具? [Y/n] (默认: Y): " -r install_choice
-    
-    if [[ "$install_choice" =~ ^[Nn]$ ]]; then
-        log "跳过 NextTrace 安装" "info"
-        return 0
-    fi
-    
-    log "检查并安装 NextTrace..." "info"
-    
-    if command -v nexttrace &>/dev/null; then
-        local nexttrace_version=$(get_nexttrace_version)
-        log "NextTrace 已安装 (版本: $nexttrace_version)" "info"
-        return 0
-    fi
-    
-    log "安装 NextTrace..." "info"
-    if curl -Ls https://github.com/sjlleo/nexttrace/raw/main/nt_install.sh | bash; then
-        if command -v nexttrace &>/dev/null; then
-            log "✓ NextTrace 安装完成" "info"
-        else
-            log "✗ NextTrace 安装验证失败" "warn"
-        fi
-    else
-        log "✗ NextTrace 安装失败" "warn"
-    fi
-}
-
-# 检查单个目录的容器
+# 检查并启动单个目录的容器
 check_directory_containers() {
     local dir="$1"
     local compose_cmd="$2"
+    local containers_started=0
     
     if [[ ! -d "$dir" ]]; then
         return 0
@@ -193,8 +172,6 @@ check_directory_containers() {
         return 0
     fi
     
-    log "检查目录: $dir ($compose_file)" "info"
-    
     # 切换到目录并检查容器状态
     local current_dir=$(pwd)
     cd "$dir"
@@ -202,26 +179,14 @@ check_directory_containers() {
     local expected_services=$($compose_cmd -f "$compose_file" config --services 2>/dev/null | wc -l || echo "0")
     local running_containers=$($compose_cmd -f "$compose_file" ps --filter status=running --quiet 2>/dev/null | wc -l || echo "0")
     
-    if (( expected_services == 0 )); then
-        log "  未检测到服务定义" "warn"
-        cd "$current_dir"
-        return 0
-    fi
-    
-    if (( running_containers < expected_services )); then
-        log "  启动容器 ($running_containers/$expected_services 运行中)" "info"
-        if $compose_cmd -f "$compose_file" up -d --force-recreate; then
-            sleep 3
-            local new_running=$($compose_cmd -f "$compose_file" ps --filter status=running --quiet 2>/dev/null | wc -l || echo "0")
-            log "  ✓ 容器启动完成 ($new_running/$expected_services 运行中)" "info"
-        else
-            log "  ✗ 容器启动失败" "warn"
+    if (( expected_services > 0 && running_containers < expected_services )); then
+        if $compose_cmd -f "$compose_file" up -d --force-recreate >/dev/null 2>&1; then
+            containers_started=1
         fi
-    else
-        log "  ✓ 容器已在运行 ($running_containers/$expected_services)" "info"
     fi
     
     cd "$current_dir"
+    echo "$containers_started"
 }
 
 # 管理Docker容器
@@ -229,77 +194,72 @@ manage_containers() {
     local compose_cmd=$(get_compose_command)
     
     if [[ -z "$compose_cmd" ]]; then
-        log "未检测到 Docker Compose，跳过容器管理" "warn"
+        echo "Docker Compose: 未检测到"
         return 0
     fi
     
-    echo
-    log "检测到 Docker Compose: $compose_cmd" "info"
-    read -p "是否检查并启动Docker容器? [Y/n] (默认: Y): " -r manage_choice
+    echo "Docker Compose: 检测到 ($compose_cmd)"
+    read -p "是否检查并启动容器? [Y/n]: " -r manage_choice
     
     if [[ "$manage_choice" =~ ^[Nn]$ ]]; then
-        log "跳过容器管理" "info"
+        echo "容器管理: 跳过"
         return 0
     fi
     
-    log "检查 Docker Compose 容器..." "info"
+    local total_started=0
+    local dirs_with_containers=()
     
-    # 遍历所有容器目录
     for dir in "${CONTAINER_DIRS[@]}"; do
-        check_directory_containers "$dir" "$compose_cmd"
+        local started=$(check_directory_containers "$dir" "$compose_cmd")
+        if [[ "$started" -eq 1 ]]; then
+            ((total_started++))
+            dirs_with_containers+=("$(basename "$dir")")
+        fi
     done
+    
+    if [[ "$total_started" -gt 0 ]]; then
+        echo "容器启动: ${total_started}个目录 (${dirs_with_containers[*]})"
+    else
+        echo "容器检查: 所有容器已在运行"
+    fi
 }
 
 # 显示配置摘要
 show_docker_summary() {
     echo
-    log "🎯 Docker 配置摘要:" "info"
+    log "🎯 Docker配置摘要:" "info"
     
-    # Docker状态
     if command -v docker &>/dev/null; then
         local docker_version=$(get_docker_version)
-        log "  ✓ Docker版本: $docker_version" "info"
+        echo "  Docker: v$docker_version"
         
-        # Docker服务状态
         if systemctl is-active docker &>/dev/null; then
-            log "  ✓ Docker服务: 运行中" "info"
+            echo "  服务状态: 运行中"
         else
-            log "  ⚠ Docker服务: 状态未知" "warn"
+            echo "  服务状态: 未知"
         fi
         
-        # 容器统计
         local running_containers=$(docker ps -q 2>/dev/null | wc -l || echo "0")
-        local total_containers=$(docker ps -a -q 2>/dev/null | wc -l || echo "0")
-        log "  📦 容器状态: $running_containers/$total_containers 运行中" "info"
+        echo "  运行容器: ${running_containers}个"
         
-        # Docker配置优化状态
         if [[ -f "$DOCKER_DAEMON_CONFIG" ]] && grep -q "max-size" "$DOCKER_DAEMON_CONFIG"; then
-            log "  ⚡ 配置优化: 已启用" "info"
+            echo "  配置优化: 已启用"
         fi
     else
-        log "  ✗ Docker: 未安装" "error"
+        echo "  Docker: 未安装"
     fi
     
-    # NextTrace状态
-    if command -v nexttrace &>/dev/null; then
-        local nexttrace_version=$(get_nexttrace_version)
-        log "  ✓ NextTrace: $nexttrace_version" "info"
-    else
-        log "  ✗ NextTrace: 未安装" "info"
-    fi
-    
-    # Docker Compose状态
     local compose_cmd=$(get_compose_command)
     if [[ -n "$compose_cmd" ]]; then
-        log "  ✓ Docker Compose: $compose_cmd" "info"
+        echo "  Docker Compose: 可用"
     else
-        log "  ✗ Docker Compose: 未安装" "warn"
+        echo "  Docker Compose: 不可用"
     fi
 }
 
 # === 主流程 ===
 main() {
-    log "🐳 配置 Docker 容器化平台..." "info"
+    log "🐳 配置Docker容器化平台..." "info"
     
     echo
     install_docker
@@ -310,26 +270,24 @@ main() {
     echo
     optimize_docker_config
     
-    install_nexttrace
-    
+    echo
     manage_containers
     
     show_docker_summary
     
     echo
-    log "🎉 Docker 配置完成!" "info"
+    log "✅ Docker配置完成!" "info"
     
-    # 显示有用的命令
     if command -v docker &>/dev/null; then
         echo
         log "常用命令:" "info"
-        log "  查看容器: docker ps" "info"
-        log "  查看镜像: docker images" "info"
-        log "  系统信息: docker system df" "info"
+        echo "  查看容器: docker ps"
+        echo "  查看镜像: docker images"
+        echo "  系统清理: docker system prune -f"
         
         local compose_cmd=$(get_compose_command)
         if [[ -n "$compose_cmd" ]]; then
-            log "  容器管理: $compose_cmd up -d" "info"
+            echo "  容器管理: $compose_cmd up -d"
         fi
     fi
 }
