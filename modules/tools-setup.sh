@@ -1,5 +1,5 @@
 #!/bin/bash
-# 系统工具配置模块 v1.3 - nexttrace修复版
+# 系统工具配置模块 v1.4 - nexttrace强制更新修复版
 # 功能: 安装常用系统和网络工具
 
 set -euo pipefail
@@ -102,145 +102,76 @@ check_tool_status() {
     fi
 }
 
-# 安装选定的工具 - 修复更新逻辑
-install_selected_tools() {
-    local category="$1"
-    local tools_to_install
-    local force_install=false
+# 安装单个工具 - 特殊处理nexttrace强制重装
+install_single_tool() {
+    local tool_name="$1"
+    local install_source="$2"
+    local force_reinstall="${3:-false}"
     
-    if [[ "$category" == "update" ]]; then
-        force_install=true
-        tools_to_install=$(get_tools_by_category "$category")
-    elif [[ "$category" == "custom" ]]; then
-        tools_to_install=$(custom_tool_selection)
-    else
-        tools_to_install=$(get_tools_by_category "$category")
-    fi
-    
-    if [[ -z "$tools_to_install" ]]; then
-        return 0
-    fi
-    
-    local installed_count=0
-    local failed_count=0
-    local updated_count=0
-    local skipped_count=0
-    local installed_tools=()
-    local failed_tools=()
-    local updated_tools=()
-    local skipped_tools=()
-    
-    for tool_name in $tools_to_install; do
-        # 查找工具信息
-        local tool_found=false
-        for tool_info in "${TOOLS[@]}"; do
-            local info_name="${tool_info%%:*}"
-            if [[ "$info_name" == "$tool_name" ]]; then
-                local check_cmd=$(echo "$tool_info" | cut -d: -f2)
-                local install_source=$(echo "$tool_info" | cut -d: -f3)
-                
-                local status=$(check_tool_status "$tool_name" "$check_cmd" || echo "missing:")
-                local was_installed=false
-                local old_version=""
-                
-                if [[ "$status" == installed:* ]]; then
-                    old_version="${status#installed:}"
-                    was_installed=true
-                    
-                    if ! $force_install; then
-                        # 普通安装模式：跳过已安装的工具
-                        installed_tools+=("$tool_name($old_version)")
-                        tool_found=true
-                        break
-                    fi
-                fi
-                
-                # 执行安装（新安装或强制重装）
-                if install_single_tool "$tool_name" "$install_source"; then
-                    # 重新检查版本
-                    sleep 2
-                    local new_status=$(check_tool_status "$tool_name" "$check_cmd" || echo "installed:已安装")
-                    if [[ "$new_status" == installed:* ]]; then
-                        local new_version="${new_status#installed:}"
-                        
-                        if $was_installed; then
-                            # 比较版本是否真正更新了
-                            if [[ "$new_version" != "$old_version" ]]; then
-                                updated_tools+=("$tool_name($old_version→$new_version)")
-                                ((updated_count++))
-                            else
-                                skipped_tools+=("$tool_name($new_version)")
-                                ((skipped_count++))
-                            fi
-                        else
-                            # 这是新安装
-                            installed_tools+=("$tool_name($new_version)")
-                            ((installed_count++))
-                        fi
-                    else
-                        if $was_installed; then
-                            # 重新安装失败，但原版本还在
-                            skipped_tools+=("$tool_name($old_version)")
-                            ((skipped_count++))
-                        else
-                            failed_tools+=("$tool_name")
-                            ((failed_count++))
-                        fi
-                    fi
-                else
-                    if $was_installed; then
-                        # 重新安装失败，但原版本还在
-                        skipped_tools+=("$tool_name($old_version)")
-                        ((skipped_count++))
-                    else
-                        failed_tools+=("$tool_name")
-                        ((failed_count++))
-                    fi
-                fi
-                
-                tool_found=true
-                break
+    if [[ "$install_source" == https://* ]]; then
+        # 通过脚本安装
+        if [[ "$tool_name" == "nexttrace" && "$force_reinstall" == "true" ]]; then
+            # nexttrace特殊处理：强制重新安装
+            echo "强制更新nexttrace..." >&2
+            
+            # 方法1：尝试直接安装（可能会覆盖）
+            if curl -fsSL "$install_source" | bash >/dev/null 2>&1; then
+                return 0
             fi
-        done
-        
-        if ! $tool_found; then
-            failed_tools+=("$tool_name")
-            ((failed_count++))
-        fi
-    done
-    
-    # 输出结果
-    if [[ ${#installed_tools[@]} -gt 0 ]]; then
-        if $force_install; then
-            echo "新安装工具: ${installed_tools[*]}"
+            
+            # 方法2：尝试删除旧版本再安装
+            echo "尝试删除旧版本后重新安装..." >&2
+            local nexttrace_path=$(command -v nexttrace 2>/dev/null || command -v nxtrace 2>/dev/null)
+            if [[ -n "$nexttrace_path" ]]; then
+                # 备份路径，然后删除
+                sudo rm -f "$nexttrace_path" 2>/dev/null || true
+                # 删除可能的链接和其他位置
+                sudo rm -f /usr/local/bin/nexttrace /usr/local/bin/nxtrace 2>/dev/null || true
+                sudo rm -f /usr/bin/nexttrace /usr/bin/nxtrace 2>/dev/null || true
+            fi
+            
+            # 重新安装
+            if curl -fsSL "$install_source" | bash >/dev/null 2>&1; then
+                return 0
+            fi
+            
+            # 方法3：尝试手动下载安装
+            echo "尝试手动下载安装..." >&2
+            local temp_dir=$(mktemp -d)
+            local arch=$(uname -m)
+            local download_url=""
+            
+            case "$arch" in
+                x86_64) download_url="https://github.com/nxtrace/NTrace-core/releases/latest/download/nexttrace_linux_amd64" ;;
+                aarch64) download_url="https://github.com/nxtrace/NTrace-core/releases/latest/download/nexttrace_linux_arm64" ;;
+                armv7l) download_url="https://github.com/nxtrace/NTrace-core/releases/latest/download/nexttrace_linux_arm" ;;
+                *) download_url="https://github.com/nxtrace/NTrace-core/releases/latest/download/nexttrace_linux_amd64" ;;
+            esac
+            
+            if curl -fsSL "$download_url" -o "$temp_dir/nexttrace" 2>/dev/null; then
+                chmod +x "$temp_dir/nexttrace"
+                sudo mv "$temp_dir/nexttrace" /usr/local/bin/ 2>/dev/null
+                rm -rf "$temp_dir"
+                return 0
+            fi
+            rm -rf "$temp_dir"
+            
+            return 1
         else
-            echo "工具状态: ${installed_tools[*]}"
+            # 其他工具正常安装
+            if curl -fsSL "$install_source" | bash >/dev/null 2>&1; then
+                return 0
+            else
+                return 1
+            fi
         fi
-    fi
-    
-    if [[ ${#updated_tools[@]} -gt 0 ]]; then
-        echo "版本更新: ${updated_tools[*]}"
-    fi
-    
-    if [[ ${#skipped_tools[@]} -gt 0 ]]; then
-        echo "保持现状: ${skipped_tools[*]}"
-    fi
-    
-    if [[ ${#failed_tools[@]} -gt 0 ]]; then
-        echo "安装失败: ${failed_tools[*]}"
-    fi
-    
-    # 统计输出
-    if [[ $installed_count -gt 0 ]]; then
-        echo "新安装: ${installed_count}个"
-    fi
-    
-    if [[ $updated_count -gt 0 ]]; then
-        echo "真实更新: ${updated_count}个"
-    fi
-    
-    if [[ $skipped_count -gt 0 ]]; then
-        echo "无需更新: ${skipped_count}个"
+    else
+        # 通过包管理器安装 - 完全静默
+        if apt update -qq >/dev/null 2>&1 && apt install -y "$install_source" >/dev/null 2>&1; then
+            return 0
+        else
+            return 1
+        fi
     fi
 }
 
@@ -323,7 +254,7 @@ custom_tool_selection() {
     echo "${selected_tools[*]}"
 }
 
-# 安装选定的工具
+# 安装选定的工具 - 修复更新逻辑和nexttrace特殊处理
 install_selected_tools() {
     local category="$1"
     local tools_to_install
@@ -345,9 +276,11 @@ install_selected_tools() {
     local installed_count=0
     local failed_count=0
     local updated_count=0
+    local skipped_count=0
     local installed_tools=()
     local failed_tools=()
     local updated_tools=()
+    local skipped_tools=()
     
     for tool_name in $tools_to_install; do
         # 查找工具信息
@@ -360,9 +293,10 @@ install_selected_tools() {
                 
                 local status=$(check_tool_status "$tool_name" "$check_cmd" || echo "missing:")
                 local was_installed=false
+                local old_version=""
                 
                 if [[ "$status" == installed:* ]]; then
-                    local old_version="${status#installed:}"
+                    old_version="${status#installed:}"
                     was_installed=true
                     
                     if ! $force_install; then
@@ -374,7 +308,20 @@ install_selected_tools() {
                 fi
                 
                 # 执行安装（新安装或强制重装）
-                if install_single_tool "$tool_name" "$install_source"; then
+                local install_success=false
+                if [[ "$tool_name" == "nexttrace" && $force_install == true ]]; then
+                    # nexttrace强制重装
+                    if install_single_tool "$tool_name" "$install_source" "true"; then
+                        install_success=true
+                    fi
+                else
+                    # 其他工具正常安装
+                    if install_single_tool "$tool_name" "$install_source"; then
+                        install_success=true
+                    fi
+                fi
+                
+                if $install_success; then
                     # 重新检查版本
                     sleep 2  # nexttrace安装后可能需要更长时间生效
                     local new_status=$(check_tool_status "$tool_name" "$check_cmd" || echo "installed:已安装")
@@ -382,21 +329,39 @@ install_selected_tools() {
                         local new_version="${new_status#installed:}"
                         
                         if $was_installed; then
-                            # 这是更新
-                            updated_tools+=("$tool_name($new_version)")
-                            ((updated_count++))
+                            # 比较版本是否真正更新了
+                            if [[ "$new_version" != "$old_version" ]] && [[ "$new_version" != "已安装" ]] && [[ "$old_version" != "已安装" ]]; then
+                                updated_tools+=("$tool_name($old_version→$new_version)")
+                                ((updated_count++))
+                            else
+                                # 版本相同或无法比较，标记为重新安装成功
+                                skipped_tools+=("$tool_name($new_version)")
+                                ((skipped_count++))
+                            fi
                         else
                             # 这是新安装
                             installed_tools+=("$tool_name($new_version)")
                             ((installed_count++))
                         fi
                     else
+                        if $was_installed; then
+                            # 重新安装失败，但原版本还在
+                            skipped_tools+=("$tool_name($old_version)")
+                            ((skipped_count++))
+                        else
+                            failed_tools+=("$tool_name")
+                            ((failed_count++))
+                        fi
+                    fi
+                else
+                    if $was_installed; then
+                        # 重新安装失败，但原版本还在
+                        skipped_tools+=("$tool_name($old_version)")
+                        ((skipped_count++))
+                    else
                         failed_tools+=("$tool_name")
                         ((failed_count++))
                     fi
-                else
-                    failed_tools+=("$tool_name")
-                    ((failed_count++))
                 fi
                 
                 tool_found=true
@@ -413,26 +378,32 @@ install_selected_tools() {
     # 输出结果
     if [[ ${#installed_tools[@]} -gt 0 ]]; then
         if $force_install; then
-            echo "保持版本: ${installed_tools[*]}"
+            echo "新安装工具: ${installed_tools[*]}"
         else
             echo "工具状态: ${installed_tools[*]}"
         fi
     fi
     
     if [[ ${#updated_tools[@]} -gt 0 ]]; then
-        echo "已更新工具: ${updated_tools[*]}"
+        echo "版本更新: ${updated_tools[*]}"
     fi
     
-    if [[ $failed_count -gt 0 ]]; then
+    if [[ ${#skipped_tools[@]} -gt 0 ]]; then
+        echo "重新安装: ${skipped_tools[*]}"
+    fi
+    
+    if [[ ${#failed_tools[@]} -gt 0 ]]; then
         echo "安装失败: ${failed_tools[*]}"
     fi
     
-    if [[ $installed_count -gt 0 ]]; then
-        echo "新安装工具: ${installed_count}个"
-    fi
-    
-    if [[ $updated_count -gt 0 ]]; then
-        echo "更新工具: ${updated_count}个"
+    # 统计输出
+    local success_operations=$((installed_count + updated_count + skipped_count))
+    if [[ $success_operations -gt 0 ]]; then
+        local operations=()
+        [[ $installed_count -gt 0 ]] && operations+=("新装${installed_count}个")
+        [[ $updated_count -gt 0 ]] && operations+=("更新${updated_count}个")
+        [[ $skipped_count -gt 0 ]] && operations+=("重装${skipped_count}个")
+        echo "操作完成: ${operations[*]}"
     fi
 }
 
