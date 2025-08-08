@@ -78,26 +78,26 @@ add_cron_job() {
     fi
 }
 
-# 获取用户选择的cron时间
+# 获取用户选择的cron时间 - 修复版本
 get_cron_schedule() {
-    read -p "使用默认时间 (每周日凌晨2点)? [Y/n] (默认: Y): " choice
+    read -p "使用默认时间 (每周日凌晨2点)? [Y/n] (默认: Y): " choice >&2
     choice=${choice:-Y}
     
     if [[ "$choice" =~ ^[Nn]$ ]]; then
-        echo "自定义时间格式: 分 时 日 月 周 (如: 0 3 * * 1)"
+        echo "自定义时间格式: 分 时 日 月 周 (如: 0 3 * * 1)" >&2
         
         while true; do
-            read -p "请输入Cron表达式: " custom_expr
+            read -p "请输入Cron表达式: " custom_expr >&2
             if [[ -n "$custom_expr" ]] && validate_cron_expression "$custom_expr"; then
-                echo "Cron时间: 自定义 ($custom_expr)"
+                echo "Cron时间: 自定义 ($custom_expr)" >&2
                 echo "$custom_expr"
                 return
             else
-                echo "格式错误，请重新输入"
+                echo "格式错误，请重新输入" >&2
             fi
         done
     else
-        echo "Cron时间: 每周日凌晨2点"
+        echo "Cron时间: 每周日凌晨2点" >&2
         echo "$DEFAULT_CRON"
     fi
 }
