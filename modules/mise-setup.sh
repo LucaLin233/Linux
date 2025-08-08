@@ -379,8 +379,8 @@ choose_python_version() {
     echo >&2
     
     local choice=""
-    read -p "请选择 [1-4] (默认: 2): " choice >&2
-    choice=${choice:-2}
+    read -p "请选择 [1-4] (默认: 4): " choice >&2
+    choice=${choice:-4}
     
     # 只返回结果到stdout，不包含其他输出
     case "$choice" in
