@@ -328,8 +328,14 @@ install_optimization() {
     
     echo
     success "网络优化完成!"
-    info "命令: $0 [status|restore]"
-    warn "建议重启系统"
+    
+    # 修改的部分 - 显示完整的远程执行命令
+    local script_url="https://raw.githubusercontent.com/LucaLin233/Linux/refs/heads/main/tools/kernel.sh"
+    info "后续命令:"
+    info "  查看状态: curl -fsSL $script_url | bash -s status"
+    info "  恢复配置: curl -fsSL $script_url | bash -s restore"
+    info "  重新优化: curl -fsSL $script_url | bash -s install -y"
+    warn "建议重启系统确保配置完全生效"
 }
 
 restore_optimization() {
