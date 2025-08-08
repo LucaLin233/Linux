@@ -294,10 +294,10 @@ user_confirm() {
 
 # === 主要功能 ===
 install_optimization() {
-    echo "╔══════════════════════════════════════════════════════════════╗"
-    echo "║              Linux Network Optimizer v$VERSION                ║"
-    echo "║          BBR + fq_codel + TCP Fast Open + MPTCP             ║"
-    echo "╚══════════════════════════════════════════════════════════════╝"
+    echo "================================================================"
+    echo "              Linux Network Optimizer v$VERSION"
+    echo "         BBR + fq_codel + TCP Fast Open + MPTCP"
+    echo "================================================================"
     
     check_root
     check_kernel
@@ -329,7 +329,6 @@ install_optimization() {
     echo
     success "网络优化完成!"
     
-    # 修改的部分 - 显示完整的远程执行命令
     local script_url="https://raw.githubusercontent.com/LucaLin233/Linux/refs/heads/main/tools/kernel.sh"
     info "后续命令:"
     info "  查看状态: curl -fsSL $script_url | bash -s status"
