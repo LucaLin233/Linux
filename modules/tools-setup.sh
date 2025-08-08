@@ -1,5 +1,5 @@
 #!/bin/bash
-# 系统工具配置模块 v1.2 - 修正版
+# 系统工具配置模块 v1.3 - nexttrace修复版
 # 功能: 安装常用系统和网络工具
 
 set -euo pipefail
@@ -11,10 +11,9 @@ log() {
     echo -e "${colors[$level]:-\033[0;32m}$msg\033[0m"
 }
 
-# === 工具定义 ===
-# 格式: "工具名:检查命令:安装脚本URL或包名:描述"
+# === 工具定义 === (更新nexttrace安装URL)
 readonly TOOLS=(
-    "nexttrace:nexttrace -V:https://github.com/sjlleo/nexttrace/raw/main/nt_install.sh:网络路由追踪工具"
+    "nexttrace:nexttrace --version:https://nxtrace.org/nt:网络路由追踪工具"
     "speedtest:speedtest --version:speedtest-cli:网络测速工具"
     "htop:htop --version:htop:增强版系统监控"
     "jq:jq --version:jq:JSON处理工具"
@@ -25,22 +24,31 @@ readonly TOOLS=(
 
 # === 核心函数 ===
 
-# 获取工具版本 - 修复版本检测
+# 获取工具版本 - 改进nexttrace检测
 get_tool_version() {
     local tool_name="$1"
     local check_cmd="$2"
     
     case "$tool_name" in
         "nexttrace")
-            local version_output
-            version_output=$($check_cmd 2>/dev/null | head -n1 || echo "")
+            local version_output=""
             
-            # 尝试多种可能的版本格式
-            if [[ "$version_output" =~ NextTrace[[:space:]]+v([0-9]+\.[0-9]+\.[0-9]+) ]]; then
+            # 尝试多种命令和参数组合
+            for cmd in "nexttrace" "nxtrace"; do
+                for flag in "--version" "-V" "-v" "version"; do
+                    if command -v "$cmd" >/dev/null 2>&1; then
+                        version_output=$($cmd $flag 2>/dev/null | head -n3 || echo "")
+                        [[ -n "$version_output" ]] && break 2
+                    fi
+                done
+            done
+            
+            # 尝试多种版本格式匹配
+            if [[ "$version_output" =~ [Vv]ersion[[:space:]]*:?[[:space:]]*([0-9]+\.[0-9]+\.[0-9]+) ]]; then
                 echo "${BASH_REMATCH[1]}"
-            elif [[ "$version_output" =~ v([0-9]+\.[0-9]+\.[0-9]+) ]]; then
+            elif [[ "$version_output" =~ [Nn][Xx][Tt]race[[:space:]]+[Vv]?([0-9]+\.[0-9]+\.[0-9]+) ]]; then
                 echo "${BASH_REMATCH[1]}"
-            elif [[ "$version_output" =~ ([0-9]+\.[0-9]+\.[0-9]+) ]]; then
+            elif [[ "$version_output" =~ [Vv]?([0-9]+\.[0-9]+\.[0-9]+) ]]; then
                 echo "${BASH_REMATCH[1]}"
             else
                 echo "已安装"
@@ -67,20 +75,30 @@ get_tool_version() {
     esac
 }
 
-# 检查工具状态
+# 检查工具状态 - 改进nexttrace检测
 check_tool_status() {
     local tool_name="$1"
     local check_cmd="$2"
     
-    if command -v "$tool_name" &>/dev/null; then
-        if eval "$check_cmd" &>/dev/null; then
+    if [[ "$tool_name" == "nexttrace" ]]; then
+        # 对nexttrace特殊处理，检查两个可能的命令名
+        if command -v nexttrace &>/dev/null || command -v nxtrace &>/dev/null; then
             local version=$(get_tool_version "$tool_name" "$check_cmd")
             echo "installed:$version"
         else
-            echo "installed:未知版本"
+            echo "missing:"
         fi
     else
-        echo "missing:"
+        if command -v "$tool_name" &>/dev/null; then
+            if eval "$check_cmd" &>/dev/null; then
+                local version=$(get_tool_version "$tool_name" "$check_cmd")
+                echo "installed:$version"
+            else
+                echo "installed:未知版本"
+            fi
+        else
+            echo "missing:"
+        fi
     fi
 }
 
@@ -238,7 +256,7 @@ install_selected_tools() {
                 # 执行安装（新安装或强制重装）
                 if install_single_tool "$tool_name" "$install_source"; then
                     # 重新检查版本
-                    sleep 1
+                    sleep 2  # nexttrace安装后可能需要更长时间生效
                     local new_status=$(check_tool_status "$tool_name" "$check_cmd" || echo "installed:已安装")
                     if [[ "$new_status" == installed:* ]]; then
                         local new_version="${new_status#installed:}"
@@ -298,7 +316,7 @@ install_selected_tools() {
     fi
 }
 
-# 显示配置摘要 - 改进常用命令显示
+# 显示配置摘要 - 改进nexttrace命令显示
 show_tools_summary() {
     echo
     log "🎯 系统工具摘要:" "info"
@@ -331,10 +349,16 @@ show_tools_summary() {
     # 显示常用命令 - 改进格式
     local has_commands=false
     echo "  💡 常用命令:"
+    
+    # 检查nexttrace/nxtrace
     if command -v nexttrace >/dev/null 2>&1; then
         echo "    网络追踪: nexttrace ip.sb"
         has_commands=true
+    elif command -v nxtrace >/dev/null 2>&1; then
+        echo "    网络追踪: nxtrace ip.sb"
+        has_commands=true
     fi
+    
     if command -v speedtest >/dev/null 2>&1; then
         echo "    网速测试: speedtest"
         has_commands=true
