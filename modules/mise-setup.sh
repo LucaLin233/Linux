@@ -1,5 +1,5 @@
 #!/bin/bash
-# Mise 版本管理器配置模块 v5.3 - 简化版
+# Mise 版本管理器配置模块 v5.4 - 修正版
 # 功能: 安装Mise、智能选择Python版本、Shell集成、智能链接管理、自动修复系统模块
 
 set -euo pipefail
@@ -93,33 +93,50 @@ ensure_system_python() {
     fi
 }
 
-# 检测当前Python链接状态
+# 检测当前Python链接状态 - 改进版本
 detect_python_status() {
     if ! ensure_system_python; then
         return 1
     fi
     
-    local link_status="正常" path_priority="正常"
+    local link_status="正常" path_priority="正常" is_hijacked=false
     
-    # 检查系统链接
+    # 检查系统链接是否被直接劫持
     if [[ -L /usr/bin/python3 ]]; then
         local python3_target
         python3_target=$(readlink /usr/bin/python3 2>/dev/null || echo "")
         if [[ -n "$python3_target" && "$python3_target" == *"mise"* ]]; then
             link_status="劫持"
+            is_hijacked=true
         fi
     fi
     
-    # 检查PATH优先级
-    local which_python
-    which_python=$(which python3 2>/dev/null || echo "")
-    if [[ -n "$which_python" && "$which_python" == *"mise"* ]]; then
-        path_priority="劫持"
+    # 检查PATH优先级 - 更智能的检测
+    local which_python_clean which_python_current
+    
+    # 使用干净的PATH检查系统优先级
+    which_python_clean=$(PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" which python3 2>/dev/null || echo "")
+    # 使用当前PATH检查
+    which_python_current=$(which python3 2>/dev/null || echo "")
+    
+    # 如果当前PATH和干净PATH指向不同位置，且当前指向mise，才认为被劫持
+    if [[ "$which_python_current" == *"mise"* ]] && [[ "$which_python_clean" != "$which_python_current" ]]; then
+        # 进一步检查：如果只是因为mise shell集成导致的，不算劫持
+        # 检查是否是通过mise activate产生的临时效果
+        if [[ -n "$MISE_SHELL" ]] || command -v mise >/dev/null && mise current python >/dev/null 2>&1; then
+            # 这是正常的mise集成，不是劫持
+            path_priority="mise集成"
+        else
+            # 这是真正的PATH劫持
+            path_priority="劫持"
+            is_hijacked=true
+        fi
     fi
     
-    echo "Python状态: 链接($link_status) PATH($path_priority)"
+    echo "Python状态: 链接($link_status) PATH($path_priority)" >&2
     
-    if [[ "$link_status" == "劫持" || "$path_priority" == "劫持" ]] && [[ ! "${1:-}" == "allow_global" ]]; then
+    # 只有在真正被劫持时才返回0（需要修复）
+    if $is_hijacked && [[ ! "${1:-}" == "allow_global" ]]; then
         return 0  # 需要修复
     else
         return 1  # 状态正常
@@ -329,7 +346,7 @@ get_top3_python_versions() {
     fi
 }
 
-# 让用户选择Python版本
+# 让用户选择Python版本 - 修正版本
 choose_python_version() {
     local versions=()
     local version_output=""
@@ -349,21 +366,23 @@ choose_python_version() {
     local latest_version=""
     latest_version=$("$MISE_PATH" latest python 2>/dev/null || echo "")
     
-    echo
-    echo "Python版本选择:"
+    # 所有菜单输出重定向到stderr，确保用户能看到
+    echo >&2
+    echo "Python版本选择:" >&2
     for i in "${!versions[@]}"; do
         local version="${versions[$i]}"
         local label=""
         [[ -n "$latest_version" && "$version" == "$latest_version" ]] && label=" (latest)"
-        echo "  $((i+1))) Python $version$label"
+        echo "  $((i+1))) Python $version$label" >&2
     done
-    echo "  4) 保持当前配置"
-    echo
+    echo "  4) 保持当前配置" >&2
+    echo >&2
     
     local choice=""
-    read -p "请选择 [1-4] (默认: 2): " choice
+    read -p "请选择 [1-4] (默认: 2): " choice >&2
     choice=${choice:-2}
     
+    # 只返回结果到stdout，不包含其他输出
     case "$choice" in
         1|2|3) 
             local idx=$((choice-1))
@@ -413,7 +432,7 @@ cleanup_old_python_versions() {
     fi
 }
 
-# 配置Python
+# 配置Python - 修正版本
 setup_python() {
     local current_version=""
     current_version=$("$MISE_PATH" current python 2>/dev/null || echo "")
@@ -422,6 +441,7 @@ setup_python() {
     local selected_version=""
     selected_version=$(choose_python_version)
     
+    # 修正：正确处理"current"选择
     if [[ "$selected_version" == "current" ]]; then
         echo "Python配置: 保持当前"
         return 0
@@ -431,6 +451,7 @@ setup_python() {
     if "$MISE_PATH" use -g "python@$selected_version" >/dev/null 2>&1; then
         echo "Python $selected_version: 安装成功"
         cleanup_old_python_versions "$selected_version"
+        return 0
     else
         log "✗ Python $selected_version 安装失败" "error"
         return 1
@@ -463,7 +484,7 @@ link_python_globally() {
 
 # === 使用方式配置函数 ===
 
-# 配置Python使用方式
+# 配置Python使用方式 - 改进版本
 setup_python_usage() {
     echo
     local needs_fix=1
@@ -477,8 +498,9 @@ setup_python_usage() {
     echo "  1) 项目级使用 (推荐) - 系统工具用系统Python，项目用mise"
     echo "  2) 全局替换 - ⚠️ mise成为系统默认，可能影响apt等工具"
     
+    # 只有在真正需要修复时才显示修复选项
     if [[ $needs_fix -eq 0 ]]; then
-        echo "  3) 修复系统配置 - 🔧 检测到被劫持，推荐立即修复"
+        echo "  3) 修复系统配置 - 🔧 检测到系统被劫持，推荐立即修复"
     fi
     echo
     
@@ -495,7 +517,10 @@ setup_python_usage() {
     case "$usage_choice" in
         1)
             echo "配置模式: 项目级使用"
-            fix_python_system_priority
+            # 如果检测到需要修复，先修复
+            if [[ $needs_fix -eq 0 ]]; then
+                fix_python_system_priority
+            fi
             echo
             echo "使用指南:"
             echo "  • 系统级: 自动使用系统Python"
@@ -527,7 +552,9 @@ setup_python_usage() {
             ;;
         *)
             echo "配置模式: 项目级使用"
-            fix_python_system_priority
+            if [[ $needs_fix -eq 0 ]]; then
+                fix_python_system_priority
+            fi
             ;;
     esac
 }
