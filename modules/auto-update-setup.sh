@@ -1,6 +1,6 @@
 #!/bin/bash
-# 自动更新系统配置模块 v4.2
-# 优化用户体验，统一交互风格，添加cron依赖检查
+# 自动更新系统配置模块 v4.3 - 简化版
+# 功能: 配置定时自动更新系统
 
 set -euo pipefail
 
@@ -21,56 +21,30 @@ log() {
 
 # 检查并安装cron
 ensure_cron_installed() {
-    log "检查cron服务..." "info"
-    
-    # 检查crontab命令是否存在
     if ! command -v crontab >/dev/null 2>&1; then
-        log "未检测到cron服务，正在安装..." "warn"
-        
-        # 更新包列表
-        if ! apt-get update >/dev/null 2>&1; then
-            log "✗ 无法更新软件包列表" "error"
-            return 1
-        fi
-        
-        # 安装cron
-        if apt-get install -y cron >/dev/null 2>&1; then
-            log "✓ cron安装成功" "info"
+        echo "安装cron服务..."
+        if apt-get update >/dev/null 2>&1 && apt-get install -y cron >/dev/null 2>&1; then
+            echo "cron服务: 安装成功"
         else
-            log "✗ cron安装失败" "error"
+            echo "cron服务: 安装失败"
             return 1
         fi
     else
-        log "✓ cron服务已安装" "info"
+        echo "cron服务: 已安装"
     fi
     
-    # 检查cron服务状态
-    if systemctl is-enabled cron >/dev/null 2>&1; then
-        log "✓ cron服务已启用" "info"
-    else
-        log "启用cron服务..." "info"
-        if systemctl enable cron >/dev/null 2>&1; then
-            log "✓ cron服务已启用" "info"
-        else
-            log "✗ 无法启用cron服务" "error"
-            return 1
-        fi
+    if ! systemctl is-active cron >/dev/null 2>&1; then
+        systemctl enable cron >/dev/null 2>&1 || true
+        systemctl start cron >/dev/null 2>&1 || true
     fi
     
-    # 检查cron服务运行状态
     if systemctl is-active cron >/dev/null 2>&1; then
-        log "✓ cron服务正在运行" "info"
+        echo "cron服务: 运行正常"
+        return 0
     else
-        log "启动cron服务..." "info"
-        if systemctl start cron >/dev/null 2>&1; then
-            log "✓ cron服务已启动" "info"
-        else
-            log "✗ 无法启动cron服务" "error"
-            return 1
-        fi
+        echo "cron服务: 启动失败"
+        return 1
     fi
-    
-    return 0
 }
 
 # === 核心函数 ===
@@ -104,56 +78,35 @@ add_cron_job() {
     fi
 }
 
-# 获取用户选择的cron时间（优化版）
+# 获取用户选择的cron时间
 get_cron_schedule() {
-    echo >&2
-    log "自动更新时间配置:" "info" >&2
-    log "  推荐使用默认时间（每周日凌晨2点），避开使用高峰" "info" >&2
-    echo >&2
-    
-    read -p "使用默认时间 (每周日凌晨2点) ? [Y/n] (默认: Y): " choice </dev/tty >&2
+    read -p "使用默认时间 (每周日凌晨2点)? [Y/n] (默认: Y): " choice
+    choice=${choice:-Y}
     
     if [[ "$choice" =~ ^[Nn]$ ]]; then
-        echo >&2
-        log "自定义Cron时间:" "info" >&2
-        log "  格式: 分 时 日 月 周" "info" >&2
-        log "  示例: 0 3 * * 1 (每周一凌晨3点)" "info" >&2
-        log "  示例: 30 1 1 * * (每月1号凌晨1点30分)" "info" >&2
-        echo >&2
+        echo "自定义时间格式: 分 时 日 月 周 (如: 0 3 * * 1)"
         
         while true; do
-            read -p "请输入Cron表达式: " custom_expr </dev/tty >&2
+            read -p "请输入Cron表达式: " custom_expr
             if [[ -n "$custom_expr" ]] && validate_cron_expression "$custom_expr"; then
-                log "✓ Cron表达式验证通过" "info" >&2
+                echo "Cron时间: 自定义 ($custom_expr)"
                 echo "$custom_expr"
                 return
             else
-                log "✗ 格式错误，请重新输入" "error" >&2
+                echo "格式错误，请重新输入"
             fi
         done
     else
-        log "✓ 使用默认时间配置" "info" >&2
+        echo "Cron时间: 每周日凌晨2点"
         echo "$DEFAULT_CRON"
-    fi
-}
-
-# 解释cron时间
-explain_cron_time() {
-    local cron_time="$1"
-    if [[ "$cron_time" == "$DEFAULT_CRON" ]]; then
-        echo "每周日凌晨2点"
-    else
-        echo "自定义时间: $cron_time"
     fi
 }
 
 # 创建自动更新脚本
 create_update_script() {
-    log "创建自动更新脚本..." "info"
-    
     cat > "$UPDATE_SCRIPT" << 'EOF'
 #!/bin/bash
-# 自动系统更新脚本 v4.2
+# 自动系统更新脚本 v4.3
 
 set -euo pipefail
 
@@ -213,19 +166,16 @@ main "$@"
 EOF
 
     chmod +x "$UPDATE_SCRIPT"
-    log "✓ 自动更新脚本创建完成" "info"
+    echo "更新脚本: 创建完成"
 }
 
-# 配置cron任务（优化版）
+# 配置cron任务
 setup_cron_job() {
-    log "配置定时任务..." "info"
-    
     if has_cron_job; then
-        echo
-        log "检测到现有的自动更新任务" "warn"
-        read -p "是否替换现有任务? [y/N] (默认: N): " -r replace
+        read -p "检测到现有任务，是否替换? [y/N] (默认: N): " -r replace
+        replace=${replace:-N}
         if [[ ! "$replace" =~ ^[Yy]$ ]]; then
-            log "保持现有任务不变" "info"
+            echo "定时任务: 保持现有"
             return 0
         fi
     fi
@@ -233,93 +183,74 @@ setup_cron_job() {
     local cron_expr=$(get_cron_schedule)
     
     if add_cron_job "$cron_expr"; then
-        log "✓ Cron任务配置成功" "info"
-        
-        echo
-        log "📋 任务配置详情:" "info"
-        log "  执行时间: $(explain_cron_time "$cron_expr")" "info"
-        log "  脚本路径: $UPDATE_SCRIPT" "info"
-        log "  日志文件: $UPDATE_LOG" "info"
-        
-        echo
-        log "当前cron任务:" "info"
-        crontab -l | grep -E "(Auto-update|$UPDATE_SCRIPT)" | sed 's/^/  /'
+        echo "定时任务: 配置成功"
     else
-        log "✗ Cron任务配置失败" "error"
+        echo "定时任务: 配置失败"
         return 1
     fi
 }
 
-# 测试更新脚本（优化版）
+# 测试更新脚本
 test_update_script() {
-    echo
-    log "自动更新脚本测试:" "info"
-    log "  可以测试脚本功能，但会执行真实的系统更新" "info"
-    echo
-    
     read -p "是否测试自动更新脚本? [y/N] (默认: N): " -r test_choice
+    test_choice=${test_choice:-N}
     
     if [[ "$test_choice" =~ ^[Yy]$ ]]; then
-        echo
-        log "⚠ 警告: 这将执行真实的系统更新操作!" "warn"
-        log "⚠ 可能会下载和安装软件包，并可能重启系统!" "warn"
-        echo
-        read -p "确认继续测试? [y/N] (默认: N): " -r confirm
+        echo "警告: 将执行真实的系统更新"
+        read -p "确认继续? [y/N] (默认: N): " -r confirm
+        confirm=${confirm:-N}
         
         if [[ "$confirm" =~ ^[Yy]$ ]]; then
-            log "开始测试自动更新脚本..." "info"
+            echo "开始测试更新脚本..."
             echo "========================================="
             "$UPDATE_SCRIPT"
             echo "========================================="
-            log "✓ 测试完成! 查看详细日志: $UPDATE_LOG" "info"
+            echo "测试完成，详细日志: $UPDATE_LOG"
         else
-            log "已取消测试" "info"
+            echo "已取消测试"
         fi
     else
-        log "跳过脚本测试" "info"
+        echo "跳过脚本测试"
     fi
 }
 
 # 显示自动更新配置摘要
 show_update_summary() {
     echo
-    log "🎯 自动更新配置摘要:" "info"
+    log "🎯 自动更新摘要:" "info"
     
-    # Cron任务状态
+    # 定时任务状态
     if has_cron_job; then
         local cron_line=$(crontab -l 2>/dev/null | grep "$UPDATE_SCRIPT" | head -1)
         local cron_time=$(echo "$cron_line" | awk '{print $1, $2, $3, $4, $5}')
-        log "  ✓ 定时任务: 已配置" "info"
-        log "  ⏰ 执行时间: $(explain_cron_time "$cron_time")" "info"
+        echo "  定时任务: 已配置"
+        if [[ "$cron_time" == "$DEFAULT_CRON" ]]; then
+            echo "  执行时间: 每周日凌晨2点"
+        else
+            echo "  执行时间: 自定义 ($cron_time)"
+        fi
     else
-        log "  ✗ 定时任务: 未配置" "warn"
+        echo "  定时任务: 未配置"
     fi
     
-    # 脚本状态
+    # 脚本和服务状态
     if [[ -x "$UPDATE_SCRIPT" ]]; then
-        log "  ✓ 更新脚本: 已创建" "info"
-        log "  📄 脚本路径: $UPDATE_SCRIPT" "info"
+        echo "  更新脚本: 已创建"
     else
-        log "  ✗ 更新脚本: 未找到" "warn"
+        echo "  更新脚本: 未找到"
     fi
     
-    # 日志文件状态
-    if [[ -f "$UPDATE_LOG" ]]; then
-        local log_size=$(du -h "$UPDATE_LOG" 2>/dev/null | awk '{print $1}' || echo "0")
-        log "  📊 日志文件: 存在 ($log_size)" "info"
-    else
-        log "  📊 日志文件: 不存在" "info"
-    fi
-    
-    # 系统信息
-    local last_update=$(stat -c %y /var/lib/apt/lists 2>/dev/null | cut -d' ' -f1 || echo "未知")
-    log "  🔄 上次apt更新: $last_update" "info"
-    
-    # Cron服务状态
     if systemctl is-active cron >/dev/null 2>&1; then
-        log "  ✓ Cron服务: 运行中" "info"
+        echo "  Cron服务: 运行中"
     else
-        log "  ✗ Cron服务: 未运行" "warn"
+        echo "  Cron服务: 未运行"
+    fi
+    
+    # 日志状态
+    if [[ -f "$UPDATE_LOG" ]]; then
+        echo "  更新日志: 存在"
+    else
+        echo "  更新日志: 待生成"
     fi
 }
 
@@ -328,16 +259,11 @@ main() {
     log "🔄 配置自动更新系统..." "info"
     
     echo
-    log "自动更新功能说明:" "info"
-    log "  • 自动更新系统软件包和安全补丁" "info"
-    log "  • 检测内核更新并智能重启" "info"
-    log "  • 清理无用的软件包和缓存" "info"
-    log "  • 记录详细的更新日志" "info"
+    echo "功能: 定时自动更新系统软件包和安全补丁"
     
     echo
-    # 首先确保cron已安装并运行
     if ! ensure_cron_installed; then
-        log "✗ cron服务配置失败，无法继续" "error"
+        log "✗ cron服务配置失败" "error"
         return 1
     fi
     
@@ -347,22 +273,20 @@ main() {
     echo
     setup_cron_job
     
+    echo
     test_update_script
     
     show_update_summary
     
     echo
-    log "🎉 自动更新系统配置完成!" "info"
+    log "✅ 自动更新系统配置完成!" "info"
     
-    # 显示常用命令
     echo
     log "常用命令:" "info"
-    log "  手动执行更新: $UPDATE_SCRIPT" "info"
-    log "  查看更新日志: tail -f $UPDATE_LOG" "info"
-    log "  查看cron任务: crontab -l" "info"
-    log "  编辑cron任务: crontab -e" "info"
-    log "  删除自动更新: crontab -l | grep -v '$UPDATE_SCRIPT' | crontab -" "info"
-    log "  查看cron服务状态: systemctl status cron" "info"
+    echo "  手动执行: $UPDATE_SCRIPT"
+    echo "  查看日志: tail -f $UPDATE_LOG"
+    echo "  管理任务: crontab -l"
+    echo "  删除任务: crontab -l | grep -v '$UPDATE_SCRIPT' | crontab -"
 }
 
 main "$@"
