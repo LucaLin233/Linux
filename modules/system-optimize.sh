@@ -1,22 +1,12 @@
 #!/bin/bash
-# 系统优化模块 v4.3 - 新增 Chrony 时间同步
+# 系统优化模块 v4.4 - 简化版
 # 功能: Zram配置、时区设置、时间同步
-# 统一代码风格，简化交互逻辑
 
 set -euo pipefail
 
 # === 常量定义 ===
 readonly ZRAM_CONFIG="/etc/default/zramswap"
 readonly DEFAULT_TIMEZONE="Asia/Shanghai"
-
-# 时区选项数组
-readonly TIMEZONES=(
-    "Asia/Shanghai:中国标准时间"
-    "UTC:协调世界时"
-    "Asia/Tokyo:日本时间"
-    "Europe/London:伦敦时间"
-    "America/New_York:纽约时间"
-)
 
 # === 日志函数 ===
 log() {
@@ -26,455 +16,188 @@ log() {
 }
 
 # === 辅助函数 ===
-
-# 将各种大小格式转换为MB (修复版)
 convert_to_mb() {
     local size="$1"
-    
-    # 移除所有空格
     size=$(echo "$size" | tr -d ' ')
     
-    case "${size^^}" in  # 转大写处理
+    case "${size^^}" in
         *G|*GB)
-            # 提取数值部分，支持小数
             local value=$(echo "$size" | sed 's/[^0-9.]//g')
-            # 使用awk处理小数运算，更可靠
             echo "$value * 1024" | awk '{printf "%.0f", $1 * $3}'
             ;;
         *M|*MB)
-            # 提取数值部分
             local value=$(echo "$size" | sed 's/[^0-9.]//g')
-            # 转换为整数
             echo "$value" | awk '{printf "%.0f", $1}'
             ;;
         *K|*KB)
             local value=$(echo "$size" | sed 's/[^0-9.]//g')
             echo "$value / 1024" | awk '{printf "%.0f", $1 / $3}'
             ;;
-        *B)
+        *)
             local value=$(echo "$size" | sed 's/[^0-9.]//g')
             echo "$value / 1024 / 1024" | awk '{printf "%.0f", $1 / $3 / $5}'
-            ;;
-        *)
-            # 纯数字，假设为字节
-            echo "$size / 1024 / 1024" | awk '{printf "%.0f", $1 / $3 / $5}'
             ;;
     esac
 }
 
-# === 核心函数 ===
-
-# 计算Zram大小 (改进版)
+# 计算Zram大小 - 更保守的配置
 calculate_zram_size() {
     local mem_mb="$1"
     
-    if (( mem_mb < 1024 )); then     # <1GB: 2倍内存
-        echo "$((mem_mb * 2))M"
-    elif (( mem_mb < 2048 )); then   # 1-2GB: 1.5倍内存
+    if (( mem_mb < 1024 )); then     # <1GB: 1.5倍
         echo "$((mem_mb * 3 / 2))M"
-    elif (( mem_mb < 8192 )); then   # 2-8GB: 等于内存
+    elif (( mem_mb < 2048 )); then   # 1-2GB: 1倍
         echo "${mem_mb}M"
-    else                             # >8GB: 固定4-8GB
-        if (( mem_mb > 16384 )); then
-            echo "8G"  # 大于16GB时用8GB
-        else
-            echo "4G"  # 8-16GB时用4GB
-        fi
+    elif (( mem_mb < 8192 )); then   # 2-8GB: 0.5倍
+        echo "$((mem_mb / 2))M"
+    else                             # >8GB: 固定2GB
+        echo "2G"
     fi
 }
 
-# 配置Zram (修复交换分区显示和数值转换问题)
+# 配置Zram - 简化版
 setup_zram() {
-    log "配置 Zram Swap..." "info"
-    
-    # 获取内存信息并计算目标Zram大小
     local mem_mb=$(awk '/MemTotal/ {print int($2/1024)}' /proc/meminfo)
     local target_zram_size=$(calculate_zram_size "$mem_mb")
     
-    log "内存: ${mem_mb}MB, 目标Zram大小: $target_zram_size" "info"
-    
-    # 显示所有现有交换分区状态
-    local all_swap=$(swapon --show | tail -n +2)  # 去掉表头
-    if [[ -n "$all_swap" ]]; then
-        echo
-        log "当前交换状态:" "info"
-        swapon --show | sed 's/^/    /'
-        echo
-    fi
-    
-    # 检查非zram交换分区并警告
-    local non_zram_swap=$(swapon --show | grep -v zram | tail -n +2)
-    if [[ -n "$non_zram_swap" ]]; then
-        log "⚠️  检测到传统交换分区，建议关闭以避免冲突" "warn"
-        read -p "继续配置Zram? [Y/n] (默认: Y): " -r continue_zram </dev/tty >&2
-        [[ "$continue_zram" =~ ^[Nn]$ ]] && return 0
-    fi
-    
-    # 检查现有zram并决定是否重新配置
+    # 检查现有zram
     local current_zram_info=$(swapon --show | grep zram | head -1)
     if [[ -n "$current_zram_info" ]]; then
         local current_size=$(echo "$current_zram_info" | awk '{print $3}')
-        log "检测到现有zram: $current_size" "info"
         
-        # 转换目标大小为MB（整数）
+        # 转换并比较大小
         local target_mb
         case "$target_zram_size" in
             *G) target_mb=$((${target_zram_size%G} * 1024)) ;;
             *M) target_mb=${target_zram_size%M} ;;
         esac
         
-        # 使用修复后的转换函数
         local current_mb=$(convert_to_mb "$current_size")
-        
-        log "当前大小: ${current_mb}MB, 目标大小: ${target_mb}MB" "info"
-        
-        # 简单的差异检查（允许5%误差，更严格一些）
-        local min_acceptable=$((target_mb * 95 / 100))
-        local max_acceptable=$((target_mb * 105 / 100))
+        local min_acceptable=$((target_mb * 90 / 100))
+        local max_acceptable=$((target_mb * 110 / 100))
         
         if (( current_mb >= min_acceptable && current_mb <= max_acceptable )); then
-            log "✓ Zram大小合适 (${current_mb}MB ≈ ${target_mb}MB)，跳过配置" "info"
+            echo "Zram: $current_size (无需调整)"
             return 0
-        else
-            log "当前${current_mb}MB与目标${target_mb}MB差异较大，重新配置..." "info"
-            systemctl stop zramswap.service 2>/dev/null || true
         fi
+        
+        systemctl stop zramswap.service 2>/dev/null || true
     fi
     
-    # 安装zram-tools
+    # 安装并配置zram
     if ! dpkg -l zram-tools &>/dev/null; then
-        log "安装 zram-tools..." "info"
-        apt-get update -qq
-        apt-get install -y zram-tools
+        apt-get update -qq && apt-get install -y zram-tools >/dev/null
     fi
     
-    # 配置zram大小
+    # 配置大小
+    local size_mib
+    case "$target_zram_size" in
+        *G) size_mib=$((${target_zram_size%G} * 1024)) ;;
+        *M) size_mib=${target_zram_size%M} ;;
+    esac
+    
     if [[ -f "$ZRAM_CONFIG" ]]; then
-        # 备份并更新配置
         cp "$ZRAM_CONFIG" "${ZRAM_CONFIG}.bak"
-        
-        # 转换大小格式: 3921M -> 3921, 4G -> 4096
-        local size_mib
-        case "$target_zram_size" in
-            *G) size_mib=$((${target_zram_size%G} * 1024)) ;;
-            *M) size_mib=${target_zram_size%M} ;;
-            *) size_mib=$target_zram_size ;;
-        esac
-        
-        # 更新或添加SIZE参数
         if grep -q "^SIZE=" "$ZRAM_CONFIG"; then
             sed -i "s/^SIZE=.*/SIZE=$size_mib/" "$ZRAM_CONFIG"
-        elif grep -q "^#SIZE=" "$ZRAM_CONFIG"; then
-            sed -i "s/^#SIZE=.*/SIZE=$size_mib/" "$ZRAM_CONFIG"
         else
             echo "SIZE=$size_mib" >> "$ZRAM_CONFIG"
         fi
-        
-        # 清理错误参数
-        sed -i '/^ZRAM_SIZE=/d' "$ZRAM_CONFIG"
-        sed -i 's/^PERCENT=/#PERCENT=/' "$ZRAM_CONFIG"
-        
     else
-        # 创建新配置文件
-        local size_mib
-        case "$target_zram_size" in
-            *G) size_mib=$((${target_zram_size%G} * 1024)) ;;
-            *M) size_mib=${target_zram_size%M} ;;
-            *) size_mib=$target_zram_size ;;
-        esac
         echo "SIZE=$size_mib" > "$ZRAM_CONFIG"
     fi
     
-    # 启用并启动服务
-    systemctl enable zramswap.service
+    systemctl enable zramswap.service >/dev/null
     systemctl start zramswap.service
     
-    # 验证配置
-    if systemctl is-active zramswap.service &>/dev/null; then
-        sleep 2
-        if swapon --show | grep -q zram0; then
-            local actual_size=$(swapon --show | grep zram0 | awk '{print $3}')
-            log "✓ Zram配置成功，实际大小: $actual_size" "info"
-            echo
-            log "最终交换状态:" "info"
-            swapon --show | sed 's/^/    /'
-        else
-            log "✗ Zram启动成功但交换设备未激活" "warn"
-        fi
+    sleep 2
+    if swapon --show | grep -q zram0; then
+        local actual_size=$(swapon --show | grep zram0 | awk '{print $3}')
+        echo "Zram: $actual_size (已配置)"
     else
-        log "✗ Zram配置失败" "error"
+        log "Zram配置失败" "error"
         return 1
     fi
 }
 
-# 显示时区选项
-show_timezone_options() {
-    echo >&2
-    echo "常用时区选择:" >&2
-    
-    for i in "${!TIMEZONES[@]}"; do
-        local tz_info="${TIMEZONES[$i]}"
-        local tz_name="${tz_info%%:*}"
-        local tz_desc="${tz_info##*:}"
-        echo "  $((i+1))) $tz_name ($tz_desc)" >&2
-    done
-    
-    echo "  6) 自定义时区" >&2
-    echo "  7) 保持当前时区" >&2
-    echo >&2
-}
-
-# 配置时区
+# 配置时区 - 简化版
 setup_timezone() {
-    log "配置系统时区..." "info"
+    local current_tz=$(timedatectl show --property=Timezone --value 2>/dev/null)
     
-    if ! command -v timedatectl &>/dev/null; then
-        log "timedatectl 不可用，跳过时区配置" "warn"
-        return 0
-    fi
-    
-    # 获取当前时区
-    local current_tz=$(timedatectl show --property=Timezone --value)
-    log "当前时区: $current_tz" "info"
-    
-    # 显示选项
-    show_timezone_options
-    
-    local choice target_tz
-    read -p "请选择时区 [1-7] (默认: 1): " choice </dev/tty >&2
+    # 直接提示，不显示选项菜单
+    read -p "时区设置 [1=上海 2=UTC 3=东京 4=伦敦 5=纽约 6=自定义 7=保持] (默认1): " choice </dev/tty >&2
     choice=${choice:-1}
     
-    if [[ "$choice" =~ ^[1-5]$ ]]; then
-        # 选择预设时区
-        local tz_info="${TIMEZONES[$((choice-1))]}"
-        target_tz="${tz_info%%:*}"
-    elif [[ "$choice" == "6" ]]; then
-        # 自定义时区
-        while true; do
-            read -p "请输入时区 (如: Asia/Shanghai): " target_tz </dev/tty >&2
-            if timedatectl list-timezones | grep -q "^$target_tz$"; then
-                break
-            else
-                log "无效时区，请重新输入" "error" >&2
+    local target_tz
+    case "$choice" in
+        1) target_tz="Asia/Shanghai" ;;
+        2) target_tz="UTC" ;;
+        3) target_tz="Asia/Tokyo" ;;
+        4) target_tz="Europe/London" ;;
+        5) target_tz="America/New_York" ;;
+        6) 
+            read -p "输入时区 (如: Asia/Shanghai): " target_tz </dev/tty >&2
+            if ! timedatectl list-timezones | grep -q "^$target_tz$"; then
+                log "无效时区，使用默认" "warn"
+                target_tz="$DEFAULT_TIMEZONE"
             fi
-        done
-    elif [[ "$choice" == "7" ]]; then
-        # 保持当前时区
-        log "保持当前时区: $current_tz" "info"
-        return 0
-    else
-        # 无效选择，使用默认
-        log "无效选择，使用默认时区: $DEFAULT_TIMEZONE" "warn"
-        target_tz="$DEFAULT_TIMEZONE"
-    fi
+            ;;
+        7) 
+            echo "时区: $current_tz (保持不变)"
+            return 0
+            ;;
+        *) 
+            target_tz="$DEFAULT_TIMEZONE"
+            ;;
+    esac
     
-    # 设置时区
     if [[ "$current_tz" != "$target_tz" ]]; then
         timedatectl set-timezone "$target_tz"
-        log "✓ 时区已设置为: $target_tz" "info"
-        log "  当前时间: $(date)" "info"
-    else
-        log "时区无需更改" "info"
     fi
+    
+    echo "时区: $target_tz"
 }
 
-# 配置 Chrony 时间同步
+# 配置Chrony - 简化版
 setup_chrony() {
-    log "配置 Chrony 时间同步..." "info"
-    
-    # 更准确的检测：同时检查命令和服务
+    # 快速检查是否已配置
     if command -v chronyd &>/dev/null && systemctl is-active chrony &>/dev/null 2>&1; then
-        local sync_status=$(chronyc tracking 2>/dev/null | grep "System clock synchronized" | awk '{print $4}' || echo "Unknown")
+        local sync_status=$(chronyc tracking 2>/dev/null | grep "System clock synchronized" | awk '{print $4}' 2>/dev/null || echo "no")
         if [[ "$sync_status" == "yes" ]]; then
-            log "✓ Chrony 已安装且正常工作，跳过配置" "info"
+            echo "时间同步: Chrony (已同步)"
             return 0
         fi
     fi
     
-    # 检查现有时间同步服务
-    local conflicting_services=()
-    if systemctl is-active systemd-timesyncd &>/dev/null; then
-        conflicting_services+=("systemd-timesyncd")
-    fi
-    if command -v ntpd &>/dev/null && systemctl is-active ntp &>/dev/null; then
-        conflicting_services+=("ntp")
-    fi
-    
-    if (( ${#conflicting_services[@]} > 0 )); then
-        log "检测到现有时间同步服务: ${conflicting_services[*]}" "warn"
-        read -p "安装 Chrony 将停用这些服务，继续? [Y/n] (默认: Y): " -r continue_chrony </dev/tty >&2
-        [[ "$continue_chrony" =~ ^[Nn]$ ]] && return 0
-    fi
-    
-    # 强制安装/重新配置 chrony
-    log "安装 Chrony..." "info"
-    
-    # 检查是否真正可用
-    if ! command -v chronyd &>/dev/null; then
-        log "Chrony 未正确安装，开始安装..." "info"
-        
-        # 尝试安装，即使网络有问题也继续
-        if apt-get install -y chrony 2>/dev/null; then
-            log "✓ Chrony 安装成功" "info"
-        else
-            log "⚠️  apt安装失败，检查是否已有安装包..." "warn"
-            
-            # 检查包状态
-            local package_status=$(dpkg -l chrony 2>/dev/null | tail -1 | awk '{print $1}' || echo "none")
-            
-            case "$package_status" in
-                "ii")
-                    log "Chrony 包已安装，尝试重新配置..." "info"
-                    dpkg-reconfigure -f noninteractive chrony 2>/dev/null || true
-                    ;;
-                "iU"|"iF")
-                    log "Chrony 包未配置，尝试配置..." "info"
-                    dpkg --configure chrony 2>/dev/null || true
-                    ;;
-                *)
-                    log "✗ Chrony 安装失败，可能是网络问题" "error"
-                    return 1
-                    ;;
-            esac
-        fi
-    else
-        log "Chrony 二进制文件已存在" "info"
-    fi
-    
-    # 再次检查是否安装成功
-    if ! command -v chronyd &>/dev/null; then
-        log "✗ Chrony 安装验证失败" "error"
-        return 1
-    fi
-    
     # 停用冲突服务
-    for service in "${conflicting_services[@]}"; do
-        log "停用服务: $service" "info"
-        systemctl stop "$service" 2>/dev/null || true
-        systemctl disable "$service" 2>/dev/null || true
-    done
+    systemctl stop systemd-timesyncd 2>/dev/null || true
+    systemctl disable systemd-timesyncd 2>/dev/null || true
     
-    # 确保 chrony 服务文件存在
-    if [[ ! -f "/lib/systemd/system/chrony.service" ]] && [[ ! -f "/etc/systemd/system/chrony.service" ]]; then
-        log "✗ Chrony 服务文件不存在" "error"
-        log "尝试重新生成systemd服务..." "info"
-        systemctl daemon-reload
-    fi
-    
-    # 启用并启动 chrony
-    log "启用 Chrony 服务..." "info"
-    
-    # 先尝试启用
-    if systemctl enable chrony 2>/dev/null; then
-        log "✓ Chrony 服务已启用" "info"
-    else
-        log "⚠️  enable 失败，但继续尝试启动" "warn"
-    fi
-    
-    # 再尝试启动
-    if systemctl start chrony 2>/dev/null; then
-        log "✓ Chrony 服务已启动" "info"
-    else
-        log "启动失败，检查服务状态..." "warn"
-        
-        # 诊断信息
-        local service_status=$(systemctl is-failed chrony 2>/dev/null || echo "unknown")
-        log "服务状态: $service_status" "info"
-        
-        # 查看错误日志
-        local error_log=$(systemctl status chrony 2>/dev/null | tail -5 | grep -E "(failed|error|Error)" || echo "")
-        if [[ -n "$error_log" ]]; then
-            log "错误信息: $error_log" "error"
-        fi
-        
-        # 尝试重新加载并启动
-        log "尝试重新加载systemd并启动..." "info"
-        systemctl daemon-reload
-        sleep 2
-        
-        if systemctl start chrony 2>/dev/null; then
-            log "✓ 重新启动成功" "info"
-        else
-            log "✗ Chrony 服务启动失败" "error"
+    # 安装chrony
+    if ! command -v chronyd &>/dev/null; then
+        if ! apt-get install -y chrony >/dev/null 2>&1; then
+            log "Chrony安装失败" "error"
             return 1
         fi
     fi
     
-    # 等待服务稳定
-    sleep 3
+    # 启动服务
+    systemctl enable chrony >/dev/null 2>&1 || true
+    systemctl start chrony >/dev/null 2>&1 || true
     
-    # 最终验证
+    sleep 2
     if systemctl is-active chrony &>/dev/null; then
-        log "✓ Chrony 服务运行正常" "info"
-        
-        # 简单检查同步状态
-        if chronyc tracking &>/dev/null 2>&1; then
-            local sources_count=$(chronyc sources 2>/dev/null | grep -c "^\^" || echo "0")
-            log "✓ Chrony 配置成功，时间源: $sources_count 个" "info"
-        else
-            log "⚠️  Chrony 已启动，同步状态检查中..." "info"
-        fi
+        local sources_count=$(chronyc sources 2>/dev/null | grep -c "^\^" || echo "0")
+        echo "时间同步: Chrony (${sources_count}个时间源)"
     else
-        log "✗ Chrony 服务最终验证失败" "error"
+        log "Chrony启动失败" "error"
         return 1
-    fi
-}
-
-# 显示系统信息
-show_system_info() {
-    local mem_mb=$(awk '/MemTotal/ {print int($2/1024)}' /proc/meminfo)
-    
-    log "系统信息:" "info"
-    log "  内存: ${mem_mb}MB" "info" 
-    log "  CPU核心: $(nproc)" "info"
-    log "  内核: $(uname -r)" "info"
-}
-
-# 显示优化摘要
-show_optimization_summary() {
-    echo
-    log "🎯 系统优化摘要:" "info"
-    
-    # Zram状态
-    if systemctl is-active zramswap.service &>/dev/null; then
-        local zram_info=$(swapon --show | grep zram | awk '{print $3}' | head -1)
-        log "  ✓ Zram: ${zram_info:-已启用}" "info"
-    else
-        log "  ✗ Zram: 未配置" "info"
-    fi
-    
-    # 时区状态
-    local current_tz=$(timedatectl show --property=Timezone --value 2>/dev/null || echo "未知")
-    log "  ✓ 时区: $current_tz" "info"
-    
-    # Chrony 状态
-    if systemctl is-active chrony &>/dev/null; then  # 👈 改这里：chronyd → chrony
-        local sync_status=$(timedatectl show --property=NTPSynchronized --value 2>/dev/null || echo "unknown")
-        if [[ "$sync_status" == "yes" ]]; then
-            log "  ✓ 时间同步: Chrony (已同步)" "info"
-        else
-            log "  ⏳ 时间同步: Chrony (同步中...)" "info"
-        fi
-    else
-        log "  ✗ 时间同步: 未配置" "info"
-    fi
-    
-    # 内存和交换使用情况
-    local mem_usage=$(free -h | awk '/^Mem:/ {printf "使用:%s/%s", $3, $2}')
-    log "  📊 内存: $mem_usage" "info"
-    
-    local swap_usage=$(free -h | awk '/^Swap:/ {printf "使用:%s/%s", $3, $2}')
-    if [[ "$swap_usage" != "使用:0B/0B" ]]; then
-        log "  💾 交换: $swap_usage" "info"
     fi
 }
 
 # === 主流程 ===
 main() {
-    log "🔧 开始系统优化配置..." "info"
-    
-    echo
-    show_system_info
+    log "🔧 系统优化配置..." "info"
     
     echo
     setup_zram
@@ -482,13 +205,11 @@ main() {
     echo
     setup_timezone
     
-    echo
+    echo  
     setup_chrony
     
-    show_optimization_summary
-    
     echo
-    log "🎉 系统优化配置完成!" "info"
+    log "✅ 优化完成" "info"
 }
 
 main "$@"
