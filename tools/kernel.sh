@@ -197,35 +197,80 @@ apply_params() {
         fi
     done
     
-    # 智能清理 - 删除旧配置和重复参数
+    # 彻底清理方案：保留非脚本管理的参数
+    local temp_preserve=$(mktemp)
     local temp_config=$(mktemp)
     
-    # 清理旧的配置块
-    sed '/^# Network Optimizer/,/^# Network Optimizer.*结束/d' "$SYSCTL_CONFIG" > "$temp_config" || \
-    cp "$SYSCTL_CONFIG" "$temp_config"
+    # 1. 提取要保留的参数（非脚本管理的参数）
+    while IFS= read -r line; do
+        # 跳过注释、空行和脚本标记
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+        [[ "$line" =~ ^[[:space:]]*$ ]] && continue
+        
+        # 检查是否为参数行
+        if [[ "$line" =~ ^[[:space:]]*([^[:space:]#=]+)[[:space:]]*= ]]; then
+            local param_name="${BASH_REMATCH[1]}"
+            
+            # 检查是否是我们要管理的参数
+            local is_our_param=false
+            for our_param in "${!supported_params[@]}"; do
+                if [[ "$param_name" == "$our_param" ]]; then
+                    is_our_param=true
+                    break
+                fi
+            done
+            
+            # 如果不是我们管理的参数，保留它
+            if [[ "$is_our_param" == "false" ]]; then
+                echo "$line" >> "$temp_preserve"
+            fi
+        fi
+    done < "$SYSCTL_CONFIG"
     
-    # 清理要设置的参数 (避免重复)
-    for param in "${!supported_params[@]}"; do
-        local escaped_param=$(printf '%s\n' "$param" | sed 's/[[\.*^$()+?{|]/\\&/g')
-        sed -i "/^[[:space:]]*${escaped_param}[[:space:]]*=/d" "$temp_config"
-    done
+    # 2. 重新构建干净的配置文件
     
-    # 写入新配置
+    # 先写入保留的参数（如果有）
+    if [[ -s "$temp_preserve" ]]; then
+        echo "# 系统原有配置" > "$temp_config"
+        cat "$temp_preserve" >> "$temp_config"
+        echo "" >> "$temp_config"
+    else
+        touch "$temp_config"
+    fi
+    
+    # 写入脚本配置
     cat >> "$temp_config" << EOF
-
 # Network Optimizer v${VERSION} - 网络性能优化
 # 生成时间: $(date "+%Y-%m-%d %H:%M:%S")
 
 EOF
     
-    # 按类别写入参数
-    for param in $(printf '%s\n' "${!supported_params[@]}" | sort); do
-        echo "${param} = ${supported_params[$param]}" >> "$temp_config"
-    done
+    # 按类别写入参数（保持整洁）
+    write_section() {
+        local pattern="$1" title="$2"
+        local params=($(printf '%s\n' "${!supported_params[@]}" | grep -E "$pattern" | sort))
+        
+        if [[ ${#params[@]} -gt 0 ]]; then
+            echo "# $title" >> "$temp_config"
+            for param in "${params[@]}"; do
+                echo "${param} = ${supported_params[$param]}" >> "$temp_config"
+            done
+            echo "" >> "$temp_config"
+        fi
+    }
+    
+    write_section "^fs\." "文件系统"
+    write_section "^net\.core\." "网络核心"
+    write_section "^net\.ipv4\.tcp" "TCP参数"
+    write_section "^net\.ipv4\.udp" "UDP参数"
+    write_section "^net\.ipv4\.(ip_forward|conf)" "路由转发"
+    write_section "^net\.mptcp\." "MPTCP"
     
     echo "# Network Optimizer 配置结束" >> "$temp_config"
     
+    # 3. 应用新配置
     mv "$temp_config" "$SYSCTL_CONFIG"
+    rm -f "$temp_preserve"
     
     sysctl -p >/dev/null 2>&1 && success "参数应用成功: $supported/${#NET_PARAMS[@]}" || warn "部分参数未生效"
 }
