@@ -1,7 +1,7 @@
 #!/bin/bash
 
 #=============================================================================
-# Debian 系统部署脚本 v3.2.0
+# Debian 系统部署脚本 v3.3.0
 # 适用系统: Debian 12+, 作者: LucaLin233
 # 功能: 模块化部署，智能依赖处理
 #=============================================================================
@@ -9,18 +9,19 @@
 set -euo pipefail
 
 #--- 全局常量 ---
-readonly SCRIPT_VERSION="3.2.0"
+readonly SCRIPT_VERSION="3.3.0"
 readonly MODULE_BASE_URL="https://raw.githubusercontent.com/LucaLin233/Linux/refs/heads/main/modules"
 readonly TEMP_DIR="/tmp/debian-setup-modules"
 readonly LOG_FILE="/var/log/debian-setup.log"
 readonly SUMMARY_FILE="/root/deployment_summary.txt"
 
-#--- 模块定义 (移除network-optimize) ---
+#--- 模块定义 (新增tools-setup) ---
 declare -A MODULES=(
     ["system-optimize"]="系统优化 (Zram, 时区, 时间同步)"
     ["zsh-setup"]="Zsh Shell 环境"
     ["mise-setup"]="Mise 版本管理器"
     ["docker-setup"]="Docker 容器化平台"
+    ["tools-setup"]="系统工具 (NextTrace, SpeedTest等)"
     ["ssh-security"]="SSH 安全配置"
     ["auto-update-setup"]="自动更新系统"
 )
@@ -171,7 +172,7 @@ select_deployment_mode() {
     echo
     print_line
     echo "部署模式选择："
-    echo "1) 🚀 全部安装 (安装所有6个模块)"
+    echo "1) 🚀 全部安装 (安装所有7个模块)"
     echo "2) 🎯 自定义选择 (按需选择模块)"
     echo
     
@@ -179,7 +180,7 @@ select_deployment_mode() {
     
     case "$mode_choice" in
         1)
-            SELECTED_MODULES=(system-optimize zsh-setup mise-setup docker-setup ssh-security auto-update-setup)
+            SELECTED_MODULES=(system-optimize zsh-setup mise-setup docker-setup tools-setup ssh-security auto-update-setup)
             log "选择: 全部安装"
             ;;
         2)
@@ -187,7 +188,7 @@ select_deployment_mode() {
             ;;
         *)
             log "无效选择，使用全部安装" "warn"
-            SELECTED_MODULES=(system-optimize zsh-setup mise-setup docker-setup ssh-security auto-update-setup)
+            SELECTED_MODULES=(system-optimize zsh-setup mise-setup docker-setup tools-setup ssh-security auto-update-setup)
             ;;
     esac
 }
@@ -197,12 +198,13 @@ custom_module_selection() {
     echo
     echo "可用模块："
     
-    local module_list=(system-optimize zsh-setup mise-setup docker-setup ssh-security auto-update-setup)
+    local module_list=(system-optimize zsh-setup mise-setup docker-setup tools-setup ssh-security auto-update-setup)
     local module_descriptions=(
         "系统优化 (Zram, 时区设置)"
         "Zsh Shell 环境"
         "Mise 版本管理器"
         "Docker 容器化平台"
+        "系统工具 (NextTrace等)"
         "SSH 安全配置"
         "自动更新系统"
     )
@@ -218,7 +220,7 @@ custom_module_selection() {
     
     local selected=()
     for num in $selection; do
-        if [[ "$num" =~ ^[1-6]$ ]]; then
+        if [[ "$num" =~ ^[1-7]$ ]]; then
             local index=$((num - 1))
             selected+=("${module_list[$index]}")
         else
@@ -277,7 +279,7 @@ resolve_dependencies() {
     fi
     
     # 按依赖顺序排序
-    local all_modules=(system-optimize zsh-setup mise-setup docker-setup ssh-security auto-update-setup)
+    local all_modules=(system-optimize zsh-setup mise-setup docker-setup tools-setup ssh-security auto-update-setup)
     for module in "${all_modules[@]}"; do
         if [[ " ${selected[*]} " =~ " $module " ]]; then
             final_list+=("$module")
@@ -399,6 +401,20 @@ get_system_status() {
         status_lines+=("📦 Mise: v$mise_version")
     else
         status_lines+=("📦 Mise: 未安装")
+    fi
+    
+    # 系统工具状态
+    local tools_status=()
+    command -v nexttrace &>/dev/null && tools_status+=("NextTrace")
+    command -v speedtest &>/dev/null && tools_status+=("SpeedTest")
+    command -v htop &>/dev/null && tools_status+=("htop")
+    command -v tree &>/dev/null && tools_status+=("tree")
+    command -v jq &>/dev/null && tools_status+=("jq")
+    
+    if (( ${#tools_status[@]} > 0 )); then
+        status_lines+=("🛠️ 工具: ${tools_status[*]}")
+    else
+        status_lines+=("🛠️ 工具: 未安装")
     fi
     
     # SSH 配置
@@ -554,7 +570,7 @@ Debian 系统部署脚本 v$SCRIPT_VERSION
   --version, -v     显示版本信息
 
 功能模块: 
-  system-optimize, zsh-setup, mise-setup, docker-setup, ssh-security, auto-update-setup
+  system-optimize, zsh-setup, mise-setup, docker-setup, tools-setup, ssh-security, auto-update-setup
 
 文件位置:
   日志: $LOG_FILE
