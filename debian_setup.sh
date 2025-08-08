@@ -339,35 +339,87 @@ execute_module() {
 }
 
 #--- 获取系统状态 ---
+#--- 改进的系统状态获取 ---
 get_system_status() {
+    local status_lines=()
+    
+    # 基础系统信息
     local cpu_cores
     cpu_cores=$(nproc 2>/dev/null || echo "未知")
     local mem_info
     mem_info=$(free -h 2>/dev/null | grep Mem | awk '{print $3"/"$2}' || echo "未知")
     local disk_usage
     disk_usage=$(df -h / 2>/dev/null | awk 'NR==2 {print $5}' || echo "未知")
+    local uptime_info
+    uptime_info=$(uptime -p 2>/dev/null || echo "未知")
+    local kernel
+    kernel=$(uname -r 2>/dev/null || echo "未知")
     
-    echo "CPU: ${cpu_cores}核心, 内存: $mem_info, 磁盘: $disk_usage"
+    status_lines+=("💻 CPU: ${cpu_cores}核心 | 内存: $mem_info | 磁盘: $disk_usage")
+    status_lines+=("⏰ 运行时间: $uptime_info")
+    status_lines+=("🔧 内核: $kernel")
     
-    # 检查关键服务状态
+    # Zsh 状态和版本
     if command -v zsh &>/dev/null; then
-        local zsh_default=""
-        [[ "$(getent passwd root | cut -d: -f7)" == "$(which zsh)" ]] && zsh_default=" (已设为默认)"
-        echo "Zsh: 已安装${zsh_default}"
+        local zsh_version
+        zsh_version=$(zsh --version 2>/dev/null | awk '{print $2}' || echo "未知")
+        local root_shell
+        root_shell=$(getent passwd root 2>/dev/null | cut -d: -f7 || echo "未知")
+        if [[ "$root_shell" == "$(which zsh 2>/dev/null)" ]]; then
+            status_lines+=("🐚 Zsh: v$zsh_version (已设为默认)")
+        else
+            status_lines+=("🐚 Zsh: v$zsh_version (已安装但未设为默认)")
+        fi
+    else
+        status_lines+=("🐚 Zsh: 未安装")
     fi
     
+    # Docker 状态和版本
     if command -v docker &>/dev/null; then
-        local docker_status="已安装"
-        systemctl is-active --quiet docker 2>/dev/null && docker_status="运行中" || docker_status="已安装但未运行"
-        echo "Docker: $docker_status"
+        local docker_version
+        docker_version=$(docker --version 2>/dev/null | awk '{print $3}' | tr -d ',' || echo "未知")
+        local containers_count
+        containers_count=$(docker ps -q 2>/dev/null | wc -l || echo "0")
+        local images_count
+        images_count=$(docker images -q 2>/dev/null | wc -l || echo "0")
+        
+        if systemctl is-active --quiet docker 2>/dev/null; then
+            status_lines+=("🐳 Docker: v$docker_version (运行中) | 容器: $containers_count | 镜像: $images_count")
+        else
+            status_lines+=("🐳 Docker: v$docker_version (已安装但未运行) | 容器: $containers_count | 镜像: $images_count")
+        fi
+    else
+        status_lines+=("🐳 Docker: 未安装")
     fi
     
+    # Mise 状态和版本
     if [[ -f "$HOME/.local/bin/mise" ]]; then
-        echo "Mise: 已安装"
+        local mise_version
+        mise_version=$("$HOME/.local/bin/mise" --version 2>/dev/null | head -1 || echo "未知")
+        status_lines+=("📦 Mise: v$mise_version")
+    else
+        status_lines+=("📦 Mise: 未安装")
     fi
+    
+    # SSH 配置
+    local ssh_port
+    ssh_port=$(grep "^Port " /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}' || echo "22")
+    local ssh_root_login
+    ssh_root_login=$(grep "^PermitRootLogin " /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}' || echo "默认")
+    status_lines+=("🔒 SSH: 端口=$ssh_port | Root登录=$ssh_root_login")
+    
+    # 网络信息
+    local network_ip
+    network_ip=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "未知")
+    local network_interface
+    network_interface=$(ip route 2>/dev/null | grep default | awk '{print $5}' | head -1 || echo "未知")
+    status_lines+=("🌐 网络: $network_ip via $network_interface")
+    
+    printf '%s\n' "${status_lines[@]}"
 }
 
 #--- 简化的部署摘要 ---
+#--- 改进摘要生成 ---
 generate_summary() {
     log "生成部署摘要"
     
@@ -378,22 +430,33 @@ generate_summary() {
     fi
     
     local total_time=$(( $(date +%s) - TOTAL_START_TIME ))
+    local avg_time=0
+    if (( ${#EXECUTED_MODULES[@]} > 0 )); then
+        local sum_time=0
+        for module in "${EXECUTED_MODULES[@]}"; do
+            sum_time=$(( sum_time + ${MODULE_EXEC_TIME[$module]} ))
+        done
+        avg_time=$(( sum_time / ${#EXECUTED_MODULES[@]} ))
+    fi
     
     echo
     print_line
     echo "Debian 系统部署完成摘要"
     print_line
     
-    # 基本信息
+    # 基本信息 (增加更多详情)
     echo "📋 基本信息:"
-    echo "   版本: $SCRIPT_VERSION | 时间: $(date '+%Y-%m-%d %H:%M:%S')"
-    echo "   主机: $(hostname) | 系统: $(grep 'PRETTY_NAME' /etc/os-release 2>/dev/null | cut -d= -f2 | tr -d '"' || echo 'Debian')"
-    echo "   总耗时: ${total_time}秒"
+    echo "   🔢 脚本版本: $SCRIPT_VERSION"
+    echo "   📅 部署时间: $(date '+%Y-%m-%d %H:%M:%S %Z')"
+    echo "   ⏱️  总耗时: ${total_time}秒 | 平均耗时: ${avg_time}秒/模块"
+    echo "   🏠 主机名: $(hostname 2>/dev/null || echo '未知')"
+    echo "   💻 系统: $(grep 'PRETTY_NAME' /etc/os-release 2>/dev/null | cut -d= -f2 | tr -d '"' || echo 'Debian')"
+    echo "   🌐 IP地址: $(hostname -I 2>/dev/null | awk '{print $1}' || echo '未知')"
     
     # 执行统计
     echo
     echo "📊 执行统计:"
-    echo "   总模块: $total_modules | 成功: ${#EXECUTED_MODULES[@]} | 失败: ${#FAILED_MODULES[@]} | 成功率: ${success_rate}%"
+    echo "   📦 总模块: $total_modules | ✅ 成功: ${#EXECUTED_MODULES[@]} | ❌ 失败: ${#FAILED_MODULES[@]} | 📈 成功率: ${success_rate}%"
     
     # 模块详情
     if (( ${#EXECUTED_MODULES[@]} > 0 )); then
@@ -401,7 +464,7 @@ generate_summary() {
         echo "✅ 成功模块:"
         for module in "${EXECUTED_MODULES[@]}"; do
             local exec_time=${MODULE_EXEC_TIME[$module]}
-            echo "   $module (${exec_time}s)"
+            echo "   🟢 $module: ${MODULES[$module]} (${exec_time}s)"
         done
     fi
     
@@ -409,27 +472,45 @@ generate_summary() {
         echo
         echo "❌ 失败模块:"
         for module in "${FAILED_MODULES[@]}"; do
-            echo "   $module"
+            local exec_time=${MODULE_EXEC_TIME[$module]:-0}
+            echo "   🔴 $module: ${MODULES[$module]} (${exec_time}s)"
         done
     fi
     
-    # 系统状态
+    # 系统状态 (现在更详细了)
     echo
-    echo "🖥️ 系统状态:"
-    get_system_status | sed 's/^/   /'
+    echo "🖥️ 当前系统状态:"
+    while IFS= read -r status_line; do
+        echo "   $status_line"
+    done < <(get_system_status)
     
-    # 保存摘要到文件
+    # 保存摘要到文件 (也更新)
     {
-        echo "Debian 系统部署摘要 - $(date '+%Y-%m-%d %H:%M:%S')"
-        echo "版本: $SCRIPT_VERSION"
-        echo "主机: $(hostname)"
+        echo "==============================================="
+        echo "Debian 系统部署摘要"
+        echo "==============================================="
+        echo "脚本版本: $SCRIPT_VERSION"
+        echo "部署时间: $(date '+%Y-%m-%d %H:%M:%S %Z')"
         echo "总耗时: ${total_time}秒"
-        echo "执行统计: 总模块 $total_modules, 成功 ${#EXECUTED_MODULES[@]}, 失败 ${#FAILED_MODULES[@]}"
-        echo "成功模块: ${EXECUTED_MODULES[*]}"
-        [[ ${#FAILED_MODULES[@]} -gt 0 ]] && echo "失败模块: ${FAILED_MODULES[*]}"
+        echo "主机: $(hostname)"
+        echo "系统: $(grep 'PRETTY_NAME' /etc/os-release 2>/dev/null | cut -d= -f2 | tr -d '"' || echo 'Debian')"
+        echo "IP地址: $(hostname -I 2>/dev/null | awk '{print $1}' || echo '未知')"
+        echo ""
+        echo "执行统计:"
+        echo "总模块: $total_modules, 成功: ${#EXECUTED_MODULES[@]}, 失败: ${#FAILED_MODULES[@]}, 成功率: ${success_rate}%"
+        echo ""
+        echo "成功模块:"
+        for module in "${EXECUTED_MODULES[@]}"; do
+            echo "  $module (${MODULE_EXEC_TIME[$module]}s)"
+        done
+        [[ ${#FAILED_MODULES[@]} -gt 0 ]] && echo "" && echo "失败模块: ${FAILED_MODULES[*]}"
+        echo ""
         echo "系统状态:"
         get_system_status
-        echo "日志文件: $LOG_FILE"
+        echo ""
+        echo "文件位置:"
+        echo "  日志: $LOG_FILE"
+        echo "  摘要: $SUMMARY_FILE"
     } > "$SUMMARY_FILE" 2>/dev/null || true
     
     echo
