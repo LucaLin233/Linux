@@ -117,7 +117,8 @@ optimize_docker_config() {
     fi
     
     echo "内存状态: ${mem_mb}MB (偏低)"
-    read -p "是否优化Docker配置以降低内存使用? [Y/n]: " -r optimize_choice
+    read -p "是否优化Docker配置以降低内存使用? [Y/n] (默认: Y): " -r optimize_choice
+    optimize_choice=${optimize_choice:-Y}
     
     if [[ "$optimize_choice" =~ ^[Nn]$ ]]; then
         echo "Docker优化: 跳过"
