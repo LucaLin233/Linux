@@ -52,7 +52,7 @@ show_swap_status() {
     local swap_output=$(swapon --show 2>/dev/null | tail -n +2)  # 跳过表头
     if [[ -n "$swap_output" ]]; then
         echo "Swap状态:"
-        while read -r device _ size used _ priority; do
+        while read -r device _ size used priority; do
             [[ -z "$device" ]] && continue
             if [[ "$device" == *"zram"* ]]; then
                 echo "  - Zram: $device ($size, 已用$used, 优先级$priority)"
