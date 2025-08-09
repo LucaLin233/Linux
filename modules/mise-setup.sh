@@ -914,18 +914,22 @@ main() {
     echo "=== main: 开始setup_python ===" >&2
     if setup_python; then
         echo "=== main: setup_python成功 ===" >&2
-        debug_log "Python配置成功"
+        echo "=== main: 准备执行debug_log ===" >&2
+        debug_log "Python配置成功" || echo "debug_log失败但继续" >&2
+        echo "=== main: debug_log完成 ===" >&2
     else
         echo "=== main: setup_python失败 ===" >&2
         echo "Python配置失败，但继续执行..."
-        debug_log "Python配置失败，继续执行"
+        debug_log "Python配置失败，继续执行" || echo "debug_log失败但继续" >&2
     fi
+    echo "=== main: setup_python分支处理完成 ===" >&2
     
+    echo "=== main: 准备开始setup_python_usage ===" >&2
     echo "=== main: 开始setup_python_usage ===" >&2
     setup_python_usage || {
         echo "=== main: setup_python_usage失败 ===" >&2
         echo "Python使用方式配置失败，使用默认配置"
-        debug_log "setup_python_usage失败"
+        debug_log "setup_python_usage失败" || true
     }
     echo "=== main: setup_python_usage完成 ===" >&2
     
@@ -960,7 +964,6 @@ main() {
     fi
     
     echo "=== main: 准备返回成功 ===" >&2
-    debug_log "main函数执行完成"
     return 0
 }
 
