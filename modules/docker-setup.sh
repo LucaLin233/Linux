@@ -196,6 +196,7 @@ start_docker_service() {
             debug_log "Docker服务状态未知"
         fi
     fi
+    return 0
 }
 
 # 优化Docker配置
@@ -267,6 +268,7 @@ EOF
     
     echo "Docker优化: 已配置并重启"
     debug_log "Docker优化配置完成"
+    return 0
 }
 
 # 管理Docker容器
@@ -311,6 +313,7 @@ manage_containers() {
         echo "容器检查: 所有容器已在运行"
         debug_log "所有容器都已在运行"
     fi
+    return 0
 }
 
 # 显示配置摘要
@@ -352,8 +355,8 @@ show_docker_summary() {
         echo "  Docker Compose: 不可用"
         debug_log "Docker Compose不可用"
     fi
+    return 0
 }
-# === 核心功能函数结束 ===
 
 # === 主流程 ===
 main() {
@@ -397,6 +400,7 @@ main() {
             echo "  容器管理: $compose_cmd up -d"
         fi
     fi
+    return 0
 }
 
 # 错误处理
