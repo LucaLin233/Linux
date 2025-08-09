@@ -400,6 +400,6 @@ main() {
 }
 
 # 错误处理
-trap 'log "脚本执行出错，行号: $LINENO" "error"; exit 1' ERR
+trap 'log "脚本执行出错，行号: $LINENO，但继续执行" "warn"' ERR
 
 main "$@"
