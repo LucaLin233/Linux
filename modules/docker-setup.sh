@@ -17,7 +17,10 @@ log() {
 }
 
 debug_log() {
-    [[ "${DEBUG:-}" == "1" ]] && log "DEBUG: $1" "debug" >&2
+    if [[ "${DEBUG:-}" == "1" ]]; then
+        log "DEBUG: $1" "debug" >&2
+    fi
+    return 0
 }
 
 # === 辅助函数 ===
