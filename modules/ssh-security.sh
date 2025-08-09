@@ -100,6 +100,28 @@ check_ssh_keys() {
     debug_log "未找到SSH密钥"
     return 1
 }
+
+# 获取当前Root登录设置
+get_current_root_login() {
+    local current_setting
+    if current_setting=$(grep "^PermitRootLogin" "$SSH_CONFIG" 2>/dev/null | awk '{print $2}'); then
+        echo "$current_setting"
+    else
+        # 如果没有显式配置，SSH默认是prohibit-password
+        echo "prohibit-password"
+    fi
+}
+
+# 格式化Root登录设置显示
+format_root_login_display() {
+    local setting="$1"
+    case "$setting" in
+        "no") echo "禁止Root登录" ;;
+        "prohibit-password") echo "仅允许密钥登录" ;;
+        "yes") echo "允许密码登录" ;;
+        *) echo "未知设置: $setting" ;;
+    esac
+}
 # === 辅助函数结束 ===
 
 # === 核心功能函数 ===
@@ -195,36 +217,46 @@ configure_password_auth() {
 
 # 配置Root登录策略
 configure_root_login() {
+    local current_setting=$(get_current_root_login)
+    local current_display=$(format_root_login_display "$current_setting")
+    
+    echo "当前Root登录设置: $current_display" >&2
     echo "Root登录策略:" >&2
-    echo "  1) 禁止Root登录 (推荐)" >&2
-    echo "  2) 仅允许密钥登录" >&2
-    echo "  3) 允许密码登录 (不推荐)" >&2
+    echo "  1) 维持原样 ($current_display)" >&2
+    echo "  2) 禁止Root登录 (推荐)" >&2
+    echo "  3) 仅允许密钥登录" >&2
+    echo "  4) 允许密码登录 (不推荐)" >&2
     echo >&2
     
     local choice
-    read -p "请选择 [1-3] (默认: 1): " choice >&2
+    read -p "请选择 [1-4] (默认: 1): " choice >&2
     choice=${choice:-1}
     
     case "$choice" in
         1)
+            debug_log "用户选择维持当前Root登录设置: $current_setting"
+            echo "Root登录: 维持原样 ($current_display)" >&2
+            echo "$current_setting"
+            ;;
+        2)
             debug_log "用户选择禁止Root登录"
             echo "Root登录: 禁止" >&2
             echo "no"
             ;;
-        2)
+        3)
             debug_log "用户选择Root仅密钥登录"
             echo "Root登录: 仅允许密钥" >&2
             echo "prohibit-password"
             ;;
-        3)
+        4)
             debug_log "用户选择Root允许密码登录"
             echo "Root登录: 允许密码 (不推荐)" >&2
             echo "yes"
             ;;
         *)
-            debug_log "无效选择，默认禁止Root登录"
-            echo "无效选择，使用默认: 禁止Root登录" >&2
-            echo "no"
+            debug_log "无效选择，维持当前Root登录设置: $current_setting"
+            echo "无效选择，维持原样: $current_display" >&2
+            echo "$current_setting"
             ;;
     esac
 }
