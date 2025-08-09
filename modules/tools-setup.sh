@@ -1,5 +1,5 @@
 #!/bin/bash
-# 系统工具配置模块 v2.0 - 智能配置版
+# 系统工具配置模块 v2.1 - 智能配置版
 # 功能: 安装常用系统和网络工具
 
 set -euo pipefail
@@ -30,60 +30,22 @@ debug_log() {
 }
 
 # === 辅助函数 ===
-# 获取工具版本
+# 获取工具版本（简化版）
 get_tool_version() {
     local tool_name="$1"
     local check_cmd="$2"
     
     debug_log "获取工具版本: $tool_name"
     
-    case "$tool_name" in
-        "nexttrace")
-            local version_output=""
-            debug_log "检测nexttrace版本"
-            
-            # 尝试多种命令和参数组合
-            for cmd in "nexttrace" "nxtrace"; do
-                for flag in "--version" "-V" "-v" "version"; do
-                    if command -v "$cmd" >/dev/null 2>&1; then
-                        version_output=$($cmd $flag 2>/dev/null | head -n3 || echo "")
-                        [[ -n "$version_output" ]] && break 2
-                    fi
-                done
-            done
-            
-            # 尝试多种版本格式匹配
-            if [[ "$version_output" =~ [Vv]ersion[[:space:]]*:?[[:space:]]*([0-9]+\.[0-9]+\.[0-9]+) ]]; then
-                echo "${BASH_REMATCH[1]}"
-            elif [[ "$version_output" =~ [Nn][Xx][Tt]race[[:space:]]+[Vv]?([0-9]+\.[0-9]+\.[0-9]+) ]]; then
-                echo "${BASH_REMATCH[1]}"
-            elif [[ "$version_output" =~ [Vv]?([0-9]+\.[0-9]+\.[0-9]+) ]]; then
-                echo "${BASH_REMATCH[1]}"
-            else
-                echo "已安装"
-            fi
-            ;;
-        "speedtest")
-            debug_log "检测speedtest版本"
-            local version_output
-            version_output=$($check_cmd 2>/dev/null | head -n1 || echo "")
-            if [[ "$version_output" =~ ([0-9]+\.[0-9]+\.[0-9]+) ]]; then
-                echo "${BASH_REMATCH[1]}"
-            else
-                echo "已安装"
-            fi
-            ;;
-        *)
-            debug_log "检测通用工具版本: $tool_name"
-            local version_output
-            version_output=$($check_cmd 2>/dev/null | head -n1 || echo "")
-            if [[ "$version_output" =~ ([0-9]+\.[0-9]+(\.[0-9]+)?) ]]; then
-                echo "${BASH_REMATCH[1]}"
-            else
-                echo "已安装"
-            fi
-            ;;
-    esac
+    local version_output
+    version_output=$($check_cmd 2>/dev/null | head -n1 || echo "")
+    
+    # 统一的版本匹配逻辑
+    if [[ "$version_output" =~ ([0-9]+\.[0-9]+(\.[0-9]+)?) ]]; then
+        echo "${BASH_REMATCH[1]}"
+    else
+        echo "已安装"
+    fi
     return 0
 }
 
@@ -94,7 +56,6 @@ check_tool_status() {
     
     debug_log "检查工具状态: $tool_name"
     
-    # 统一处理所有工具，不再对nexttrace特殊处理
     if command -v "$tool_name" &>/dev/null; then
         if eval "$check_cmd" &>/dev/null; then
             local version=$(get_tool_version "$tool_name" "$check_cmd")
@@ -142,39 +103,26 @@ get_tools_by_category() {
 # 处理现有nexttrace安装的迁移
 handle_existing_nexttrace() {
     debug_log "检查现有nexttrace安装方式"
-    echo "DEBUG: 开始检查nexttrace安装方式" >&2
     
     # 刷新命令缓存，确保检测准确
     hash -r 2>/dev/null || true
-    echo "DEBUG: 已刷新hash缓存" >&2
     
-    # 第一步检查
-    if ! command -v nexttrace >/dev/null 2>&1 && ! command -v nxtrace >/dev/null 2>&1; then
+    if ! command -v nexttrace >/dev/null 2>&1; then
         debug_log "未找到现有nexttrace"
-        echo "DEBUG: 未找到nexttrace命令，返回0" >&2
         return 0  # 没有现有安装
     fi
     
-    echo "DEBUG: 找到nexttrace命令，继续检查安装方式..." >&2
-    
-    # 第二步检查 - 使用更可靠的方法
-    echo "DEBUG: 执行 dpkg-query 检查..." >&2
+    # 检查是否通过apt安装
     if dpkg-query -W -f='${Status}' nexttrace 2>/dev/null | grep -q "install ok installed"; then
         debug_log "检测到apt安装的nexttrace，跳过迁移"
-        echo "DEBUG: dpkg-query确认是apt安装，返回0" >&2
         return 0  # 已经是apt安装，无需迁移
     fi
-    
-    echo "DEBUG: dpkg-query检查失败！尝试备选方法..." >&2
     
     # 备选检测方法
     if dpkg --get-selections 2>/dev/null | grep -q "nexttrace.*install"; then
         debug_log "检测到apt安装的nexttrace（备选方法），跳过迁移"
-        echo "DEBUG: 备选方法确认是apt安装，返回0" >&2
         return 0
     fi
-    
-    echo "DEBUG: 所有检测方法都认为不是apt安装" >&2
     
     # 脚本安装的版本，需要迁移
     echo "检测到脚本安装的nexttrace，正在迁移到apt源..." >&2
@@ -183,11 +131,8 @@ handle_existing_nexttrace() {
     # 删除脚本安装的版本
     local nexttrace_paths=(
         "$(command -v nexttrace 2>/dev/null || true)"
-        "$(command -v nxtrace 2>/dev/null || true)"
         "/usr/local/bin/nexttrace"
-        "/usr/local/bin/nxtrace" 
         "/usr/bin/nexttrace"
-        "/usr/bin/nxtrace"
     )
     
     for path in "${nexttrace_paths[@]}"; do
@@ -217,13 +162,11 @@ install_single_tool() {
         
         # 先处理现有安装
         if ! handle_existing_nexttrace; then
-            # 需要重新安装（脚本安装版本已清理）
             force_reinstall=true
             debug_log "脚本版本已清理，需要重新安装"
         fi
         
         if $force_reinstall; then
-            # 强制更新：先卸载apt版本（如果有）
             debug_log "强制更新，先卸载现有apt版本"
             apt remove -y nexttrace >/dev/null 2>&1 || true
         fi
@@ -233,7 +176,7 @@ install_single_tool() {
             debug_log "添加nexttrace官方apt源"
             echo "正在配置nexttrace官方源..." >&2
             if echo "deb [trusted=yes] https://github.com/nxtrace/nexttrace-debs/releases/latest/download ./" | \
-                sudo tee /etc/apt/sources.list.d/nexttrace.list >/dev/null 2>&1; then
+                tee /etc/apt/sources.list.d/nexttrace.list >/dev/null 2>&1; then
                 debug_log "nexttrace apt源配置成功"
             else
                 debug_log "nexttrace apt源配置失败"
@@ -300,8 +243,6 @@ get_user_choice() {
 
 # 自定义选择工具
 custom_tool_selection() {
-    local selected_tools=()
-    
     debug_log "进入自定义工具选择"
     echo "选择要安装的工具 (多选用空格分隔，如: 1 3 5):" >&2
     for i in "${!TOOLS[@]}"; do
@@ -322,6 +263,7 @@ custom_tool_selection() {
     fi
     
     debug_log "用户选择: $choices"
+    local selected_tools=()
     for choice in $choices; do
         if [[ "$choice" =~ ^[0-9]+$ ]] && [[ "$choice" -ge 1 ]] && [[ "$choice" -le ${#TOOLS[@]} ]]; then
             local idx=$((choice-1))
@@ -339,15 +281,16 @@ custom_tool_selection() {
 # 安装选定的工具
 install_selected_tools() {
     local category="$1"
-    local tools_to_install
     local force_install=false
     
     debug_log "开始安装工具，类别: $category"
     
     if [[ "$category" == "update" ]]; then
         force_install=true
-        tools_to_install=$(get_tools_by_category "$category")
-    elif [[ "$category" == "custom" ]]; then
+    fi
+    
+    local tools_to_install
+    if [[ "$category" == "custom" ]]; then
         tools_to_install=$(custom_tool_selection)
     else
         tools_to_install=$(get_tools_by_category "$category")
@@ -360,19 +303,13 @@ install_selected_tools() {
     
     debug_log "准备安装的工具: $tools_to_install"
     
-    local installed_count=0
-    local failed_count=0
-    local updated_count=0
-    local skipped_count=0
-    local installed_tools=()
-    local failed_tools=()
-    local updated_tools=()
-    local skipped_tools=()
+    local installed_count=0 failed_count=0 updated_count=0 skipped_count=0
+    local installed_tools=() failed_tools=() updated_tools=() skipped_tools=()
     
     for tool_name in $tools_to_install; do
         debug_log "处理工具: $tool_name"
-        # 查找工具信息
         local tool_found=false
+        
         for tool_info in "${TOOLS[@]}"; do
             local info_name="${tool_info%%:*}"
             if [[ "$info_name" == "$tool_name" ]]; then
@@ -380,8 +317,7 @@ install_selected_tools() {
                 local install_source=$(echo "$tool_info" | cut -d: -f3)
                 
                 local status=$(check_tool_status "$tool_name" "$check_cmd" || echo "missing:")
-                local was_installed=false
-                local old_version=""
+                local was_installed=false old_version=""
                 
                 if [[ "$status" == installed:* ]]; then
                     old_version="${status#installed:}"
@@ -391,20 +327,16 @@ install_selected_tools() {
                     if [[ "$tool_name" == "nexttrace" && "$install_source" == "apt-nexttrace" ]]; then
                         debug_log "检查nexttrace是否需要迁移到apt源"
                         if ! handle_existing_nexttrace; then
-                            # 需要迁移，强制重新安装
                             debug_log "nexttrace需要迁移到apt源"
                             echo "正在迁移nexttrace到apt源..."
-                            was_installed=true  # 保持原状态
                             # 继续执行安装逻辑
                         elif ! $force_install; then
-                            # 已经是apt安装且非强制模式，跳过
                             debug_log "nexttrace已通过apt安装，跳过"
                             installed_tools+=("$tool_name($old_version)")
                             tool_found=true
                             break
                         fi
                     elif ! $force_install; then
-                        # 其他工具的普通安装模式：跳过已安装的工具
                         debug_log "工具 $tool_name 已安装，版本: $old_version"
                         installed_tools+=("$tool_name($old_version)")
                         tool_found=true
@@ -412,43 +344,31 @@ install_selected_tools() {
                     fi
                 fi
                 
-                # 执行安装（新安装或强制重装）
+                # 执行安装
                 debug_log "开始安装 $tool_name"
-                local install_success=false
-                
-                # 统一处理所有工具
                 if install_single_tool "$tool_name" "$install_source" "$force_install"; then
-                    install_success=true
-                fi
-                
-                if $install_success; then
                     debug_log "工具 $tool_name 安装成功，重新检查版本"
-                    # 刷新命令缓存
                     hash -r 2>/dev/null || true
-                    # 重新检查版本
-                    sleep 2  # nexttrace安装后可能需要更长时间生效
+                    sleep 1  # 等待安装生效
+                    
                     local new_status=$(check_tool_status "$tool_name" "$check_cmd" || echo "installed:已安装")
                     if [[ "$new_status" == installed:* ]]; then
                         local new_version="${new_status#installed:}"
                         
                         if $was_installed; then
-                            # 比较版本是否真正更新了
                             if [[ "$new_version" != "$old_version" ]] && [[ "$new_version" != "已安装" ]] && [[ "$old_version" != "已安装" ]]; then
                                 updated_tools+=("$tool_name($old_version→$new_version)")
                                 ((updated_count++))
                             else
-                                # 版本相同或无法比较，标记为重新安装成功
                                 skipped_tools+=("$tool_name($new_version)")
                                 ((skipped_count++))
                             fi
                         else
-                            # 这是新安装
                             installed_tools+=("$tool_name($new_version)")
                             ((installed_count++))
                         fi
                     else
                         if $was_installed; then
-                            # 重新安装失败，但原版本还在
                             skipped_tools+=("$tool_name($old_version)")
                             ((skipped_count++))
                         else
@@ -459,7 +379,6 @@ install_selected_tools() {
                 else
                     debug_log "工具 $tool_name 安装失败"
                     if $was_installed; then
-                        # 重新安装失败，但原版本还在
                         skipped_tools+=("$tool_name($old_version)")
                         ((skipped_count++))
                     else
@@ -489,17 +408,9 @@ install_selected_tools() {
         fi
     fi
     
-    if [[ ${#updated_tools[@]} -gt 0 ]]; then
-        echo "版本更新: ${updated_tools[*]}"
-    fi
-    
-    if [[ ${#skipped_tools[@]} -gt 0 ]]; then
-        echo "重新安装: ${skipped_tools[*]}"
-    fi
-    
-    if [[ ${#failed_tools[@]} -gt 0 ]]; then
-        echo "安装失败: ${failed_tools[*]}"
-    fi
+    [[ ${#updated_tools[@]} -gt 0 ]] && echo "版本更新: ${updated_tools[*]}"
+    [[ ${#skipped_tools[@]} -gt 0 ]] && echo "重新安装: ${skipped_tools[*]}"
+    [[ ${#failed_tools[@]} -gt 0 ]] && echo "安装失败: ${failed_tools[*]}"
     
     # 统计输出
     local success_operations=$((installed_count + updated_count + skipped_count))
@@ -519,13 +430,11 @@ show_tools_summary() {
     echo
     log "🎯 系统工具摘要:" "info"
     
-    local installed_tools=()
-    local missing_tools=()
+    local installed_tools=() missing_tools=()
     
     for tool_info in "${TOOLS[@]}"; do
         local tool_name="${tool_info%%:*}"
         local check_cmd=$(echo "$tool_info" | cut -d: -f2)
-        local description="${tool_info##*:}"
         
         local status=$(check_tool_status "$tool_name" "$check_cmd" || echo "missing:")
         if [[ "$status" == installed:* ]]; then
@@ -536,44 +445,31 @@ show_tools_summary() {
         fi
     done
     
-    if [[ ${#installed_tools[@]} -gt 0 ]]; then
-        echo "  ✓ 已安装: ${installed_tools[*]}"
-    fi
+    [[ ${#installed_tools[@]} -gt 0 ]] && echo "  ✓ 已安装: ${installed_tools[*]}"
+    [[ ${#missing_tools[@]} -gt 0 ]] && echo "  ✗ 未安装: ${missing_tools[*]}"
     
-    if [[ ${#missing_tools[@]} -gt 0 ]]; then
-        echo "  ✗ 未安装: ${missing_tools[*]}"
-    fi
-    
-    # 显示常用命令 - 统一nexttrace命令显示
-    local has_commands=false
+    # 显示常用命令
     echo "  💡 常用命令:"
+    local has_commands=false
     
-    # nexttrace现在统一使用nexttrace命令
-    if command -v nexttrace >/dev/null 2>&1; then
-        echo "    网络追踪: nexttrace ip.sb"
-        has_commands=true
-    fi
+    local commands=(
+        "nexttrace:网络追踪: nexttrace ip.sb"
+        "speedtest:网速测试: speedtest"
+        "htop:系统监控: htop"
+        "tree:目录树: tree /path/to/dir"
+        "jq:JSON处理: echo '{}' | jq ."
+    )
     
-    if command -v speedtest >/dev/null 2>&1; then
-        echo "    网速测试: speedtest"
-        has_commands=true
-    fi
-    if command -v htop >/dev/null 2>&1; then
-        echo "    系统监控: htop"
-        has_commands=true
-    fi
-    if command -v tree >/dev/null 2>&1; then
-        echo "    目录树: tree /path/to/dir"
-        has_commands=true
-    fi
-    if command -v jq >/dev/null 2>&1; then
-        echo "    JSON处理: echo '{}' | jq ."
-        has_commands=true
-    fi
+    for cmd_info in "${commands[@]}"; do
+        local cmd_name="${cmd_info%%:*}"
+        local cmd_desc="${cmd_info#*:}"
+        if command -v "$cmd_name" >/dev/null 2>&1; then
+            echo "    $cmd_desc"
+            has_commands=true
+        fi
+    done
     
-    if ! $has_commands; then
-        echo "    暂无可用工具"
-    fi
+    [[ $has_commands == false ]] && echo "    暂无可用工具"
     
     return 0
 }
