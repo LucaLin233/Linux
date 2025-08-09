@@ -1,5 +1,5 @@
 #!/bin/bash
-# SSH 安全配置模块 v4.5 - 简化版
+# SSH 安全配置模块 v5.0 - 智能安全版
 # 功能: SSH端口配置、密码认证控制、安全策略设置
 
 set -euo pipefail
@@ -11,29 +11,38 @@ readonly AUTHORIZED_KEYS="$HOME/.ssh/authorized_keys"
 # === 日志函数 ===
 log() {
     local msg="$1" level="${2:-info}"
-    local -A colors=([info]="\033[0;36m" [warn]="\033[0;33m" [error]="\033[0;31m")
+    local -A colors=([info]="\033[0;36m" [warn]="\033[0;33m" [error]="\033[0;31m" [debug]="\033[0;35m")
     echo -e "${colors[$level]:-\033[0;32m}$msg\033[0m"
 }
 
-# === 核心函数 ===
+debug_log() {
+    [[ "${DEBUG:-}" == "1" ]] && log "DEBUG: $1" "debug" >&2
+}
 
+# === 辅助函数 ===
 # 备份SSH配置
 backup_ssh_config() {
     if [[ -f "$SSH_CONFIG" ]]; then
-        # 只保留一个备份
-        cp "$SSH_CONFIG" "$SSH_CONFIG.backup"
+        cp "$SSH_CONFIG" "$SSH_CONFIG.backup.$(date +%s)" 2>/dev/null || {
+            log "SSH配置备份失败" "error"
+            return 1
+        }
+        debug_log "SSH配置已备份"
         echo "SSH配置: 已备份"
+        return 0
+    else
+        log "SSH配置文件不存在" "error"
+        return 1
     fi
 }
 
 # 获取当前SSH端口
 get_current_ssh_ports() {
     local ports
-    ports=$(grep "^Port " "$SSH_CONFIG" 2>/dev/null | awk '{print $2}' || echo "")
-    if [[ -z "$ports" ]]; then
-        echo "22"
+    if ports=$(grep "^Port " "$SSH_CONFIG" 2>/dev/null | awk '{print $2}'); then
+        [[ -n "$ports" ]] && echo "$ports" | tr '\n' ' ' | sed 's/ $//' || echo "22"
     else
-        echo "$ports" | tr '\n' ' ' | sed 's/ $//'
+        echo "22"
     fi
 }
 
@@ -42,281 +51,294 @@ validate_port() {
     local port="$1"
     local current_ports="${2:-}"
     
+    debug_log "验证端口: $port, 当前端口: $current_ports"
+    
     # 检查格式和范围
     if ! [[ "$port" =~ ^[0-9]+$ ]] || (( port < 1024 || port > 65535 )); then
+        debug_log "端口格式或范围无效: $port"
         return 1
     fi
     
     # 如果是当前SSH端口，允许通过
     if [[ "$current_ports" == *"$port"* ]]; then
+        debug_log "端口是当前SSH端口，允许: $port"
         return 0
     fi
     
     # 检查是否被占用
     if ss -tuln 2>/dev/null | grep -q ":$port\b"; then
+        debug_log "端口被占用: $port"
         return 1
     fi
     
+    debug_log "端口验证通过: $port"
     return 0
 }
 
-# 验证多个端口
-validate_ports() {
-    local ports="$1"
-    local current_ports="${2:-}"
-    local port_array=($ports)
-    local valid_ports=()
+# 检查SSH密钥
+check_ssh_keys() {
+    local key_count=0
     
-    for port in "${port_array[@]}"; do
-        if validate_port "$port" "$current_ports"; then
-            valid_ports+=("$port")
+    # 检查authorized_keys
+    if [[ -f "$AUTHORIZED_KEYS" && -s "$AUTHORIZED_KEYS" ]]; then
+        key_count=$(grep -c "^ssh-" "$AUTHORIZED_KEYS" 2>/dev/null || echo "0")
+        if (( key_count > 0 )); then
+            debug_log "找到 $key_count 个SSH密钥在 authorized_keys"
+            return 0
+        fi
+    fi
+    
+    # 检查公钥文件
+    local key_files=("$HOME/.ssh/id_rsa.pub" "$HOME/.ssh/id_ed25519.pub" "$HOME/.ssh/id_ecdsa.pub")
+    for key_file in "${key_files[@]}"; do
+        if [[ -f "$key_file" ]]; then
+            debug_log "找到SSH公钥文件: $key_file"
+            return 0
         fi
     done
     
-    if (( ${#valid_ports[@]} == 0 )); then
-        return 1
-    fi
-    
-    echo "${valid_ports[*]}"
-    return 0
+    debug_log "未找到SSH密钥"
+    return 1
 }
+# === 辅助函数结束 ===
 
-# 选择SSH端口 - 修复菜单显示
+# === 核心功能函数 ===
+# 选择SSH端口
 choose_ssh_ports() {
     local current_ports=$(get_current_ssh_ports)
     
-    echo "当前SSH端口: $current_ports" >&2
-    echo "端口配置:" >&2
-    echo "  1) 保持当前 ($current_ports)" >&2
-    echo "  2) 使用2222端口" >&2
-    echo "  3) 使用2022端口" >&2
-    echo "  4) 自定义端口" >&2
-    echo "  5) 多端口配置" >&2
-    echo >&2
+    echo "当前SSH端口: $current_ports"
+    echo "端口配置:"
+    echo "  1) 保持当前 ($current_ports)"
+    echo "  2) 使用2222端口"
+    echo "  3) 使用2022端口"
+    echo "  4) 自定义端口"
+    echo
     
     local choice new_ports
-    read -p "请选择 [1-5] (默认: 1): " choice >&2
+    read -p "请选择 [1-4] (默认: 1): " choice
     choice=${choice:-1}
     
     case "$choice" in
         1)
+            debug_log "用户选择保持当前端口: $current_ports"
             echo "$current_ports"
             ;;
         2)
             if validate_port "2222" "$current_ports"; then
+                debug_log "用户选择端口2222"
                 echo "2222"
             else
-                echo "端口2222不可用，保持当前端口" >&2
+                echo "端口2222不可用，保持当前端口"
                 echo "$current_ports"
             fi
             ;;
         3)
             if validate_port "2022" "$current_ports"; then
+                debug_log "用户选择端口2022"
                 echo "2022"
             else
-                echo "端口2022不可用，保持当前端口" >&2
+                echo "端口2022不可用，保持当前端口"
                 echo "$current_ports"
             fi
             ;;
         4)
             while true; do
-                read -p "输入端口号 (1024-65535): " new_ports >&2
+                read -p "输入端口号 (1024-65535): " new_ports
                 if [[ -z "$new_ports" ]]; then
-                    echo "端口为空，保持当前端口" >&2
+                    echo "端口为空，保持当前端口"
                     echo "$current_ports"
                     break
                 elif validate_port "$new_ports" "$current_ports"; then
+                    debug_log "用户自定义端口: $new_ports"
                     echo "$new_ports"
                     break
                 else
-                    echo "端口无效或被占用，请重新输入" >&2
-                fi
-            done
-            ;;
-        5)
-            while true; do
-                read -p "输入多个端口 (空格分隔): " new_ports >&2
-                if [[ -z "$new_ports" ]]; then
-                    echo "端口为空，保持当前端口" >&2
-                    echo "$current_ports"
-                    break
-                else
-                    local validated_ports
-                    if validated_ports=$(validate_ports "$new_ports" "$current_ports"); then
-                        echo "$validated_ports"
-                        break
-                    else
-                        echo "部分端口无效，请重新输入" >&2
-                    fi
+                    echo "端口无效或被占用，请重新输入"
                 fi
             done
             ;;
         *)
-            echo "无效选择，保持当前端口" >&2
+            echo "无效选择，保持当前端口"
             echo "$current_ports"
             ;;
     esac
 }
 
-# 检查SSH密钥
-check_ssh_keys() {
-    if [[ -f "$AUTHORIZED_KEYS" && -s "$AUTHORIZED_KEYS" ]]; then
-        local key_count=$(grep -c "^ssh-" "$AUTHORIZED_KEYS" 2>/dev/null || echo "0")
-        if (( key_count > 0 )); then
-            return 0
-        fi
-    fi
-    
-    local key_files=("$HOME/.ssh/id_rsa.pub" "$HOME/.ssh/id_ed25519.pub" "$HOME/.ssh/id_ecdsa.pub")
-    for key_file in "${key_files[@]}"; do
-        if [[ -f "$key_file" ]]; then
-            return 0
-        fi
-    done
-    
-    return 1
-}
-
-# 配置密码认证 - 修复输出
+# 配置密码认证
 configure_password_auth() {
     if check_ssh_keys; then
         local key_count=$(grep -c "^ssh-" "$AUTHORIZED_KEYS" 2>/dev/null || echo "0")
-        echo "SSH密钥状态: 已配置 ($key_count 个)" >&2
+        echo "SSH密钥状态: 已配置 ($key_count 个)"
         
         local disable_password
-        read -p "是否禁用密码认证 (仅允许密钥登录)? [y/N] (默认: N): " -r disable_password >&2
-        disable_password=${disable_password:-N}
+        read -p "是否禁用密码登录? [Y/n] (默认: Y): " -r disable_password
+        disable_password=${disable_password:-Y}
         
         if [[ "$disable_password" =~ ^[Yy]$ ]]; then
-            echo "密码认证: 将禁用" >&2
+            echo "密码登录: 将禁用"
+            debug_log "用户选择禁用密码登录"
             echo "no"
         else
-            echo "密码认证: 保持启用" >&2
+            echo "密码登录: 保持启用"
+            debug_log "用户选择启用密码登录"
             echo "yes"
         fi
     else
-        echo "SSH密钥状态: 未配置，保持密码认证" >&2
+        echo "SSH密钥状态: 未配置"
+        echo "为了安全考虑，建议先配置SSH密钥后再禁用密码登录"
+        echo "密码登录: 保持启用"
+        debug_log "未找到SSH密钥，保持密码登录"
         echo "yes"
     fi
 }
 
-# 配置SSH安全设置 - 修复配置生成逻辑
-configure_ssh_security() {
+# 配置Root登录策略
+configure_root_login() {
+    echo "Root登录策略:"
+    echo "  1) 禁止Root登录 (推荐)"
+    echo "  2) 仅允许密钥登录"
+    echo "  3) 允许密码登录 (不推荐)"
+    echo
+    
+    local choice
+    read -p "请选择 [1-3] (默认: 1): " choice
+    choice=${choice:-1}
+    
+    case "$choice" in
+        1)
+            debug_log "用户选择禁止Root登录"
+            echo "Root登录: 禁止"
+            echo "no"
+            ;;
+        2)
+            debug_log "用户选择Root仅密钥登录"
+            echo "Root登录: 仅允许密钥"
+            echo "prohibit-password"
+            ;;
+        3)
+            debug_log "用户选择Root允许密码登录"
+            echo "Root登录: 允许密码 (不推荐)"
+            echo "yes"
+            ;;
+        *)
+            debug_log "无效选择，默认禁止Root登录"
+            echo "无效选择，使用默认: 禁止Root登录"
+            echo "no"
+            ;;
+    esac
+}
+
+# 生成SSH安全配置
+generate_ssh_config() {
     local new_ports="$1"
     local password_auth="$2"
+    local root_login="$3"
     
-    backup_ssh_config
+    debug_log "生成SSH配置: 端口=$new_ports, 密码认证=$password_auth, Root登录=$root_login"
     
-    # 更安全的配置方法：完全重写配置
-    local temp_config=$(mktemp)
+    local temp_config
+    temp_config=$(mktemp) || {
+        log "无法创建临时配置文件" "error"
+        return 1
+    }
     
-    # 生成完整的SSH配置
+    # 生成精简但安全的SSH配置
     cat > "$temp_config" << EOF
-# SSH daemon configuration file
-# Generated by ssh-security module
+# SSH daemon configuration
+# Generated by ssh-security module $(date)
 
 # Network
 $(for port in $new_ports; do echo "Port $port"; done)
-AddressFamily any
-ListenAddress 0.0.0.0
-ListenAddress ::
-
-# Protocol
-Protocol 2
-
-# HostKeys
-HostKey /etc/ssh/ssh_host_rsa_key
-HostKey /etc/ssh/ssh_host_ecdsa_key
-HostKey /etc/ssh/ssh_host_ed25519_key
-
-# Logging
-SyslogFacility AUTH
-LogLevel INFO
 
 # Authentication
-LoginGraceTime 60
-PermitRootLogin prohibit-password
-StrictModes yes
-MaxAuthTries 6
-MaxSessions 10
-
-PubkeyAuthentication yes
-AuthorizedKeysFile .ssh/authorized_keys
-
+PermitRootLogin $root_login
 PasswordAuthentication $password_auth
 PermitEmptyPasswords no
-ChallengeResponseAuthentication no
-
-# Kerberos options
-KerberosAuthentication no
-KerberosOrLocalPasswd yes
-KerberosTicketCleanup yes
-KerberosGetAFSToken no
-
-# GSSAPI options
-GSSAPIAuthentication no
-GSSAPICleanupCredentials yes
-GSSAPIStrictAcceptorCheck yes
-GSSAPIKeyExchange no
-
-# Set this to 'yes' to enable PAM authentication, account processing,
-# and session processing.
-UsePAM yes
-
-# Connection settings
-ClientAliveInterval 600
-ClientAliveCountMax 3
-TCPKeepAlive yes
-
-# Subsystems
-Subsystem sftp /usr/lib/openssh/sftp-server
+PubkeyAuthentication yes
 
 # Security
-AllowAgentForwarding yes
-AllowTcpForwarding yes
-GatewayPorts no
-X11Forwarding yes
-X11DisplayOffset 10
-X11UseLocalhost yes
-PermitTTY yes
-PrintMotd no
-PrintLastLog yes
-PermitUserEnvironment no
-Compression delayed
+MaxAuthTries 3
+LoginGraceTime 60
+ClientAliveInterval 300
+ClientAliveCountMax 2
+
+# Disable less secure features
+AllowAgentForwarding no
+AllowTcpForwarding no
+X11Forwarding no
 UseDNS no
 
-# Accept locale-related environment variables
-AcceptEnv LANG LC_*
+# System integration
+UsePAM yes
+PrintMotd no
+
+# Subsystem
+Subsystem sftp /usr/lib/openssh/sftp-server
 EOF
     
-    # 替换原配置文件
-    mv "$temp_config" "$SSH_CONFIG"
-    echo "SSH配置: 已更新"
+    echo "$temp_config"
+    return 0
 }
 
-# 验证并应用SSH配置 - 增强错误输出
+# 应用SSH配置
 apply_ssh_config() {
-    # 验证配置
-    local sshd_test_output
-    sshd_test_output=$(sshd -t 2>&1)
-    local sshd_result=$?
+    local temp_config="$1"
     
-    if [[ $sshd_result -ne 0 ]]; then
-        echo "SSH配置验证失败:" >&2
-        echo "$sshd_test_output" >&2
-        echo "恢复备份配置..." >&2
-        cp "$SSH_CONFIG.backup" "$SSH_CONFIG"
-        systemctl reload sshd
+    debug_log "开始应用SSH配置"
+    
+    # 验证配置文件语法
+    if ! sshd -t -f "$temp_config" 2>/dev/null; then
+        local sshd_error
+        sshd_error=$(sshd -t -f "$temp_config" 2>&1)
+        log "SSH配置验证失败: $sshd_error" "error"
+        rm -f "$temp_config"
         return 1
     fi
     
-    # 重启服务
-    if systemctl restart sshd 2>/dev/null; then
-        echo "SSH服务: 已重启"
+    debug_log "SSH配置验证通过"
+    
+    # 备份当前配置
+    if ! backup_ssh_config; then
+        rm -f "$temp_config"
+        return 1
+    fi
+    
+    # 应用新配置
+    if ! mv "$temp_config" "$SSH_CONFIG"; then
+        log "无法替换SSH配置文件" "error"
+        return 1
+    fi
+    
+    # 设置正确的权限
+    chmod 644 "$SSH_CONFIG" || {
+        log "设置SSH配置文件权限失败" "warn"
+    }
+    
+    debug_log "SSH配置文件已更新"
+    
+    # 重新加载SSH服务
+    if systemctl reload sshd 2>/dev/null; then
+        echo "SSH服务: 已重新加载"
+        debug_log "SSH服务重新加载成功"
         return 0
     else
-        echo "SSH服务重启失败" >&2
-        return 1
+        log "SSH服务重新加载失败，尝试重启" "warn"
+        if systemctl restart sshd 2>/dev/null; then
+            echo "SSH服务: 已重启"
+            debug_log "SSH服务重启成功"
+            return 0
+        else
+            log "SSH服务重启失败，恢复配置" "error"
+            # 恢复备份配置
+            local backup_file=$(ls -t "$SSH_CONFIG.backup."* 2>/dev/null | head -1)
+            if [[ -n "$backup_file" ]]; then
+                cp "$backup_file" "$SSH_CONFIG"
+                systemctl restart sshd
+                log "已恢复备份配置" "warn"
+            fi
+            return 1
+        fi
     fi
 }
 
@@ -326,20 +348,21 @@ show_ssh_summary() {
     log "🎯 SSH安全摘要:" "info"
     
     local current_ports=$(get_current_ssh_ports)
-    local port_array=($current_ports)
-    if (( ${#port_array[@]} == 1 )); then
-        echo "  SSH端口: $current_ports"
+    echo "  SSH端口: $current_ports"
+    
+    if grep -q "PasswordAuthentication no" "$SSH_CONFIG" 2>/dev/null; then
+        echo "  密码登录: 已禁用"
     else
-        echo "  SSH端口: $current_ports (多端口)"
+        echo "  密码登录: 已启用"
     fi
     
-    if grep -q "PasswordAuthentication no" "$SSH_CONFIG"; then
-        echo "  密码认证: 已禁用"
-    else
-        echo "  密码认证: 已启用"
-    fi
-    
-    echo "  Root登录: 仅允许密钥"
+    local root_setting=$(grep "PermitRootLogin" "$SSH_CONFIG" | awk '{print $2}' || echo "unknown")
+    case "$root_setting" in
+        "no") echo "  Root登录: 已禁止" ;;
+        "prohibit-password") echo "  Root登录: 仅允许密钥" ;;
+        "yes") echo "  Root登录: 允许密码" ;;
+        *) echo "  Root登录: 未知状态" ;;
+    esac
     
     if check_ssh_keys; then
         local key_count=$(grep -c "^ssh-" "$AUTHORIZED_KEYS" 2>/dev/null || echo "0")
@@ -357,32 +380,67 @@ show_security_warnings() {
     echo
     log "⚠️ 重要提醒:" "warn"
     
-    local port_array=($new_ports)
-    if [[ "${port_array[0]}" != "22" ]]; then
-        echo "  新SSH连接命令: ssh -p ${port_array[0]} user@server"
-        echo "  请确保防火墙允许新端口访问"
+    if [[ "$new_ports" != "22" ]]; then
+        echo "  新SSH连接命令: ssh -p $new_ports user@server"
+        echo "  请确保防火墙允许新端口 $new_ports"
     fi
     
-    if [[ "$password_auth" == "no" ]]; then
-        echo "  密码登录已禁用，请确保SSH密钥正常"
+    if [[ "$password_auth" == "no" ]] && ! check_ssh_keys; then
+        echo "  ⚠️ 警告: 密码登录已禁用但未检测到SSH密钥!"
+        echo "  请立即配置SSH密钥，否则可能无法登录!"
     fi
+    
+    echo "  建议测试新连接后再关闭当前会话"
 }
+# === 核心功能函数结束 ===
 
 # === 主流程 ===
 main() {
+    # 检查root权限
+    [[ $EUID -eq 0 ]] || {
+        log "需要root权限运行" "error"
+        exit 1
+    }
+    
+    # 检查SSH服务
+    if ! systemctl is-active sshd &>/dev/null; then
+        log "SSH服务未运行" "error"
+        exit 1
+    fi
+    
     log "🔐 配置SSH安全..." "info"
     
     echo
-    local new_ports=$(choose_ssh_ports)
+    local new_ports
+    if ! new_ports=$(choose_ssh_ports); then
+        log "端口选择失败" "error"
+        exit 1
+    fi
     
     echo
-    local password_auth=$(configure_password_auth)
+    local password_auth
+    if ! password_auth=$(configure_password_auth); then
+        log "密码认证配置失败" "error"
+        exit 1
+    fi
     
     echo
-    configure_ssh_security "$new_ports" "$password_auth"
+    local root_login
+    if ! root_login=$(configure_root_login); then
+        log "Root登录配置失败" "error"
+        exit 1
+    fi
     
-    if ! apply_ssh_config; then
-        log "✗ SSH配置失败" "error"
+    echo
+    echo "正在生成SSH配置..."
+    local temp_config
+    if ! temp_config=$(generate_ssh_config "$new_ports" "$password_auth" "$root_login"); then
+        log "SSH配置生成失败" "error"
+        exit 1
+    fi
+    
+    if ! apply_ssh_config "$temp_config"; then
+        log "✗ SSH配置应用失败" "error"
         exit 1
     fi
     
@@ -392,5 +450,8 @@ main() {
     echo
     log "✅ SSH安全配置完成!" "info"
 }
+
+# 错误处理
+trap 'log "脚本执行出错，行号: $LINENO" "error"; exit 1' ERR
 
 main "$@"
