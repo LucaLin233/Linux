@@ -157,11 +157,11 @@ choose_ssh_ports() {
                     echo "端口无效或被占用，请重新输入" >&2
                 fi
             done
-            >&2
+            ;;
         *)
             echo "无效选择，保持当前端口" >&2
             echo "$current_ports"
-            ;&
+            ;;
     esac
 }
 
