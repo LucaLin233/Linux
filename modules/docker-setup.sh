@@ -383,23 +383,33 @@ main() {
         debug_log "容器管理失败，但继续执行"
     fi
     
+    echo "DEBUG: 准备显示Docker摘要"  # 新增
     show_docker_summary
+    echo "DEBUG: Docker摘要显示完成"  # 新增
     
     echo
     log "✅ Docker配置完成!" "info"
     
+    echo "DEBUG: 准备检查docker命令"  # 新增
     if command -v docker &>/dev/null; then
+        echo "DEBUG: docker命令存在"  # 新增
         echo
         log "常用命令:" "info"
         echo "  查看容器: docker ps"
         echo "  查看镜像: docker images"
         echo "  系统清理: docker system prune -f"
         
+        echo "DEBUG: 准备获取compose命令"  # 新增
         local compose_cmd=$(get_compose_command)
+        echo "DEBUG: compose_cmd='$compose_cmd'"  # 新增
         if [[ -n "$compose_cmd" ]]; then
             echo "  容器管理: $compose_cmd up -d"
         fi
+        echo "DEBUG: compose命令处理完成"  # 新增
+    else
+        echo "DEBUG: docker命令不存在"  # 新增
     fi
+    echo "DEBUG: main函数即将结束"  # 新增
     return 0
 }
 
