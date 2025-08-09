@@ -1,5 +1,5 @@
 #!/bin/bash
-# Mise 版本管理器配置模块 v5.1 - 智能配置版
+# Mise 版本管理器配置模块 v5.1 - 智能配置版（修复readonly问题）
 # 功能: 安装Mise、智能选择Python版本、Shell集成、智能链接管理、自动修复系统模块
 
 set -euo pipefail
@@ -20,6 +20,31 @@ debug_log() {
 }
 
 # === 辅助函数 ===
+
+# 动态获取mise可执行路径 - 新增函数解决readonly问题
+get_mise_executable() {
+    local mise_candidates=(
+        # 优先检查PATH中的mise  
+        "$(command -v mise 2>/dev/null || echo '')"
+        # 默认安装位置
+        "$MISE_PATH"
+        # 其他可能位置
+        "$HOME/.local/share/mise/bin/mise"
+        "/usr/local/bin/mise"
+    )
+    
+    for path in "${mise_candidates[@]}"; do
+        if [[ -n "$path" && -x "$path" ]]; then
+            debug_log "找到可用mise: $path"
+            echo "$path"
+            return 0
+        fi
+    done
+    
+    debug_log "未找到可用mise"
+    return 1
+}
+
 # 诊断系统包管理状态
 diagnose_apt_system() {
     debug_log "诊断APT系统状态"
@@ -320,11 +345,18 @@ EOF
     hash -r 2>/dev/null || true
 }
 
-# 获取Mise版本
+# 获取Mise版本 - 修改为使用动态路径
 get_mise_version() {
     debug_log "获取Mise版本"
+    local mise_cmd=""
+    if ! mise_cmd=$(get_mise_executable); then
+        debug_log "无法找到mise可执行文件"
+        echo "未知"
+        return 1
+    fi
+    
     local version_output
-    version_output=$("$MISE_PATH" --version 2>/dev/null || echo "")
+    version_output=$("$mise_cmd" --version 2>/dev/null || echo "")
     if [[ "$version_output" =~ v?([0-9]+\.[0-9]+\.[0-9]+) ]]; then
         debug_log "Mise版本: ${BASH_REMATCH[1]}"
         echo "${BASH_REMATCH[1]}"
@@ -334,7 +366,7 @@ get_mise_version() {
     fi
 }
 
-# 获取最新的三个Python主版本
+# 获取最新的三个Python主版本 - 修改为使用动态路径
 get_top3_python_versions() {
     debug_log "获取最新Python版本"
     local default_versions=("3.11.9" "3.12.4" "3.13.0")
@@ -342,7 +374,14 @@ get_top3_python_versions() {
     local major_versions=""
     local final_versions=()
     
-    if ! versions_output=$("$MISE_PATH" ls-remote python 2>/dev/null); then
+    local mise_cmd=""
+    if ! mise_cmd=$(get_mise_executable); then
+        debug_log "获取远程Python版本失败，使用默认版本"
+        printf '%s\n' "${default_versions[@]}"
+        return
+    fi
+    
+    if ! versions_output=$("$mise_cmd" ls-remote python 2>/dev/null); then
         debug_log "获取远程Python版本失败，使用默认版本"
         printf '%s\n' "${default_versions[@]}"
         return
@@ -374,15 +413,20 @@ get_top3_python_versions() {
     fi
 }
 
-# 获取已安装的Python版本列表
+# 获取已安装的Python版本列表 - 修改为使用动态路径
 get_installed_python_versions() {
     debug_log "获取已安装Python版本"
-    "$MISE_PATH" ls python 2>/dev/null | awk '/^python/ {print $2}' | grep -E "^[0-9]+\.[0-9]+\.[0-9]+$" 2>/dev/null || true
+    local mise_cmd=""
+    if ! mise_cmd=$(get_mise_executable); then
+        debug_log "无法找到mise，返回空版本列表"
+        return 0
+    fi
+    "$mise_cmd" ls python 2>/dev/null | awk '/^python/ {print $2}' | grep -E "^[0-9]+\.[0-9]+\.[0-9]+$" 2>/dev/null || true
 }
-# === 辅助函数结束 ===
 
 # === 核心功能函数 ===
-# 安装或更新Mise
+
+# 安装或更新Mise - 修复readonly变量问题
 install_mise() {
     debug_log "开始安装或更新Mise"
     mkdir -p "$MISE_BIN_DIR" || {
@@ -429,19 +473,12 @@ install_mise() {
         fi
     fi
     
-    # 改进的验证逻辑 - 关键修复
+    # 改进的验证逻辑 - 不修改readonly变量
     debug_log "开始验证Mise安装"
     
-    # 首先尝试通过命令查找
-    if command -v mise &>/dev/null; then
-        local actual_path=$(command -v mise)
-        debug_log "找到mise命令: $actual_path"
-        # 更新MISE_PATH变量为实际路径 - 这是关键！
-        MISE_PATH="$actual_path"
-        debug_log "已更新MISE_PATH为: $MISE_PATH"
-    # 然后检查预期位置
-    elif [[ -f "$MISE_PATH" && -x "$MISE_PATH" ]]; then
-        debug_log "在预期位置找到mise: $MISE_PATH"
+    local actual_mise_path=""
+    if actual_mise_path=$(get_mise_executable); then
+        debug_log "Mise验证成功，路径: $actual_mise_path"
     else
         log "✗ 安装验证失败" "error"
         debug_log "验证失败详情:"
@@ -452,10 +489,10 @@ install_mise() {
         exit 1
     fi
     
-    debug_log "Mise安装验证完成，使用路径: $MISE_PATH"
+    debug_log "Mise安装验证完成"
 }
 
-# 让用户选择Python版本
+# 让用户选择Python版本 - 修改为使用动态路径
 choose_python_version() {
     debug_log "用户选择Python版本"
     local versions=()
@@ -474,8 +511,11 @@ choose_python_version() {
         versions=("3.11.9" "3.12.4" "3.13.0")
     fi
     
+    local mise_cmd=""
     local latest_version=""
-    latest_version=$("$MISE_PATH" latest python 2>/dev/null || echo "")
+    if mise_cmd=$(get_mise_executable); then
+        latest_version=$("$mise_cmd" latest python 2>/dev/null || echo "")
+    fi
     
     # 所有菜单输出重定向到stderr，确保用户能看到
     echo >&2
@@ -518,7 +558,7 @@ choose_python_version() {
     esac
 }
 
-# 清理旧版本Python
+# 清理旧版本Python - 修改为使用动态路径
 cleanup_old_python_versions() {
     local current_version="$1"
     debug_log "清理旧Python版本，当前版本: $current_version"
@@ -537,18 +577,21 @@ cleanup_old_python_versions() {
         read -p "是否删除其他版本? [y/N]: " -r cleanup_choice
         if [[ "$cleanup_choice" =~ ^[Yy]$ ]]; then
             debug_log "用户选择删除其他Python版本"
-            while IFS= read -r version; do
-                if [[ -n "$version" ]]; then
-                    debug_log "删除Python版本: $version"
-                    if "$MISE_PATH" uninstall "python@$version" >/dev/null 2>&1; then
-                        echo "Python $version: 已删除"
-                        debug_log "Python $version 删除成功"
-                    else
-                        echo "Python $version: 删除失败"
-                        debug_log "Python $version 删除失败"
+            local mise_cmd=""
+            if mise_cmd=$(get_mise_executable); then
+                while IFS= read -r version; do
+                    if [[ -n "$version" ]]; then
+                        debug_log "删除Python版本: $version"
+                        if "$mise_cmd" uninstall "python@$version" >/dev/null 2>&1; then
+                            echo "Python $version: 已删除"
+                            debug_log "Python $version 删除成功"
+                        else
+                            echo "Python $version: 删除失败"
+                            debug_log "Python $version 删除失败"
+                        fi
                     fi
-                fi
-            done <<< "$installed_versions"
+                done <<< "$installed_versions"
+            fi
         else
             debug_log "用户选择保留其他Python版本"
         fi
@@ -557,11 +600,17 @@ cleanup_old_python_versions() {
     fi
 }
 
-# 配置Python
+# 配置Python - 修改为使用动态路径
 setup_python() {
     debug_log "开始配置Python"
+    local mise_cmd=""
+    if ! mise_cmd=$(get_mise_executable); then
+        log "✗ 找不到mise可执行文件" "error"
+        return 1
+    fi
+    
     local current_version=""
-    current_version=$("$MISE_PATH" current python 2>/dev/null || echo "")
+    current_version=$("$mise_cmd" current python 2>/dev/null || echo "")
     [[ -n "$current_version" ]] && echo "当前Python: $current_version"
     
     local selected_version=""
@@ -576,7 +625,7 @@ setup_python() {
     
     echo "安装Python $selected_version..."
     debug_log "安装Python版本: $selected_version"
-    if "$MISE_PATH" use -g "python@$selected_version" >/dev/null 2>&1; then
+    if "$mise_cmd" use -g "python@$selected_version" >/dev/null 2>&1; then
         echo "Python $selected_version: 安装成功"
         debug_log "Python $selected_version 安装成功"
         cleanup_old_python_versions "$selected_version"
@@ -588,11 +637,18 @@ setup_python() {
     fi
 }
 
-# 创建全局Python链接
+# 创建全局Python链接 - 修改为使用动态路径
 link_python_globally() {
     debug_log "创建全局Python链接"
+    local mise_cmd=""
+    if ! mise_cmd=$(get_mise_executable); then
+        echo "全局Python链接: 失败，找不到mise"
+        debug_log "找不到mise可执行文件"
+        return 1
+    fi
+    
     local python_path=""
-    python_path=$("$MISE_PATH" which python 2>/dev/null || echo "")
+    python_path=$("$mise_cmd" which python 2>/dev/null || echo "")
     
     if [[ -x "$python_path" ]]; then
         debug_log "找到mise Python路径: $python_path"
@@ -752,20 +808,21 @@ configure_shell_integration() {
     done
 }
 
-# 显示配置摘要
+# 显示配置摘要 - 修改为使用动态路径
 show_mise_summary() {
     debug_log "显示配置摘要"
     echo
     log "🎯 Mise配置摘要:" "info"
     
-    if [[ -f "$MISE_PATH" ]]; then
+    local mise_cmd=""
+    if mise_cmd=$(get_mise_executable); then
         local mise_version=""
         mise_version=$(get_mise_version)
         echo "  Mise: v$mise_version"
         
-        if "$MISE_PATH" which python &>/dev/null; then
+        if "$mise_cmd" which python &>/dev/null; then
             local current_version=""
-            current_version=$("$MISE_PATH" current python 2>/dev/null || echo "未知")
+            current_version=$("$mise_cmd" current python 2>/dev/null || echo "未知")
             echo "  Mise Python: $current_version"
         else
             echo "  Mise Python: 未配置"
@@ -816,14 +873,13 @@ show_mise_summary() {
         echo "  Zsh集成: 已配置"
     fi
 }
-# === 核心功能函数结束 ===
 
 # === 主流程 ===
 main() {
     log "🔧 配置Mise版本管理器..." "info"
     
     echo
-    if [[ -f "$MISE_PATH" ]]; then
+    if get_mise_executable >/dev/null; then
         detect_python_status >/dev/null 2>&1 || true
     fi
     
@@ -851,7 +907,7 @@ main() {
     log "✅ Mise配置完成!" "info"
     log "提示: 运行 'source ~/.bashrc' 或重新登录激活" "info"
     
-    if [[ -f "$MISE_PATH" ]]; then
+    if get_mise_executable >/dev/null; then
         echo
         log "常用命令:" "info"
         echo "  查看工具: mise list"
