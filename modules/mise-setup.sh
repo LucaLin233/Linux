@@ -429,27 +429,30 @@ install_mise() {
         fi
     fi
     
-    # 多种方式验证安装
+    # 改进的验证逻辑 - 关键修复
     debug_log "开始验证Mise安装"
-    debug_log "检查文件: $MISE_PATH"
-    debug_log "检查命令: $(command -v mise 2>/dev/null || echo 'not found')"
-    debug_log "当前PATH: $PATH"
     
-    if [[ -f "$MISE_PATH" && -x "$MISE_PATH" ]]; then
-        debug_log "Mise安装验证成功 (文件存在且可执行)"
-    elif command -v mise &>/dev/null; then
-        debug_log "Mise安装验证成功 (命令可用)"
-        # 更新MISE_PATH变量为实际路径
+    # 首先尝试通过命令查找
+    if command -v mise &>/dev/null; then
         local actual_path=$(command -v mise)
-        debug_log "实际Mise路径: $actual_path"
+        debug_log "找到mise命令: $actual_path"
+        # 更新MISE_PATH变量为实际路径 - 这是关键！
+        MISE_PATH="$actual_path"
+        debug_log "已更新MISE_PATH为: $MISE_PATH"
+    # 然后检查预期位置
+    elif [[ -f "$MISE_PATH" && -x "$MISE_PATH" ]]; then
+        debug_log "在预期位置找到mise: $MISE_PATH"
     else
         log "✗ 安装验证失败" "error"
-        debug_log "验证失败 - 文件检查: $([[ -f "$MISE_PATH" ]] && echo 'exists' || echo 'missing')"
-        debug_log "验证失败 - 权限检查: $([[ -x "$MISE_PATH" ]] && echo 'executable' || echo 'not executable')"
-        debug_log "验证失败 - 命令检查: $(command -v mise &>/dev/null && echo 'found' || echo 'not found')"
+        debug_log "验证失败详情:"
+        debug_log "  - 命令检查: $(command -v mise &>/dev/null && echo 'found' || echo 'not found')"
+        debug_log "  - 文件存在: $([[ -f "$MISE_PATH" ]] && echo 'yes' || echo 'no')"
+        debug_log "  - 可执行: $([[ -x "$MISE_PATH" ]] && echo 'yes' || echo 'no')"
+        debug_log "  - 当前PATH: $PATH"
         exit 1
     fi
-    debug_log "Mise安装验证完成"
+    
+    debug_log "Mise安装验证完成，使用路径: $MISE_PATH"
 }
 
 # 让用户选择Python版本
