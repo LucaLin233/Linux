@@ -1,6 +1,6 @@
 #!/bin/bash
-# Mise 版本管理器配置模块 v5.2 - 精简版（功能完整保留）
-# 功能: 安装Mise、智能选择Python版本、Shell集成、智能链接管理、自动修复系统模块
+# Mise 版本管理器配置模块 v6.0 - 项目级使用专版
+# 功能: 安装Mise、智能选择Python版本、Shell集成、系统修复
 
 set -euo pipefail
 
@@ -287,34 +287,6 @@ EOF
     done
 }
 
-# 配置全局模式的PATH
-configure_path_for_global_mode() {
-    debug_log "配置全局模式PATH"
-    local shells=("bash:$HOME/.bashrc" "zsh:$HOME/.zshrc")
-    
-    for shell_info in "${shells[@]}"; do
-        local shell_name="${shell_info%%:*}"
-        local config_file="${shell_info#*:}"
-        
-        command -v "$shell_name" &>/dev/null || { debug_log "$shell_name 不存在，跳过配置"; continue; }
-        
-        [[ ! -f "$config_file" ]] && touch "$config_file"
-        
-        sed -i '/# Mise PATH priority/,+1d' "$config_file" 2>/dev/null || true
-        sed -i '/# Mise global mode PATH/,+1d' "$config_file" 2>/dev/null || true
-        
-        debug_log "为 $shell_name 配置全局模式PATH"
-        cat >> "$config_file" << 'EOF'
-
-# Mise global mode PATH - mise Python 优先
-export PATH="$HOME/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-EOF
-    done
-    
-    export PATH="$HOME/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-    hash -r 2>/dev/null || true
-}
-
 # 获取Mise版本
 get_mise_version() {
     debug_log "获取Mise版本"
@@ -332,37 +304,6 @@ get_mise_version() {
     else
         debug_log "无法获取Mise版本"
         echo "未知"
-    fi
-}
-
-# 获取最新的三个Python主版本
-get_top3_python_versions() {
-    debug_log "获取最新Python版本"
-    local default_versions=("3.11.9" "3.12.4" "3.13.0")
-    local mise_cmd=""
-    
-    mise_cmd=$(get_mise_executable) || { debug_log "获取远程Python版本失败，使用默认版本"; printf '%s\n' "${default_versions[@]}"; return; }
-    
-    local versions_output=$("$mise_cmd" ls-remote python 2>/dev/null) || { debug_log "获取远程Python版本失败，使用默认版本"; printf '%s\n' "${default_versions[@]}"; return; }
-    
-    local major_versions=$(echo "$versions_output" | grep -E "^[0-9]+\.[0-9]+\.[0-9]+$" | sed -E 's/^([0-9]+\.[0-9]+)\.[0-9]+$/\1/' | sort -V -u | tail -3 2>/dev/null) || { debug_log "处理版本信息失败，使用默认版本"; printf '%s\n' "${default_versions[@]}"; return; }
-    
-    local final_versions=()
-    while IFS= read -r major; do
-        if [[ -n "$major" ]]; then
-            local latest_patch=$(echo "$versions_output" | grep -E "^${major}\.[0-9]+$" | sort -V | tail -1 2>/dev/null)
-            if [[ -n "$latest_patch" ]]; then
-                final_versions+=("$latest_patch")
-                debug_log "找到Python版本: $latest_patch"
-            fi
-        fi
-    done <<< "$major_versions"
-    
-    if [[ ${#final_versions[@]} -eq 0 ]]; then
-        debug_log "未找到可用版本，使用默认版本"
-        printf '%s\n' "${default_versions[@]}"
-    else
-        printf '%s\n' "${final_versions[@]}"
     fi
 }
 
@@ -434,62 +375,56 @@ install_mise() {
     return 0
 }
 
-# 让用户选择Python版本
+# 简化的Python版本选择
 choose_python_version() {
-    debug_log "用户选择Python版本"
-    local versions=()
-    local version_output=$(get_top3_python_versions)
+    debug_log "Python版本选择"
     
-    if [[ -n "$version_output" ]]; then
-        while IFS= read -r line; do
-            [[ -n "$line" ]] && versions+=("$line")
-        done <<< "$version_output"
+    local mise_cmd=""
+    if ! mise_cmd=$(get_mise_executable); then
+        echo "3.12.4"  # fallback
+        return
     fi
     
-    [[ ${#versions[@]} -eq 0 ]] && { debug_log "使用默认Python版本列表"; versions=("3.11.9" "3.12.4" "3.13.0"); }
+    local current_version=$("$mise_cmd" current python 2>/dev/null || echo "")
+    [[ -n "$current_version" ]] && echo "当前Python: $current_version" >&2
     
-    local mise_cmd latest_version=""
-    if mise_cmd=$(get_mise_executable); then
-        latest_version=$("$mise_cmd" latest python 2>/dev/null || echo "")
-    fi
+    local latest_version=$("$mise_cmd" latest python 2>/dev/null || echo "3.12.4")
     
-    # 所有菜单输出重定向到stderr，确保用户能看到
     echo >&2
     echo "Python版本选择:" >&2
-    for i in "${!versions[@]}"; do
-        local version="${versions[$i]}"
-        local label=""
-        [[ -n "$latest_version" && "$version" == "$latest_version" ]] && label=" (latest)"
-        echo "  $((i+1))) Python $version$label" >&2
-    done
-    echo "  4) 保持当前配置" >&2
+    echo "  1) 安装最新版本 (Python $latest_version) - 推荐" >&2
+    echo "  2) 手动输入版本号" >&2
+    echo "  3) 保持当前配置" >&2
     echo >&2
     
     local choice=""
-    read -p "请选择 [1-4] (默认: 4): " choice >&2
-    choice=${choice:-4}
+    read -p "请选择 [1-3] (默认: 1): " choice >&2
+    choice=${choice:-1}
     
-    debug_log "用户选择: $choice"
-    
-    # 只返回结果到stdout，不包含其他输出
     case "$choice" in
-        1|2|3) 
-            local idx=$((choice-1))
-            if [[ $idx -lt ${#versions[@]} ]]; then
-                debug_log "选择Python版本: ${versions[$idx]}"
-                echo "${versions[$idx]}"
+        1) 
+            debug_log "选择最新版本: $latest_version"
+            echo "$latest_version"
+            ;;
+        2)
+            local custom_version=""
+            read -p "请输入Python版本号 (如 3.11.9): " custom_version >&2
+            if [[ "$custom_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+                debug_log "用户输入版本: $custom_version"
+                echo "$custom_version"
             else
-                debug_log "无效选择，使用默认版本3.12.4"
-                echo "3.12.4"
+                echo "版本号格式错误，使用最新版本: $latest_version" >&2
+                debug_log "版本号格式错误，使用最新版本"
+                echo "$latest_version"
             fi
             ;;
-        4) 
-            debug_log "保持当前Python配置"
-            echo "current" 
+        3) 
+            debug_log "保持当前配置"
+            echo "current"
             ;;
         *) 
-            debug_log "无效选择，使用默认版本3.12.4"
-            echo "3.12.4" 
+            debug_log "无效选择，使用最新版本"
+            echo "$latest_version"
             ;;
     esac
 }
@@ -564,107 +499,33 @@ setup_python() {
     fi
 }
 
-# 创建全局Python链接
-link_python_globally() {
-    debug_log "创建全局Python链接"
-    local mise_cmd=""
-    mise_cmd=$(get_mise_executable) || { echo "全局Python链接: 失败，找不到mise"; debug_log "找不到mise可执行文件"; return 1; }
-    
-    local python_path=$("$mise_cmd" which python 2>/dev/null || echo "")
-    
-    if [[ -x "$python_path" ]]; then
-        debug_log "找到mise Python路径: $python_path"
-        [[ -L /usr/bin/python3 ]] && sudo cp -L /usr/bin/python3 /usr/bin/python3.backup 2>/dev/null || { debug_log "备份/usr/bin/python3失败"; true; }
-        [[ -e /usr/bin/python ]] && sudo cp -L /usr/bin/python /usr/bin/python.backup 2>/dev/null || { debug_log "备份/usr/bin/python失败"; true; }
-        
-        if sudo ln -sf "$python_path" /usr/bin/python && sudo ln -sf "$python_path" /usr/bin/python3; then
-            echo "全局Python链接: 已创建"
-            echo "  /usr/bin/python -> $python_path"
-            echo "  /usr/bin/python3 -> $python_path"
-            debug_log "全局Python链接创建成功"
-        else
-            echo "全局Python链接: 创建失败"
-            debug_log "全局Python链接创建失败"
-        fi
-    else
-        echo "全局Python链接: 失败，找不到mise Python"
-        debug_log "找不到mise Python路径"
-    fi
-}
-
-# 配置Python使用方式
+# 简化的项目级使用配置
 setup_python_usage() {
-    debug_log "配置Python使用方式"
-    echo
-    local needs_fix=1
+    debug_log "配置项目级Python使用"
+    
+    # 直接配置为项目级使用
+    configure_safe_path_priority
+    
+    # 检测是否需要修复
     if detect_python_status >/dev/null 2>&1; then
-        needs_fix=0
-        debug_log "检测到系统需要修复"
-    else
-        needs_fix=1
-        debug_log "系统状态正常"
+        echo
+        log "⚠️ 检测到系统Python被劫持" "warn"
+        read -p "是否立即修复系统配置? [Y/n]: " -r fix_choice
+        
+        if [[ "$fix_choice" =~ ^[Nn]$ ]]; then
+            log "跳过修复，可能影响系统工具正常使用" "warn"
+        else
+            echo "修复系统配置中..."
+            fix_python_system_priority
+        fi
     fi
     
-    echo "Python使用方式:"
-    echo "  1) 项目级使用 (推荐) - 系统工具用系统Python，项目用mise"
-    echo "  2) 全局替换 - ⚠️ mise成为系统默认，可能影响apt等工具"
-    
-    # 只有在真正需要修复时才显示修复选项
-    [[ $needs_fix -eq 0 ]] && echo "  3) 修复系统配置 - 🔧 检测到系统被劫持，推荐立即修复"
     echo
+    echo "使用指南:"
+    echo "  • 系统级: 自动使用系统Python"
+    echo "  • 项目级: cd project && mise use python@3.12.4"
+    echo "  • 临时使用: mise exec python@3.12.4 -- python script.py"
     
-    local usage_choice="" default_choice=1 max_choice=2
-    [[ $needs_fix -eq 0 ]] && { default_choice=3; max_choice=3; }
-    
-    read -p "请选择 [1-$max_choice] (默认: $default_choice): " -r usage_choice
-    usage_choice=${usage_choice:-$default_choice}
-    
-    debug_log "用户选择使用方式: $usage_choice"
-    
-    case "$usage_choice" in
-        1)
-            echo "配置模式: 项目级使用"
-            debug_log "配置项目级使用模式"
-            [[ $needs_fix -eq 0 ]] && fix_python_system_priority
-            echo
-            echo "使用指南:"
-            echo "  • 系统级: 自动使用系统Python"
-            echo "  • 项目级: cd project && mise use python@3.12.4"
-            echo "  • 临时使用: mise exec python@3.12.4 -- python script.py"
-            ;;
-        2)
-            echo
-            log "⚠️ 警告: 全局替换会影响系统工具！" "warn"
-            read -p "确认继续? [y/N]: " -r confirm_choice
-            if [[ "$confirm_choice" =~ ^[Yy]$ ]]; then
-                echo "配置模式: 全局替换"
-                debug_log "配置全局替换模式"
-                link_python_globally
-                configure_path_for_global_mode
-                echo "重要: 如遇系统工具报错，重新运行脚本选择修复"
-            else
-                echo "配置模式: 改为项目级使用"
-                debug_log "用户取消全局替换，改为项目级使用"
-                fix_python_system_priority
-            fi
-            ;;
-        3)
-            if [[ $needs_fix -eq 0 ]]; then
-                echo "执行系统修复..."
-                debug_log "执行系统修复"
-                fix_python_system_priority
-            else
-                echo "配置模式: 项目级使用"
-                debug_log "配置项目级使用（备用选项）"
-                fix_python_system_priority
-            fi
-            ;;
-        *)
-            echo "配置模式: 项目级使用"
-            debug_log "默认配置项目级使用"
-            [[ $needs_fix -eq 0 ]] && fix_python_system_priority
-            ;;
-    esac
     return 0
 }
 
@@ -770,6 +631,7 @@ show_mise_summary() {
         echo "  Mise: 未安装"
     fi
     
+    echo "  使用模式: 项目级使用 (推荐)"
     grep -q "mise activate" "$HOME/.bashrc" 2>/dev/null && echo "  Bash集成: 已配置"
     [[ -f "$HOME/.zshrc" ]] && grep -q "mise activate" "$HOME/.zshrc" 2>/dev/null && echo "  Zsh集成: 已配置"
     return 0
@@ -777,7 +639,7 @@ show_mise_summary() {
 
 # === 主流程 ===
 main() {
-    log "🔧 配置Mise版本管理器..." "info"
+    log "🔧 配置Mise版本管理器 - 项目级使用专版..." "info"
     
     echo
     get_mise_executable >/dev/null 2>&1 && detect_python_status >/dev/null 2>&1 || true
