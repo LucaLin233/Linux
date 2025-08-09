@@ -389,7 +389,7 @@ install_mise() {
         return 1
     }
     
-    if [[ -f "$MISE_PATH" ]]; then
+    if [[ -f "$MISE_PATH" ]] || command -v mise &>/dev/null; then
         local mise_version
         mise_version=$(get_mise_version)
         echo "Mise状态: 已安装 v$mise_version"
@@ -400,6 +400,10 @@ install_mise() {
             if curl -fsSL https://mise.run | sh >/dev/null 2>&1; then
                 echo "Mise更新: 成功"
                 debug_log "Mise更新成功"
+                # 刷新命令缓存
+                hash -r 2>/dev/null || true
+                # 重新确保PATH包含mise目录
+                export PATH="$MISE_BIN_DIR:$PATH"
             else
                 echo "Mise更新: 失败，继续使用现有版本"
                 debug_log "Mise更新失败"
@@ -413,6 +417,10 @@ install_mise() {
         if curl -fsSL https://mise.run | sh >/dev/null 2>&1; then
             echo "Mise安装: 成功"
             debug_log "Mise安装成功"
+            # 刷新命令缓存
+            hash -r 2>/dev/null || true
+            # 确保PATH包含mise目录
+            export PATH="$MISE_BIN_DIR:$PATH"
         else
             log "✗ Mise安装失败" "error"
             debug_log "Mise安装失败"
@@ -420,12 +428,27 @@ install_mise() {
         fi
     fi
     
-    if [[ ! -f "$MISE_PATH" ]]; then
+    # 多种方式验证安装
+    debug_log "开始验证Mise安装"
+    debug_log "检查文件: $MISE_PATH"
+    debug_log "检查命令: $(command -v mise 2>/dev/null || echo 'not found')"
+    debug_log "当前PATH: $PATH"
+    
+    if [[ -f "$MISE_PATH" && -x "$MISE_PATH" ]]; then
+        debug_log "Mise安装验证成功 (文件存在且可执行)"
+    elif command -v mise &>/dev/null; then
+        debug_log "Mise安装验证成功 (命令可用)"
+        # 更新MISE_PATH变量为实际路径
+        local actual_path=$(command -v mise)
+        debug_log "实际Mise路径: $actual_path"
+    else
         log "✗ 安装验证失败" "error"
-        debug_log "Mise安装验证失败"
+        debug_log "验证失败 - 文件检查: $([[ -f "$MISE_PATH" ]] && echo 'exists' || echo 'missing')"
+        debug_log "验证失败 - 权限检查: $([[ -x "$MISE_PATH" ]] && echo 'executable' || echo 'not executable')"
+        debug_log "验证失败 - 命令检查: $(command -v mise &>/dev/null && echo 'found' || echo 'not found')"
         exit 1
     fi
-    debug_log "Mise安装验证成功"
+    debug_log "Mise安装验证完成"
 }
 
 # 让用户选择Python版本
