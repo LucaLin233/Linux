@@ -157,23 +157,29 @@ handle_existing_nexttrace() {
     
     echo "DEBUG: 找到nexttrace命令，继续检查安装方式..." >&2
     
-    # 第二步检查 - 加上详细调试
-    echo "DEBUG: 执行 dpkg 检查..." >&2
-    if dpkg -l | grep -q "nexttrace" 2>/dev/null; then
+    # 第二步检查 - 使用更可靠的方法
+    echo "DEBUG: 执行 dpkg-query 检查..." >&2
+    if dpkg-query -W -f='${Status}' nexttrace 2>/dev/null | grep -q "install ok installed"; then
         debug_log "检测到apt安装的nexttrace，跳过迁移"
-        echo "DEBUG: dpkg确认是apt安装，返回0" >&2
+        echo "DEBUG: dpkg-query确认是apt安装，返回0" >&2
         return 0  # 已经是apt安装，无需迁移
     fi
     
-    echo "DEBUG: dpkg检查失败！认为不是apt安装" >&2
-    echo "DEBUG: 手动检查 dpkg -l | grep nexttrace 的结果:" >&2
-    dpkg -l | grep "nexttrace" >&2 || echo "DEBUG: grep没有找到结果" >&2
+    echo "DEBUG: dpkg-query检查失败！尝试备选方法..." >&2
+    
+    # 备选检测方法
+    if dpkg --get-selections 2>/dev/null | grep -q "nexttrace.*install"; then
+        debug_log "检测到apt安装的nexttrace（备选方法），跳过迁移"
+        echo "DEBUG: 备选方法确认是apt安装，返回0" >&2
+        return 0
+    fi
+    
+    echo "DEBUG: 所有检测方法都认为不是apt安装" >&2
     
     # 脚本安装的版本，需要迁移
     echo "检测到脚本安装的nexttrace，正在迁移到apt源..." >&2
     debug_log "开始迁移脚本安装的nexttrace到apt源"
     
-    # 其余代码保持不变...
     # 删除脚本安装的版本
     local nexttrace_paths=(
         "$(command -v nexttrace 2>/dev/null || true)"
