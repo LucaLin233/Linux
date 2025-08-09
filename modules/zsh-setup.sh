@@ -1,5 +1,5 @@
 #!/bin/bash
-# Zsh Shell 环境配置模块 v5.0 - 智能配置版
+# Zsh Shell 环境配置模块 v5.1 - 智能配置版
 # 功能: 安装配置Zsh + Oh My Zsh + Powerlevel10k + 常用插件
 
 set -euo pipefail
@@ -26,12 +26,15 @@ debug_log() {
 backup_zshrc() {
     debug_log "备份.zshrc文件"
     if [[ -f "$HOME/.zshrc" ]] && [[ ! -f "$HOME/.zshrc.backup" ]]; then
-        if ! cp "$HOME/.zshrc" "$HOME/.zshrc.backup" 2>/dev/null; then
+        if cp "$HOME/.zshrc" "$HOME/.zshrc.backup" 2>/dev/null; then
+            debug_log ".zshrc备份完成"
+            return 0
+        else
             log "备份.zshrc失败" "error"
             return 1
         fi
-        debug_log ".zshrc备份完成"
     fi
+    debug_log ".zshrc备份检查完成"
     return 0
 }
 # === 辅助函数结束 ===
@@ -88,10 +91,8 @@ install_components() {
     # 安装插件
     local new_plugins=0
     local failed_plugins=()
-    if ! mkdir -p "$PLUGINS_DIR" 2>/dev/null; then
-        log "创建插件目录失败" "error"
-        errors+=("插件目录创建失败")
-    else
+    
+    if mkdir -p "$PLUGINS_DIR" 2>/dev/null; then
         debug_log "开始安装插件"
         
         local plugins=(
@@ -120,6 +121,9 @@ install_components() {
         
         [[ $new_plugins -gt 0 ]] && components+=("${new_plugins}个插件")
         [[ ${#failed_plugins[@]} -gt 0 ]] && errors+=("插件失败: ${failed_plugins[*]}")
+    else
+        log "创建插件目录失败" "error"
+        errors+=("插件目录创建失败")
     fi
     
     # 输出结果
@@ -135,16 +139,23 @@ install_components() {
             log "⚠️  $error" "warn"
         done
     fi
+    
+    return 0  # 不让错误中断整个流程
 }
 
 # 配置zshrc文件
 configure_zshrc() {
     debug_log "开始配置.zshrc"
+    
     if ! backup_zshrc; then
         return 1
     fi
     
-    if ! cat > "$HOME/.zshrc" << 'EOF'; then
+    debug_log "写入.zshrc配置文件"
+    cat > "$HOME/.zshrc" << 'EOF' || {
+        log ".zshrc配置写入失败" "error" 
+        return 1
+    }
 # Oh My Zsh 配置
 export ZSH="$HOME/.oh-my-zsh"
 ZSH_THEME="powerlevel10k/powerlevel10k"
@@ -183,10 +194,9 @@ alias update='apt update -y'
 alias reproxy='cd /root/proxy && docker compose down && docker compose pull && docker compose up -d --remove-orphans'
 alias autodel='docker system prune -a -f && apt autoremove -y'
 EOF
-        log ".zshrc配置写入失败" "error"
-        return 1
-    fi
+    
     debug_log ".zshrc配置完成"
+    return 0
 }
 
 # 选择并配置主题
@@ -213,7 +223,6 @@ setup_theme() {
             debug_log "下载LucaLin主题配置"
             if curl -fsSL "https://raw.githubusercontent.com/LucaLin233/Linux/refs/heads/main/p10k-config.zsh" -o "$HOME/.p10k.zsh" 2>/dev/null; then
                 debug_log "LucaLin主题下载成功"
-                return 0
             else
                 echo "主题: 配置向导 (下载失败，首次启动时配置)"
                 debug_log "LucaLin主题下载失败"
@@ -224,7 +233,6 @@ setup_theme() {
             debug_log "下载Rainbow主题配置"
             if curl -fsSL "https://raw.githubusercontent.com/romkatv/powerlevel10k/master/config/p10k-rainbow.zsh" -o "$HOME/.p10k.zsh" 2>/dev/null; then
                 debug_log "Rainbow主题下载成功"
-                return 0
             else
                 echo "主题: 配置向导 (下载失败，首次启动时配置)"
                 debug_log "Rainbow主题下载失败"
@@ -235,7 +243,6 @@ setup_theme() {
             debug_log "下载Lean主题配置"
             if curl -fsSL "https://raw.githubusercontent.com/romkatv/powerlevel10k/master/config/p10k-lean.zsh" -o "$HOME/.p10k.zsh" 2>/dev/null; then
                 debug_log "Lean主题下载成功"
-                return 0
             else
                 echo "主题: 配置向导 (下载失败，首次启动时配置)"
                 debug_log "Lean主题下载失败"
@@ -246,7 +253,6 @@ setup_theme() {
             debug_log "下载Classic主题配置"
             if curl -fsSL "https://raw.githubusercontent.com/romkatv/powerlevel10k/master/config/p10k-classic.zsh" -o "$HOME/.p10k.zsh" 2>/dev/null; then
                 debug_log "Classic主题下载成功"
-                return 0
             else
                 echo "主题: 配置向导 (下载失败，首次启动时配置)"
                 debug_log "Classic主题下载失败"
@@ -257,7 +263,6 @@ setup_theme() {
             debug_log "下载Pure主题配置"
             if curl -fsSL "https://raw.githubusercontent.com/romkatv/powerlevel10k/master/config/p10k-pure.zsh" -o "$HOME/.p10k.zsh" 2>/dev/null; then
                 debug_log "Pure主题下载成功"
-                return 0
             else
                 echo "主题: 配置向导 (下载失败，首次启动时配置)"
                 debug_log "Pure主题下载失败"
@@ -272,16 +277,16 @@ setup_theme() {
             debug_log "使用默认LucaLin主题"
             curl -fsSL "https://raw.githubusercontent.com/LucaLin233/Linux/refs/heads/main/p10k-config.zsh" -o "$HOME/.p10k.zsh" 2>/dev/null || {
                 debug_log "默认主题下载失败"
-                true
             }
             ;;
     esac
+    
+    return 0  # 主题下载失败不应该中断整个流程
 }
 
 # 设置默认Shell
 setup_default_shell() {
     debug_log "设置默认Shell"
-    local current_shell=$(getent passwd root | cut -d: -f7)
     local zsh_path
     
     if ! zsh_path=$(which zsh 2>/dev/null); then
@@ -289,6 +294,7 @@ setup_default_shell() {
         return 1
     fi
     
+    local current_shell=$(getent passwd root 2>/dev/null | cut -d: -f7 || echo "unknown")
     debug_log "当前Shell: $current_shell, Zsh路径: $zsh_path"
     
     if [[ "$current_shell" != "$zsh_path" ]]; then
@@ -303,6 +309,8 @@ setup_default_shell() {
         echo "默认Shell: 已是Zsh"
         debug_log "默认Shell已是Zsh"
     fi
+    
+    return 0
 }
 # === 核心功能函数结束 ===
 
@@ -311,26 +319,35 @@ main() {
     log "🐚 配置Zsh环境..." "info"
     
     echo
-    install_components
+    install_components || {
+        log "组件安装出现问题，但继续执行" "warn"
+    }
     
     echo
-    if ! configure_zshrc; then
+    if configure_zshrc; then
+        echo "配置文件: .zshrc 已更新"
+    else
         log "zshrc配置失败" "error"
-        exit 1
+        return 1
     fi
-    echo "配置文件: .zshrc 已更新"
     
     echo
-    setup_theme
+    setup_theme || {
+        log "主题设置出现问题，但不影响主要功能" "warn"
+    }
     
     echo
-    setup_default_shell
+    setup_default_shell || {
+        log "默认Shell设置失败" "warn"
+    }
     
     echo
     log "✅ Zsh配置完成，运行 'exec zsh' 体验" "info"
+    
+    return 0
 }
 
-# 错误处理
-trap 'log "脚本执行出错，行号: $LINENO" "error"; exit 1' ERR
+# 错误处理 - 修复版
+trap 'echo "❌ Zsh配置脚本在第 $LINENO 行执行失败" >&2; exit 1' ERR
 
 main "$@"
