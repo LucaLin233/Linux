@@ -143,6 +143,9 @@ get_tools_by_category() {
 handle_existing_nexttrace() {
     debug_log "检查现有nexttrace安装方式"
     
+    # 刷新命令缓存，确保检测准确
+    hash -r 2>/dev/null || true
+    
     if ! command -v nexttrace >/dev/null 2>&1 && ! command -v nxtrace >/dev/null 2>&1; then
         debug_log "未找到现有nexttrace"
         return 0  # 没有现有安装
@@ -401,6 +404,8 @@ install_selected_tools() {
                 
                 if $install_success; then
                     debug_log "工具 $tool_name 安装成功，重新检查版本"
+                    # 刷新命令缓存
+                    hash -r 2>/dev/null || true
                     # 重新检查版本
                     sleep 2  # nexttrace安装后可能需要更长时间生效
                     local new_status=$(check_tool_status "$tool_name" "$check_cmd" || echo "installed:已安装")
