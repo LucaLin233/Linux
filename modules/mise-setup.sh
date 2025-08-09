@@ -426,7 +426,7 @@ get_installed_python_versions() {
 
 # === 核心功能函数 ===
 
-# 安装或更新Mise - 修复readonly变量问题
+# 安装或更新Mise - 修复readonly变量问题并添加详细调试
 install_mise() {
     debug_log "开始安装或更新Mise"
     mkdir -p "$MISE_BIN_DIR" || {
@@ -473,19 +473,75 @@ install_mise() {
         fi
     fi
     
-    # 改进的验证逻辑 - 不修改readonly变量
+    # 改进的验证逻辑 - 不修改readonly变量，添加详细调试
     debug_log "开始验证Mise安装"
+    
+    # 输出当前环境状态用于调试
+    echo "=== Mise验证环境调试信息 ===" >&2
+    echo "当前工作目录: $(pwd)" >&2
+    echo "HOME目录: $HOME" >&2  
+    echo "当前PATH: $PATH" >&2
+    echo "当前用户: $(whoami)" >&2
+    echo "MISE_PATH常量: $MISE_PATH" >&2
+    echo "MISE_BIN_DIR常量: $MISE_BIN_DIR" >&2
+    echo "" >&2
+    
+    echo "文件系统检查:" >&2
+    echo "  ~/.local/bin目录存在: $([[ -d ~/.local/bin ]] && echo 'yes' || echo 'no')" >&2
+    echo "  ~/.local/bin目录内容:" >&2
+    ls -la ~/.local/bin/ 2>/dev/null | head -10 || echo "    无法访问目录" >&2
+    echo "  $MISE_PATH 文件存在: $([[ -f "$MISE_PATH" ]] && echo 'yes' || echo 'no')" >&2
+    echo "  $MISE_PATH 可执行: $([[ -x "$MISE_PATH" ]] && echo 'yes' || echo 'no')" >&2
+    if [[ -f "$MISE_PATH" ]]; then
+        echo "  $MISE_PATH 文件详情:" >&2
+        ls -la "$MISE_PATH" 2>/dev/null || echo "    无法获取文件详情" >&2
+    fi
+    echo "" >&2
+    
+    echo "命令查找检查:" >&2
+    echo "  which mise: $(which mise 2>/dev/null || echo 'not found')" >&2
+    echo "  command -v mise: $(command -v mise 2>/dev/null || echo 'not found')" >&2
+    echo "  type -p mise: $(type -p mise 2>/dev/null || echo 'not found')" >&2
+    if command -v mise &>/dev/null; then
+        echo "  mise版本检查: $(mise --version 2>/dev/null | head -1 || echo 'version check failed')" >&2
+    fi
+    echo "==============================" >&2
     
     local actual_mise_path=""
     if actual_mise_path=$(get_mise_executable); then
+        echo "Mise验证: 成功 (路径: $actual_mise_path)"
         debug_log "Mise验证成功，路径: $actual_mise_path"
+        
+        # 额外验证：确保找到的mise能正常执行
+        if "$actual_mise_path" --version >/dev/null 2>&1; then
+            debug_log "Mise功能验证成功"
+        else
+            echo "警告: 找到mise文件但无法正常执行" >&2
+            echo "尝试执行 $actual_mise_path --version 的结果:" >&2
+            "$actual_mise_path" --version 2>&1 | head -3 || echo "执行失败" >&2
+        fi
     else
         log "✗ 安装验证失败" "error"
-        debug_log "验证失败详情:"
-        debug_log "  - 命令检查: $(command -v mise &>/dev/null && echo 'found' || echo 'not found')"
-        debug_log "  - 文件存在: $([[ -f "$MISE_PATH" ]] && echo 'yes' || echo 'no')"
-        debug_log "  - 可执行: $([[ -x "$MISE_PATH" ]] && echo 'yes' || echo 'no')"
-        debug_log "  - 当前PATH: $PATH"
+        
+        echo "" >&2
+        echo "=== 验证失败详细分析 ===" >&2
+        echo "get_mise_executable函数检查的路径:" >&2
+        echo "  1. command -v mise: $(command -v mise 2>/dev/null || echo 'not found')" >&2
+        echo "  2. $MISE_PATH: $([[ -f "$MISE_PATH" && -x "$MISE_PATH" ]] && echo 'valid' || echo 'invalid')" >&2
+        echo "  3. ~/.local/share/mise/bin/mise: $([[ -f ~/.local/share/mise/bin/mise && -x ~/.local/share/mise/bin/mise ]] && echo 'valid' || echo 'invalid')" >&2
+        echo "  4. /usr/local/bin/mise: $([[ -f /usr/local/bin/mise && -x /usr/local/bin/mise ]] && echo 'valid' || echo 'invalid')" >&2
+        echo "" >&2
+        
+        echo "可能的mise安装位置检查:" >&2
+        find /root -name "mise" -type f -executable 2>/dev/null | head -5 || echo "  未找到mise文件" >&2
+        echo "" >&2
+        
+        echo "PATH中所有可执行文件:" >&2
+        echo "$PATH" | tr ':' '\n' | while read -r dir; do
+            [[ -d "$dir" ]] && ls -la "$dir"/mise* 2>/dev/null
+        done || echo "  未在PATH中找到mise" >&2
+        echo "=========================" >&2
+        
         exit 1
     fi
     
