@@ -223,10 +223,15 @@ set_system_parameters() {
     local disk_swap_output=$(swapon --show 2>/dev/null | grep -v zram | tail -n +2)
     if [[ -n "$disk_swap_output" ]]; then
         while read -r disk_swap _; do
-            [[ -n "$disk_swap" && -b "$disk_swap" ]] || continue
-            if swapoff "$disk_swap" 2>/dev/null && swapon "$disk_swap" -p "$disk_priority" 2>/dev/null; then
-                ((disk_swap_count++))
-                debug_log "磁盘swap $disk_swap 优先级设置为 $disk_priority"
+            [[ -n "$disk_swap" ]] || continue
+            # 检查是文件还是块设备
+            if [[ -f "$disk_swap" || -b "$disk_swap" ]]; then
+                if swapoff "$disk_swap" 2>/dev/null && swapon "$disk_swap" -p "$disk_priority" 2>/dev/null; then
+                    ((disk_swap_count++))
+                    debug_log "磁盘swap $disk_swap 优先级设置为 $disk_priority"
+                else
+                    debug_log "无法重新设置 $disk_swap 优先级"
+                fi
             fi
         done <<< "$disk_swap_output"
     fi
