@@ -1,5 +1,5 @@
 #!/bin/bash
-# SSH 安全配置模块 v5.0 - 智能安全版
+# SSH 安全配置模块 v5.1 - 智能安全版
 # 功能: SSH端口配置、密码认证控制、安全策略设置
 
 set -euo pipefail
@@ -16,20 +16,25 @@ log() {
 }
 
 debug_log() {
-    [[ "${DEBUG:-}" == "1" ]] && log "DEBUG: $1" "debug" >&2
+    if [[ "${DEBUG:-}" == "1" ]]; then
+        log "DEBUG: $1" "debug" >&2
+    fi
+    return 0
 }
 
 # === 辅助函数 ===
 # 备份SSH配置
 backup_ssh_config() {
+    debug_log "开始备份SSH配置"
     if [[ -f "$SSH_CONFIG" ]]; then
-        cp "$SSH_CONFIG" "$SSH_CONFIG.backup.$(date +%s)" 2>/dev/null || {
+        if cp "$SSH_CONFIG" "$SSH_CONFIG.backup.$(date +%s)" 2>/dev/null; then
+            debug_log "SSH配置已备份"
+            echo "SSH配置: 已备份"
+            return 0
+        else
             log "SSH配置备份失败" "error"
             return 1
-        }
-        debug_log "SSH配置已备份"
-        echo "SSH配置: 已备份"
-        return 0
+        fi
     else
         log "SSH配置文件不存在" "error"
         return 1
@@ -38,12 +43,18 @@ backup_ssh_config() {
 
 # 获取当前SSH端口
 get_current_ssh_ports() {
+    debug_log "获取当前SSH端口"
     local ports
     if ports=$(grep "^Port " "$SSH_CONFIG" 2>/dev/null | awk '{print $2}'); then
-        [[ -n "$ports" ]] && echo "$ports" | tr '\n' ' ' | sed 's/ $//' || echo "22"
+        if [[ -n "$ports" ]]; then
+            echo "$ports" | tr '\n' ' ' | sed 's/ $//'
+        else
+            echo "22"
+        fi
     else
         echo "22"
     fi
+    return 0
 }
 
 # 验证端口号
@@ -77,6 +88,7 @@ validate_port() {
 
 # 检查SSH密钥
 check_ssh_keys() {
+    debug_log "检查SSH密钥"
     local key_count=0
     
     # 检查authorized_keys
@@ -103,6 +115,7 @@ check_ssh_keys() {
 
 # 获取当前Root登录设置
 get_current_root_login() {
+    debug_log "获取当前Root登录设置"
     local current_setting
     if current_setting=$(grep "^PermitRootLogin" "$SSH_CONFIG" 2>/dev/null | awk '{print $2}'); then
         echo "$current_setting"
@@ -110,23 +123,26 @@ get_current_root_login() {
         # 如果没有显式配置，SSH默认是prohibit-password
         echo "prohibit-password"
     fi
+    return 0
 }
 
 # 格式化Root登录设置显示
 format_root_login_display() {
     local setting="$1"
+    debug_log "格式化Root登录显示: $setting"
     case "$setting" in
         "no") echo "禁止Root登录" ;;
         "prohibit-password") echo "仅允许密钥登录" ;;
         "yes") echo "允许密码登录" ;;
         *) echo "未知设置: $setting" ;;
     esac
+    return 0
 }
-# === 辅助函数结束 ===
 
 # === 核心功能函数 ===
 # 选择SSH端口
 choose_ssh_ports() {
+    debug_log "开始选择SSH端口"
     local current_ports=$(get_current_ssh_ports)
     
     echo "当前SSH端口: $current_ports" >&2
@@ -138,7 +154,7 @@ choose_ssh_ports() {
     echo >&2
     
     local choice new_ports
-    read -p "请选择 [1-4] (默认: 1): " choice >&2
+    read -p "请选择 [1-4] (默认: 1): " choice >&2 || choice="1"
     choice=${choice:-1}
     
     case "$choice" in
@@ -166,7 +182,7 @@ choose_ssh_ports() {
             ;;
         4)
             while true; do
-                read -p "输入端口号 (1024-65535): " new_ports >&2
+                read -p "输入端口号 (1024-65535): " new_ports >&2 || new_ports=""
                 if [[ -z "$new_ports" ]]; then
                     echo "端口为空，保持当前端口" >&2
                     echo "$current_ports"
@@ -185,16 +201,18 @@ choose_ssh_ports() {
             echo "$current_ports"
             ;;
     esac
+    return 0
 }
 
 # 配置密码认证
 configure_password_auth() {
+    debug_log "开始配置密码认证"
     if check_ssh_keys; then
         local key_count=$(grep -c "^ssh-" "$AUTHORIZED_KEYS" 2>/dev/null || echo "0")
         echo "SSH密钥状态: 已配置 ($key_count 个)" >&2
         
         local disable_password
-        read -p "是否禁用密码登录? [Y/n] (默认: Y): " -r disable_password >&2
+        read -p "是否禁用密码登录? [Y/n] (默认: Y): " -r disable_password >&2 || disable_password="Y"
         disable_password=${disable_password:-Y}
         
         if [[ "$disable_password" =~ ^[Yy]$ ]]; then
@@ -213,10 +231,12 @@ configure_password_auth() {
         debug_log "未找到SSH密钥，保持密码登录"
         echo "yes"
     fi
+    return 0
 }
 
 # 配置Root登录策略
 configure_root_login() {
+    debug_log "开始配置Root登录策略"
     local current_setting=$(get_current_root_login)
     local current_display=$(format_root_login_display "$current_setting")
     
@@ -229,7 +249,7 @@ configure_root_login() {
     echo >&2
     
     local choice
-    read -p "请选择 [1-4] (默认: 1): " choice >&2
+    read -p "请选择 [1-4] (默认: 1): " choice >&2 || choice="1"
     choice=${choice:-1}
     
     case "$choice" in
@@ -259,6 +279,7 @@ configure_root_login() {
             echo "$current_setting"
             ;;
     esac
+    return 0
 }
 
 # 生成SSH安全配置
@@ -270,13 +291,13 @@ generate_ssh_config() {
     debug_log "生成SSH配置: 端口=$new_ports, 密码认证=$password_auth, Root登录=$root_login"
     
     local temp_config
-    temp_config=$(mktemp) || {
+    if ! temp_config=$(mktemp); then
         log "无法创建临时配置文件" "error"
         return 1
-    }
+    fi
     
     # 生成精简但安全的SSH配置
-    cat > "$temp_config" << EOF
+    if ! cat > "$temp_config" << EOF; then
 # SSH daemon configuration
 # Generated by ssh-security module $(date)
 
@@ -308,6 +329,10 @@ PrintMotd no
 # Subsystem
 Subsystem sftp /usr/lib/openssh/sftp-server
 EOF
+        log "无法写入SSH配置文件" "error"
+        rm -f "$temp_config"
+        return 1
+    fi
     
     echo "$temp_config"
     return 0
@@ -363,7 +388,8 @@ apply_ssh_config() {
         else
             log "SSH服务重启失败，恢复配置" "error"
             # 恢复备份配置
-            local backup_file=$(ls -t "$SSH_CONFIG.backup."* 2>/dev/null | head -1)
+            local backup_file
+            backup_file=$(ls -t "$SSH_CONFIG.backup."* 2>/dev/null | head -1)
             if [[ -n "$backup_file" ]]; then
                 cp "$backup_file" "$SSH_CONFIG"
                 systemctl restart sshd
@@ -376,6 +402,7 @@ apply_ssh_config() {
 
 # 显示配置摘要
 show_ssh_summary() {
+    debug_log "显示SSH配置摘要"
     echo
     log "🎯 SSH安全摘要:" "info"
     
@@ -388,7 +415,8 @@ show_ssh_summary() {
         echo "  密码登录: 已启用"
     fi
     
-    local root_setting=$(grep "PermitRootLogin" "$SSH_CONFIG" | awk '{print $2}' || echo "unknown")
+    local root_setting
+    root_setting=$(grep "PermitRootLogin" "$SSH_CONFIG" | awk '{print $2}' 2>/dev/null || echo "unknown")
     case "$root_setting" in
         "no") echo "  Root登录: 已禁止" ;;
         "prohibit-password") echo "  Root登录: 仅允许密钥" ;;
@@ -397,11 +425,13 @@ show_ssh_summary() {
     esac
     
     if check_ssh_keys; then
-        local key_count=$(grep -c "^ssh-" "$AUTHORIZED_KEYS" 2>/dev/null || echo "0")
+        local key_count
+        key_count=$(grep -c "^ssh-" "$AUTHORIZED_KEYS" 2>/dev/null || echo "0")
         echo "  SSH密钥: 已配置 ($key_count 个)"
     else
         echo "  SSH密钥: 未配置"
     fi
+    return 0
 }
 
 # 显示安全提醒
@@ -409,6 +439,7 @@ show_security_warnings() {
     local new_ports="$1"
     local password_auth="$2"
     
+    debug_log "显示安全提醒"
     echo
     log "⚠️ 重要提醒:" "warn"
     
@@ -423,16 +454,18 @@ show_security_warnings() {
     fi
     
     echo "  建议测试新连接后再关闭当前会话"
+    return 0
 }
-# === 核心功能函数结束 ===
 
 # === 主流程 ===
 main() {
+    debug_log "开始SSH安全配置"
+    
     # 检查root权限
-    [[ $EUID -eq 0 ]] || {
+    if [[ $EUID -ne 0 ]]; then
         log "需要root权限运行" "error"
         exit 1
-    }
+    fi
     
     # 检查SSH服务
     if ! systemctl is-active sshd &>/dev/null; then
@@ -481,6 +514,7 @@ main() {
     
     echo
     log "✅ SSH安全配置完成!" "info"
+    return 0
 }
 
 # 错误处理
