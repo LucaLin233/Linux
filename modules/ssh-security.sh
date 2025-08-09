@@ -107,16 +107,16 @@ check_ssh_keys() {
 choose_ssh_ports() {
     local current_ports=$(get_current_ssh_ports)
     
-    echo "当前SSH端口: $current_ports"
-    echo "端口配置:"
-    echo "  1) 保持当前 ($current_ports)"
-    echo "  2) 使用2222端口"
-    echo "  3) 使用2022端口"
-    echo "  4) 自定义端口"
-    echo
+    echo "当前SSH端口: $current_ports" >&2
+    echo "端口配置:" >&2
+    echo "  1) 保持当前 ($current_ports)" >&2
+    echo "  2) 使用2222端口" >&2
+    echo "  3) 使用2022端口" >&2
+    echo "  4) 自定义端口" >&2
+    echo >&2
     
     local choice new_ports
-    read -p "请选择 [1-4] (默认: 1): " choice
+    read -p "请选择 [1-4] (默认: 1): " choice >&2
     choice=${choice:-1}
     
     case "$choice" in
@@ -129,7 +129,7 @@ choose_ssh_ports() {
                 debug_log "用户选择端口2222"
                 echo "2222"
             else
-                echo "端口2222不可用，保持当前端口"
+                echo "端口2222不可用，保持当前端口" >&2
                 echo "$current_ports"
             fi
             ;;
@@ -138,15 +138,15 @@ choose_ssh_ports() {
                 debug_log "用户选择端口2022"
                 echo "2022"
             else
-                echo "端口2022不可用，保持当前端口"
+                echo "端口2022不可用，保持当前端口" >&2
                 echo "$current_ports"
             fi
             ;;
         4)
             while true; do
-                read -p "输入端口号 (1024-65535): " new_ports
+                read -p "输入端口号 (1024-65535): " new_ports >&2
                 if [[ -z "$new_ports" ]]; then
-                    echo "端口为空，保持当前端口"
+                    echo "端口为空，保持当前端口" >&2
                     echo "$current_ports"
                     break
                 elif validate_port "$new_ports" "$current_ports"; then
@@ -154,14 +154,14 @@ choose_ssh_ports() {
                     echo "$new_ports"
                     break
                 else
-                    echo "端口无效或被占用，请重新输入"
+                    echo "端口无效或被占用，请重新输入" >&2
                 fi
             done
-            ;;
+            >&2
         *)
-            echo "无效选择，保持当前端口"
+            echo "无效选择，保持当前端口" >&2
             echo "$current_ports"
-            ;;
+            ;&
     esac
 }
 
@@ -169,25 +169,25 @@ choose_ssh_ports() {
 configure_password_auth() {
     if check_ssh_keys; then
         local key_count=$(grep -c "^ssh-" "$AUTHORIZED_KEYS" 2>/dev/null || echo "0")
-        echo "SSH密钥状态: 已配置 ($key_count 个)"
+        echo "SSH密钥状态: 已配置 ($key_count 个)" >&2
         
         local disable_password
-        read -p "是否禁用密码登录? [Y/n] (默认: Y): " -r disable_password
+        read -p "是否禁用密码登录? [Y/n] (默认: Y): " -r disable_password >&2
         disable_password=${disable_password:-Y}
         
         if [[ "$disable_password" =~ ^[Yy]$ ]]; then
-            echo "密码登录: 将禁用"
+            echo "密码登录: 将禁用" >&2
             debug_log "用户选择禁用密码登录"
             echo "no"
         else
-            echo "密码登录: 保持启用"
+            echo "密码登录: 保持启用" >&2
             debug_log "用户选择启用密码登录"
             echo "yes"
         fi
     else
-        echo "SSH密钥状态: 未配置"
-        echo "为了安全考虑，建议先配置SSH密钥后再禁用密码登录"
-        echo "密码登录: 保持启用"
+        echo "SSH密钥状态: 未配置" >&2
+        echo "为了安全考虑，建议先配置SSH密钥后再禁用密码登录" >&2
+        echo "密码登录: 保持启用" >&2
         debug_log "未找到SSH密钥，保持密码登录"
         echo "yes"
     fi
@@ -195,35 +195,35 @@ configure_password_auth() {
 
 # 配置Root登录策略
 configure_root_login() {
-    echo "Root登录策略:"
-    echo "  1) 禁止Root登录 (推荐)"
-    echo "  2) 仅允许密钥登录"
-    echo "  3) 允许密码登录 (不推荐)"
-    echo
+    echo "Root登录策略:" >&2
+    echo "  1) 禁止Root登录 (推荐)" >&2
+    echo "  2) 仅允许密钥登录" >&2
+    echo "  3) 允许密码登录 (不推荐)" >&2
+    echo >&2
     
     local choice
-    read -p "请选择 [1-3] (默认: 1): " choice
+    read -p "请选择 [1-3] (默认: 1): " choice >&2
     choice=${choice:-1}
     
     case "$choice" in
         1)
             debug_log "用户选择禁止Root登录"
-            echo "Root登录: 禁止"
+            echo "Root登录: 禁止" >&2
             echo "no"
             ;;
         2)
             debug_log "用户选择Root仅密钥登录"
-            echo "Root登录: 仅允许密钥"
+            echo "Root登录: 仅允许密钥" >&2
             echo "prohibit-password"
             ;;
         3)
             debug_log "用户选择Root允许密码登录"
-            echo "Root登录: 允许密码 (不推荐)"
+            echo "Root登录: 允许密码 (不推荐)" >&2
             echo "yes"
             ;;
         *)
             debug_log "无效选择，默认禁止Root登录"
-            echo "无效选择，使用默认: 禁止Root登录"
+            echo "无效选择，使用默认: 禁止Root登录" >&2
             echo "no"
             ;;
     esac
