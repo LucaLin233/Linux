@@ -142,25 +142,38 @@ get_tools_by_category() {
 # 处理现有nexttrace安装的迁移
 handle_existing_nexttrace() {
     debug_log "检查现有nexttrace安装方式"
+    echo "DEBUG: 开始检查nexttrace安装方式" >&2
     
     # 刷新命令缓存，确保检测准确
     hash -r 2>/dev/null || true
+    echo "DEBUG: 已刷新hash缓存" >&2
     
+    # 第一步检查
     if ! command -v nexttrace >/dev/null 2>&1 && ! command -v nxtrace >/dev/null 2>&1; then
         debug_log "未找到现有nexttrace"
+        echo "DEBUG: 未找到nexttrace命令，返回0" >&2
         return 0  # 没有现有安装
     fi
     
-    # 检查是否通过apt安装
+    echo "DEBUG: 找到nexttrace命令，继续检查安装方式..." >&2
+    
+    # 第二步检查 - 加上详细调试
+    echo "DEBUG: 执行 dpkg 检查..." >&2
     if dpkg -l | grep -q "nexttrace" 2>/dev/null; then
         debug_log "检测到apt安装的nexttrace，跳过迁移"
+        echo "DEBUG: dpkg确认是apt安装，返回0" >&2
         return 0  # 已经是apt安装，无需迁移
     fi
+    
+    echo "DEBUG: dpkg检查失败！认为不是apt安装" >&2
+    echo "DEBUG: 手动检查 dpkg -l | grep nexttrace 的结果:" >&2
+    dpkg -l | grep "nexttrace" >&2 || echo "DEBUG: grep没有找到结果" >&2
     
     # 脚本安装的版本，需要迁移
     echo "检测到脚本安装的nexttrace，正在迁移到apt源..." >&2
     debug_log "开始迁移脚本安装的nexttrace到apt源"
     
+    # 其余代码保持不变...
     # 删除脚本安装的版本
     local nexttrace_paths=(
         "$(command -v nexttrace 2>/dev/null || true)"
@@ -174,7 +187,7 @@ handle_existing_nexttrace() {
     for path in "${nexttrace_paths[@]}"; do
         if [[ -n "$path" && -f "$path" ]]; then
             debug_log "删除脚本安装的文件: $path"
-            sudo rm -f "$path" 2>/dev/null || true
+            rm -f "$path" 2>/dev/null || true
         fi
     done
     
