@@ -150,24 +150,39 @@ set_system_parameters() {
     
     # 设置swappiness
     if [[ -w /proc/sys/vm/swappiness ]]; then
-        echo "$swappiness" > /proc/sys/vm/swappiness 2>/dev/null || {
-            log "设置swappiness失败" "warn"
-        }
+        echo "$swappiness" > /proc/sys/vm/swappiness 2>/dev/null || true
     fi
     
-    # 设置zram优先级
+    # 设置zram优先级 - 修复逻辑
     for i in $(seq 0 $((device_count - 1))); do
-        if [[ -b "/dev/zram$i" ]]; then
-            swapon "/dev/zram$i" -p "$zram_priority" 2>/dev/null || {
-                log "设置zram$i优先级失败" "warn"
-            }
+        local device="/dev/zram$i"
+        if [[ -b "$device" ]]; then
+            # 检查是否已经激活
+            if swapon --show 2>/dev/null | grep -q "^$device "; then
+                # 已激活，重新设置优先级
+                if ! swapoff "$device" 2>/dev/null; then
+                    debug_log "无法关闭zram$i"
+                    continue
+                fi
+            fi
+            # 激活并设置优先级
+            if ! swapon "$device" -p "$zram_priority" 2>/dev/null; then
+                debug_log "设置zram$i优先级失败"
+                # 尝试不带优先级激活
+                swapon "$device" 2>/dev/null || true
+            fi
         fi
     done
     
     # 设置磁盘swap优先级（如果存在）
-    if swapon --show | grep -v zram | grep -q "/"; then
-        local disk_swap=$(swapon --show | grep -v zram | awk 'NR>1 {print $1}' | head -1)
-        [[ -n "$disk_swap" ]] && swapoff "$disk_swap" 2>/dev/null && swapon "$disk_swap" -p "$disk_priority" 2>/dev/null || true
+    local disk_swap_lines=$(swapon --show 2>/dev/null | grep -v zram | tail -n +2)
+    if [[ -n "$disk_swap_lines" ]]; then
+        while IFS= read -r line; do
+            local disk_swap=$(echo "$line" | awk '{print $1}')
+            if [[ -n "$disk_swap" && -b "$disk_swap" ]]; then
+                swapoff "$disk_swap" 2>/dev/null && swapon "$disk_swap" -p "$disk_priority" 2>/dev/null || true
+            fi
+        done <<< "$disk_swap_lines"
     fi
     
     echo "$zram_priority"
@@ -311,7 +326,8 @@ setup_zram() {
         local max_acceptable=$((target_size_mb * 110 / 100))
         
         if (( current_mb >= min_acceptable && current_mb <= max_acceptable )); then
-            local priority=$(set_system_parameters "$mem_mb" 1)
+            # 重新设置优先级但不显示错误
+            priority=$(set_system_parameters "$mem_mb" 1)
             echo "Zram: $current_size ($algorithm, 已配置, 优先级$priority)"
             return 0
         fi
@@ -326,12 +342,12 @@ setup_zram() {
     # 配置新的zram
     local device_count=1
     local actual_size priority
+    local config_success=false
     
     if [[ "$device_type" == "multi" ]]; then
         if device_count=$(setup_multiple_zram "$target_size_mb" "$algorithm"); then
-            priority=$(set_system_parameters "$mem_mb" "$device_count")
+            config_success=true
             actual_size="${target_size_mb}MB"
-            echo "Zram: $actual_size ($algorithm, ${device_count}设备, 优先级$priority)"
         else
             log "多设备配置失败，回退到单设备" "warn"
             device_type="single"
@@ -341,10 +357,9 @@ setup_zram() {
     if [[ "$device_type" == "single" ]]; then
         if setup_single_zram "$target_size_mb" "$algorithm"; then
             sleep 2
-            if swapon --show | grep -q zram0; then
-                actual_size=$(swapon --show | grep zram0 | awk '{print $3}')
-                priority=$(set_system_parameters "$mem_mb" 1)
-                echo "Zram: $actual_size ($algorithm, 单设备, 优先级$priority)"
+            if swapon --show 2>/dev/null | grep -q zram0; then
+                config_success=true
+                actual_size=$(swapon --show 2>/dev/null | grep zram0 | awk '{print $3}')
             else
                 log "Zram启动验证失败" "error"
                 return 1
@@ -352,6 +367,16 @@ setup_zram() {
         else
             log "Zram配置失败" "error"
             return 1
+        fi
+    fi
+    
+    # 统一设置优先级和显示结果
+    if [[ "$config_success" == "true" ]]; then
+        priority=$(set_system_parameters "$mem_mb" "$device_count")
+        if [[ "$device_type" == "multi" ]]; then
+            echo "Zram: $actual_size ($algorithm, ${device_count}设备, 优先级$priority)"
+        else
+            echo "Zram: $actual_size ($algorithm, 单设备, 优先级$priority)"
         fi
     fi
 }
