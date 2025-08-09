@@ -1,5 +1,5 @@
 #!/bin/bash
-# Mise 版本管理器配置模块 v6.0 - 项目级使用专版
+# Mise 版本管理器配置模块 v6.1 - 优化版
 # 功能: 安装Mise、智能选择Python版本、Shell集成、系统修复
 
 set -euo pipefail
@@ -39,6 +39,24 @@ get_mise_executable() {
     done
     
     debug_log "未找到可用mise"
+    return 1
+}
+
+# 重新加载环境
+reload_environment() {
+    debug_log "重新加载环境"
+    export PATH="$MISE_BIN_DIR:$PATH"
+    hash -r 2>/dev/null || true
+    
+    # 验证mise是否可以正常执行
+    local mise_cmd=""
+    if mise_cmd=$(get_mise_executable); then
+        if "$mise_cmd" --version >/dev/null 2>&1; then
+            debug_log "环境重新加载成功"
+            return 0
+        fi
+    fi
+    debug_log "环境重新加载失败"
     return 1
 }
 
@@ -323,19 +341,24 @@ install_mise() {
     mkdir -p "$MISE_BIN_DIR" || { log "创建Mise目录失败" "error"; return 1; }
     
     if [[ -f "$MISE_PATH" ]] || command -v mise &>/dev/null; then
-        local mise_version=$(get_mise_version)
-        echo "Mise状态: 已安装 v$mise_version"
+        local old_version=$(get_mise_version)
+        echo "Mise状态: 已安装 v$old_version"
         
         read -p "是否更新到最新版本? [y/N]: " -r update_choice
         if [[ "$update_choice" =~ ^[Yy]$ ]]; then
             debug_log "更新Mise到最新版本"
             if curl -fsSL https://mise.run | sh >/dev/null 2>&1; then
-                echo "Mise更新: 成功"
-                debug_log "Mise更新成功"
-                hash -r 2>/dev/null || true
-                export PATH="$MISE_BIN_DIR:$PATH"
+                reload_environment
+                local new_version=$(get_mise_version)
+                if [[ "$new_version" != "$old_version" ]]; then
+                    echo "Mise更新: 成功 v$old_version -> v$new_version"
+                    debug_log "Mise更新成功: $old_version -> $new_version"
+                else
+                    echo "Mise更新: 已是最新版本 v$new_version"
+                    debug_log "Mise已是最新版本"
+                fi
             else
-                echo "Mise更新: 失败，继续使用现有版本"
+                echo "Mise更新: 失败，继续使用现有版本 v$old_version"
                 debug_log "Mise更新失败"
             fi
         else
@@ -345,10 +368,10 @@ install_mise() {
         echo "安装Mise中..."
         debug_log "首次安装Mise"
         if curl -fsSL https://mise.run | sh >/dev/null 2>&1; then
-            echo "Mise安装: 成功"
+            reload_environment
+            local version=$(get_mise_version)
+            echo "Mise安装: 成功 v$version"
             debug_log "Mise安装成功"
-            hash -r 2>/dev/null || true
-            export PATH="$MISE_BIN_DIR:$PATH"
         else
             log "✗ Mise安装失败" "error"
             debug_log "Mise安装失败"
@@ -357,14 +380,11 @@ install_mise() {
     fi
     
     # 验证安装
-    debug_log "开始验证Mise安装"
+    debug_log "验证Mise安装"
     local actual_mise_path=""
     if actual_mise_path=$(get_mise_executable); then
         echo "Mise验证: 成功 (路径: $actual_mise_path)"
         debug_log "Mise验证成功，路径: $actual_mise_path"
-        
-        # 额外验证：确保找到的mise能正常执行
-        "$actual_mise_path" --version >/dev/null 2>&1 && debug_log "Mise功能验证成功" || echo "警告: 找到mise文件但无法正常执行" >&2
     else
         log "✗ 安装验证失败" "error"
         debug_log "验证失败"
@@ -385,21 +405,18 @@ choose_python_version() {
         return
     fi
     
-    local current_version=$("$mise_cmd" current python 2>/dev/null || echo "")
-    [[ -n "$current_version" ]] && echo "当前Python: $current_version" >&2
-    
     local latest_version=$("$mise_cmd" latest python 2>/dev/null || echo "3.12.4")
     
     echo >&2
     echo "Python版本选择:" >&2
-    echo "  1) 安装最新版本 (Python $latest_version) - 推荐" >&2
+    echo "  1) 安装最新版本 (Python $latest_version)" >&2
     echo "  2) 手动输入版本号" >&2
-    echo "  3) 保持当前配置" >&2
+    echo "  3) 保持当前配置 - 推荐" >&2
     echo >&2
     
     local choice=""
-    read -p "请选择 [1-3] (默认: 1): " choice >&2
-    choice=${choice:-1}
+    read -p "请选择 [1-3] (默认: 3): " choice >&2
+    choice=${choice:-3}
     
     case "$choice" in
         1) 
@@ -423,8 +440,8 @@ choose_python_version() {
             echo "current"
             ;;
         *) 
-            debug_log "无效选择，使用最新版本"
-            echo "$latest_version"
+            debug_log "无效选择，保持当前配置"
+            echo "current"
             ;;
     esac
 }
@@ -473,8 +490,13 @@ setup_python() {
     local mise_cmd=""
     mise_cmd=$(get_mise_executable) || { log "✗ 找不到mise可执行文件" "error"; return 1; }
     
+    # 检查并显示当前Python版本（只显示一次）
     local current_version=$("$mise_cmd" current python 2>/dev/null || echo "")
-    [[ -n "$current_version" ]] && echo "当前Python: $current_version"
+    if [[ -n "$current_version" ]]; then
+        echo "当前Python: $current_version"
+    else
+        echo "当前Python: 未配置"
+    fi
     
     local selected_version=$(choose_python_version)
     
@@ -520,11 +542,25 @@ setup_python_usage() {
         fi
     fi
     
+    # 动态生成使用指南
+    local mise_cmd=""
+    local example_version="3.12.4"  # 默认示例版本
+    
+    if mise_cmd=$(get_mise_executable); then
+        local current_version=$("$mise_cmd" current python 2>/dev/null || echo "")
+        if [[ -n "$current_version" && "$current_version" != "未配置" ]]; then
+            example_version="$current_version"
+        else
+            local latest_version=$("$mise_cmd" latest python 2>/dev/null || echo "")
+            [[ -n "$latest_version" && "$latest_version" != "未知" ]] && example_version="$latest_version"
+        fi
+    fi
+    
     echo
     echo "使用指南:"
     echo "  • 系统级: 自动使用系统Python"
-    echo "  • 项目级: cd project && mise use python@3.12.4"
-    echo "  • 临时使用: mise exec python@3.12.4 -- python script.py"
+    echo "  • 项目级: cd project && mise use python@$example_version"
+    echo "  • 临时使用: mise exec python@$example_version -- python script.py"
     
     return 0
 }
@@ -568,7 +604,6 @@ configure_shell_integration() {
         fi
     done
     
-    # 确保函数正确返回
     if $integration_success; then
         debug_log "Shell集成配置完成"
         return 0
@@ -611,7 +646,7 @@ show_mise_summary() {
                 echo "  当前优先: mise Python"
             fi
         elif [[ "$which_python" == "/usr/bin/python3" ]] || [[ "$which_python" == "$system_python_path" ]]; then
-            echo "  当前优先: 系统Python (推荐)"
+            echo "  当前优先: 系统Python"
         else
             echo "  当前优先: 异常状态 ($which_python)"
         fi
@@ -631,7 +666,6 @@ show_mise_summary() {
         echo "  Mise: 未安装"
     fi
     
-    echo "  使用模式: 项目级使用 (推荐)"
     grep -q "mise activate" "$HOME/.bashrc" 2>/dev/null && echo "  Bash集成: 已配置"
     [[ -f "$HOME/.zshrc" ]] && grep -q "mise activate" "$HOME/.zshrc" 2>/dev/null && echo "  Zsh集成: 已配置"
     return 0
@@ -639,7 +673,7 @@ show_mise_summary() {
 
 # === 主流程 ===
 main() {
-    log "🔧 配置Mise版本管理器 - 项目级使用专版..." "info"
+    log "🔧 配置Mise版本管理器..." "info"
     
     echo
     get_mise_executable >/dev/null 2>&1 && detect_python_status >/dev/null 2>&1 || true
@@ -659,15 +693,6 @@ main() {
     echo
     log "✅ Mise配置完成!" "info"
     log "提示: 运行 'source ~/.bashrc' 或重新登录激活" "info"
-    
-    if get_mise_executable >/dev/null 2>&1; then
-        echo
-        log "常用命令:" "info"
-        echo "  查看工具: mise list"
-        echo "  项目使用: mise use python@3.12.4"
-        echo "  全局设置: mise use -g python@3.12.4"
-        echo "  查看当前: mise current"
-    fi
     
     return 0
 }
