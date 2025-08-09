@@ -606,26 +606,38 @@ cleanup_old_python_versions() {
     fi
 }
 
-# 配置Python - 修改为使用动态路径，明确返回值
+# 配置Python - 添加逐行调试
 setup_python() {
+    echo "=== setup_python开始 ===" >&2
     debug_log "开始配置Python"
+    
+    echo "步骤1: 获取mise可执行文件" >&2
     local mise_cmd=""
     if ! mise_cmd=$(get_mise_executable); then
         log "✗ 找不到mise可执行文件" "error"
         return 1
     fi
+    echo "步骤1完成: mise_cmd=$mise_cmd" >&2
     
+    echo "步骤2: 获取当前Python版本" >&2
     local current_version=""
     current_version=$("$mise_cmd" current python 2>/dev/null || echo "")
+    echo "步骤2完成: current_version=$current_version" >&2
+    
     [[ -n "$current_version" ]] && echo "当前Python: $current_version"
     
+    echo "步骤3: 用户选择Python版本" >&2
     local selected_version=""
     selected_version=$(choose_python_version)
+    echo "步骤3完成: selected_version=$selected_version" >&2
     
+    echo "步骤4: 处理用户选择" >&2
     # 修正：正确处理"current"选择，明确返回0
     if [[ "$selected_version" == "current" ]]; then
         echo "Python配置: 保持当前"
         debug_log "保持当前Python配置"
+        echo "步骤4完成: 返回成功(保持当前)" >&2
+        echo "=== setup_python结束(成功) ===" >&2
         return 0  # 明确返回成功
     fi
     
@@ -635,10 +647,12 @@ setup_python() {
         echo "Python $selected_version: 安装成功"
         debug_log "Python $selected_version 安装成功"
         cleanup_old_python_versions "$selected_version"
+        echo "=== setup_python结束(安装成功) ===" >&2
         return 0  # 明确返回成功
     else
         log "✗ Python $selected_version 安装失败" "error"
         debug_log "Python $selected_version 安装失败"
+        echo "=== setup_python结束(安装失败) ===" >&2
         return 1  # 明确返回失败
     fi
 }
@@ -885,51 +899,57 @@ main() {
     log "🔧 配置Mise版本管理器..." "info"
     
     echo
-    # 检查Python状态，但不让失败影响主流程
     if get_mise_executable >/dev/null 2>&1; then
         detect_python_status >/dev/null 2>&1 || true
     fi
     
-    # mise安装/验证 - 这是关键步骤，失败就退出
+    echo "=== main: 开始install_mise ===" >&2
     if ! install_mise; then
         log "Mise安装失败" "error"
         exit 1
     fi
+    echo "=== main: install_mise完成 ===" >&2
     
     echo
-    # Python配置 - 允许失败但继续执行
+    echo "=== main: 开始setup_python ===" >&2
     if setup_python; then
+        echo "=== main: setup_python成功 ===" >&2
         debug_log "Python配置成功"
     else
+        echo "=== main: setup_python失败 ===" >&2
         echo "Python配置失败，但继续执行..."
         debug_log "Python配置失败，继续执行"
-        # 继续执行，不退出
     fi
     
-    # Python使用方式配置 - 确保不会因为返回值失败
+    echo "=== main: 开始setup_python_usage ===" >&2
     setup_python_usage || {
+        echo "=== main: setup_python_usage失败 ===" >&2
         echo "Python使用方式配置失败，使用默认配置"
         debug_log "setup_python_usage失败"
     }
+    echo "=== main: setup_python_usage完成 ===" >&2
     
     echo
-    # Shell集成配置 - 确保不会因为返回值失败
+    echo "=== main: 开始configure_shell_integration ===" >&2
     configure_shell_integration || {
+        echo "=== main: configure_shell_integration失败 ===" >&2
         echo "Shell集成配置失败"
         debug_log "configure_shell_integration失败"
     }
+    echo "=== main: configure_shell_integration完成 ===" >&2
     
-    # 显示摘要 - 确保不会因为返回值失败
+    echo "=== main: 开始show_mise_summary ===" >&2
     show_mise_summary || {
+        echo "=== main: show_mise_summary失败 ===" >&2
         echo "显示摘要失败"
         debug_log "show_mise_summary失败"
     }
+    echo "=== main: show_mise_summary完成 ===" >&2
     
     echo
     log "✅ Mise配置完成!" "info"
     log "提示: 运行 'source ~/.bashrc' 或重新登录激活" "info"
     
-    # 显示常用命令 - 确保不会失败
     if get_mise_executable >/dev/null 2>&1; then
         echo
         log "常用命令:" "info"
@@ -939,7 +959,7 @@ main() {
         echo "  查看当前: mise current"
     fi
     
-    # 确保main函数成功返回
+    echo "=== main: 准备返回成功 ===" >&2
     debug_log "main函数执行完成"
     return 0
 }
