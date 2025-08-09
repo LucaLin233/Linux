@@ -365,8 +365,24 @@ install_selected_tools() {
                     old_version="${status#installed:}"
                     was_installed=true
                     
-                    if ! $force_install; then
-                        # 普通安装模式：跳过已安装的工具
+                    # nexttrace特殊处理：检查是否需要迁移到apt源
+                    if [[ "$tool_name" == "nexttrace" && "$install_source" == "apt-nexttrace" ]]; then
+                        debug_log "检查nexttrace是否需要迁移到apt源"
+                        if ! handle_existing_nexttrace; then
+                            # 需要迁移，强制重新安装
+                            debug_log "nexttrace需要迁移到apt源"
+                            echo "正在迁移nexttrace到apt源..."
+                            was_installed=true  # 保持原状态
+                            # 继续执行安装逻辑
+                        elif ! $force_install; then
+                            # 已经是apt安装且非强制模式，跳过
+                            debug_log "nexttrace已通过apt安装，跳过"
+                            installed_tools+=("$tool_name($old_version)")
+                            tool_found=true
+                            break
+                        fi
+                    elif ! $force_install; then
+                        # 其他工具的普通安装模式：跳过已安装的工具
                         debug_log "工具 $tool_name 已安装，版本: $old_version"
                         installed_tools+=("$tool_name($old_version)")
                         tool_found=true
