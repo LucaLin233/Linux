@@ -318,14 +318,21 @@ manage_containers() {
 
 # 显示配置摘要
 show_docker_summary() {
+    echo "DEBUG: 进入show_docker_summary函数"
     debug_log "显示Docker配置摘要"
+    
+    echo "DEBUG: 准备输出摘要标题"
     echo
     log "🎯 Docker配置摘要:" "info"
     
+    echo "DEBUG: 准备检查docker命令"
     if command -v docker &>/dev/null; then
+        echo "DEBUG: docker命令存在，准备获取版本"
         local docker_version=$(get_docker_version)
+        echo "DEBUG: 获取到docker版本: '$docker_version'"
         echo "  Docker: v$docker_version"
         
+        echo "DEBUG: 准备检查systemctl状态"
         if systemctl is-active docker &>/dev/null; then
             echo "  服务状态: 运行中"
             debug_log "Docker服务运行中"
@@ -334,10 +341,13 @@ show_docker_summary() {
             debug_log "Docker服务状态未知"
         fi
         
+        echo "DEBUG: 准备获取运行容器数量"
         local running_containers=$(docker ps -q 2>/dev/null | wc -l || echo "0")
+        echo "DEBUG: 运行容器数量: '$running_containers'"
         echo "  运行容器: ${running_containers}个"
         debug_log "当前运行 $running_containers 个容器"
         
+        echo "DEBUG: 准备检查daemon配置文件"
         if [[ -f "$DOCKER_DAEMON_CONFIG" ]] && grep -q "max-size" "$DOCKER_DAEMON_CONFIG"; then
             echo "  配置优化: 已启用"
             debug_log "Docker优化配置已启用"
@@ -347,7 +357,9 @@ show_docker_summary() {
         debug_log "Docker未安装"
     fi
     
+    echo "DEBUG: 准备获取compose命令"
     local compose_cmd=$(get_compose_command)
+    echo "DEBUG: compose命令: '$compose_cmd'"
     if [[ -n "$compose_cmd" ]]; then
         echo "  Docker Compose: 可用"
         debug_log "Docker Compose可用: $compose_cmd"
@@ -355,6 +367,8 @@ show_docker_summary() {
         echo "  Docker Compose: 不可用"
         debug_log "Docker Compose不可用"
     fi
+    
+    echo "DEBUG: show_docker_summary函数即将结束"
     return 0
 }
 
