@@ -289,12 +289,32 @@ resolve_dependencies() {
     SELECTED_MODULES=("${final_list[@]}")
 }
 
+#--- 获取最新commit ---
+get_latest_commit() {
+    local commit_hash
+    commit_hash=$(curl -s --connect-timeout 5 --max-time 10 \
+        "https://api.github.com/repos/LucaLin233/Linux/commits/main" 2>/dev/null | \
+        grep '"sha"' | head -1 | cut -d'"' -f4 | cut -c1-7 2>/dev/null)
+    
+    if [[ -n "$commit_hash" && ${#commit_hash} -eq 7 ]]; then
+        echo "$commit_hash"
+    else
+        echo "main"  # fallback到分支名
+    fi
+}
+
 #--- 下载模块 ---
 download_module() {
     local module="$1"
     local module_file="$TEMP_DIR/${module}.sh"
+    local latest_commit=$(get_latest_commit)
     
-    if curl -fsSL --connect-timeout 10 "$MODULE_BASE_URL/${module}.sh" -o "$module_file" 2>/dev/null; then
+    log "获取模块 $module (commit: $latest_commit)"
+    
+    # 使用commit hash确保获取最新版本
+    local download_url="https://raw.githubusercontent.com/LucaLin233/Linux/$latest_commit/modules/${module}.sh"
+    
+    if curl -fsSL --connect-timeout 10 "$download_url" -o "$module_file" 2>/dev/null; then
         if [[ -s "$module_file" ]] && head -1 "$module_file" | grep -q "#!/bin/bash" 2>/dev/null; then
             chmod +x "$module_file" 2>/dev/null || true
             return 0
