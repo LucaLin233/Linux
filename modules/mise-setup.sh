@@ -784,13 +784,16 @@ setup_python_usage() {
     esac
 }
 
-# 配置Shell集成
+# 配置Shell集成 - 修复返回值问题
 configure_shell_integration() {
     debug_log "配置Shell集成"
+    
     local shells=(
         "bash:$HOME/.bashrc:eval \"\$(\$HOME/.local/bin/mise activate bash)\""
         "zsh:$HOME/.zshrc:eval \"\$(mise activate zsh)\""
     )
+    
+    local integration_success=true
     
     for shell_info in "${shells[@]}"; do
         local shell_name="${shell_info%%:*}"
@@ -805,27 +808,49 @@ configure_shell_integration() {
         
         [[ ! -f "$config_file" ]] && touch "$config_file"
         
+        # 检查集成是否已存在 - 确保grep不会导致失败
         if grep -q "mise activate $shell_name" "$config_file" 2>/dev/null; then
             echo "$shell_name集成: 已存在"
             debug_log "$shell_name 集成已存在"
         else
             debug_log "为 $shell_name 配置集成"
             if [[ "$shell_name" == "bash" ]]; then
-                echo -e "\n# Mise version manager\n$activate_cmd" >> "$config_file"
+                echo -e "\n# Mise version manager\n$activate_cmd" >> "$config_file" || {
+                    echo "$shell_name集成: 配置失败"
+                    integration_success=false
+                    continue
+                }
             else
                 if grep -q "# mise 版本管理器配置" "$config_file" 2>/dev/null; then
                     sed -i "/# mise 版本管理器配置/a $activate_cmd" "$config_file" 2>/dev/null || {
                         debug_log "sed命令失败，使用追加方式"
-                        echo -e "\n# Mise version manager\n$activate_cmd" >> "$config_file"
+                        echo -e "\n# Mise version manager\n$activate_cmd" >> "$config_file" || {
+                            echo "$shell_name集成: 配置失败"
+                            integration_success=false
+                            continue
+                        }
                     }
                 else
-                    echo -e "\n# Mise version manager\n$activate_cmd" >> "$config_file"
+                    echo -e "\n# Mise version manager\n$activate_cmd" >> "$config_file" || {
+                        echo "$shell_name集成: 配置失败"
+                        integration_success=false
+                        continue
+                    }
                 fi
             fi
             echo "$shell_name集成: 已配置"
             debug_log "$shell_name 集成配置完成"
         fi
     done
+    
+    # 确保函数正确返回
+    if $integration_success; then
+        debug_log "Shell集成配置完成"
+        return 0
+    else
+        debug_log "Shell集成配置部分失败"
+        return 1
+    fi
 }
 
 # 显示配置摘要 - 修改为使用动态路径
