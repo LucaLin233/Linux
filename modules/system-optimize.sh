@@ -16,7 +16,7 @@ log() {
 }
 
 debug_log() {
-    [[ "${DEBUG:-}" == "1" ]] && log "DEBUG: $1" "debug"
+    [[ "${DEBUG:-}" == "1" ]] && log "DEBUG: $1" "debug" >&2
 }
 
 # === 辅助函数 ===
@@ -55,6 +55,32 @@ format_size() {
     else
         echo "${mb}MB"
     fi
+}
+
+# 彻底清理zram配置
+cleanup_zram_completely() {
+    debug_log "开始彻底清理zram"
+    
+    # 停止服务
+    systemctl stop zramswap.service 2>/dev/null || true
+    systemctl disable zramswap.service 2>/dev/null || true
+    
+    # 关闭所有zram设备
+    for dev in /dev/zram*; do
+        if [[ -b "$dev" ]]; then
+            swapoff "$dev" 2>/dev/null || true
+            echo 1 > "/sys/block/$(basename $dev)/reset" 2>/dev/null || true
+        fi
+    done
+    
+    # 卸载zram模块
+    modprobe -r zram 2>/dev/null || true
+    
+    # 清理配置文件
+    [[ -f "$ZRAM_CONFIG" ]] && rm -f "${ZRAM_CONFIG}.bak" 2>/dev/null || true
+    
+    sleep 2
+    debug_log "zram清理完成"
 }
 
 # CPU性能快速检测
@@ -266,40 +292,60 @@ setup_multiple_zram() {
     
     debug_log "配置多zram: ${device_count}个设备, 每个${per_device_mb}MB"
     
-    # 停用现有swap
+    # 彻底清理现有zram
     systemctl stop zramswap.service 2>/dev/null || true
     for dev in /dev/zram*; do
-        [[ -b "$dev" ]] && swapoff "$dev" 2>/dev/null || true
+        if [[ -b "$dev" ]]; then
+            swapoff "$dev" 2>/dev/null || true
+            echo 1 > "/sys/block/$(basename $dev)/reset" 2>/dev/null || true
+        fi
     done
     
-    # 卸载现有zram模块
+    # 卸载并重新加载zram模块
     modprobe -r zram 2>/dev/null || true
+    sleep 1
     
     # 加载zram模块
     if ! modprobe zram num_devices="$device_count" 2>/dev/null; then
-        log "加载zram模块失败" "error"
+        debug_log "加载zram模块失败"
         return 1
     fi
+    
+    sleep 1
     
     # 配置每个设备
     for i in $(seq 0 $((device_count - 1))); do
         local device="/dev/zram$i"
         debug_log "配置设备 $device"
         
+        # 等待设备就绪
+        local retry=0
+        while [[ ! -b "$device" ]] && (( retry < 10 )); do
+            sleep 0.1
+            ((retry++))
+        done
+        
+        if [[ ! -b "$device" ]]; then
+            debug_log "设备zram$i未就绪"
+            return 1
+        fi
+        
         # 设置压缩算法
-        if ! echo "$algorithm" > "/sys/block/zram$i/comp_algorithm" 2>/dev/null; then
-            log "设置zram$i压缩算法失败" "warn"
+        if [[ -w "/sys/block/zram$i/comp_algorithm" ]]; then
+            if ! echo "$algorithm" > "/sys/block/zram$i/comp_algorithm" 2>/dev/null; then
+                debug_log "设置zram$i压缩算法失败，使用默认"
+            fi
         fi
         
         # 设置大小
         if ! echo "${per_device_mb}M" > "/sys/block/zram$i/disksize" 2>/dev/null; then
-            log "设置zram$i大小失败" "error"
+            debug_log "设置zram$i大小失败"
             return 1
         fi
         
         # 创建swap
         if ! mkswap "$device" >/dev/null 2>&1; then
-            log "创建zram$i swap失败" "error"
+            debug_log "创建zram$i swap失败"
             return 1
         fi
     done
@@ -331,8 +377,15 @@ setup_zram() {
     local device_type=$(echo "$config" | cut -d, -f2)
     local multiplier=$(echo "$config" | cut -d, -f3)
     
-    # 计算zram大小
-    local target_size_mb=$(echo "$mem_mb * $multiplier" | bc | cut -d. -f1)
+    # 计算zram大小 - 修复bc计算错误
+    local target_size_mb
+    if target_size_mb=$(echo "$mem_mb * $multiplier" | bc 2>/dev/null); then
+        target_size_mb=$(echo "$target_size_mb" | cut -d. -f1)
+    else
+        # bc失败时的备用计算
+        target_size_mb=$((mem_mb * ${multiplier%.*} / 1))
+        debug_log "bc计算失败，使用整数计算: $target_size_mb"
+    fi
     
     debug_log "内存: ${mem_mb}MB, 配置: $config, 目标大小: ${target_size_mb}MB"
     
@@ -352,11 +405,9 @@ setup_zram() {
             return 0
         fi
         
-        # 清理现有配置
-        systemctl stop zramswap.service 2>/dev/null || true
-        for dev in /dev/zram*; do
-            [[ -b "$dev" ]] && swapoff "$dev" 2>/dev/null || true
-        done
+        # 配置不匹配，需要重新配置
+        echo "现有配置不匹配，重新配置..."
+        cleanup_zram_completely
     fi
     
     # 配置新的zram
@@ -370,6 +421,7 @@ setup_zram() {
             actual_size_mb="$target_size_mb"
         else
             log "多设备配置失败，回退到单设备" "warn"
+            cleanup_zram_completely
             device_type="single"
         fi
     fi
