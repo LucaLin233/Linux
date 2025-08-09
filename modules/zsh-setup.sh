@@ -152,10 +152,7 @@ configure_zshrc() {
     fi
     
     debug_log "写入.zshrc配置文件"
-    cat > "$HOME/.zshrc" << 'EOF' || {
-        log ".zshrc配置写入失败" "error" 
-        return 1
-    }
+    if ! cat > "$HOME/.zshrc" << 'EOF'; then
 # Oh My Zsh 配置
 export ZSH="$HOME/.oh-my-zsh"
 ZSH_THEME="powerlevel10k/powerlevel10k"
@@ -194,6 +191,9 @@ alias update='apt update -y'
 alias reproxy='cd /root/proxy && docker compose down && docker compose pull && docker compose up -d --remove-orphans'
 alias autodel='docker system prune -a -f && apt autoremove -y'
 EOF
+        log ".zshrc配置写入失败" "error"
+        return 1
+    fi
     
     debug_log ".zshrc配置完成"
     return 0
