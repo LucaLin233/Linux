@@ -389,25 +389,52 @@ setup_zram() {
     
     debug_log "内存: ${mem_mb}MB, 配置: $config, 目标大小: ${target_size_mb}MB"
     
-    # 检查现有zram是否合适
-    local current_zram_info=$(swapon --show 2>/dev/null | grep zram | head -1)
-    if [[ -n "$current_zram_info" ]]; then
-        local current_size=$(echo "$current_zram_info" | awk '{print $3}')
-        local current_mb=$(convert_to_mb "$current_size")
+    # 检查现有zram是否合适 - 修复多设备检查逻辑
+    local current_zram_devices=$(swapon --show 2>/dev/null | grep zram | wc -l)
+    if (( current_zram_devices > 0 )); then
+        # 计算当前zram总大小
+        local current_total_mb=0
+        while IFS= read -r line; do
+            if [[ "$line" == *"zram"* ]]; then
+                local current_size=$(echo "$line" | awk '{print $3}')
+                local current_mb=$(convert_to_mb "$current_size")
+                current_total_mb=$((current_total_mb + current_mb))
+            fi
+        done < <(swapon --show 2>/dev/null)
+        
+        debug_log "当前zram总大小: ${current_total_mb}MB, 设备数: $current_zram_devices"
+        
+        # 检查大小是否匹配
         local min_acceptable=$((target_size_mb * 90 / 100))
         local max_acceptable=$((target_size_mb * 110 / 100))
         
-        if (( current_mb >= min_acceptable && current_mb <= max_acceptable )); then
-            # 重新设置优先级但不显示错误
-            priority=$(set_system_parameters "$mem_mb" 1)
-            local display_size=$(format_size "$current_mb")
-            echo "Zram: $display_size ($algorithm, 已配置, 优先级$priority)"
-            return 0
+        # 检查设备数是否匹配期望配置
+        local expected_device_count=1
+        if [[ "$device_type" == "multi" ]]; then
+            expected_device_count=$((cores > 4 ? 4 : cores))
         fi
         
-        # 配置不匹配，需要重新配置
-        echo "现有配置不匹配，重新配置..."
-        cleanup_zram_completely
+        debug_log "期望设备数: $expected_device_count, 当前设备数: $current_zram_devices"
+        debug_log "大小范围: ${min_acceptable}MB - ${max_acceptable}MB, 当前: ${current_total_mb}MB"
+        
+        # 检查配置是否完全匹配
+        if (( current_total_mb >= min_acceptable && 
+              current_total_mb <= max_acceptable && 
+              current_zram_devices == expected_device_count )); then
+            # 配置匹配，重新设置优先级
+            priority=$(set_system_parameters "$mem_mb" "$current_zram_devices")
+            local display_size=$(format_size "$current_total_mb")
+            if (( current_zram_devices > 1 )); then
+                echo "Zram: $display_size ($algorithm, ${current_zram_devices}设备, 优先级$priority, 已配置)"
+            else
+                echo "Zram: $display_size ($algorithm, 单设备, 优先级$priority, 已配置)"
+            fi
+            return 0
+        else
+            # 配置不匹配，需要重新配置
+            echo "现有配置不匹配 (大小:${current_total_mb}MB vs ${target_size_mb}MB, 设备:${current_zram_devices} vs ${expected_device_count})，重新配置..."
+            cleanup_zram_completely
+        fi
     fi
     
     # 配置新的zram
