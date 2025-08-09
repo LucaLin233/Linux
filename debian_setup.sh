@@ -15,13 +15,6 @@ readonly TEMP_DIR="/tmp/debian-setup-modules"
 readonly LOG_FILE="/var/log/debian-setup.log"
 readonly SUMMARY_FILE="/root/deployment_summary.txt"
 
-# 缓存控制参数
-readonly CURL_CACHE_OPTS=(
-    -H "Cache-Control: no-cache, no-store, must-revalidate"
-    -H "Pragma: no-cache"
-    -H "Expires: 0"
-)
-
 #--- 模块定义 (新增tools-setup) ---
 declare -A MODULES=(
     ["system-optimize"]="系统优化 (Zram, 时区, 时间同步)"
@@ -300,12 +293,8 @@ resolve_dependencies() {
 download_module() {
     local module="$1"
     local module_file="$TEMP_DIR/${module}.sh"
-    local timestamp=$(date +%s)
     
-    if curl -fsSL --connect-timeout 10 "${CURL_CACHE_OPTS[@]}" \
-        "$MODULE_BASE_URL/${module}.sh?v=$timestamp" \
-        -o "$module_file" 2>/dev/null; then
-        
+    if curl -fsSL --connect-timeout 10 "$MODULE_BASE_URL/${module}.sh" -o "$module_file" 2>/dev/null; then
         if [[ -s "$module_file" ]] && head -1 "$module_file" | grep -q "#!/bin/bash" 2>/dev/null; then
             chmod +x "$module_file" 2>/dev/null || true
             return 0
@@ -565,7 +554,7 @@ show_recommendations() {
     echo "📚 常用命令:"
     echo "   查看日志: tail -f $LOG_FILE"
     echo "   查看摘要: cat $SUMMARY_FILE"
-    echo "   重新运行: bash <(curl -fsSL -H \"Cache-Control: no-cache\" \"https://raw.githubusercontent.com/LucaLin233/Linux/refs/heads/main/debian_setup.sh?\$(date +%s)\")"
+    echo "   重新运行: bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/refs/heads/main/debian_setup.sh)"
 }
 
 #--- 极简版帮助 ---
