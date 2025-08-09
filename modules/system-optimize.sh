@@ -401,7 +401,12 @@ setup_zram() {
             local priority=$(echo "$params_result" | cut -d, -f1)
             
             local display_size=$(format_size "$current_total_mb")
-            local device_desc=$((current_zram_devices > 1 ? "${current_zram_devices}设备" : "单设备"))
+            local device_desc
+            if (( current_zram_devices > 1 )); then
+                device_desc="${current_zram_devices}设备"
+            else
+                device_desc="单设备"
+            fi
             echo "Zram: $display_size ($algorithm, ${device_desc}, 优先级$priority, 已配置)"
             show_swap_status
             return 0
@@ -449,7 +454,12 @@ setup_zram() {
         local priority=$(echo "$params_result" | cut -d, -f1)
         
         local display_size=$(format_size "$actual_size_mb")
-        local device_desc=$((device_count > 1 ? "${device_count}设备" : "单设备"))
+        local device_desc
+        if (( device_count > 1 )); then
+            device_desc="${device_count}设备"
+        else
+            device_desc="单设备"
+        fi
         echo "Zram: $display_size ($algorithm, ${device_desc}, 优先级$priority)"
         show_swap_status
     fi
