@@ -6,7 +6,7 @@ set -euo pipefail
 
 # === 常量定义 ===
 readonly TOOLS=(
-    "nexttrace:nexttrace --version:https://nxtrace.org/nt:网络路由追踪工具"
+    "nexttrace:nexttrace --version:apt-nexttrace:网络路由追踪工具"
     "speedtest:speedtest --version:speedtest-cli:网络测速工具"
     "htop:htop --version:htop:增强版系统监控"
     "jq:jq --version:jq:JSON处理工具"
@@ -94,25 +94,16 @@ check_tool_status() {
     
     debug_log "检查工具状态: $tool_name"
     
-    if [[ "$tool_name" == "nexttrace" ]]; then
-        # 对nexttrace特殊处理，检查两个可能的命令名
-        if command -v nexttrace &>/dev/null || command -v nxtrace &>/dev/null; then
+    # 统一处理所有工具，不再对nexttrace特殊处理
+    if command -v "$tool_name" &>/dev/null; then
+        if eval "$check_cmd" &>/dev/null; then
             local version=$(get_tool_version "$tool_name" "$check_cmd")
             echo "installed:$version"
         else
-            echo "missing:"
+            echo "installed:未知版本"
         fi
     else
-        if command -v "$tool_name" &>/dev/null; then
-            if eval "$check_cmd" &>/dev/null; then
-                local version=$(get_tool_version "$tool_name" "$check_cmd")
-                echo "installed:$version"
-            else
-                echo "installed:未知版本"
-            fi
-        else
-            echo "missing:"
-        fi
+        echo "missing:"
     fi
     return 0
 }
@@ -148,6 +139,47 @@ get_tools_by_category() {
     return 0
 }
 
+# 处理现有nexttrace安装的迁移
+handle_existing_nexttrace() {
+    debug_log "检查现有nexttrace安装方式"
+    
+    if ! command -v nexttrace >/dev/null 2>&1 && ! command -v nxtrace >/dev/null 2>&1; then
+        debug_log "未找到现有nexttrace"
+        return 0  # 没有现有安装
+    fi
+    
+    # 检查是否通过apt安装
+    if dpkg -l | grep -q "nexttrace" 2>/dev/null; then
+        debug_log "检测到apt安装的nexttrace，跳过迁移"
+        return 0  # 已经是apt安装，无需迁移
+    fi
+    
+    # 脚本安装的版本，需要迁移
+    echo "检测到脚本安装的nexttrace，正在迁移到apt源..." >&2
+    debug_log "开始迁移脚本安装的nexttrace到apt源"
+    
+    # 删除脚本安装的版本
+    local nexttrace_paths=(
+        "$(command -v nexttrace 2>/dev/null || true)"
+        "$(command -v nxtrace 2>/dev/null || true)"
+        "/usr/local/bin/nexttrace"
+        "/usr/local/bin/nxtrace" 
+        "/usr/bin/nexttrace"
+        "/usr/bin/nxtrace"
+    )
+    
+    for path in "${nexttrace_paths[@]}"; do
+        if [[ -n "$path" && -f "$path" ]]; then
+            debug_log "删除脚本安装的文件: $path"
+            sudo rm -f "$path" 2>/dev/null || true
+        fi
+    done
+    
+    # 清理PATH缓存
+    hash -r 2>/dev/null || true
+    return 1  # 返回1表示需要重新安装
+}
+
 # === 核心功能函数 ===
 # 安装单个工具
 install_single_tool() {
@@ -157,73 +189,64 @@ install_single_tool() {
     
     debug_log "安装工具: $tool_name (强制重装: $force_reinstall)"
     
-    if [[ "$install_source" == https://* ]]; then
-        # 通过脚本安装
-        if [[ "$tool_name" == "nexttrace" && "$force_reinstall" == "true" ]]; then
-            # nexttrace特殊处理：强制重新安装
-            debug_log "强制更新nexttrace"
-            echo "强制更新nexttrace..." >&2
-            
-            # 方法1：尝试直接安装（可能会覆盖）
-            if curl -fsSL "$install_source" | bash >/dev/null 2>&1; then
-                return 0
-            fi
-            
-            # 方法2：尝试删除旧版本再安装
-            debug_log "尝试删除旧版本后重新安装nexttrace"
-            echo "尝试删除旧版本后重新安装..." >&2
-            local nexttrace_path=$(command -v nexttrace 2>/dev/null || command -v nxtrace 2>/dev/null)
-            if [[ -n "$nexttrace_path" ]]; then
-                # 备份路径，然后删除
-                sudo rm -f "$nexttrace_path" 2>/dev/null || true
-                # 删除可能的链接和其他位置
-                sudo rm -f /usr/local/bin/nexttrace /usr/local/bin/nxtrace 2>/dev/null || true
-                sudo rm -f /usr/bin/nexttrace /usr/bin/nxtrace 2>/dev/null || true
-            fi
-            
-            # 重新安装
-            if curl -fsSL "$install_source" | bash >/dev/null 2>&1; then
-                return 0
-            fi
-            
-            # 方法3：尝试手动下载安装
-            debug_log "尝试手动下载安装nexttrace"
-            echo "尝试手动下载安装..." >&2
-            local temp_dir=$(mktemp -d)
-            local arch=$(uname -m)
-            local download_url=""
-            
-            case "$arch" in
-                x86_64) download_url="https://github.com/nxtrace/NTrace-core/releases/latest/download/nexttrace_linux_amd64" ;;
-                aarch64) download_url="https://github.com/nxtrace/NTrace-core/releases/latest/download/nexttrace_linux_arm64" ;;
-                armv7l) download_url="https://github.com/nxtrace/NTrace-core/releases/latest/download/nexttrace_linux_arm" ;;
-                *) download_url="https://github.com/nxtrace/NTrace-core/releases/latest/download/nexttrace_linux_amd64" ;;
-            esac
-            
-            if curl -fsSL "$download_url" -o "$temp_dir/nexttrace" 2>/dev/null; then
-                chmod +x "$temp_dir/nexttrace"
-                sudo mv "$temp_dir/nexttrace" /usr/local/bin/ 2>/dev/null
-                rm -rf "$temp_dir"
-                return 0
-            fi
-            rm -rf "$temp_dir"
-            
-            return 1
-        else
-            # 其他工具正常安装
-            debug_log "通过脚本安装: $tool_name"
-            if curl -fsSL "$install_source" | bash >/dev/null 2>&1; then
-                return 0
+    if [[ "$install_source" == "apt-nexttrace" ]]; then
+        # nexttrace专用的apt源安装
+        debug_log "通过apt源安装nexttrace"
+        
+        # 先处理现有安装
+        if ! handle_existing_nexttrace; then
+            # 需要重新安装（脚本安装版本已清理）
+            force_reinstall=true
+            debug_log "脚本版本已清理，需要重新安装"
+        fi
+        
+        if $force_reinstall; then
+            # 强制更新：先卸载apt版本（如果有）
+            debug_log "强制更新，先卸载现有apt版本"
+            apt remove -y nexttrace >/dev/null 2>&1 || true
+        fi
+        
+        # 添加官方apt源（如果不存在）
+        if [[ ! -f /etc/apt/sources.list.d/nexttrace.list ]]; then
+            debug_log "添加nexttrace官方apt源"
+            echo "正在配置nexttrace官方源..." >&2
+            if echo "deb [trusted=yes] https://github.com/nxtrace/nexttrace-debs/releases/latest/download ./" | \
+                sudo tee /etc/apt/sources.list.d/nexttrace.list >/dev/null 2>&1; then
+                debug_log "nexttrace apt源配置成功"
             else
+                debug_log "nexttrace apt源配置失败"
                 return 1
             fi
+        fi
+        
+        # 更新包列表并安装
+        debug_log "更新包列表并安装nexttrace"
+        if apt update -qq >/dev/null 2>&1 && apt install -y nexttrace >/dev/null 2>&1; then
+            debug_log "nexttrace通过apt源安装成功"
+            return 0
+        else
+            debug_log "nexttrace通过apt源安装失败"
+            return 1
+        fi
+        
+    elif [[ "$install_source" == https://* ]]; then
+        # 其他工具的脚本安装
+        debug_log "通过脚本安装: $tool_name"
+        if curl -fsSL "$install_source" | bash >/dev/null 2>&1; then
+            debug_log "脚本安装成功: $tool_name"
+            return 0
+        else
+            debug_log "脚本安装失败: $tool_name"
+            return 1
         fi
     else
         # 通过包管理器安装
         debug_log "通过包管理器安装: $tool_name"
         if apt update -qq >/dev/null 2>&1 && apt install -y "$install_source" >/dev/null 2>&1; then
+            debug_log "包管理器安装成功: $tool_name"
             return 0
         else
+            debug_log "包管理器安装失败: $tool_name"
             return 1
         fi
     fi
@@ -354,16 +377,10 @@ install_selected_tools() {
                 # 执行安装（新安装或强制重装）
                 debug_log "开始安装 $tool_name"
                 local install_success=false
-                if [[ "$tool_name" == "nexttrace" && $force_install == true ]]; then
-                    # nexttrace强制重装
-                    if install_single_tool "$tool_name" "$install_source" "true"; then
-                        install_success=true
-                    fi
-                else
-                    # 其他工具正常安装
-                    if install_single_tool "$tool_name" "$install_source"; then
-                        install_success=true
-                    fi
+                
+                # 统一处理所有工具
+                if install_single_tool "$tool_name" "$install_source" "$force_install"; then
+                    install_success=true
                 fi
                 
                 if $install_success; then
@@ -487,16 +504,13 @@ show_tools_summary() {
         echo "  ✗ 未安装: ${missing_tools[*]}"
     fi
     
-    # 显示常用命令
+    # 显示常用命令 - 统一nexttrace命令显示
     local has_commands=false
     echo "  💡 常用命令:"
     
-    # 检查nexttrace/nxtrace
+    # nexttrace现在统一使用nexttrace命令
     if command -v nexttrace >/dev/null 2>&1; then
         echo "    网络追踪: nexttrace ip.sb"
-        has_commands=true
-    elif command -v nxtrace >/dev/null 2>&1; then
-        echo "    网络追踪: nxtrace ip.sb"
         has_commands=true
     fi
     
