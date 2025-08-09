@@ -44,6 +44,19 @@ convert_to_mb() {
     esac
 }
 
+# 转换为合适的显示单位
+format_size() {
+    local mb="$1"
+    if (( mb >= 1024 )); then
+        local gb=$(echo "scale=1; $mb / 1024" | bc)
+        # 去掉末尾的.0
+        gb=$(echo "$gb" | sed 's/\.0$//')
+        echo "${gb}GB"
+    else
+        echo "${mb}MB"
+    fi
+}
+
 # CPU性能快速检测
 benchmark_cpu_quick() {
     debug_log "开始CPU性能检测"
@@ -298,6 +311,10 @@ setup_multiple_zram() {
 # 主要的zram配置函数
 setup_zram() {
     local mem_mb=$(awk '/MemTotal/ {print int($2/1024)}' /proc/meminfo)
+    local cores=$(nproc)
+    local mem_display=$(format_size "$mem_mb")
+    
+    echo "检测到: ${mem_display}内存, ${cores}核CPU"
     
     # CPU性能检测
     local cpu_level
@@ -305,6 +322,8 @@ setup_zram() {
         log "CPU检测失败，使用保守配置" "warn"
         cpu_level="weak"
     fi
+    
+    echo "CPU性能: $cpu_level"
     
     # 获取最优配置
     local config=$(get_optimal_zram_config "$mem_mb" "$cpu_level")
@@ -328,7 +347,8 @@ setup_zram() {
         if (( current_mb >= min_acceptable && current_mb <= max_acceptable )); then
             # 重新设置优先级但不显示错误
             priority=$(set_system_parameters "$mem_mb" 1)
-            echo "Zram: $current_size ($algorithm, 已配置, 优先级$priority)"
+            local display_size=$(format_size "$current_mb")
+            echo "Zram: $display_size ($algorithm, 已配置, 优先级$priority)"
             return 0
         fi
         
@@ -341,13 +361,13 @@ setup_zram() {
     
     # 配置新的zram
     local device_count=1
-    local actual_size priority
+    local actual_size_mb priority
     local config_success=false
     
     if [[ "$device_type" == "multi" ]]; then
         if device_count=$(setup_multiple_zram "$target_size_mb" "$algorithm"); then
             config_success=true
-            actual_size="${target_size_mb}MB"
+            actual_size_mb="$target_size_mb"
         else
             log "多设备配置失败，回退到单设备" "warn"
             device_type="single"
@@ -359,7 +379,8 @@ setup_zram() {
             sleep 2
             if swapon --show 2>/dev/null | grep -q zram0; then
                 config_success=true
-                actual_size=$(swapon --show 2>/dev/null | grep zram0 | awk '{print $3}')
+                local current_size=$(swapon --show 2>/dev/null | grep zram0 | awk '{print $3}')
+                actual_size_mb=$(convert_to_mb "$current_size")
             else
                 log "Zram启动验证失败" "error"
                 return 1
@@ -373,10 +394,11 @@ setup_zram() {
     # 统一设置优先级和显示结果
     if [[ "$config_success" == "true" ]]; then
         priority=$(set_system_parameters "$mem_mb" "$device_count")
+        local display_size=$(format_size "$actual_size_mb")
         if [[ "$device_type" == "multi" ]]; then
-            echo "Zram: $actual_size ($algorithm, ${device_count}设备, 优先级$priority)"
+            echo "Zram: $display_size ($algorithm, ${device_count}设备, 优先级$priority)"
         else
-            echo "Zram: $actual_size ($algorithm, 单设备, 优先级$priority)"
+            echo "Zram: $display_size ($algorithm, 单设备, 优先级$priority)"
         fi
     fi
 }
