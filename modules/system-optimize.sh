@@ -195,11 +195,50 @@ set_system_parameters() {
         zram_priority=100; disk_priority=20; swappiness=60
     fi
     
-    debug_log "设置zram优先级: $zram_priority, swappiness: $swappiness"
+    debug_log "目标配置: zram优先级=$zram_priority, swappiness=$swappiness"
     
-    # 设置swappiness
-    if [[ -w /proc/sys/vm/swappiness ]]; then
-        echo "$swappiness" > /proc/sys/vm/swappiness 2>/dev/null || debug_log "swappiness设置失败"
+    # 设置swappiness（智能检查版）
+    local current_swappiness=$(cat /proc/sys/vm/swappiness 2>/dev/null || echo "60")
+    
+    # 只有在值不同时才设置
+    if [[ "$current_swappiness" != "$swappiness" ]]; then
+        if [[ -w /proc/sys/vm/swappiness ]]; then
+            if echo "$swappiness" > /proc/sys/vm/swappiness 2>/dev/null; then
+                debug_log "swappiness设置: $current_swappiness -> $swappiness"
+                
+                # 检查持久化配置是否已存在
+                local sysctl_file="/etc/sysctl.d/99-zram-swappiness.conf"
+                local existing_value=""
+                
+                if [[ -f "$sysctl_file" ]]; then
+                    existing_value=$(grep "vm.swappiness" "$sysctl_file" 2>/dev/null | awk '{print $3}')
+                fi
+                
+                # 只有在持久化值不同时才写入
+                if [[ "$existing_value" != "$swappiness" ]]; then
+                    echo "vm.swappiness = $swappiness" > "$sysctl_file" 2>/dev/null || {
+                        # 备用方案处理sysctl.conf
+                        if grep -q "^vm.swappiness" /etc/sysctl.conf 2>/dev/null; then
+                            local conf_value=$(grep "^vm.swappiness" /etc/sysctl.conf | awk '{print $3}')
+                            if [[ "$conf_value" != "$swappiness" ]]; then
+                                sed -i "s/^vm.swappiness.*/vm.swappiness = $swappiness/" /etc/sysctl.conf
+                                debug_log "更新sysctl.conf中的swappiness"
+                            fi
+                        else
+                            echo "vm.swappiness = $swappiness" >> /etc/sysctl.conf
+                            debug_log "添加swappiness到sysctl.conf"
+                        fi
+                    }
+                    debug_log "swappiness持久化配置已更新"
+                else
+                    debug_log "swappiness持久化配置已存在且正确"
+                fi
+            else
+                debug_log "swappiness设置失败"
+            fi
+        fi
+    else
+        debug_log "swappiness已是目标值: $swappiness"
     fi
     
     # 设置zram优先级
