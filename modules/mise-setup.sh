@@ -135,32 +135,33 @@ detect_python_status() {
         fi
     fi
     
-    # 检查PATH优先级
-    local which_python_clean which_python_current
-    
-    # 使用干净的PATH检查系统优先级
+    # 检查PATH优先级 - 修复检测逻辑
+    local which_python_current=$(which python3 2>/dev/null || echo "")
+    local which_python_clean
     which_python_clean=$(PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" which python3 2>/dev/null || echo "")
-    # 使用当前PATH检查
-    which_python_current=$(which python3 2>/dev/null || echo "")
     
-    # 如果当前PATH和干净PATH指向不同位置，且当前指向mise，才认为被劫持
-    if [[ "$which_python_current" == *"mise"* ]] && [[ "$which_python_clean" != "$which_python_current" ]]; then
-        # 进一步检查：如果只是因为mise shell集成导致的，不算劫持
-        if [[ -n "$MISE_SHELL" ]] || command -v mise >/dev/null && mise current python >/dev/null 2>&1; then
-            # 这是正常的mise集成，不是劫持
-            path_priority="mise集成"
-            debug_log "检测到mise正常集成"
-        else
-            # 这是真正的PATH劫持
+    debug_log "当前python3路径: $which_python_current"
+    debug_log "系统python3路径: $which_python_clean"
+    
+    # 如果当前指向mise相关路径，且与系统路径不同，则认为被劫持
+    if [[ "$which_python_current" == *"mise"* ]] && [[ "$which_python_current" != "$which_python_clean" ]]; then
+        # 检查是否是mise shell集成造成的临时效果
+        if [[ -z "$MISE_SHELL" ]] && ! (command -v mise >/dev/null && mise current python >/dev/null 2>&1 && [[ -n "$MISE_ACTIVATED" ]]); then
+            # 不是mise集成，是PATH被劫持
             path_priority="劫持"
             is_hijacked=true
-            debug_log "检测到PATH被劫持"
+            debug_log "检测到PATH被mise劫持"
+        else
+            # 这可能是项目级使用但PATH配置不当
+            path_priority="mise集成异常"
+            is_hijacked=true
+            debug_log "检测到mise集成PATH配置异常"
         fi
     fi
     
     echo "Python状态: 链接($link_status) PATH($path_priority)" >&2
     
-    # 只有在真正被劫持时才返回0（需要修复）
+    # 只要检测到劫持就返回0（需要修复）
     if $is_hijacked && [[ ! "${1:-}" == "allow_global" ]]; then
         debug_log "Python状态需要修复"
         return 0  # 需要修复
@@ -659,11 +660,8 @@ setup_python_usage() {
         1)
             echo "配置模式: 项目级使用"
             debug_log "配置项目级使用模式"
-            # 如果检测到需要修复，先修复
-            if [[ $needs_fix -eq 0 ]]; then
-                debug_log "先修复系统配置"
-                fix_python_system_priority
-            fi
+            # 总是执行修复，确保系统优先
+            fix_python_system_priority
             echo
             echo "使用指南:"
             echo "  • 系统级: 自动使用系统Python"
@@ -770,29 +768,39 @@ show_mise_summary() {
             echo "  Mise Python: 未配置"
         fi
         
+        # 使用系统Python检查版本
         local system_python_version=""
         system_python_version=$(/usr/bin/python3 --version 2>/dev/null || echo "无法获取")
         echo "  系统Python: $system_python_version"
         
+        # 检查当前优先级 - 修复逻辑
         local which_python=""
         which_python=$(which python3 2>/dev/null || echo "")
+        local system_python_path=$(PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" which python3 2>/dev/null || echo "")
+        
         if [[ "$which_python" == *"mise"* ]]; then
-            echo "  当前优先: mise Python"
-        elif [[ "$which_python" == "/usr/bin/python3" ]]; then
+            if [[ "$which_python" != "$system_python_path" ]]; then
+                echo "  当前优先: mise Python (需要修复)"
+            else
+                echo "  当前优先: mise Python"
+            fi
+        elif [[ "$which_python" == "/usr/bin/python3" ]] || [[ "$which_python" == "$system_python_path" ]]; then
             echo "  当前优先: 系统Python (推荐)"
         else
-            echo "  当前优先: 异常状态"
+            echo "  当前优先: 异常状态 ($which_python)"
         fi
         
+        # 使用系统Python检查系统模块
         local apt_pkg_ok=false
         local debconf_ok=false
-        if python3 -c "import apt_pkg" &>/dev/null 2>&1; then apt_pkg_ok=true; fi
-        if python3 -c "import debconf" &>/dev/null 2>&1; then debconf_ok=true; fi
+        if /usr/bin/python3 -c "import apt_pkg" &>/dev/null 2>&1; then apt_pkg_ok=true; fi
+        if /usr/bin/python3 -c "import debconf" &>/dev/null 2>&1; then debconf_ok=true; fi
         
         if $apt_pkg_ok && $debconf_ok; then
             echo "  系统模块: 正常"
         else
             echo "  系统模块: 部分异常 (不影响mise使用)"
+            debug_log "系统模块检查失败: apt_pkg=$apt_pkg_ok, debconf=$debconf_ok"
         fi
     else
         echo "  Mise: 未安装"
