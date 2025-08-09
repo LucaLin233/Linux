@@ -200,10 +200,16 @@ EOF
     success "系统限制配置完成"
 }
 
-# === 智能参数清理和应用 ===
+# === 智能参数清理和应用 (改进版，支持重复运行) ===
 apply_params() {
     info "应用网络参数..."
-    backup_config "$SYSCTL_CONFIG"
+    
+    # 确保目标目录存在
+    mkdir -p /etc/sysctl.d
+    
+    local target_config="/etc/sysctl.d/98-tuning.conf"
+    local temp_config=$(mktemp)
+    local temp_preserve=$(mktemp)
     
     # 检测支持的参数
     declare -A supported_params
@@ -216,51 +222,64 @@ apply_params() {
         fi
     done
     
-    # 彻底清理方案：保留非脚本管理的参数
-    local temp_preserve=$(mktemp)
-    local temp_config=$(mktemp)
-    
-    # 1. 提取要保留的参数（非脚本管理的参数）
-    while IFS= read -r line; do
-        # 跳过注释、空行和脚本标记
-        [[ "$line" =~ ^[[:space:]]*# ]] && continue
-        [[ "$line" =~ ^[[:space:]]*$ ]] && continue
-        
-        # 检查是否为参数行
-        if [[ "$line" =~ ^[[:space:]]*([^[:space:]#=]+)[[:space:]]*= ]]; then
-            local param_name="${BASH_REMATCH[1]}"
-            
-            # 检查是否是我们要管理的参数
-            local is_our_param=false
-            for our_param in "${!supported_params[@]}"; do
-                if [[ "$param_name" == "$our_param" ]]; then
-                    is_our_param=true
-                    break
-                fi
-            done
-            
-            # 如果不是我们管理的参数，保留它
-            if [[ "$is_our_param" == "false" ]]; then
-                echo "$line" >> "$temp_preserve"
-            fi
-        fi
-    done < "$SYSCTL_CONFIG"
-    
-    # 2. 重新构建干净的配置文件
-    
-    # 先写入保留的参数（如果有）
-    if [[ -s "$temp_preserve" ]]; then
-        echo "# 系统原有配置" > "$temp_config"
-        cat "$temp_preserve" >> "$temp_config"
-        echo "" >> "$temp_config"
+    # 处理现有配置 - 优先检查目标配置文件
+    local source_config=""
+    if [[ -f "$target_config" ]]; then
+        source_config="$target_config"
+        info "检测到现有 $target_config，保留用户配置..."
+    elif [[ -f "$SYSCTL_CONFIG" ]]; then
+        source_config="$SYSCTL_CONFIG"
+        info "检测到 $SYSCTL_CONFIG，准备迁移..."
+        backup_config "$SYSCTL_CONFIG"
     else
-        touch "$temp_config"
+        info "未发现现有配置，将创建新配置"
+    fi
+    
+    # 如果有源配置文件，提取非脚本管理的参数
+    if [[ -n "$source_config" && -f "$source_config" ]]; then
+        while IFS= read -r line; do
+            # 跳过注释、空行和脚本标记
+            [[ "$line" =~ ^[[:space:]]*# ]] && continue
+            [[ "$line" =~ ^[[:space:]]*$ ]] && continue
+            [[ "$line" =~ Network\ Optimizer ]] && continue
+            
+            # 检查是否为参数行
+            if [[ "$line" =~ ^[[:space:]]*([^[:space:]#=]+)[[:space:]]*= ]]; then
+                local param_name="${BASH_REMATCH[1]}"
+                
+                # 检查是否是我们要管理的参数
+                local is_our_param=false
+                for our_param in "${!supported_params[@]}"; do
+                    if [[ "$param_name" == "$our_param" ]]; then
+                        is_our_param=true
+                        break
+                    fi
+                done
+                
+                # 如果不是我们管理的参数，保留它
+                if [[ "$is_our_param" == "false" ]]; then
+                    echo "$line" >> "$temp_preserve"
+                fi
+            fi
+        done < "$source_config"
+        
+        # 如果有保留的参数，写入临时文件
+        if [[ -s "$temp_preserve" ]]; then
+            echo "# 用户自定义配置" > "$temp_config"
+            cat "$temp_preserve" >> "$temp_config"
+            echo "" >> "$temp_config"
+            echo "# ===== 用户配置 (上方) | 脚本配置 (下方) ===== " >> "$temp_config"
+            echo "" >> "$temp_config"
+            info "✅ 用户自定义配置已保留"
+        fi
     fi
     
     # 写入脚本配置
     cat >> "$temp_config" << EOF
 # Network Optimizer v${VERSION} - 网络性能优化
 # 生成时间: $(date "+%Y-%m-%d %H:%M:%S")
+# 配置文件: 98-tuning.conf (优先级高于默认配置)
+# 重复运行安全：用户参数已保留
 
 EOF
     
@@ -287,11 +306,20 @@ EOF
     
     echo "# Network Optimizer 配置结束" >> "$temp_config"
     
-    # 3. 应用新配置
-    mv "$temp_config" "$SYSCTL_CONFIG"
+    # 应用新配置
+    mv "$temp_config" "$target_config"
     rm -f "$temp_preserve"
     
-    sysctl -p >/dev/null 2>&1 && success "参数应用成功: $supported/${#NET_PARAMS[@]}" || warn "部分参数未生效"
+    # 如果原来有 sysctl.conf，删除它 (已备份)
+    if [[ -f "$SYSCTL_CONFIG" ]]; then
+        rm -f "$SYSCTL_CONFIG"
+        success "✅ 配置已迁移: $SYSCTL_CONFIG → $target_config"
+    else
+        success "✅ 配置已更新: $target_config"
+    fi
+    
+    # 重新加载所有 sysctl 配置
+    sysctl --system >/dev/null 2>&1 && success "参数应用成功: $supported/${#NET_PARAMS[@]}" || warn "部分参数未生效"
 }
 
 # === 网卡队列优化 ===
@@ -334,6 +362,14 @@ verify_config() {
             ((issues++)) || true
         fi
     done
+    
+    # 检查我们的配置文件
+    if [[ -f "/etc/sysctl.d/98-tuning.conf" ]]; then
+        info "✅ 网络配置: 已优化 (/etc/sysctl.d/98-tuning.conf)"
+    else
+        warn "❌ 网络配置: 未找到配置文件"
+        ((issues++)) || true
+    fi
     
     grep -q "1048576" "$LIMITS_CONFIG" 2>/dev/null && info "✅ 系统限制: 已优化" || { warn "❌ 系统限制: 未配置"; ((issues++)) || true; }
     
@@ -405,7 +441,20 @@ restore_optimization() {
     check_root
     info "恢复原始配置..."
     
-    restore_config "$SYSCTL_CONFIG"
+    local target_config="/etc/sysctl.d/98-tuning.conf"
+    
+    # 恢复原始 sysctl.conf (如果有备份)
+    if [[ -f "${SYSCTL_CONFIG}.initial_backup" ]]; then
+        restore_config "$SYSCTL_CONFIG"
+        info "✅ 已恢复: $SYSCTL_CONFIG"
+    fi
+    
+    # 删除我们的配置文件
+    if [[ -f "$target_config" ]]; then
+        rm -f "$target_config"
+        info "✅ 已删除: $target_config"
+    fi
+    
     restore_config "$LIMITS_CONFIG"
     
     # 重置网卡和恢复文件
@@ -416,7 +465,7 @@ restore_optimization() {
         [[ -f "$file" ]] && mv "$file" "${file%.disabled}" 2>/dev/null || true
     done
     
-    sysctl -p >/dev/null 2>&1 || true
+    sysctl --system >/dev/null 2>&1 || true
     success "配置恢复完成!"
 }
 
