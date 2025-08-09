@@ -218,7 +218,7 @@ optimize_docker_config() {
     
     echo "内存状态: ${mem_mb}MB (偏低)"
     debug_log "内存偏低 (${mem_mb}MB)，询问是否优化"
-    read -p "是否优化Docker配置以降低内存使用? [Y/n] (默认: Y): " -r optimize_choice
+    read -p "是否优化Docker配置以降低内存使用? [Y/n] (默认: Y): " -r optimize_choice || optimize_choice="Y"
     optimize_choice=${optimize_choice:-Y}
     
     if [[ "$optimize_choice" =~ ^[Nn]$ ]]; then
@@ -282,7 +282,7 @@ manage_containers() {
     
     echo "Docker Compose: 检测到 ($compose_cmd)"
     debug_log "检测到Docker Compose命令: $compose_cmd"
-    read -p "是否检查并启动容器? [Y/n] (默认: Y): " -r manage_choice
+    read -p "是否检查并启动容器? [Y/n] (默认: Y): " -r manage_choice || manage_choice="Y"
     manage_choice=${manage_choice:-Y}
     
     if [[ "$manage_choice" =~ ^[Nn]$ ]]; then
