@@ -1,17 +1,10 @@
 #!/bin/bash
-# 系统工具配置模块 v1.4 - nexttrace强制更新修复版
+# 系统工具配置模块 v2.0 - 智能配置版
 # 功能: 安装常用系统和网络工具
 
 set -euo pipefail
 
-# === 日志函数 ===
-log() {
-    local msg="$1" level="${2:-info}"
-    local -A colors=([info]="\033[0;36m" [warn]="\033[0;33m" [error]="\033[0;31m")
-    echo -e "${colors[$level]:-\033[0;32m}$msg\033[0m"
-}
-
-# === 工具定义 === (更新nexttrace安装URL)
+# === 常量定义 ===
 readonly TOOLS=(
     "nexttrace:nexttrace --version:https://nxtrace.org/nt:网络路由追踪工具"
     "speedtest:speedtest --version:speedtest-cli:网络测速工具"
@@ -22,16 +15,32 @@ readonly TOOLS=(
     "wget:wget --version:wget:文件下载工具"
 )
 
-# === 核心函数 ===
+# === 日志函数 ===
+log() {
+    local msg="$1" level="${2:-info}"
+    local -A colors=([info]="\033[0;36m" [warn]="\033[0;33m" [error]="\033[0;31m" [debug]="\033[0;35m")
+    echo -e "${colors[$level]:-\033[0;32m}$msg\033[0m"
+}
 
-# 获取工具版本 - 改进nexttrace检测
+debug_log() {
+    if [[ "${DEBUG:-}" == "1" ]]; then
+        log "DEBUG: $1" "debug" >&2
+    fi
+    return 0
+}
+
+# === 辅助函数 ===
+# 获取工具版本
 get_tool_version() {
     local tool_name="$1"
     local check_cmd="$2"
     
+    debug_log "获取工具版本: $tool_name"
+    
     case "$tool_name" in
         "nexttrace")
             local version_output=""
+            debug_log "检测nexttrace版本"
             
             # 尝试多种命令和参数组合
             for cmd in "nexttrace" "nxtrace"; do
@@ -55,6 +64,7 @@ get_tool_version() {
             fi
             ;;
         "speedtest")
+            debug_log "检测speedtest版本"
             local version_output
             version_output=$($check_cmd 2>/dev/null | head -n1 || echo "")
             if [[ "$version_output" =~ ([0-9]+\.[0-9]+\.[0-9]+) ]]; then
@@ -64,6 +74,7 @@ get_tool_version() {
             fi
             ;;
         *)
+            debug_log "检测通用工具版本: $tool_name"
             local version_output
             version_output=$($check_cmd 2>/dev/null | head -n1 || echo "")
             if [[ "$version_output" =~ ([0-9]+\.[0-9]+(\.[0-9]+)?) ]]; then
@@ -73,12 +84,15 @@ get_tool_version() {
             fi
             ;;
     esac
+    return 0
 }
 
-# 检查工具状态 - 改进nexttrace检测
+# 检查工具状态
 check_tool_status() {
     local tool_name="$1"
     local check_cmd="$2"
+    
+    debug_log "检查工具状态: $tool_name"
     
     if [[ "$tool_name" == "nexttrace" ]]; then
         # 对nexttrace特殊处理，检查两个可能的命令名
@@ -100,18 +114,54 @@ check_tool_status() {
             echo "missing:"
         fi
     fi
+    return 0
 }
 
-# 安装单个工具 - 特殊处理nexttrace强制重装
+# 显示工具选择菜单
+show_tool_menu() {
+    debug_log "显示工具选择菜单"
+    echo "可安装的工具:" >&2
+    echo "  1) 全部安装 - 一次安装所有工具" >&2
+    echo "  2) 网络工具 - NextTrace + SpeedTest" >&2
+    echo "  3) 系统工具 - htop + tree + jq" >&2
+    echo "  4) 基础工具 - curl + wget" >&2
+    echo "  5) 自定义选择 - 手动选择要安装的工具" >&2
+    echo "  6) 跳过安装" >&2
+    echo "  7) 检查更新 - 重新安装已有工具到最新版本" >&2
+    echo >&2
+    return 0
+}
+
+# 根据分类获取工具列表
+get_tools_by_category() {
+    local category="$1"
+    
+    debug_log "获取工具分类: $category"
+    
+    case "$category" in
+        "network") echo "nexttrace speedtest" ;;
+        "system") echo "htop tree jq" ;;
+        "basic") echo "curl wget" ;;
+        "all"|"update") echo "nexttrace speedtest htop jq tree curl wget" ;;
+        *) echo "" ;;
+    esac
+    return 0
+}
+
+# === 核心功能函数 ===
+# 安装单个工具
 install_single_tool() {
     local tool_name="$1"
     local install_source="$2"
     local force_reinstall="${3:-false}"
     
+    debug_log "安装工具: $tool_name (强制重装: $force_reinstall)"
+    
     if [[ "$install_source" == https://* ]]; then
         # 通过脚本安装
         if [[ "$tool_name" == "nexttrace" && "$force_reinstall" == "true" ]]; then
             # nexttrace特殊处理：强制重新安装
+            debug_log "强制更新nexttrace"
             echo "强制更新nexttrace..." >&2
             
             # 方法1：尝试直接安装（可能会覆盖）
@@ -120,6 +170,7 @@ install_single_tool() {
             fi
             
             # 方法2：尝试删除旧版本再安装
+            debug_log "尝试删除旧版本后重新安装nexttrace"
             echo "尝试删除旧版本后重新安装..." >&2
             local nexttrace_path=$(command -v nexttrace 2>/dev/null || command -v nxtrace 2>/dev/null)
             if [[ -n "$nexttrace_path" ]]; then
@@ -136,6 +187,7 @@ install_single_tool() {
             fi
             
             # 方法3：尝试手动下载安装
+            debug_log "尝试手动下载安装nexttrace"
             echo "尝试手动下载安装..." >&2
             local temp_dir=$(mktemp -d)
             local arch=$(uname -m)
@@ -159,6 +211,7 @@ install_single_tool() {
             return 1
         else
             # 其他工具正常安装
+            debug_log "通过脚本安装: $tool_name"
             if curl -fsSL "$install_source" | bash >/dev/null 2>&1; then
                 return 0
             else
@@ -166,7 +219,8 @@ install_single_tool() {
             fi
         fi
     else
-        # 通过包管理器安装 - 完全静默
+        # 通过包管理器安装
+        debug_log "通过包管理器安装: $tool_name"
         if apt update -qq >/dev/null 2>&1 && apt install -y "$install_source" >/dev/null 2>&1; then
             return 0
         else
@@ -175,26 +229,16 @@ install_single_tool() {
     fi
 }
 
-# 显示工具选择菜单
-show_tool_menu() {
-    echo "可安装的工具:" >&2
-    echo "  1) 全部安装 - 一次安装所有工具" >&2
-    echo "  2) 网络工具 - NextTrace + SpeedTest" >&2
-    echo "  3) 系统工具 - htop + tree + jq" >&2
-    echo "  4) 基础工具 - curl + wget" >&2
-    echo "  5) 自定义选择 - 手动选择要安装的工具" >&2
-    echo "  6) 跳过安装" >&2
-    echo "  7) 检查更新 - 重新安装已有工具到最新版本" >&2
-    echo >&2
-}
-
 # 获取用户选择
 get_user_choice() {
+    debug_log "获取用户选择"
     show_tool_menu
     
     local choice
-    read -p "请选择 [1-7] (默认: 1): " choice >&2
+    read -p "请选择 [1-7] (默认: 1): " choice >&2 || choice="1"
     choice=${choice:-1}
+    
+    debug_log "用户选择: $choice"
     
     case "$choice" in
         1) echo "all" ;;
@@ -206,25 +250,14 @@ get_user_choice() {
         7) echo "update" ;;
         *) echo "all" ;;
     esac
-}
-
-# 根据分类获取工具列表
-get_tools_by_category() {
-    local category="$1"
-    
-    case "$category" in
-        "network") echo "nexttrace speedtest" ;;
-        "system") echo "htop tree jq" ;;
-        "basic") echo "curl wget" ;;
-        "all"|"update") echo "nexttrace speedtest htop jq tree curl wget" ;;
-        *) echo "" ;;
-    esac
+    return 0
 }
 
 # 自定义选择工具
 custom_tool_selection() {
     local selected_tools=()
     
+    debug_log "进入自定义工具选择"
     echo "选择要安装的工具 (多选用空格分隔，如: 1 3 5):" >&2
     for i in "${!TOOLS[@]}"; do
         local tool_info="${TOOLS[$i]}"
@@ -235,13 +268,15 @@ custom_tool_selection() {
     echo >&2
     
     local choices
-    read -p "请输入数字 (默认: 全选): " choices >&2
+    read -p "请输入数字 (默认: 全选): " choices >&2 || choices=""
     
     if [[ -z "$choices" ]]; then
+        debug_log "用户未输入，默认全选"
         echo "nexttrace speedtest htop jq tree curl wget"
-        return
+        return 0
     fi
     
+    debug_log "用户选择: $choices"
     for choice in $choices; do
         if [[ "$choice" =~ ^[0-9]+$ ]] && [[ "$choice" -ge 1 ]] && [[ "$choice" -le ${#TOOLS[@]} ]]; then
             local idx=$((choice-1))
@@ -251,14 +286,18 @@ custom_tool_selection() {
         fi
     done
     
+    debug_log "最终选择的工具: ${selected_tools[*]}"
     echo "${selected_tools[*]}"
+    return 0
 }
 
-# 安装选定的工具 - 修复更新逻辑和nexttrace特殊处理
+# 安装选定的工具
 install_selected_tools() {
     local category="$1"
     local tools_to_install
     local force_install=false
+    
+    debug_log "开始安装工具，类别: $category"
     
     if [[ "$category" == "update" ]]; then
         force_install=true
@@ -270,8 +309,11 @@ install_selected_tools() {
     fi
     
     if [[ -z "$tools_to_install" ]]; then
+        debug_log "没有工具需要安装"
         return 0
     fi
+    
+    debug_log "准备安装的工具: $tools_to_install"
     
     local installed_count=0
     local failed_count=0
@@ -283,6 +325,7 @@ install_selected_tools() {
     local skipped_tools=()
     
     for tool_name in $tools_to_install; do
+        debug_log "处理工具: $tool_name"
         # 查找工具信息
         local tool_found=false
         for tool_info in "${TOOLS[@]}"; do
@@ -301,6 +344,7 @@ install_selected_tools() {
                     
                     if ! $force_install; then
                         # 普通安装模式：跳过已安装的工具
+                        debug_log "工具 $tool_name 已安装，版本: $old_version"
                         installed_tools+=("$tool_name($old_version)")
                         tool_found=true
                         break
@@ -308,6 +352,7 @@ install_selected_tools() {
                 fi
                 
                 # 执行安装（新安装或强制重装）
+                debug_log "开始安装 $tool_name"
                 local install_success=false
                 if [[ "$tool_name" == "nexttrace" && $force_install == true ]]; then
                     # nexttrace强制重装
@@ -322,6 +367,7 @@ install_selected_tools() {
                 fi
                 
                 if $install_success; then
+                    debug_log "工具 $tool_name 安装成功，重新检查版本"
                     # 重新检查版本
                     sleep 2  # nexttrace安装后可能需要更长时间生效
                     local new_status=$(check_tool_status "$tool_name" "$check_cmd" || echo "installed:已安装")
@@ -354,6 +400,7 @@ install_selected_tools() {
                         fi
                     fi
                 else
+                    debug_log "工具 $tool_name 安装失败"
                     if $was_installed; then
                         # 重新安装失败，但原版本还在
                         skipped_tools+=("$tool_name($old_version)")
@@ -370,6 +417,7 @@ install_selected_tools() {
         done
         
         if ! $tool_found; then
+            debug_log "未找到工具定义: $tool_name"
             failed_tools+=("$tool_name")
             ((failed_count++))
         fi
@@ -405,10 +453,12 @@ install_selected_tools() {
         [[ $skipped_count -gt 0 ]] && operations+=("重装${skipped_count}个")
         echo "操作完成: ${operations[*]}"
     fi
+    return 0
 }
 
-# 显示配置摘要 - 改进nexttrace命令显示
+# 显示配置摘要
 show_tools_summary() {
+    debug_log "显示工具摘要"
     echo
     log "🎯 系统工具摘要:" "info"
     
@@ -437,7 +487,7 @@ show_tools_summary() {
         echo "  ✗ 未安装: ${missing_tools[*]}"
     fi
     
-    # 显示常用命令 - 改进格式
+    # 显示常用命令
     local has_commands=false
     echo "  💡 常用命令:"
     
@@ -483,6 +533,7 @@ main() {
     
     if [[ "$choice" == "skip" ]]; then
         echo "工具安装: 跳过"
+        debug_log "用户选择跳过工具安装"
     else
         echo
         case "$choice" in
@@ -494,15 +545,26 @@ main() {
             "update") echo "更新模式: 检查更新已安装工具" ;;
         esac
         
-        install_selected_tools "$choice" || true  # 确保不会因为工具安装失败而退出
+        debug_log "开始安装选定工具"
+        install_selected_tools "$choice" || {
+            debug_log "工具安装过程中出现错误，但继续执行"
+            true
+        }
     fi
     
-    show_tools_summary || true  # 确保摘要显示不会导致脚本失败
+    debug_log "显示工具摘要"
+    show_tools_summary || {
+        debug_log "显示摘要失败，但继续执行"
+        true
+    }
     
     echo
     log "✅ 系统工具配置完成!" "info"
     
-    return 0  # 显式返回成功
+    return 0
 }
+
+# 错误处理
+trap 'log "脚本执行出错，行号: $LINENO" "error"; exit 1' ERR
 
 main "$@"
