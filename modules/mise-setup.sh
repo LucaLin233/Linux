@@ -606,7 +606,7 @@ cleanup_old_python_versions() {
     fi
 }
 
-# 配置Python - 修改为使用动态路径
+# 配置Python - 修改为使用动态路径，明确返回值
 setup_python() {
     debug_log "开始配置Python"
     local mise_cmd=""
@@ -622,11 +622,11 @@ setup_python() {
     local selected_version=""
     selected_version=$(choose_python_version)
     
-    # 修正：正确处理"current"选择
+    # 修正：正确处理"current"选择，明确返回0
     if [[ "$selected_version" == "current" ]]; then
         echo "Python配置: 保持当前"
         debug_log "保持当前Python配置"
-        return 0
+        return 0  # 明确返回成功
     fi
     
     echo "安装Python $selected_version..."
@@ -635,11 +635,11 @@ setup_python() {
         echo "Python $selected_version: 安装成功"
         debug_log "Python $selected_version 安装成功"
         cleanup_old_python_versions "$selected_version"
-        return 0
+        return 0  # 明确返回成功
     else
         log "✗ Python $selected_version 安装失败" "error"
         debug_log "Python $selected_version 安装失败"
-        return 1
+        return 1  # 明确返回失败
     fi
 }
 
@@ -885,35 +885,52 @@ main() {
     log "🔧 配置Mise版本管理器..." "info"
     
     echo
-    if get_mise_executable >/dev/null; then
+    # 检查Python状态，但不让失败影响主流程
+    if get_mise_executable >/dev/null 2>&1; then
         detect_python_status >/dev/null 2>&1 || true
     fi
     
+    # mise安装/验证 - 这是关键步骤，失败就退出
     if ! install_mise; then
         log "Mise安装失败" "error"
         exit 1
     fi
     
     echo
+    # Python配置 - 允许失败但继续执行
     if setup_python; then
         debug_log "Python配置成功"
     else
         echo "Python配置失败，但继续执行..."
         debug_log "Python配置失败，继续执行"
+        # 继续执行，不退出
     fi
     
-    setup_python_usage
+    # Python使用方式配置 - 确保不会因为返回值失败
+    setup_python_usage || {
+        echo "Python使用方式配置失败，使用默认配置"
+        debug_log "setup_python_usage失败"
+    }
     
     echo
-    configure_shell_integration
+    # Shell集成配置 - 确保不会因为返回值失败
+    configure_shell_integration || {
+        echo "Shell集成配置失败"
+        debug_log "configure_shell_integration失败"
+    }
     
-    show_mise_summary
+    # 显示摘要 - 确保不会因为返回值失败
+    show_mise_summary || {
+        echo "显示摘要失败"
+        debug_log "show_mise_summary失败"
+    }
     
     echo
     log "✅ Mise配置完成!" "info"
     log "提示: 运行 'source ~/.bashrc' 或重新登录激活" "info"
     
-    if get_mise_executable >/dev/null; then
+    # 显示常用命令 - 确保不会失败
+    if get_mise_executable >/dev/null 2>&1; then
         echo
         log "常用命令:" "info"
         echo "  查看工具: mise list"
@@ -921,6 +938,10 @@ main() {
         echo "  全局设置: mise use -g python@3.12.4"
         echo "  查看当前: mise current"
     fi
+    
+    # 确保main函数成功返回
+    debug_log "main函数执行完成"
+    return 0
 }
 
 # 错误处理
