@@ -1,11 +1,10 @@
 #!/bin/bash
 # Docker 容器化平台配置模块 v5.1 - 稳定版
-# 功能: 安装Docker、优化配置、管理容器
+# 功能: 安装Docker、优化配置
 
 set -euo pipefail
 
 # === 常量定义 ===
-readonly CONTAINER_DIRS=(/root /root/proxy /root/vmagent)
 readonly DOCKER_CONFIG_DIR="/etc/docker"
 readonly DOCKER_DAEMON_CONFIG="$DOCKER_CONFIG_DIR/daemon.json"
 
@@ -65,79 +64,6 @@ get_docker_version() {
     version=$(docker --version 2>/dev/null | awk '{print $3}' | tr -d ',' || echo "未知")
     debug_log "Docker版本: $version"
     echo "$version"
-}
-
-# 获取Docker Compose命令
-get_compose_command() {
-    debug_log "检测Docker Compose命令"
-    if command -v docker &>/dev/null && docker compose version &>/dev/null 2>&1; then
-        debug_log "找到docker compose命令"
-        echo "docker compose"
-    elif command -v docker-compose &>/dev/null; then
-        debug_log "找到docker-compose命令"
-        echo "docker-compose"
-    else
-        debug_log "未找到Docker Compose命令"
-        echo ""
-    fi
-}
-
-# 检查并启动单个目录的容器
-check_directory_containers() {
-    local dir="$1"
-    local compose_cmd="$2"
-    local containers_started=0
-    
-    debug_log "检查目录容器: $dir"
-    
-    if [[ ! -d "$dir" ]]; then
-        debug_log "目录不存在: $dir"
-        return 0
-    fi
-    
-    # 查找compose文件
-    local compose_file=""
-    for file in compose.yaml compose.yml docker-compose.yml docker-compose.yaml; do
-        if [[ -f "$dir/$file" ]]; then
-            compose_file="$file"
-            debug_log "找到compose文件: $dir/$file"
-            break
-        fi
-    done
-    
-    if [[ -z "$compose_file" ]]; then
-        debug_log "未找到compose文件: $dir"
-        return 0
-    fi
-    
-    # 切换到目录并检查容器状态
-    local current_dir=$(pwd)
-    if ! cd "$dir" 2>/dev/null; then
-        debug_log "无法切换到目录: $dir"
-        return 0
-    fi
-    
-    local expected_services=$($compose_cmd -f "$compose_file" config --services 2>/dev/null | wc -l || echo "0")
-    local running_containers=$($compose_cmd -f "$compose_file" ps --filter status=running --quiet 2>/dev/null | wc -l || echo "0")
-    
-    debug_log "目录 $dir: 期望服务数=$expected_services, 运行容器数=$running_containers"
-    
-    if (( expected_services > 0 && running_containers < expected_services )); then
-        debug_log "启动容器: $dir"
-        if $compose_cmd -f "$compose_file" up -d --force-recreate >/dev/null 2>&1; then
-            containers_started=1
-            debug_log "容器启动成功: $dir"
-        else
-            debug_log "容器启动失败: $dir"
-        fi
-    else
-        debug_log "容器状态正常: $dir"
-    fi
-    
-    if ! cd "$current_dir" 2>/dev/null; then
-        debug_log "无法切换回原目录: $current_dir"
-    fi
-    echo "$containers_started"
 }
 
 # === 核心功能函数 ===
@@ -273,51 +199,6 @@ EOF
     return 0
 }
 
-# 管理Docker容器
-manage_containers() {
-    debug_log "开始管理Docker容器"
-    local compose_cmd=$(get_compose_command)
-    
-    if [[ -z "$compose_cmd" ]]; then
-        echo "Docker Compose: 未检测到"
-        debug_log "未检测到Docker Compose"
-        return 0
-    fi
-    
-    echo "Docker Compose: 检测到 ($compose_cmd)"
-    debug_log "检测到Docker Compose命令: $compose_cmd"
-    read -p "是否检查并启动容器? [Y/n] (默认: Y): " -r manage_choice || manage_choice="Y"
-    manage_choice=${manage_choice:-Y}
-    
-    if [[ "$manage_choice" =~ ^[Nn]$ ]]; then
-        echo "容器管理: 跳过"
-        debug_log "用户选择跳过容器管理"
-        return 0
-    fi
-    
-    debug_log "开始检查容器目录"
-    local total_started=0
-    local dirs_with_containers=()
-    
-    for dir in "${CONTAINER_DIRS[@]}"; do
-        local started=$(check_directory_containers "$dir" "$compose_cmd")
-        if [[ "$started" -eq 1 ]]; then
-            ((total_started++))
-            dirs_with_containers+=("$(basename "$dir")")
-            debug_log "目录 $dir 中的容器已启动"
-        fi
-    done
-    
-    if [[ "$total_started" -gt 0 ]]; then
-        echo "容器启动: ${total_started}个目录 (${dirs_with_containers[*]})"
-        debug_log "总计启动 $total_started 个目录的容器"
-    else
-        echo "容器检查: 所有容器已在运行"
-        debug_log "所有容器都已在运行"
-    fi
-    return 0
-}
-
 # 显示配置摘要
 show_docker_summary() {
     debug_log "显示Docker配置摘要"
@@ -348,15 +229,6 @@ show_docker_summary() {
         echo "  Docker: 未安装"
         debug_log "Docker未安装"
     fi
-    
-    local compose_cmd=$(get_compose_command)
-    if [[ -n "$compose_cmd" ]]; then
-        echo "  Docker Compose: 可用"
-        debug_log "Docker Compose可用: $compose_cmd"
-    else
-        echo "  Docker Compose: 不可用"
-        debug_log "Docker Compose不可用"
-    fi
     return 0
 }
 
@@ -380,11 +252,6 @@ main() {
         debug_log "Docker优化配置失败，但继续执行"
     fi
     
-    echo
-    if ! manage_containers; then
-        debug_log "容器管理失败，但继续执行"
-    fi
-    
     show_docker_summary
     
     echo
@@ -396,11 +263,6 @@ main() {
         echo "  查看容器: docker ps"
         echo "  查看镜像: docker images"
         echo "  系统清理: docker system prune -f"
-        
-        local compose_cmd=$(get_compose_command)
-        if [[ -n "$compose_cmd" ]]; then
-            echo "  容器管理: $compose_cmd up -d"
-        fi
     fi
     return 0
 }
