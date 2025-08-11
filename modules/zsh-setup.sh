@@ -192,8 +192,8 @@ alias redocker='cd /root/proxy && docker compose down && docker compose pull && 
 alias resys='systemctl restart singbox realm snell snellr'
 alias autodel='docker system prune -a -f && apt autoremove -y'
 alias sstop='systemctl stop'
-alias sr='systemctl restart'
-alias ss='systemctl status'
+alias sre='systemctl restart'
+alias sst='systemctl status'
 EOF
         log ".zshrc配置写入失败" "error"
         return 1
