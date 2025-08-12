@@ -194,6 +194,7 @@ alias autodel='docker system prune -a -f && apt autoremove -y'
 alias sstop='systemctl stop'
 alias sre='systemctl restart'
 alias sst='systemctl status'
+alias sdre='systemctl daemon-reload'
 EOF
         log ".zshrc配置写入失败" "error"
         return 1
