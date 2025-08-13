@@ -386,7 +386,7 @@ setup_multiple_zram() {
     return 0
 }
 
-# 主要的zram配置函数
+# 主要的zram配置函数 - 修复版
 setup_zram() {
     local mem_mb=$(awk '/MemTotal/ {print int($2/1024)}' /proc/meminfo)
     local cores=$(nproc)
@@ -411,24 +411,42 @@ setup_zram() {
     
     # 计算zram大小
     local target_size_mb
-    if target_size_mb=$(awk "BEGIN {printf \"%.0f\", $mem_mb * $multiplier}"); then
+    if command -v bc >/dev/null 2>&1 && target_size_mb=$(awk "BEGIN {printf \"%.0f\", $mem_mb * $multiplier}" 2>/dev/null); then
         debug_log "目标大小计算: ${mem_mb}MB * $multiplier = ${target_size_mb}MB"
     else
-        # 备用计算
-        target_size_mb=$((mem_mb * ${multiplier%.*} / 1))
+        # 备用计算 - 处理没有bc的情况
+        local int_multiplier=$(echo "$multiplier" | cut -d. -f1)
+        local decimal_part=$(echo "$multiplier" | cut -d. -f2 2>/dev/null || echo "0")
+        if [[ ${#decimal_part} -eq 1 ]]; then
+            decimal_part="${decimal_part}0"
+        fi
+        target_size_mb=$(( (mem_mb * int_multiplier) + (mem_mb * ${decimal_part:-0} / 100) ))
         debug_log "使用整数计算: $target_size_mb"
     fi
     
-    # 检查现有zram是否合适
-    local current_zram_devices=$(swapon --show 2>/dev/null | grep -c zram || echo "0")
-    if (( current_zram_devices > 0 )); then
+    # 安全获取当前zram设备数量 - 关键修复
+    local current_zram_devices=0
+    local zram_output
+    if zram_output=$(swapon --show 2>/dev/null); then
+        # 清理输出并统计zram设备
+        current_zram_devices=$(echo "$zram_output" | grep -c "zram" 2>/dev/null || echo "0")
+    fi
+    
+    # 确保变量是纯数字 - 关键修复
+    current_zram_devices=$(echo "$current_zram_devices" | tr -cd '0-9' | head -c 10)
+    current_zram_devices=${current_zram_devices:-0}
+    
+    debug_log "当前zram设备数量: $current_zram_devices"
+    
+    # 安全的数值比较 - 关键修复
+    if [[ "$current_zram_devices" =~ ^[0-9]+$ ]] && [[ "$current_zram_devices" -gt 0 ]]; then
         # 计算当前zram总大小
         local current_total_mb=0
         while read -r device _ size _; do
             [[ "$device" == *"zram"* ]] || continue
             local current_mb=$(convert_to_mb "$size")
             current_total_mb=$((current_total_mb + current_mb))
-        done < <(swapon --show 2>/dev/null)
+        done < <(swapon --show 2>/dev/null | grep zram)
         
         # 检查配置是否匹配
         local min_acceptable=$((target_size_mb * 90 / 100))
@@ -596,8 +614,16 @@ main() {
         exit 1
     }
     
+    # 安装bc（如果缺失） - 新增
+    if ! command -v bc &>/dev/null; then
+        log "安装必需依赖: bc" "info"
+        apt-get update -qq && apt-get install -y bc >/dev/null 2>&1 || {
+            log "bc安装失败，将使用备用计算方法" "warn"
+        }
+    fi
+    
     # 检查必要命令
-    for cmd in bc awk swapon systemctl; do
+    for cmd in awk swapon systemctl; do  # 移除了bc的强制要求
         command -v "$cmd" &>/dev/null || {
             log "缺少必要命令: $cmd" "error"
             exit 1
