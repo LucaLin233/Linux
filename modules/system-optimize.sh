@@ -281,7 +281,7 @@ set_system_parameters() {
     echo "$zram_priority,$swappiness,$disk_swap_count"
 }
 
-# 配置单个zram设备
+# 修复后的setup_single_zram函数
 setup_single_zram() {
     local size_mib="$1"
     local algorithm="$2"
@@ -291,37 +291,90 @@ setup_single_zram() {
     # 停用现有zram
     systemctl stop zramswap.service 2>/dev/null || true
     
-    # 安装zram-tools
+    # 尝试安装zram-tools
+    local use_service=true
     if ! dpkg -l zram-tools &>/dev/null; then
         debug_log "安装zram-tools"
         if ! apt-get update -qq && apt-get install -y zram-tools >/dev/null 2>&1; then
-            log "zram-tools安装失败" "error"
-            return 1
+            log "zram-tools安装失败，使用手动配置" "warn"
+            use_service=false
         fi
     fi
     
-    # 配置文件
-    if [[ -f "$ZRAM_CONFIG" ]]; then
-        cp "$ZRAM_CONFIG" "${ZRAM_CONFIG}.bak" 2>/dev/null || true
-        sed -i "s/^SIZE=.*/SIZE=$size_mib/" "$ZRAM_CONFIG" 2>/dev/null || echo "SIZE=$size_mib" >> "$ZRAM_CONFIG"
-        sed -i "s/^ALGO=.*/ALGO=$algorithm/" "$ZRAM_CONFIG" 2>/dev/null || echo "ALGO=$algorithm" >> "$ZRAM_CONFIG"
-    else
-        cat > "$ZRAM_CONFIG" << EOF
+    if [[ "$use_service" == "true" ]] && systemctl list-unit-files | grep -q zramswap.service; then
+        # 使用zram-tools服务
+        # 配置文件
+        if [[ -f "$ZRAM_CONFIG" ]]; then
+            cp "$ZRAM_CONFIG" "${ZRAM_CONFIG}.bak" 2>/dev/null || true
+            sed -i "s/^SIZE=.*/SIZE=$size_mib/" "$ZRAM_CONFIG" 2>/dev/null || echo "SIZE=$size_mib" >> "$ZRAM_CONFIG"
+            sed -i "s/^ALGO=.*/ALGO=$algorithm/" "$ZRAM_CONFIG" 2>/dev/null || echo "ALGO=$algorithm" >> "$ZRAM_CONFIG"
+        else
+            cat > "$ZRAM_CONFIG" << EOF
 SIZE=$size_mib
 ALGO=$algorithm
 EOF
+        fi
+        
+        # 启动服务
+        systemctl enable zramswap.service >/dev/null 2>&1 || {
+            log "启用zramswap服务失败，转为手动配置" "warn"
+            use_service=false
+        }
+        
+        if [[ "$use_service" == "true" ]]; then
+            systemctl start zramswap.service >/dev/null 2>&1 || {
+                log "启动zramswap服务失败，转为手动配置" "warn"
+                use_service=false
+            }
+        fi
+    else
+        use_service=false
     fi
     
-    # 启动服务
-    systemctl enable zramswap.service >/dev/null 2>&1 || {
-        log "启用zramswap服务失败" "error"
-        return 1
-    }
-    
-    systemctl start zramswap.service >/dev/null 2>&1 || {
-        log "启动zramswap服务失败" "error" 
-        return 1
-    }
+    # 手动配置模式
+    if [[ "$use_service" == "false" ]]; then
+        debug_log "使用手动配置模式"
+        
+        # 确保zram模块已加载
+        modprobe zram num_devices=1 2>/dev/null || {
+            log "加载zram模块失败" "error"
+            return 1
+        }
+        
+        # 等待设备创建
+        local retry=0
+        while [[ ! -b /dev/zram0 ]] && (( retry < 10 )); do
+            sleep 0.1
+            ((retry++))
+        done
+        
+        [[ -b /dev/zram0 ]] || {
+            log "zram0设备未创建" "error"
+            return 1
+        }
+        
+        # 重置设备（如果已配置）
+        swapoff /dev/zram0 2>/dev/null || true
+        echo 1 > /sys/block/zram0/reset 2>/dev/null || true
+        
+        # 配置设备
+        echo "$algorithm" > /sys/block/zram0/comp_algorithm 2>/dev/null || true
+        echo "${size_mib}M" > /sys/block/zram0/disksize 2>/dev/null || {
+            log "设置zram大小失败" "error"
+            return 1
+        }
+        
+        # 创建并激活swap
+        mkswap /dev/zram0 >/dev/null 2>&1 || {
+            log "创建zram swap失败" "error"
+            return 1
+        }
+        
+        swapon /dev/zram0 2>/dev/null || {
+            log "激活zram swap失败" "error"
+            return 1
+        }
+    fi
     
     sleep 2
     return 0
