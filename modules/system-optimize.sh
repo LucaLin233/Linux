@@ -288,28 +288,40 @@ set_system_parameters() {
     echo "$zram_priority,$swappiness,$disk_swap_count"
 }
 
-# 配置单个zram设备 - 完全修复版
+# 配置单个zram设备 - 修复交互问题版本
 setup_single_zram() {
     local size_mib="$1"
     local algorithm="$2"
     
     debug_log "配置单zram: ${size_mib}MB, 算法: $algorithm"
     
-    # === 1. 包完整性检查（但不要在这里停止服务）===
+    # === 1. 预清理可能导致交互的配置文件 ===
+    if ! dpkg -l zram-tools &>/dev/null; then
+        debug_log "预清理可能的配置文件冲突"
+        # 如果包未安装但配置文件存在，先删除以避免交互
+        [[ -f "$ZRAM_CONFIG" ]] && rm -f "$ZRAM_CONFIG" 2>/dev/null || true
+        [[ -f "${ZRAM_CONFIG}.bak" ]] && rm -f "${ZRAM_CONFIG}.bak" 2>/dev/null || true
+    fi
+    
+    # === 2. 包完整性检查和安装 ===
     if ! dpkg -l zram-tools &>/dev/null; then
         debug_log "安装zram-tools"
-        if ! apt-get update -qq && apt-get install -y zram-tools >/dev/null 2>&1; then
+        # 使用非交互模式安装
+        DEBIAN_FRONTEND=noninteractive apt-get update -qq && \
+        DEBIAN_FRONTEND=noninteractive apt-get install -y zram-tools >/dev/null 2>&1 || {
             log "zram-tools安装失败" "error"
             return 1
-        fi
+        }
         systemctl daemon-reload
     else
         # 检查关键文件是否真的存在
         if [[ ! -f /usr/sbin/zramswap ]] || [[ ! -f /usr/lib/systemd/system/zramswap.service ]]; then
             log "检测到zram-tools包损坏，重新安装" "warn"
+            # 先清理配置文件避免交互
+            rm -f "$ZRAM_CONFIG" "${ZRAM_CONFIG}.bak" 2>/dev/null || true
             apt-get purge -y zram-tools >/dev/null 2>&1 || true
             apt-get autoremove -y >/dev/null 2>&1 || true
-            if ! apt-get install -y zram-tools >/dev/null 2>&1; then
+            if ! DEBIAN_FRONTEND=noninteractive apt-get install -y zram-tools >/dev/null 2>&1; then
                 log "zram-tools重装失败" "error"
                 return 1
             fi
@@ -317,17 +329,15 @@ setup_single_zram() {
         fi
     fi
     
-    # === 2. 创建正确的配置文件（这是关键！）===
+    # 继续原来的配置逻辑...
     debug_log "创建配置文件: SIZE=${size_mib}, ALGO=$algorithm"
-    [[ -f "$ZRAM_CONFIG" ]] && cp "$ZRAM_CONFIG" "${ZRAM_CONFIG}.bak" 2>/dev/null || true
     
-    # 完全重写配置文件，确保PERCENT被注释掉，SIZE生效
+    # 完全重写配置文件
     cat > "$ZRAM_CONFIG" << EOF
 # Compression algorithm selection
 ALGO=$algorithm
 
 # Use fixed SIZE instead of PERCENT
-# PERCENT=50  # Commented out - SIZE takes precedence
 SIZE=$size_mib
 
 # Specifies the priority for the swap devices
@@ -337,7 +347,7 @@ EOF
     debug_log "配置文件已创建"
     [[ "${DEBUG:-}" == "1" ]] && cat "$ZRAM_CONFIG" >&2
     
-    # === 3. 启动服务 ===
+    # 启动服务
     if ! systemctl enable zramswap.service >/dev/null 2>&1; then
         log "启用zramswap服务失败" "error"
         return 1
@@ -345,21 +355,16 @@ EOF
     
     if ! systemctl start zramswap.service >/dev/null 2>&1; then
         log "启动zramswap服务失败" "error"
-        if [[ "${DEBUG:-}" == "1" ]]; then
-            debug_log "服务启动失败，检查日志："
-            journalctl -u zramswap.service --no-pager -n 5 >&2
-        fi
         return 1
     fi
     
-    # === 4. 验证配置 ===
-    sleep 3  # 等待服务完全启动
+    sleep 3
     
-    # 检查设备是否存在且大小正确
+    # 验证配置
     if [[ -b /dev/zram0 ]]; then
         local actual_bytes=$(cat /sys/block/zram0/disksize 2>/dev/null || echo "0")
         local actual_mb=$((actual_bytes / 1024 / 1024))
-        local min_expected=$((size_mib * 95 / 100))  # 允许5%误差
+        local min_expected=$((size_mib * 95 / 100))
         local max_expected=$((size_mib * 105 / 100))
         
         if (( actual_mb >= min_expected && actual_mb <= max_expected )); then
