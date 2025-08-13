@@ -93,7 +93,7 @@ cleanup_zram_completely() {
 # === 辅助函数结束 ===
 
 # === 核心功能函数 ===
-# CPU性能快速检测
+# CPU性能快速检测 - 修复bc依赖
 benchmark_cpu_quick() {
     debug_log "开始CPU性能检测"
     local cores=$(nproc)
@@ -107,27 +107,20 @@ benchmark_cpu_quick() {
     fi
     local end_time=$(date +%s.%N)
     
-    local duration
+    local duration cpu_score
     if command -v bc >/dev/null 2>&1; then
         duration=$(echo "$end_time - $start_time" | bc 2>/dev/null || echo "5")
+        cpu_score=$(echo "scale=2; ($cores * 2) / $duration" | bc 2>/dev/null || echo "2")
     else
         # 备用计算：使用整数运算
         local start_int=${start_time%.*}
         local end_int=${end_time%.*}
-        duration=$((end_int - start_int + 1))  # 加1作为保守估计
-    fi
-    
-    local cpu_score
-    if command -v bc >/dev/null 2>&1; then
-        cpu_score=$(echo "scale=2; ($cores * 2) / $duration" | bc 2>/dev/null || echo "2")
-    else
-        # 备用计算
-        cpu_score=$(( (cores * 2 * 100) / (${duration%.*} * 100) ))  # 简化的整数计算
+        duration=$((end_int - start_int + 1))  # 保守估计
+        cpu_score=$(( (cores * 200) / duration / 100 ))  # 简化计算
     fi
     
     debug_log "CPU核心数: $cores, 测试时间: ${duration}s, 得分: $cpu_score"
     
-    # 使用字符串比较避免bc依赖
     if command -v bc >/dev/null 2>&1; then
         if (( $(echo "$cpu_score < 3" | bc -l 2>/dev/null || echo "1") )); then
             echo "weak"
@@ -137,7 +130,7 @@ benchmark_cpu_quick() {
             echo "strong"
         fi
     else
-        # 备用比较（假设cpu_score是整数）
+        # 备用比较
         if (( cpu_score < 3 )); then
             echo "weak"
         elif (( cpu_score < 8 )); then
@@ -308,16 +301,25 @@ set_system_parameters() {
     echo "$zram_priority,$swappiness,$disk_swap_count"
 }
 
-# 配置单个zram设备 - 修复版
+# 配置单个zram设备 - 添加包损坏检测
 setup_single_zram() {
     local size_mib="$1"
     local algorithm="$2"
     
     debug_log "配置单zram: ${size_mib}MB, 算法: $algorithm"
     
-    # === 包完整性检查 ===
-    if dpkg -l zram-tools &>/dev/null; then
-        # 检查关键文件是否真的存在
+    # 停用现有zram
+    systemctl stop zramswap.service 2>/dev/null || true
+    
+    # 安装zram-tools - 添加包损坏检测
+    if ! dpkg -l zram-tools &>/dev/null; then
+        debug_log "安装zram-tools"
+        if ! apt-get update -qq && apt-get install -y zram-tools >/dev/null 2>&1; then
+            log "zram-tools安装失败" "error"
+            return 1
+        fi
+    else
+        # 检查关键文件是否真的存在（包损坏检测）
         if [[ ! -f /usr/sbin/zramswap ]] || [[ ! -f /usr/lib/systemd/system/zramswap.service ]]; then
             log "检测到zram-tools包损坏，重新安装" "warn"
             apt-get purge -y zram-tools >/dev/null 2>&1 || true
@@ -327,18 +329,6 @@ setup_single_zram() {
                 return 1
             fi
             systemctl daemon-reload
-        fi
-    fi
-    
-    # 停用现有zram
-    systemctl stop zramswap.service 2>/dev/null || true
-    
-    # 安装zram-tools
-    if ! dpkg -l zram-tools &>/dev/null; then
-        debug_log "安装zram-tools"
-        if ! apt-get update -qq && apt-get install -y zram-tools >/dev/null 2>&1; then
-            log "zram-tools安装失败" "error"
-            return 1
         fi
     fi
     
@@ -428,25 +418,13 @@ setup_multiple_zram() {
     return 0
 }
 
-# 主要的zram配置函数 - 修复版
+# 主要的zram配置函数 - 只修复关键bug，保持原逻辑
 setup_zram() {
     local mem_mb=$(awk '/MemTotal/ {print int($2/1024)}' /proc/meminfo)
     local cores=$(nproc)
     local mem_display=$(format_size "$mem_mb")
     
     echo "检测到: ${mem_display}内存, ${cores}核CPU"
-    
-    # === 检查现有zram是否已经正常工作 ===
-    if swapon --show 2>/dev/null | grep -q zram0 && 
-       systemctl is-active zramswap.service >/dev/null 2>&1; then
-        
-        local current_size=$(swapon --show 2>/dev/null | grep zram0 | awk '{print $3}')
-        local current_zram_mb=$(convert_to_mb "$current_size")
-        
-        echo "Zram: $(format_size $current_zram_mb) (已配置并运行)"
-        show_swap_status
-        return 0
-    fi
     
     # CPU性能检测
     local cpu_level
@@ -463,12 +441,12 @@ setup_zram() {
     local device_type=$(echo "$config" | cut -d, -f2)
     local multiplier=$(echo "$config" | cut -d, -f3)
     
-    # 计算zram大小 - 修复版
+    # 计算zram大小 - 修复bc依赖
     local target_size_mb
     if command -v bc >/dev/null 2>&1 && target_size_mb=$(awk "BEGIN {printf \"%.0f\", $mem_mb * $multiplier}" 2>/dev/null); then
         debug_log "目标大小计算: ${mem_mb}MB * $multiplier = ${target_size_mb}MB"
     else
-        # 备用计算 - 处理没有bc的情况
+        # 备用计算
         local int_multiplier=$(echo "$multiplier" | cut -d. -f1)
         local decimal_part=$(echo "$multiplier" | cut -d. -f2 2>/dev/null || echo "0")
         if [[ ${#decimal_part} -eq 1 ]]; then
@@ -478,11 +456,11 @@ setup_zram() {
         debug_log "使用整数计算: $target_size_mb"
     fi
     
-    # 安全获取当前zram设备数量 - 关键修复
+    # 检查现有zram是否合适 - 修复第424行问题
     local current_zram_devices=0
     local zram_output
     if zram_output=$(swapon --show 2>/dev/null); then
-        # 清理输出并统计zram设备
+        # 安全获取zram设备数量 - 关键修复
         current_zram_devices=$(echo "$zram_output" | grep -c "zram" 2>/dev/null || echo "0")
     fi
     
@@ -492,7 +470,7 @@ setup_zram() {
     
     debug_log "当前zram设备数量: $current_zram_devices"
     
-    # 安全的数值比较 - 关键修复
+    # 安全的数值比较 - 修复第424行语法错误
     if [[ "$current_zram_devices" =~ ^[0-9]+$ ]] && [[ "$current_zram_devices" -gt 0 ]]; then
         # 计算当前zram总大小
         local current_total_mb=0
@@ -500,7 +478,7 @@ setup_zram() {
             [[ "$device" == *"zram"* ]] || continue
             local current_mb=$(convert_to_mb "$size")
             current_total_mb=$((current_total_mb + current_mb))
-        done < <(swapon --show 2>/dev/null | grep zram)
+        done < <(swapon --show 2>/dev/null)
         
         # 检查配置是否匹配
         local min_acceptable=$((target_size_mb * 90 / 100))
@@ -668,10 +646,7 @@ main() {
         exit 1
     }
     
-    # === 预检查和依赖安装 ===
-    log "检查系统环境..." "info"
-    
-    # 检查包管理器是否被锁定
+    # 检查包管理器锁定状态 - 新增
     local wait_count=0
     while [[ $wait_count -lt 6 ]]; do  # 最多等待60秒
         if timeout 10s apt-get update -qq 2>/dev/null; then
@@ -690,26 +665,22 @@ main() {
         exit 1
     fi
     
-    # 安装基础依赖
-    local deps_to_install=()
-    command -v bc &>/dev/null || deps_to_install+=("bc")
-    
-    if [[ ${#deps_to_install[@]} -gt 0 ]]; then
-        log "安装依赖: ${deps_to_install[*]}" "info"
-        apt-get install -y "${deps_to_install[@]}" >/dev/null 2>&1 || {
-            log "依赖安装失败，某些功能可能受限" "warn"
-        }
-    fi
-    
     # 检查必要命令
-    for cmd in awk swapon systemctl; do
+    for cmd in bc awk swapon systemctl; do
         command -v "$cmd" &>/dev/null || {
-            log "缺少必要命令: $cmd" "error"
-            exit 1
+            if [[ "$cmd" == "bc" ]]; then
+                log "安装必需的依赖: bc" "info"
+                apt-get install -y bc >/dev/null 2>&1 || {
+                    log "bc安装失败，将使用备用计算方法" "warn"
+                }
+            else
+                log "缺少必要命令: $cmd" "error"
+                exit 1
+            fi
         }
     done
     
-    # 避免分页器问题
+    # 避免分页器问题 - 新增
     export SYSTEMD_PAGER=""
     export PAGER=""
     
