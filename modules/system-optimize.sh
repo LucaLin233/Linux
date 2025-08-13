@@ -107,17 +107,44 @@ benchmark_cpu_quick() {
     fi
     local end_time=$(date +%s.%N)
     
-    local duration=$(echo "$end_time - $start_time" | bc 2>/dev/null || echo "5")
-    local cpu_score=$(echo "scale=2; ($cores * 2) / $duration" | bc 2>/dev/null || echo "2")
+    local duration
+    if command -v bc >/dev/null 2>&1; then
+        duration=$(echo "$end_time - $start_time" | bc 2>/dev/null || echo "5")
+    else
+        # 备用计算：使用整数运算
+        local start_int=${start_time%.*}
+        local end_int=${end_time%.*}
+        duration=$((end_int - start_int + 1))  # 加1作为保守估计
+    fi
+    
+    local cpu_score
+    if command -v bc >/dev/null 2>&1; then
+        cpu_score=$(echo "scale=2; ($cores * 2) / $duration" | bc 2>/dev/null || echo "2")
+    else
+        # 备用计算
+        cpu_score=$(( (cores * 2 * 100) / (${duration%.*} * 100) ))  # 简化的整数计算
+    fi
     
     debug_log "CPU核心数: $cores, 测试时间: ${duration}s, 得分: $cpu_score"
     
-    if (( $(echo "$cpu_score < 3" | bc -l 2>/dev/null || echo "1") )); then
-        echo "weak"
-    elif (( $(echo "$cpu_score < 8" | bc -l 2>/dev/null || echo "0") )); then
-        echo "moderate"  
+    # 使用字符串比较避免bc依赖
+    if command -v bc >/dev/null 2>&1; then
+        if (( $(echo "$cpu_score < 3" | bc -l 2>/dev/null || echo "1") )); then
+            echo "weak"
+        elif (( $(echo "$cpu_score < 8" | bc -l 2>/dev/null || echo "0") )); then
+            echo "moderate"  
+        else
+            echo "strong"
+        fi
     else
-        echo "strong"
+        # 备用比较（假设cpu_score是整数）
+        if (( cpu_score < 3 )); then
+            echo "weak"
+        elif (( cpu_score < 8 )); then
+            echo "moderate"
+        else
+            echo "strong"
+        fi
     fi
 }
 
@@ -281,56 +308,51 @@ set_system_parameters() {
     echo "$zram_priority,$swappiness,$disk_swap_count"
 }
 
-# setup_single_zram函数
+# 配置单个zram设备 - 修复版
 setup_single_zram() {
     local size_mib="$1"
     local algorithm="$2"
     
     debug_log "配置单zram: ${size_mib}MB, 算法: $algorithm"
     
-    # 检查现有配置是否合适
-    if swapon --show 2>/dev/null | grep -q zram0; then
-        local current_size=$(swapon --show 2>/dev/null | grep zram0 | awk '{print $3}')
-        local current_zram_size=$(convert_to_mb "$current_size")
-        local min_acceptable=$((size_mib * 90 / 100))
-        local max_acceptable=$((size_mib * 110 / 100))
-        
-        if (( current_zram_size >= min_acceptable && current_zram_size <= max_acceptable )); then
-            if systemctl is-active zramswap.service >/dev/null 2>&1; then
-                debug_log "现有zram配置合适且服务正常"
-                return 0
+    # === 包完整性检查 ===
+    if dpkg -l zram-tools &>/dev/null; then
+        # 检查关键文件是否真的存在
+        if [[ ! -f /usr/sbin/zramswap ]] || [[ ! -f /usr/lib/systemd/system/zramswap.service ]]; then
+            log "检测到zram-tools包损坏，重新安装" "warn"
+            apt-get purge -y zram-tools >/dev/null 2>&1 || true
+            apt-get autoremove -y >/dev/null 2>&1 || true
+            if ! apt-get install -y zram-tools >/dev/null 2>&1; then
+                log "zram-tools重装失败" "error"
+                return 1
             fi
+            systemctl daemon-reload
         fi
     fi
     
-    # 停止现有配置
+    # 停用现有zram
     systemctl stop zramswap.service 2>/dev/null || true
     
-    # 确保zram-tools已安装
+    # 安装zram-tools
     if ! dpkg -l zram-tools &>/dev/null; then
         debug_log "安装zram-tools"
-        apt-get update -qq && apt-get install -y zram-tools >/dev/null 2>&1 || {
+        if ! apt-get update -qq && apt-get install -y zram-tools >/dev/null 2>&1; then
             log "zram-tools安装失败" "error"
             return 1
-        }
-    fi
-    
-    # 检查服务文件
-    systemctl daemon-reload
-    if ! systemctl list-unit-files 2>/dev/null | grep -q "zramswap.service"; then
-        debug_log "重新安装zram-tools"
-        apt-get install --reinstall -y zram-tools >/dev/null 2>&1 || {
-            log "zram-tools重装失败" "error"
-            return 1
-        }
-        systemctl daemon-reload
+        fi
     fi
     
     # 配置文件
-    cat > "$ZRAM_CONFIG" << EOF
+    if [[ -f "$ZRAM_CONFIG" ]]; then
+        cp "$ZRAM_CONFIG" "${ZRAM_CONFIG}.bak" 2>/dev/null || true
+        sed -i "s/^SIZE=.*/SIZE=$size_mib/" "$ZRAM_CONFIG" 2>/dev/null || echo "SIZE=$size_mib" >> "$ZRAM_CONFIG"
+        sed -i "s/^ALGO=.*/ALGO=$algorithm/" "$ZRAM_CONFIG" 2>/dev/null || echo "ALGO=$algorithm" >> "$ZRAM_CONFIG"
+    else
+        cat > "$ZRAM_CONFIG" << EOF
 SIZE=$size_mib
 ALGO=$algorithm
 EOF
+    fi
     
     # 启动服务
     systemctl enable zramswap.service >/dev/null 2>&1 || {
@@ -339,7 +361,7 @@ EOF
     }
     
     systemctl start zramswap.service >/dev/null 2>&1 || {
-        log "启动zramswap服务失败" "error"
+        log "启动zramswap服务失败" "error" 
         return 1
     }
     
@@ -414,6 +436,18 @@ setup_zram() {
     
     echo "检测到: ${mem_display}内存, ${cores}核CPU"
     
+    # === 检查现有zram是否已经正常工作 ===
+    if swapon --show 2>/dev/null | grep -q zram0 && 
+       systemctl is-active zramswap.service >/dev/null 2>&1; then
+        
+        local current_size=$(swapon --show 2>/dev/null | grep zram0 | awk '{print $3}')
+        local current_zram_mb=$(convert_to_mb "$current_size")
+        
+        echo "Zram: $(format_size $current_zram_mb) (已配置并运行)"
+        show_swap_status
+        return 0
+    fi
+    
     # CPU性能检测
     local cpu_level
     if ! cpu_level=$(benchmark_cpu_quick); then
@@ -429,7 +463,7 @@ setup_zram() {
     local device_type=$(echo "$config" | cut -d, -f2)
     local multiplier=$(echo "$config" | cut -d, -f3)
     
-    # 计算zram大小
+    # 计算zram大小 - 修复版
     local target_size_mb
     if command -v bc >/dev/null 2>&1 && target_size_mb=$(awk "BEGIN {printf \"%.0f\", $mem_mb * $multiplier}" 2>/dev/null); then
         debug_log "目标大小计算: ${mem_mb}MB * $multiplier = ${target_size_mb}MB"
@@ -440,7 +474,7 @@ setup_zram() {
         if [[ ${#decimal_part} -eq 1 ]]; then
             decimal_part="${decimal_part}0"
         fi
-        target_size_mb=$(( (mem_mb * int_multiplier) + (mem_mb * ${decimal_part:-0} / 100) ))
+        target_size_mb=$(( (mem_mb * ${int_multiplier:-1}) + (mem_mb * ${decimal_part:-0} / 100) ))
         debug_log "使用整数计算: $target_size_mb"
     fi
     
@@ -634,21 +668,50 @@ main() {
         exit 1
     }
     
-    # 安装bc（如果缺失） - 新增
-    if ! command -v bc &>/dev/null; then
-        log "安装必需依赖: bc" "info"
-        apt-get update -qq && apt-get install -y bc >/dev/null 2>&1 || {
-            log "bc安装失败，将使用备用计算方法" "warn"
+    # === 预检查和依赖安装 ===
+    log "检查系统环境..." "info"
+    
+    # 检查包管理器是否被锁定
+    local wait_count=0
+    while [[ $wait_count -lt 6 ]]; do  # 最多等待60秒
+        if timeout 10s apt-get update -qq 2>/dev/null; then
+            break
+        else
+            if [[ $wait_count -eq 0 ]]; then
+                log "检测到包管理器被锁定，等待释放..." "warn"
+            fi
+            sleep 10
+            wait_count=$((wait_count + 1))
+        fi
+    done
+    
+    if [[ $wait_count -ge 6 ]]; then
+        log "包管理器锁定超时，请检查是否有其他apt进程运行" "error"
+        exit 1
+    fi
+    
+    # 安装基础依赖
+    local deps_to_install=()
+    command -v bc &>/dev/null || deps_to_install+=("bc")
+    
+    if [[ ${#deps_to_install[@]} -gt 0 ]]; then
+        log "安装依赖: ${deps_to_install[*]}" "info"
+        apt-get install -y "${deps_to_install[@]}" >/dev/null 2>&1 || {
+            log "依赖安装失败，某些功能可能受限" "warn"
         }
     fi
     
     # 检查必要命令
-    for cmd in awk swapon systemctl; do  # 移除了bc的强制要求
+    for cmd in awk swapon systemctl; do
         command -v "$cmd" &>/dev/null || {
             log "缺少必要命令: $cmd" "error"
             exit 1
         }
     done
+    
+    # 避免分页器问题
+    export SYSTEMD_PAGER=""
+    export PAGER=""
     
     log "🔧 智能系统优化配置..." "info"
     
