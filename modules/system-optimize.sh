@@ -157,7 +157,7 @@ get_memory_category() {
     fi
 }
 
-# 智能决策矩阵
+# 智能决策矩阵 - 统一zstd版本
 get_optimal_zram_config() {
     local mem_mb="$1"
     local cpu_level="$2"
@@ -166,97 +166,126 @@ get_optimal_zram_config() {
     local mem_category=$(get_memory_category "$mem_mb")
     debug_log "内存分类: $mem_category, CPU等级: $cpu_level, 核心数: $cores"
     
-    # 决策矩阵：算法,设备数,大小倍数
-    case "$mem_category-$cpu_level" in
-        "low-"*) 
-            echo "lz4,single,1.8" ;;
-        "medium-weak") 
-            echo "lz4,single,1.5" ;;
-        "medium-moderate"|"medium-strong") 
-            echo "lz4,single,1.2" ;;
-        "high-weak") 
-            echo "lz4,single,1.0" ;;
-        "high-moderate") 
-            echo "zstd,single,0.8" ;;
-        "high-strong") 
+    # 统一使用zstd，根据内存调整策略
+    case "$mem_category" in
+        "low") 
+            echo "zstd,single,2.0" ;;    # 1GB以下更激进
+        "medium") 
+            echo "zstd,single,1.5" ;;    # 1-2GB
+        "high") 
             if (( cores >= 4 )); then
-                echo "zstd,multi,0.75"
+                echo "zstd,multi,1.0"    # 2-4GB，多核用多设备
+            else
+                echo "zstd,single,1.0"
+            fi
+            ;;
+        "flagship") 
+            if (( cores >= 4 )); then
+                echo "zstd,multi,0.6"    # 4GB+，适度配置
             else
                 echo "zstd,single,0.8"
             fi
             ;;
-        "flagship-"*) 
-            if (( cores >= 4 )); then
-                echo "zstd,multi,0.5"
-            else
-                echo "zstd,single,0.6"
-            fi
-            ;;
         *)
-            log "未知配置组合: $mem_category-$cpu_level，使用默认" "warn"
-            echo "lz4,single,1.0"
+            log "未知配置组合: $mem_category，使用默认" "warn"
+            echo "zstd,single,1.0"
             ;;
     esac
 }
 
-# 设置系统参数（优先级和swappiness）
+# 设置系统参数（增强版，包含zswap禁用和页面集群优化）
 set_system_parameters() {
     local mem_mb="$1"
     local device_count="${2:-1}"
     
-    # 优先级设置
+    # 更积极的swappiness设置
     local zram_priority disk_priority swappiness
     
     if (( mem_mb <= 1024 )); then
-        zram_priority=90; disk_priority=40; swappiness=40
+        zram_priority=100; disk_priority=40; swappiness=60   # 低内存更积极使用swap
     elif (( mem_mb <= 2048 )); then
-        zram_priority=100; disk_priority=30; swappiness=50
+        zram_priority=100; disk_priority=30; swappiness=70   # 中等内存积极使用
+    elif (( mem_mb <= 4096 )); then
+        zram_priority=100; disk_priority=20; swappiness=80   # 高内存很积极
     else
-        zram_priority=100; disk_priority=20; swappiness=60
+        zram_priority=100; disk_priority=10; swappiness=90   # 旗舰配置最积极
     fi
     
     debug_log "目标配置: zram优先级=$zram_priority, swappiness=$swappiness"
     
-    # 持久化配置
-    local sysctl_file="/etc/sysctl.d/99-zram-swappiness.conf"
-    local existing_value=""
-    local needs_persist=false
+    # 创建完整的sysctl配置文件
+    local sysctl_file="/etc/sysctl.d/99-zram-optimize.conf"
+    local needs_update=false
     
-    if [[ -f "$sysctl_file" ]]; then
-        existing_value=$(grep "vm.swappiness" "$sysctl_file" 2>/dev/null | awk '{print $3}')
-        if [[ "$existing_value" != "$swappiness" ]]; then
-            needs_persist=true
-        fi
+    # 检查是否需要更新配置
+    if [[ ! -f "$sysctl_file" ]]; then
+        needs_update=true
     else
-        needs_persist=true
-    fi
-    
-    # 创建或更新持久化配置
-    if [[ "$needs_persist" == "true" ]]; then
-        if echo "vm.swappiness = $swappiness" > "$sysctl_file" 2>/dev/null; then
-            debug_log "swappiness持久化已设置: $swappiness"
-        else
-            # 备用方案
-            if grep -q "^vm.swappiness" /etc/sysctl.conf 2>/dev/null; then
-                sed -i "s/^vm.swappiness.*/vm.swappiness = $swappiness/" /etc/sysctl.conf
-            else
-                echo "vm.swappiness = $swappiness" >> /etc/sysctl.conf
-            fi
-            debug_log "swappiness持久化已设置到sysctl.conf"
+        # 检查关键参数是否匹配
+        local current_swappiness=$(grep "^vm.swappiness" "$sysctl_file" 2>/dev/null | awk '{print $3}')
+        local current_page_cluster=$(grep "^vm.page-cluster" "$sysctl_file" 2>/dev/null | awk '{print $3}')
+        
+        if [[ "$current_swappiness" != "$swappiness" ]] || [[ "$current_page_cluster" != "0" ]]; then
+            needs_update=true
         fi
     fi
     
-    # 运行时设置
+    # 创建或更新sysctl配置文件
+    if [[ "$needs_update" == "true" ]]; then
+        cat > "$sysctl_file" << EOF
+# Zram优化配置 - 由系统优化脚本自动生成
+# 更积极地使用zram swap
+vm.swappiness = $swappiness
+
+# 优化页面集群，提高zram效率（特别是使用zstd时）
+vm.page-cluster = 0
+
+# 禁用zswap避免与zram冲突
+# zswap会拦截要交换的页面，导致zram利用率低下
+kernel.zswap.enabled = 0
+EOF
+        
+        if [[ $? -eq 0 ]]; then
+            debug_log "sysctl配置已更新: swappiness=$swappiness, page-cluster=0, zswap disabled"
+            
+            # 应用配置
+            sysctl -p "$sysctl_file" >/dev/null 2>&1 || {
+                debug_log "sysctl应用失败，使用运行时设置"
+            }
+        else
+            log "sysctl配置文件写入失败" "error"
+        fi
+    fi
+    
+    # 运行时设置（确保立即生效）
+    # 1. 设置swappiness
     local current_swappiness=$(cat /proc/sys/vm/swappiness 2>/dev/null || echo "60")
     if [[ "$current_swappiness" != "$swappiness" ]]; then
         if [[ -w /proc/sys/vm/swappiness ]]; then
-            if echo "$swappiness" > /proc/sys/vm/swappiness 2>/dev/null; then
+            echo "$swappiness" > /proc/sys/vm/swappiness 2>/dev/null && \
                 debug_log "swappiness运行时已设置: $current_swappiness -> $swappiness"
-            fi
         fi
     fi
     
-    # 设置zram优先级
+    # 2. 设置page-cluster
+    local current_page_cluster=$(cat /proc/sys/vm/page-cluster 2>/dev/null || echo "3")
+    if [[ "$current_page_cluster" != "0" ]]; then
+        if [[ -w /proc/sys/vm/page-cluster ]]; then
+            echo "0" > /proc/sys/vm/page-cluster 2>/dev/null && \
+                debug_log "page-cluster已设置: $current_page_cluster -> 0"
+        fi
+    fi
+    
+    # 3. 禁用zswap（如果存在）
+    if [[ -f /sys/module/zswap/parameters/enabled ]]; then
+        local current_zswap=$(cat /sys/module/zswap/parameters/enabled 2>/dev/null || echo "N")
+        if [[ "$current_zswap" == "Y" ]]; then
+            echo "0" > /sys/module/zswap/parameters/enabled 2>/dev/null && \
+                debug_log "zswap已禁用，避免与zram冲突"
+        fi
+    fi
+    
+    # 设置zram优先级（保持原有逻辑）
     for i in $(seq 0 $((device_count - 1))); do
         local device="/dev/zram$i"
         if [[ -b "$device" ]]; then
