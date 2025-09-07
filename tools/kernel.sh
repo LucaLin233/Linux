@@ -1,5 +1,5 @@
 #!/bin/bash
-# Linux Network Optimizer v2.0 - 独立网络调优脚本
+# Linux Network Optimizer v2.0 - 独立网络调优脚本 (无 MPTCP 版本)
 # 项目: https://github.com/LucaLin233/Linux
 # 
 # 使用方法:
@@ -80,18 +80,6 @@ declare -A NET_PARAMS=(
     ["net.ipv4.tcp_congestion_control"]="bbr"
 )
 
-# MPTCP参数
-declare -A MPTCP_PARAMS=(
-    ["net.mptcp.enabled"]="1"
-    ["net.mptcp.checksum_enabled"]="0"
-    ["net.mptcp.allow_join_initial_addr_port"]="1"
-    ["net.mptcp.pm_type"]="0"
-    ["net.mptcp.stale_loss_cnt"]="4"
-    ["net.mptcp.add_addr_timeout"]="120000"
-    ["net.mptcp.close_timeout"]="30000"
-    ["net.mptcp.scheduler"]="default"
-)
-
 # === 基础检测 ===
 check_root() { [[ $EUID -eq 0 ]] || error "需要 root 权限"; }
 
@@ -130,26 +118,6 @@ setup_bbr() {
         warn "BBR 不可用，使用 cubic 算法"
         NET_PARAMS["net.ipv4.tcp_congestion_control"]="cubic"
     fi
-}
-
-# === MPTCP检测 ===
-check_mptcp() {
-    [[ ! -f /proc/sys/net/mptcp/enabled ]] && { warn "MPTCP: 系统不支持"; return; }
-    
-    info "检测 MPTCP 参数..."
-    local supported=0
-    
-    for param in "${!MPTCP_PARAMS[@]}"; do
-        if sysctl -n "$param" >/dev/null 2>&1; then
-            NET_PARAMS["$param"]="${MPTCP_PARAMS[$param]}"
-            ((supported++)) || true
-            info "  ✅ $param"
-        else
-            warn "  ❌ $param"
-        fi
-    done
-    
-    info "MPTCP: $supported/${#MPTCP_PARAMS[@]} 参数支持"
 }
 
 # === 备份管理 ===
@@ -302,7 +270,7 @@ EOF
     write_section "^net\.ipv4\.tcp" "TCP参数"
     write_section "^net\.ipv4\.udp" "UDP参数"
     write_section "^net\.ipv4\.(ip_forward|conf)" "路由转发"
-    write_section "^net\.mptcp\." "MPTCP"
+    # 移除 MPTCP 部分: write_section "^net\.mptcp\." "MPTCP"
     
     echo "# Network Optimizer 配置结束" >> "$temp_config"
     
@@ -348,7 +316,7 @@ verify_config() {
         "net.ipv4.tcp_congestion_control:BBR/拥塞控制:bbr"
         "net.core.default_qdisc:队列调度器:fq_codel"
         "net.ipv4.tcp_fastopen:TCP Fast Open:3"
-        "net.mptcp.enabled:MPTCP:1"
+        # 移除 MPTCP 相关验证: "net.mptcp.enabled:MPTCP:1"
     )
     
     for check in "${checks[@]}"; do
@@ -396,7 +364,7 @@ user_confirm() {
 install_optimization() {
     echo "================================================================"
     echo "              Linux Network Optimizer v$VERSION"
-    echo "         BBR + fq_codel + TCP Fast Open + MPTCP"
+    echo "             BBR + fq_codel + TCP Fast Open"
     echo "================================================================"
     
     check_root
@@ -409,7 +377,7 @@ install_optimization() {
     echo
     info "将进行网络优化:"
     echo "  • BBR + fq_codel + TCP Fast Open"
-    echo "  • MPTCP (如果支持)"  
+    # 移除 MPTCP 提示: echo "  • MPTCP (如果支持)"  
     echo "  • 系统资源限制"
     echo "  • 网络缓冲区优化"
     echo
@@ -418,7 +386,7 @@ install_optimization() {
     
     echo
     setup_bbr
-    check_mptcp
+    # 移除 MPTCP 检测: check_mptcp
     setup_limits
     apply_params
     setup_qdisc "$interface"
@@ -429,7 +397,7 @@ install_optimization() {
     echo
     success "网络优化完成!"
     
-    local script_url="https://raw.githubusercontent.com/LucaLin233/Linux/refs/heads/main/tools/kernel.sh"
+    local script_url="https://raw.githubusercontent.com/LucaLin233/Linux/refs/heads/main/tools/kernel.sh" # 请更新为你的实际脚本URL
     info "后续命令:"
     info "  查看状态: curl -fsSL $script_url | bash -s status"
     info "  恢复配置: curl -fsSL $script_url | bash -s restore"
@@ -476,7 +444,7 @@ show_status() {
     
     echo "当前配置:"
     local params=("net.ipv4.tcp_congestion_control:拥塞控制" "net.core.default_qdisc:队列调度器" 
-                  "net.ipv4.tcp_fastopen:TCP Fast Open" "net.mptcp.enabled:MPTCP")
+                  "net.ipv4.tcp_fastopen:TCP Fast Open") # 移除 MPTCP
     
     for item in "${params[@]}"; do
         IFS=':' read -r param desc <<< "$item"
@@ -497,7 +465,7 @@ main() {
             -y|--yes) export AUTO_YES=1 ;;
             -h|--help) echo "用法: $0 [install|restore|status] [-y]"; exit 0 ;;
             *) warn "未知参数: $1"; exit 1 ;;
-        esac
+        esctl.dac
         shift
     done
     
