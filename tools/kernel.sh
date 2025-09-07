@@ -270,7 +270,6 @@ EOF
     write_section "^net\.ipv4\.tcp" "TCP参数"
     write_section "^net\.ipv4\.udp" "UDP参数"
     write_section "^net\.ipv4\.(ip_forward|conf)" "路由转发"
-    # 移除 MPTCP 部分: write_section "^net\.mptcp\." "MPTCP"
     
     echo "# Network Optimizer 配置结束" >> "$temp_config"
     
@@ -316,7 +315,6 @@ verify_config() {
         "net.ipv4.tcp_congestion_control:BBR/拥塞控制:bbr"
         "net.core.default_qdisc:队列调度器:fq_codel"
         "net.ipv4.tcp_fastopen:TCP Fast Open:3"
-        # 移除 MPTCP 相关验证: "net.mptcp.enabled:MPTCP:1"
     )
     
     for check in "${checks[@]}"; do
@@ -377,7 +375,6 @@ install_optimization() {
     echo
     info "将进行网络优化:"
     echo "  • BBR + fq_codel + TCP Fast Open"
-    # 移除 MPTCP 提示: echo "  • MPTCP (如果支持)"  
     echo "  • 系统资源限制"
     echo "  • 网络缓冲区优化"
     echo
@@ -386,7 +383,6 @@ install_optimization() {
     
     echo
     setup_bbr
-    # 移除 MPTCP 检测: check_mptcp
     setup_limits
     apply_params
     setup_qdisc "$interface"
@@ -444,7 +440,7 @@ show_status() {
     
     echo "当前配置:"
     local params=("net.ipv4.tcp_congestion_control:拥塞控制" "net.core.default_qdisc:队列调度器" 
-                  "net.ipv4.tcp_fastopen:TCP Fast Open") # 移除 MPTCP
+                  "net.ipv4.tcp_fastopen:TCP Fast Open")
     
     for item in "${params[@]}"; do
         IFS=':' read -r param desc <<< "$item"
@@ -465,7 +461,7 @@ main() {
             -y|--yes) export AUTO_YES=1 ;;
             -h|--help) echo "用法: $0 [install|restore|status] [-y]"; exit 0 ;;
             *) warn "未知参数: $1"; exit 1 ;;
-        esctl.dac
+        esac # <--- 修正点1
         shift
     done
     
@@ -474,7 +470,7 @@ main() {
         restore) restore_optimization ;;
         status) show_status ;;
         *) error "未知命令: $cmd" ;;
-    esac
+    esac # <--- 修正点2
 }
 
 trap 'error "执行中断"' INT ERR
