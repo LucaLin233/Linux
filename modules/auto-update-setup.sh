@@ -1,5 +1,5 @@
 #!/bin/bash
-# 自动更新系统配置模块 v4.5 - 增强稳定性版
+# 自动更新系统配置模块 v4.6 - 修复包状态检测
 # 功能: 配置定时自动更新系统
 
 set -euo pipefail
@@ -25,7 +25,6 @@ debug_log() {
 }
 
 # === 辅助函数 ===
-# 简化的cron验证
 validate_cron_expression() {
     local expr="$1"
     debug_log "验证Cron表达式: $expr"
@@ -39,7 +38,6 @@ validate_cron_expression() {
     fi
 }
 
-# 检查是否已有cron任务
 has_cron_job() {
     debug_log "检查现有Cron任务"
     if crontab -l 2>/dev/null | grep -q "$UPDATE_SCRIPT"; then
@@ -51,7 +49,6 @@ has_cron_job() {
     fi
 }
 
-# 获取用户选择的cron时间
 get_cron_schedule() {
     debug_log "获取用户Cron时间选择"
     local choice
@@ -83,7 +80,6 @@ get_cron_schedule() {
 }
 
 # === 核心功能函数 ===
-# 检查并安装cron
 ensure_cron_installed() {
     debug_log "开始检查Cron服务"
     
@@ -120,7 +116,6 @@ ensure_cron_installed() {
     fi
 }
 
-# 添加cron任务
 add_cron_job() {
     local cron_expr="$1"
     debug_log "添加Cron任务: $cron_expr"
@@ -131,7 +126,6 @@ add_cron_job() {
         return 1
     fi
     
-    # 移除旧的，添加新的
     crontab -l 2>/dev/null | grep -v "$UPDATE_SCRIPT" | grep -v "Auto-update managed" > "$temp_cron" || true
     echo "$CRON_COMMENT" >> "$temp_cron"
     echo "$cron_expr $UPDATE_SCRIPT" >> "$temp_cron"
@@ -147,19 +141,18 @@ add_cron_job() {
     fi
 }
 
-# 创建自动更新脚本
 create_update_script() {
     debug_log "开始创建自动更新脚本"
     
     if ! cat > "$UPDATE_SCRIPT" << 'EOF'; then
 #!/bin/bash
-# 自动系统更新脚本 v4.5 - 增强稳定性版
+# 自动系统更新脚本 v4.6 - 修复包状态检测
 
 set -euo pipefail
 
 readonly LOGFILE="/var/log/auto-update.log"
 readonly APT_OPTIONS="-y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold -o APT::ListChanges::Frontend=none"
-readonly MAX_WAIT_DPKG=300  # 最长等待dpkg解锁时间(秒)
+readonly MAX_WAIT_DPKG=300
 
 log_update() {
     local msg="$1"
@@ -167,7 +160,6 @@ log_update() {
     echo "[$timestamp] $msg" | tee -a "$LOGFILE"
 }
 
-# 等待dpkg解锁
 wait_for_dpkg() {
     local waited=0
     log_update "检查dpkg锁状态..."
@@ -192,7 +184,6 @@ wait_for_dpkg() {
     log_update "dpkg锁检查完成"
 }
 
-# 确保包配置完整
 ensure_packages_configured() {
     log_update "验证包配置状态..."
     
@@ -206,28 +197,57 @@ ensure_packages_configured() {
         log_update "警告: 依赖修复出现问题"
     fi
     
-    # 检查是否还有问题包
-    local broken_count=$(dpkg -l | grep -c '^i[HUFWtri]' || echo 0)
+    # 检查真正有问题的包（状态码说明）
+    # ii = 正常安装 ✓
+    # rc = 配置残留（已删除但配置文件还在，不影响系统）
+    # ri = 需要重新安装 ✗
+    # iU/iF/iH = 解包/配置失败 ✗
+    
+    # 统计各状态
+    local status_summary=$(dpkg -l 2>/dev/null | awk 'NR>5 {print $1}' | sort | uniq -c)
+    log_update "包状态统计:"
+    echo "$status_summary" >> "$LOGFILE"
+    
+    # 检查需要重装的包（ri状态）
+    local reinstall_pkgs=$(dpkg -l 2>/dev/null | awk '$1 == "ri" {print $2}')
+    local reinstall_count=$(echo "$reinstall_pkgs" | grep -c . || echo 0)
+    
+    if [[ $reinstall_count -gt 0 ]]; then
+        log_update "发现 $reinstall_count 个需要重装的包，尝试修复..."
+        echo "$reinstall_pkgs" | while read pkg; do
+            log_update "重装: $pkg"
+            apt-get install --reinstall -y "$pkg" >> "$LOGFILE" 2>&1 || \
+                log_update "警告: $pkg 重装失败"
+        done
+    fi
+    
+    # 检查配置失败的包（iU/iF/iH等）
+    local broken_pkgs=$(dpkg -l 2>/dev/null | awk '$1 ~ /^i[UFH]/ {print $2}')
+    local broken_count=$(echo "$broken_pkgs" | grep -c . || echo 0)
+    
     if [[ $broken_count -gt 0 ]]; then
-        log_update "警告: 发现 $broken_count 个状态异常的包"
-        dpkg -l | grep '^i[HUFWtri]' >> "$LOGFILE" 2>&1 || true
+        log_update "警告: 发现 $broken_count 个配置异常的包"
+        echo "$broken_pkgs" >> "$LOGFILE"
     else
         log_update "包配置状态: 正常"
     fi
+    
+    # 配置残留统计（仅提示）
+    local rc_count=$(dpkg -l 2>/dev/null | grep -c '^rc' || echo 0)
+    if [[ $rc_count -gt 0 ]]; then
+        log_update "提示: 有 $rc_count 个已删除包的配置文件残留（不影响系统）"
+    fi
 }
 
-# 检查/boot空间
 check_boot_space() {
     local boot_usage=$(df /boot 2>/dev/null | tail -1 | awk '{print $5}' | sed 's/%//' || echo 0)
     
     if [[ $boot_usage -gt 80 ]]; then
         log_update "警告: /boot 空间使用率 ${boot_usage}%，清理旧内核..."
         
-        # 保留当前和最新两个内核
         local current_kernel=$(uname -r)
         log_update "当前内核: $current_kernel"
         
-        # 列出可删除的旧内核
         dpkg -l | grep '^ii' | grep 'linux-image-[0-9]' | \
             awk '{print $2}' | grep -v "$current_kernel" | \
             sort -V | head -n -1 | while read old_kernel; do
@@ -235,7 +255,6 @@ check_boot_space() {
             apt-get purge -y "$old_kernel" >> "$LOGFILE" 2>&1 || true
         done
         
-        # 再次检查空间
         boot_usage=$(df /boot 2>/dev/null | tail -1 | awk '{print $5}' | sed 's/%//' || echo 0)
         log_update "/boot 清理后使用率: ${boot_usage}%"
     else
@@ -243,7 +262,6 @@ check_boot_space() {
     fi
 }
 
-# 检查内核更新
 check_kernel_update() {
     local current=$(uname -r)
     local latest=$(find /boot -name "vmlinuz-*" -printf "%f\n" 2>/dev/null | sed 's/vmlinuz-//' | sort -V | tail -1)
@@ -251,7 +269,6 @@ check_kernel_update() {
     if [[ -n "$latest" && "$current" != "$latest" ]]; then
         log_update "检测到新内核: $latest (当前: $current)"
         
-        # 验证新内核文件完整性
         if [[ ! -f "/boot/vmlinuz-$latest" ]]; then
             log_update "错误: 内核文件不存在"
             return 1
@@ -262,7 +279,6 @@ check_kernel_update() {
             return 1
         fi
         
-        # 检查内核模块
         if [[ ! -d "/lib/modules/$latest" ]]; then
             log_update "警告: 内核模块目录不存在"
             return 1
@@ -275,31 +291,24 @@ check_kernel_update() {
     return 1
 }
 
-# 安全重启
 safe_reboot() {
     log_update "准备重启应用新内核..."
     
-    # 再次确保包配置完成
     log_update "最后确认包配置状态..."
     dpkg --configure -a >> "$LOGFILE" 2>&1 || true
     
-    # 等待dpkg解锁
     wait_for_dpkg
     
-    # 验证内核安装
     local latest=$(find /boot -name "vmlinuz-*" -printf "%f\n" 2>/dev/null | sed 's/vmlinuz-//' | sort -V | tail -1)
     if [[ ! -f "/boot/initrd.img-$latest" ]]; then
         log_update "错误: initramfs 缺失，取消重启"
         return 1
     fi
     
-    # 最后的空间检查
     check_boot_space
     
-    # 确保SSH服务运行
     systemctl is-active sshd >/dev/null || systemctl start sshd
     
-    # 同步磁盘
     sync
     log_update "系统将在60秒后重启（紧急情况可手动取消）..."
     sleep 60
@@ -308,20 +317,14 @@ safe_reboot() {
     systemctl reboot || reboot
 }
 
-# 主函数
 main() {
     : > "$LOGFILE"
     log_update "=== 开始自动系统更新 ==="
     log_update "系统: $(lsb_release -ds 2>/dev/null || echo 'Unknown')"
     log_update "内核: $(uname -r)"
     
-    # 等待dpkg解锁
     wait_for_dpkg
-    
-    # 检查/boot空间（更新前）
     check_boot_space
-    
-    # 确保之前的包配置完成
     ensure_packages_configured
     
     log_update "更新软件包列表..."
@@ -330,11 +333,9 @@ main() {
     log_update "升级系统软件包..."
     DEBIAN_FRONTEND=noninteractive apt-get dist-upgrade $APT_OPTIONS >> "$LOGFILE" 2>&1
     
-    # 更新后再次确保包配置完成
     log_update "确保所有包配置完成..."
     ensure_packages_configured
     
-    # 检查内核更新
     if check_kernel_update; then
         safe_reboot
     else
@@ -348,7 +349,6 @@ main() {
     log_update "=== 自动更新完成 ==="
 }
 
-# 错误处理
 trap 'log_update "✗ 更新过程中发生错误（行号: $LINENO）"' ERR
 
 main "$@"
@@ -367,7 +367,6 @@ EOF
     return 0
 }
 
-# 配置cron任务
 setup_cron_job() {
     debug_log "开始配置Cron任务"
     
@@ -399,7 +398,6 @@ setup_cron_job() {
     fi
 }
 
-# 测试更新脚本
 test_update_script() {
     debug_log "询问是否测试更新脚本"
     
@@ -436,13 +434,11 @@ test_update_script() {
     return 0
 }
 
-# 显示自动更新配置摘要
 show_update_summary() {
     debug_log "显示自动更新配置摘要"
     echo
     log "🎯 自动更新摘要:" "info"
     
-    # 定时任务状态
     if has_cron_job; then
         local cron_line
         cron_line=$(crontab -l 2>/dev/null | grep "$UPDATE_SCRIPT" | head -1)
@@ -458,7 +454,6 @@ show_update_summary() {
         echo "  定时任务: 未配置"
     fi
     
-    # 脚本和服务状态
     if [[ -x "$UPDATE_SCRIPT" ]]; then
         echo "  更新脚本: 已创建"
     else
@@ -471,7 +466,6 @@ show_update_summary() {
         echo "  Cron服务: 未运行"
     fi
     
-    # 日志状态
     if [[ -f "$UPDATE_LOG" ]]; then
         echo "  更新日志: 存在"
     else
@@ -480,14 +474,13 @@ show_update_summary() {
     return 0
 }
 
-# === 主流程 ===
 main() {
     debug_log "开始自动更新系统配置"
     log "🔄 配置自动更新系统..." "info"
     
     echo
     echo "功能: 定时自动更新系统软件包和安全补丁"
-    echo "版本: v4.5 (增强稳定性)"
+    echo "版本: v4.6 (修复包状态检测)"
     
     echo
     if ! ensure_cron_installed; then
@@ -521,12 +514,11 @@ main() {
     echo "  查看日志: tail -f $UPDATE_LOG"
     echo "  管理任务: crontab -l"
     echo "  删除任务: crontab -l | grep -v '$UPDATE_SCRIPT' | crontab -"
-    echo "  检查状态: dpkg -l | grep '^i[HUFWtri]'"
+    echo "  检查状态: dpkg -l | awk 'NR>5 {print \$1}' | sort | uniq -c"
     
     return 0
 }
 
-# 错误处理
 trap 'log "脚本执行出错，行号: $LINENO" "error"; exit 1' ERR
 
 main "$@"
