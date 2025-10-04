@@ -1,5 +1,5 @@
 #!/bin/bash
-# 自动更新系统配置模块 v4.6 - 修复包状态检测
+# 自动更新系统配置模块 v4.6.1 - 修复计数bug
 # 功能: 配置定时自动更新系统
 
 set -euo pipefail
@@ -144,9 +144,9 @@ add_cron_job() {
 create_update_script() {
     debug_log "开始创建自动更新脚本"
     
-    if ! cat > "$UPDATE_SCRIPT" << 'EOF'; then
+    cat > "$UPDATE_SCRIPT" << 'EOF'
 #!/bin/bash
-# 自动系统更新脚本 v4.6 - 修复包状态检测
+# 自动系统更新脚本 v4.6.1 - 修复计数bug
 
 set -euo pipefail
 
@@ -187,43 +187,39 @@ wait_for_dpkg() {
 ensure_packages_configured() {
     log_update "验证包配置状态..."
     
-    # 配置所有未完成的包
     if ! dpkg --configure -a >> "$LOGFILE" 2>&1; then
         log_update "警告: dpkg配置出现问题，尝试修复"
     fi
     
-    # 修复依赖
     if ! apt-get install -f -y >> "$LOGFILE" 2>&1; then
         log_update "警告: 依赖修复出现问题"
     fi
     
-    # 检查真正有问题的包（状态码说明）
-    # ii = 正常安装 ✓
-    # rc = 配置残留（已删除但配置文件还在，不影响系统）
-    # ri = 需要重新安装 ✗
-    # iU/iF/iH = 解包/配置失败 ✗
-    
-    # 统计各状态
     local status_summary=$(dpkg -l 2>/dev/null | awk 'NR>5 {print $1}' | sort | uniq -c)
     log_update "包状态统计:"
     echo "$status_summary" >> "$LOGFILE"
     
-    # 检查需要重装的包（ri状态）
     local reinstall_pkgs=$(dpkg -l 2>/dev/null | awk '$1 == "ri" {print $2}')
-    local reinstall_count=$(echo "$reinstall_pkgs" | grep -c . || echo 0)
+    local reinstall_count=0
+    if [[ -n "$reinstall_pkgs" ]]; then
+        reinstall_count=$(echo "$reinstall_pkgs" | wc -l)
+    fi
     
     if [[ $reinstall_count -gt 0 ]]; then
         log_update "发现 $reinstall_count 个需要重装的包，尝试修复..."
         echo "$reinstall_pkgs" | while read pkg; do
+            [[ -z "$pkg" ]] && continue
             log_update "重装: $pkg"
             apt-get install --reinstall -y "$pkg" >> "$LOGFILE" 2>&1 || \
                 log_update "警告: $pkg 重装失败"
         done
     fi
     
-    # 检查配置失败的包（iU/iF/iH等）
     local broken_pkgs=$(dpkg -l 2>/dev/null | awk '$1 ~ /^i[UFH]/ {print $2}')
-    local broken_count=$(echo "$broken_pkgs" | grep -c . || echo 0)
+    local broken_count=0
+    if [[ -n "$broken_pkgs" ]]; then
+        broken_count=$(echo "$broken_pkgs" | wc -l)
+    fi
     
     if [[ $broken_count -gt 0 ]]; then
         log_update "警告: 发现 $broken_count 个配置异常的包"
@@ -232,8 +228,7 @@ ensure_packages_configured() {
         log_update "包配置状态: 正常"
     fi
     
-    # 配置残留统计（仅提示）
-    local rc_count=$(dpkg -l 2>/dev/null | grep -c '^rc' || echo 0)
+    local rc_count=$(dpkg -l 2>/dev/null | awk '$1 == "rc"' | wc -l)
     if [[ $rc_count -gt 0 ]]; then
         log_update "提示: 有 $rc_count 个已删除包的配置文件残留（不影响系统）"
     fi
@@ -353,15 +348,8 @@ trap 'log_update "✗ 更新过程中发生错误（行号: $LINENO）"' ERR
 
 main "$@"
 EOF
-        debug_log "自动更新脚本写入失败"
-        return 1
-    fi
     
-    if ! chmod +x "$UPDATE_SCRIPT"; then
-        debug_log "设置脚本执行权限失败"
-        return 1
-    fi
-    
+    chmod +x "$UPDATE_SCRIPT"
     echo "更新脚本: 创建完成"
     debug_log "自动更新脚本创建成功"
     return 0
@@ -480,7 +468,7 @@ main() {
     
     echo
     echo "功能: 定时自动更新系统软件包和安全补丁"
-    echo "版本: v4.6 (修复包状态检测)"
+    echo "版本: v4.6.1 (修复计数bug)"
     
     echo
     if ! ensure_cron_installed; then
