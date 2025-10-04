@@ -1,5 +1,5 @@
 #!/bin/bash
-# 自动更新系统配置模块 v4.4 - 智能配置版
+# 自动更新系统配置模块 v4.5 - 增强稳定性版
 # 功能: 配置定时自动更新系统
 
 set -euo pipefail
@@ -153,12 +153,13 @@ create_update_script() {
     
     if ! cat > "$UPDATE_SCRIPT" << 'EOF'; then
 #!/bin/bash
-# 自动系统更新脚本 v4.4
+# 自动系统更新脚本 v4.5 - 增强稳定性版
 
 set -euo pipefail
 
 readonly LOGFILE="/var/log/auto-update.log"
 readonly APT_OPTIONS="-y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold -o APT::ListChanges::Frontend=none"
+readonly MAX_WAIT_DPKG=300  # 最长等待dpkg解锁时间(秒)
 
 log_update() {
     local msg="$1"
@@ -166,30 +167,162 @@ log_update() {
     echo "[$timestamp] $msg" | tee -a "$LOGFILE"
 }
 
+# 等待dpkg解锁
+wait_for_dpkg() {
+    local waited=0
+    log_update "检查dpkg锁状态..."
+    
+    while fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 || \
+          fuser /var/lib/apt/lists/lock >/dev/null 2>&1 || \
+          fuser /var/cache/apt/archives/lock >/dev/null 2>&1; do
+        
+        if [[ $waited -ge $MAX_WAIT_DPKG ]]; then
+            log_update "警告: dpkg锁等待超时，尝试强制解锁"
+            rm -f /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock
+            rm -f /var/lib/apt/lists/lock
+            rm -f /var/cache/apt/archives/lock
+            break
+        fi
+        
+        log_update "等待dpkg解锁... ($waited/$MAX_WAIT_DPKG 秒)"
+        sleep 5
+        waited=$((waited + 5))
+    done
+    
+    log_update "dpkg锁检查完成"
+}
+
+# 确保包配置完整
+ensure_packages_configured() {
+    log_update "验证包配置状态..."
+    
+    # 配置所有未完成的包
+    if ! dpkg --configure -a >> "$LOGFILE" 2>&1; then
+        log_update "警告: dpkg配置出现问题，尝试修复"
+    fi
+    
+    # 修复依赖
+    if ! apt-get install -f -y >> "$LOGFILE" 2>&1; then
+        log_update "警告: 依赖修复出现问题"
+    fi
+    
+    # 检查是否还有问题包
+    local broken_count=$(dpkg -l | grep -c '^i[HUFWtri]' || echo 0)
+    if [[ $broken_count -gt 0 ]]; then
+        log_update "警告: 发现 $broken_count 个状态异常的包"
+        dpkg -l | grep '^i[HUFWtri]' >> "$LOGFILE" 2>&1 || true
+    else
+        log_update "包配置状态: 正常"
+    fi
+}
+
+# 检查/boot空间
+check_boot_space() {
+    local boot_usage=$(df /boot 2>/dev/null | tail -1 | awk '{print $5}' | sed 's/%//' || echo 0)
+    
+    if [[ $boot_usage -gt 80 ]]; then
+        log_update "警告: /boot 空间使用率 ${boot_usage}%，清理旧内核..."
+        
+        # 保留当前和最新两个内核
+        local current_kernel=$(uname -r)
+        log_update "当前内核: $current_kernel"
+        
+        # 列出可删除的旧内核
+        dpkg -l | grep '^ii' | grep 'linux-image-[0-9]' | \
+            awk '{print $2}' | grep -v "$current_kernel" | \
+            sort -V | head -n -1 | while read old_kernel; do
+            log_update "移除旧内核: $old_kernel"
+            apt-get purge -y "$old_kernel" >> "$LOGFILE" 2>&1 || true
+        done
+        
+        # 再次检查空间
+        boot_usage=$(df /boot 2>/dev/null | tail -1 | awk '{print $5}' | sed 's/%//' || echo 0)
+        log_update "/boot 清理后使用率: ${boot_usage}%"
+    else
+        log_update "/boot 空间使用率: ${boot_usage}% (正常)"
+    fi
+}
+
+# 检查内核更新
 check_kernel_update() {
     local current=$(uname -r)
     local latest=$(find /boot -name "vmlinuz-*" -printf "%f\n" 2>/dev/null | sed 's/vmlinuz-//' | sort -V | tail -1)
     
     if [[ -n "$latest" && "$current" != "$latest" ]]; then
         log_update "检测到新内核: $latest (当前: $current)"
+        
+        # 验证新内核文件完整性
+        if [[ ! -f "/boot/vmlinuz-$latest" ]]; then
+            log_update "错误: 内核文件不存在"
+            return 1
+        fi
+        
+        if [[ ! -f "/boot/initrd.img-$latest" ]]; then
+            log_update "错误: initramfs 未找到，可能安装未完成"
+            return 1
+        fi
+        
+        # 检查内核模块
+        if [[ ! -d "/lib/modules/$latest" ]]; then
+            log_update "警告: 内核模块目录不存在"
+            return 1
+        fi
+        
+        log_update "新内核文件验证: 通过"
         return 0
     fi
     
     return 1
 }
 
+# 安全重启
 safe_reboot() {
-    log_update "准备重启系统应用新内核..."
+    log_update "准备重启应用新内核..."
+    
+    # 再次确保包配置完成
+    log_update "最后确认包配置状态..."
+    dpkg --configure -a >> "$LOGFILE" 2>&1 || true
+    
+    # 等待dpkg解锁
+    wait_for_dpkg
+    
+    # 验证内核安装
+    local latest=$(find /boot -name "vmlinuz-*" -printf "%f\n" 2>/dev/null | sed 's/vmlinuz-//' | sort -V | tail -1)
+    if [[ ! -f "/boot/initrd.img-$latest" ]]; then
+        log_update "错误: initramfs 缺失，取消重启"
+        return 1
+    fi
+    
+    # 最后的空间检查
+    check_boot_space
+    
+    # 确保SSH服务运行
     systemctl is-active sshd >/dev/null || systemctl start sshd
+    
+    # 同步磁盘
     sync
-    log_update "系统将在30秒后重启..."
-    sleep 30
+    log_update "系统将在60秒后重启（紧急情况可手动取消）..."
+    sleep 60
+    
+    log_update "执行系统重启..."
     systemctl reboot || reboot
 }
 
+# 主函数
 main() {
     : > "$LOGFILE"
     log_update "=== 开始自动系统更新 ==="
+    log_update "系统: $(lsb_release -ds 2>/dev/null || echo 'Unknown')"
+    log_update "内核: $(uname -r)"
+    
+    # 等待dpkg解锁
+    wait_for_dpkg
+    
+    # 检查/boot空间（更新前）
+    check_boot_space
+    
+    # 确保之前的包配置完成
+    ensure_packages_configured
     
     log_update "更新软件包列表..."
     apt-get update >> "$LOGFILE" 2>&1
@@ -197,8 +330,15 @@ main() {
     log_update "升级系统软件包..."
     DEBIAN_FRONTEND=noninteractive apt-get dist-upgrade $APT_OPTIONS >> "$LOGFILE" 2>&1
     
+    # 更新后再次确保包配置完成
+    log_update "确保所有包配置完成..."
+    ensure_packages_configured
+    
+    # 检查内核更新
     if check_kernel_update; then
         safe_reboot
+    else
+        log_update "无需重启（未检测到内核更新）"
     fi
     
     log_update "清理系统缓存..."
@@ -208,7 +348,9 @@ main() {
     log_update "=== 自动更新完成 ==="
 }
 
-trap 'log_update "✗ 更新过程中发生错误"' ERR
+# 错误处理
+trap 'log_update "✗ 更新过程中发生错误（行号: $LINENO）"' ERR
+
 main "$@"
 EOF
         debug_log "自动更新脚本写入失败"
@@ -345,6 +487,7 @@ main() {
     
     echo
     echo "功能: 定时自动更新系统软件包和安全补丁"
+    echo "版本: v4.5 (增强稳定性)"
     
     echo
     if ! ensure_cron_installed; then
@@ -378,6 +521,7 @@ main() {
     echo "  查看日志: tail -f $UPDATE_LOG"
     echo "  管理任务: crontab -l"
     echo "  删除任务: crontab -l | grep -v '$UPDATE_SCRIPT' | crontab -"
+    echo "  检查状态: dpkg -l | grep '^i[HUFWtri]'"
     
     return 0
 }
