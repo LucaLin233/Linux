@@ -188,9 +188,9 @@ command -v mise >/dev/null 2>&1 && eval "$(mise activate zsh)"
 # 实用别名
 alias upgrade='apt update && apt full-upgrade -y'
 alias update='apt update -y'
-alias redocker='cd /root/proxy && docker compose down && docker compose pull && docker compose up -d --remove-orphans'
-alias resys='systemctl restart singbox realm snell snellr'
-alias autodel='docker system prune -a -f && apt autoremove -y'
+alias reproxy='cd /root/proxy && docker compose down && docker compose pull && docker compose up -d --remove-orphans'
+alias dlog='docker logs -f'
+alias autodel='docker system prune -a -f && apt autoremove -y && apt clean'
 alias sstop='systemctl stop'
 alias sre='systemctl restart'
 alias sst='systemctl status'
