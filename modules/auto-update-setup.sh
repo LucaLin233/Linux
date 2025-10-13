@@ -1,5 +1,5 @@
 #!/bin/bash
-# 自动更新系统配置模块 v4.7.0 - 修复dpkg冲突和计数bug
+# 自动更新系统配置模块 v4.7.1 - 修复脚本结构错误
 # 功能: 配置定时自动更新系统
 
 set -euo pipefail
@@ -146,7 +146,7 @@ create_update_script() {
     
     cat > "$UPDATE_SCRIPT" << 'EOF'
 #!/bin/bash
-# 自动系统更新脚本 v4.7.0 - 修复dpkg冲突和计数bug
+# 自动系统更新脚本 v4.7.1 - 修复dpkg冲突和计数bug
 
 set -euo pipefail
 
@@ -233,7 +233,6 @@ ensure_packages_configured() {
     
     wait_for_dpkg
     
-    # 修改这段：显示包状态统计
     log_update "包状态统计:"
     local status_summary=$(dpkg -l 2>/dev/null | awk 'NR>5 && $1 ~ /^[a-z]/ {print $1}' | sort | uniq -c)
     if [[ -n "$status_summary" ]]; then
@@ -256,18 +255,15 @@ ensure_packages_configured() {
         echo "$reinstall_pkgs" | while read pkg; do
             [[ -z "$pkg" ]] && continue
             
-            # 内核包特殊处理
             if [[ "$pkg" =~ ^linux-(image|headers|modules) ]]; then
                 log_update "检测到损坏的内核包: $pkg"
                 
-                # 检查是否是当前运行的内核
                 if [[ "$pkg" == *"$current_kernel"* ]]; then
                     log_update "警告: 这是当前运行的内核，跳过处理以确保系统稳定"
                     log_update "建议: 更新到新内核后再处理"
                     continue
                 fi
                 
-                # 非当前内核，尝试修复或清理
                 wait_for_dpkg
                 
                 log_update "尝试重装非活动内核: $pkg (超时10分钟)"
@@ -291,7 +287,6 @@ ensure_packages_configured() {
                 continue
             fi
             
-            # 非内核包的处理
             log_update "重装普通包: $pkg (超时5分钟)"
             wait_for_dpkg
             
@@ -310,13 +305,11 @@ ensure_packages_configured() {
             sleep 2
         done
         
-        # 重装后再次检查配置
         wait_for_dpkg
         log_update "验证重装后的包配置..."
         dpkg --configure -a >> "$LOGFILE" 2>&1 || true
     fi
     
-    # 检查配置异常的包（iU, iF, iH 状态）
     local broken_pkgs=$(dpkg -l 2>/dev/null | awk '$1 ~ /^i[UFH]/ {print $2}')
     local broken_count=0
     if [[ -n "$broken_pkgs" ]]; then
@@ -348,7 +341,6 @@ ensure_packages_configured() {
         log_update "包配置状态: 正常"
     fi
     
-    # 清理残留配置文件（可选）
     local rc_count=$(dpkg -l 2>/dev/null | awk '$1 == "rc"' | wc -l)
     if [[ $rc_count -gt 0 ]]; then
         log_update "提示: 有 $rc_count 个已删除包的配置文件残留（不影响系统）"
@@ -470,15 +462,13 @@ main() {
     log_update "=== 开始自动系统更新 ==="
     log_update "系统: $(lsb_release -ds 2>/dev/null || echo 'Unknown')"
     log_update "内核: $(uname -r)"
-    log_update "脚本版本: v4.7.0"
+    log_update "脚本版本: v4.7.1"
     
-    # 第一阶段: 清理准备
     log_update "--- 第一阶段: 系统准备 ---"
     wait_for_dpkg
     ensure_packages_configured
     check_boot_space
     
-    # 第二阶段: 系统更新
     log_update "--- 第二阶段: 系统更新 ---"
     wait_for_dpkg
     
@@ -501,7 +491,6 @@ main() {
         DEBIAN_FRONTEND=noninteractive apt-get dist-upgrade $APT_OPTIONS >> "$LOGFILE" 2>&1 || true
     fi
     
-    # 第三阶段: 清理验证
     log_update "--- 第三阶段: 清理验证 ---"
     wait_for_dpkg
     sleep 3
@@ -512,7 +501,6 @@ main() {
     check_boot_space
     wait_for_dpkg
     
-    # 第四阶段: 检查重启
     log_update "--- 第四阶段: 检查重启 ---"
     if check_kernel_update; then
         safe_reboot
@@ -520,7 +508,6 @@ main() {
         log_update "无需重启（未检测到内核更新）"
     fi
     
-    # 第五阶段: 最终清理
     log_update "--- 第五阶段: 最终清理 ---"
     wait_for_dpkg
     
@@ -534,7 +521,25 @@ main() {
     
     log_update "=== 自动更新完成 ==="
     log_update "最终包状态:"
-    dpkg -l 2>/dev/null | awk 'NR>5 && $1 ~ /^[a-z]/ {print $1}' | sort | uniq -c >> "$LOGFILE"
+    
+    local pkg_stats=$(dpkg -l 2>/dev/null | awk 'NR>5 && $1 ~ /^[a-z]/ {print $1}' | sort | uniq -c)
+    if [[ -n "$pkg_stats" ]]; then
+        echo "$pkg_stats" | while read count status; do
+            local status_desc=""
+            case "$status" in
+                ii) status_desc="正常安装" ;;
+                rc) status_desc="已删除(配置残留)" ;;
+                iU) status_desc="待解包" ;;
+                iF) status_desc="配置失败" ;;
+                iH) status_desc="半安装" ;;
+                ri) status_desc="需要重装" ;;
+                *) status_desc="其他状态" ;;
+            esac
+            log_update "  $count 个包 [$status] $status_desc"
+        done
+    else
+        log_update "  无法获取包状态信息"
+    fi
 }
 
 trap 'log_update "✗ 更新过程中发生错误（行号: $LINENO）"' ERR
@@ -656,94 +661,50 @@ show_update_summary() {
 }
 
 main() {
-    : > "$LOGFILE"
-    log_update "=== 开始自动系统更新 ==="
-    log_update "系统: $(lsb_release -ds 2>/dev/null || echo 'Unknown')"
-    log_update "内核: $(uname -r)"
-    log_update "脚本版本: v4.7.0"
+    debug_log "开始自动更新系统配置"
+    log "🔄 配置自动更新系统..." "info"
     
-    # 第一阶段: 清理准备
-    log_update "--- 第一阶段: 系统准备 ---"
-    wait_for_dpkg
-    ensure_packages_configured
-    check_boot_space
+    echo
+    echo "功能: 定时自动更新系统软件包和安全补丁"
+    echo "版本: v4.7.1 (修复dpkg冲突和结构错误)"
     
-    # 第二阶段: 系统更新
-    log_update "--- 第二阶段: 系统更新 ---"
-    wait_for_dpkg
-    
-    log_update "更新软件包列表..."
-    if ! apt-get update >> "$LOGFILE" 2>&1; then
-        log_update "警告: 软件包列表更新失败，重试..."
-        sleep 5
-        apt-get update >> "$LOGFILE" 2>&1 || true
+    echo
+    if ! ensure_cron_installed; then
+        log "✗ cron服务配置失败" "error"
+        return 1
     fi
     
-    wait_for_dpkg
-    
-    log_update "升级系统软件包..."
-    if ! DEBIAN_FRONTEND=noninteractive apt-get dist-upgrade $APT_OPTIONS >> "$LOGFILE" 2>&1; then
-        log_update "警告: 系统升级出现问题，尝试修复..."
-        sleep 5
-        wait_for_dpkg
-        apt-get install -f -y >> "$LOGFILE" 2>&1 || true
-        wait_for_dpkg
-        DEBIAN_FRONTEND=noninteractive apt-get dist-upgrade $APT_OPTIONS >> "$LOGFILE" 2>&1 || true
+    echo
+    if ! create_update_script; then
+        log "✗ 更新脚本创建失败" "error"
+        return 1
     fi
     
-    # 第三阶段: 清理验证
-    log_update "--- 第三阶段: 清理验证 ---"
-    wait_for_dpkg
-    sleep 3
-    
-    ensure_packages_configured
-    wait_for_dpkg
-    
-    check_boot_space
-    wait_for_dpkg
-    
-    # 第四阶段: 检查重启
-    log_update "--- 第四阶段: 检查重启 ---"
-    if check_kernel_update; then
-        safe_reboot
-    else
-        log_update "无需重启（未检测到内核更新）"
+    echo
+    if ! setup_cron_job; then
+        log "✗ 定时任务配置失败" "error"
+        return 1
     fi
     
-    # 第五阶段: 最终清理
-    log_update "--- 第五阶段: 最终清理 ---"
-    wait_for_dpkg
+    echo
+    test_update_script
     
-    log_update "清理不需要的软件包..."
-    apt-get autoremove -y >> "$LOGFILE" 2>&1 || true
+    show_update_summary
     
-    wait_for_dpkg
+    echo
+    log "✅ 自动更新系统配置完成!" "info"
     
-    log_update "清理软件包缓存..."
-    apt-get autoclean >> "$LOGFILE" 2>&1 || true
+    echo
+    log "常用命令:" "info"
+    echo "  手动执行: $UPDATE_SCRIPT"
+    echo "  查看日志: tail -f $UPDATE_LOG"
+    echo "  实时监控: watch -n1 'tail -20 $UPDATE_LOG'"
+    echo "  管理任务: crontab -l"
+    echo "  删除任务: crontab -l | grep -v '$UPDATE_SCRIPT' | crontab -"
+    echo "  检查状态: dpkg -l | awk 'NR>5 {print \$1}' | sort | uniq -c"
+    echo "  检查锁状态: fuser /var/lib/dpkg/lock-frontend"
     
-    log_update "=== 自动更新完成 ==="
-    log_update "最终包状态:"
-    
-    # 获取统计并格式化输出
-    local pkg_stats=$(dpkg -l 2>/dev/null | awk 'NR>5 && $1 ~ /^[a-z]/ {print $1}' | sort | uniq -c)
-    if [[ -n "$pkg_stats" ]]; then
-        echo "$pkg_stats" | while read count status; do
-            local status_desc=""
-            case "$status" in
-                ii) status_desc="正常安装" ;;
-                rc) status_desc="已删除(配置残留)" ;;
-                iU) status_desc="待解包" ;;
-                iF) status_desc="配置失败" ;;
-                iH) status_desc="半安装" ;;
-                ri) status_desc="需要重装" ;;
-                *) status_desc="其他状态" ;;
-            esac
-            log_update "  $count 个包 [$status] $status_desc"
-        done
-    else
-        log_update "  无法获取包状态信息"
-    fi
+    return 0
 }
 
 trap 'log "脚本执行出错，行号: $LINENO" "error"; exit 1' ERR
