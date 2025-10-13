@@ -237,6 +237,7 @@ ensure_packages_configured() {
     log_update "包状态统计:"
     echo "$status_summary" >> "$LOGFILE"
     
+    # 获取需要重装的包
     local reinstall_pkgs=$(dpkg -l 2>/dev/null | awk '$1 == "ri" {print $2}')
     local reinstall_count=0
     if [[ -n "$reinstall_pkgs" ]]; then
@@ -245,37 +246,73 @@ ensure_packages_configured() {
     
     if [[ $reinstall_count -gt 0 ]]; then
         log_update "发现 $reinstall_count 个需要重装的包，尝试修复..."
+        
+        local current_kernel=$(uname -r)
+        
         echo "$reinstall_pkgs" | while read pkg; do
             [[ -z "$pkg" ]] && continue
             
             # 内核包特殊处理
             if [[ "$pkg" =~ ^linux-(image|headers|modules) ]]; then
                 log_update "检测到损坏的内核包: $pkg"
-                log_update "建议手动处理或直接清理"
                 
-                wait_for_dpkg
-                if timeout 60 apt-get purge -y "$pkg" >> "$LOGFILE" 2>&1; then
-                    log_update "已清理: $pkg"
-                else
-                    log_update "警告: 清理失败 $pkg"
+                # 检查是否是当前运行的内核
+                if [[ "$pkg" == *"$current_kernel"* ]]; then
+                    log_update "警告: 这是当前运行的内核，跳过处理以确保系统稳定"
+                    log_update "建议: 更新到新内核后再处理"
+                    continue
                 fi
+                
+                # 非当前内核，尝试修复或清理
+                wait_for_dpkg
+                
+                log_update "尝试重装非活动内核: $pkg (超时10分钟)"
+                if timeout 600 apt-get install --reinstall -y \
+                    -o Dpkg::Options::="--force-confdef" \
+                    -o Dpkg::Options::="--force-confold" \
+                    "$pkg" >> "$LOGFILE" 2>&1; then
+                    log_update "✓ 成功重装: $pkg"
+                else
+                    log_update "重装失败，尝试清理: $pkg"
+                    wait_for_dpkg
+                    
+                    if timeout 120 apt-get purge -y "$pkg" >> "$LOGFILE" 2>&1; then
+                        log_update "✓ 已清理损坏的内核包: $pkg"
+                    else
+                        log_update "✗ 清理失败: $pkg (建议手动处理)"
+                    fi
+                fi
+                
+                sleep 3
                 continue
             fi
             
-            log_update "重装: $pkg"
+            # 非内核包的处理
+            log_update "重装普通包: $pkg (超时5分钟)"
             wait_for_dpkg
             
-            if ! timeout 300 apt-get install --reinstall -y \
+            if timeout 300 apt-get install --reinstall -y \
                 -o Dpkg::Options::="--force-confdef" \
                 -o Dpkg::Options::="--force-confold" \
                 "$pkg" >> "$LOGFILE" 2>&1; then
-                log_update "警告: $pkg 重装失败或超时"
+                log_update "✓ 成功重装: $pkg"
+            else
+                log_update "✗ 警告: $pkg 重装失败或超时"
+                log_update "尝试修复依赖..."
+                wait_for_dpkg
+                apt-get install -f -y >> "$LOGFILE" 2>&1 || true
             fi
             
             sleep 2
         done
+        
+        # 重装后再次检查配置
+        wait_for_dpkg
+        log_update "验证重装后的包配置..."
+        dpkg --configure -a >> "$LOGFILE" 2>&1 || true
     fi
     
+    # 检查配置异常的包（iU, iF, iH 状态）
     local broken_pkgs=$(dpkg -l 2>/dev/null | awk '$1 ~ /^i[UFH]/ {print $2}')
     local broken_count=0
     if [[ -n "$broken_pkgs" ]]; then
@@ -284,14 +321,38 @@ ensure_packages_configured() {
     
     if [[ $broken_count -gt 0 ]]; then
         log_update "警告: 发现 $broken_count 个配置异常的包"
-        echo "$broken_pkgs" >> "$LOGFILE"
+        echo "$broken_pkgs" | tee -a "$LOGFILE"
+        
+        log_update "尝试自动修复配置异常的包..."
+        echo "$broken_pkgs" | while read broken_pkg; do
+            [[ -z "$broken_pkg" ]] && continue
+            log_update "修复: $broken_pkg"
+            wait_for_dpkg
+            
+            if timeout 180 apt-get install --reinstall -y \
+                -o Dpkg::Options::="--force-confdef" \
+                -o Dpkg::Options::="--force-confold" \
+                "$broken_pkg" >> "$LOGFILE" 2>&1; then
+                log_update "✓ 修复成功: $broken_pkg"
+            else
+                log_update "✗ 修复失败: $broken_pkg (需要手动处理)"
+            fi
+        done
     else
         log_update "包配置状态: 正常"
     fi
     
+    # 清理残留配置文件（可选）
     local rc_count=$(dpkg -l 2>/dev/null | awk '$1 == "rc"' | wc -l)
     if [[ $rc_count -gt 0 ]]; then
         log_update "提示: 有 $rc_count 个已删除包的配置文件残留（不影响系统）"
+        
+        if [[ $rc_count -lt 20 ]]; then
+            log_update "清理残留配置文件..."
+            dpkg -l | awk '$1 == "rc" {print $2}' | while read rc_pkg; do
+                dpkg --purge "$rc_pkg" >> "$LOGFILE" 2>&1 || true
+            done
+        fi
     fi
 }
 
