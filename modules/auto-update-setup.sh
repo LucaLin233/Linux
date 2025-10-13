@@ -1,5 +1,5 @@
 #!/bin/bash
-# 自动更新系统配置模块 v4.6.1 - 修复计数bug
+# 自动更新系统配置模块 v4.7.0 - 修复dpkg冲突和计数bug
 # 功能: 配置定时自动更新系统
 
 set -euo pipefail
@@ -146,13 +146,14 @@ create_update_script() {
     
     cat > "$UPDATE_SCRIPT" << 'EOF'
 #!/bin/bash
-# 自动系统更新脚本 v4.6.1 - 修复计数bug
+# 自动系统更新脚本 v4.7.0 - 修复dpkg冲突和计数bug
 
 set -euo pipefail
 
 readonly LOGFILE="/var/log/auto-update.log"
 readonly APT_OPTIONS="-y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold -o APT::ListChanges::Frontend=none"
 readonly MAX_WAIT_DPKG=300
+readonly MAX_DPKG_RETRIES=3
 
 log_update() {
     local msg="$1"
@@ -162,47 +163,84 @@ log_update() {
 
 wait_for_dpkg() {
     local waited=0
+    local retry=0
+    
     log_update "检查dpkg锁状态..."
     
-    while fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 || \
-          fuser /var/lib/apt/lists/lock >/dev/null 2>&1 || \
-          fuser /var/cache/apt/archives/lock >/dev/null 2>&1; do
+    while [[ $retry -lt $MAX_DPKG_RETRIES ]]; do
+        waited=0
+        local locked=false
         
-        if [[ $waited -ge $MAX_WAIT_DPKG ]]; then
-            log_update "警告: dpkg锁等待超时，尝试强制解锁"
-            rm -f /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock
-            rm -f /var/lib/apt/lists/lock
-            rm -f /var/cache/apt/archives/lock
-            break
+        while fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 || \
+              fuser /var/lib/apt/lists/lock >/dev/null 2>&1 || \
+              fuser /var/cache/apt/archives/lock >/dev/null 2>&1; do
+            
+            locked=true
+            
+            if [[ $waited -ge $MAX_WAIT_DPKG ]]; then
+                log_update "警告: dpkg锁等待超时 (尝试 $((retry + 1))/$MAX_DPKG_RETRIES)"
+                break
+            fi
+            
+            log_update "等待dpkg解锁... ($waited/$MAX_WAIT_DPKG 秒)"
+            sleep 5
+            waited=$((waited + 5))
+        done
+        
+        if [[ "$locked" == "false" ]]; then
+            log_update "dpkg锁检查完成"
+            return 0
         fi
         
-        log_update "等待dpkg解锁... ($waited/$MAX_WAIT_DPKG 秒)"
-        sleep 5
-        waited=$((waited + 5))
+        if [[ $waited -ge $MAX_WAIT_DPKG ]]; then
+            retry=$((retry + 1))
+            if [[ $retry -ge $MAX_DPKG_RETRIES ]]; then
+                log_update "错误: dpkg锁释放失败，尝试强制解锁"
+                pkill -9 apt || true
+                pkill -9 dpkg || true
+                sleep 2
+                rm -f /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock
+                rm -f /var/lib/apt/lists/lock
+                rm -f /var/cache/apt/archives/lock
+                sleep 2
+                break
+            fi
+            sleep 10
+        fi
     done
     
-    log_update "dpkg锁检查完成"
+    log_update "dpkg锁处理完成"
 }
 
 ensure_packages_configured() {
     log_update "验证包配置状态..."
     
+    wait_for_dpkg
+    
     if ! dpkg --configure -a >> "$LOGFILE" 2>&1; then
         log_update "警告: dpkg配置出现问题，尝试修复"
+        sleep 5
+        dpkg --configure -a >> "$LOGFILE" 2>&1 || true
     fi
+    
+    wait_for_dpkg
     
     if ! apt-get install -f -y >> "$LOGFILE" 2>&1; then
         log_update "警告: 依赖修复出现问题"
+        sleep 5
+        apt-get install -f -y >> "$LOGFILE" 2>&1 || true
     fi
     
-    local status_summary=$(dpkg -l 2>/dev/null | awk 'NR>5 {print $1}' | sort | uniq -c)
+    wait_for_dpkg
+    
+    local status_summary=$(dpkg -l 2>/dev/null | awk 'NR>5 && $1 ~ /^[a-z]/ {print $1}' | sort | uniq -c)
     log_update "包状态统计:"
     echo "$status_summary" >> "$LOGFILE"
     
     local reinstall_pkgs=$(dpkg -l 2>/dev/null | awk '$1 == "ri" {print $2}')
     local reinstall_count=0
     if [[ -n "$reinstall_pkgs" ]]; then
-        reinstall_count=$(echo "$reinstall_pkgs" | wc -l)
+        reinstall_count=$(echo "$reinstall_pkgs" | grep -c . || echo 0)
     fi
     
     if [[ $reinstall_count -gt 0 ]]; then
@@ -210,6 +248,7 @@ ensure_packages_configured() {
         echo "$reinstall_pkgs" | while read pkg; do
             [[ -z "$pkg" ]] && continue
             log_update "重装: $pkg"
+            wait_for_dpkg
             apt-get install --reinstall -y "$pkg" >> "$LOGFILE" 2>&1 || \
                 log_update "警告: $pkg 重装失败"
         done
@@ -218,7 +257,7 @@ ensure_packages_configured() {
     local broken_pkgs=$(dpkg -l 2>/dev/null | awk '$1 ~ /^i[UFH]/ {print $2}')
     local broken_count=0
     if [[ -n "$broken_pkgs" ]]; then
-        broken_count=$(echo "$broken_pkgs" | wc -l)
+        broken_count=$(echo "$broken_pkgs" | grep -c . || echo 0)
     fi
     
     if [[ $broken_count -gt 0 ]]; then
@@ -237,23 +276,47 @@ ensure_packages_configured() {
 check_boot_space() {
     local boot_usage=$(df /boot 2>/dev/null | tail -1 | awk '{print $5}' | sed 's/%//' || echo 0)
     
+    log_update "/boot 空间使用率: ${boot_usage}%"
+    
     if [[ $boot_usage -gt 80 ]]; then
-        log_update "警告: /boot 空间使用率 ${boot_usage}%，清理旧内核..."
+        log_update "警告: /boot 空间不足，开始清理旧内核..."
         
         local current_kernel=$(uname -r)
         log_update "当前内核: $current_kernel"
         
-        dpkg -l | grep '^ii' | grep 'linux-image-[0-9]' | \
-            awk '{print $2}' | grep -v "$current_kernel" | \
-            sort -V | head -n -1 | while read old_kernel; do
-            log_update "移除旧内核: $old_kernel"
-            apt-get purge -y "$old_kernel" >> "$LOGFILE" 2>&1 || true
+        local all_kernels=$(dpkg -l | grep '^ii' | grep 'linux-image-[0-9]' | awk '{print $2}' | sort -V)
+        local kernel_count=$(echo "$all_kernels" | wc -l)
+        
+        log_update "已安装内核数量: $kernel_count"
+        
+        if [[ $kernel_count -le 2 ]]; then
+            log_update "内核数量 <= 2，跳过清理"
+            return 0
+        fi
+        
+        wait_for_dpkg
+        
+        echo "$all_kernels" | grep -v "$current_kernel" | head -n -2 | while read old_kernel; do
+            [[ -z "$old_kernel" ]] && continue
+            log_update "准备移除旧内核: $old_kernel"
+            
+            wait_for_dpkg
+            
+            if apt-get purge -y "$old_kernel" >> "$LOGFILE" 2>&1; then
+                log_update "成功移除: $old_kernel"
+            else
+                log_update "警告: 移除失败 $old_kernel"
+            fi
+            
+            sleep 2
         done
+        
+        wait_for_dpkg
         
         boot_usage=$(df /boot 2>/dev/null | tail -1 | awk '{print $5}' | sed 's/%//' || echo 0)
         log_update "/boot 清理后使用率: ${boot_usage}%"
     else
-        log_update "/boot 空间使用率: ${boot_usage}% (正常)"
+        log_update "/boot 空间充足，无需清理"
     fi
 }
 
@@ -290,6 +353,7 @@ safe_reboot() {
     log_update "准备重启应用新内核..."
     
     log_update "最后确认包配置状态..."
+    wait_for_dpkg
     dpkg --configure -a >> "$LOGFILE" 2>&1 || true
     
     wait_for_dpkg
@@ -317,31 +381,71 @@ main() {
     log_update "=== 开始自动系统更新 ==="
     log_update "系统: $(lsb_release -ds 2>/dev/null || echo 'Unknown')"
     log_update "内核: $(uname -r)"
+    log_update "脚本版本: v4.7.0"
     
+    # 第一阶段: 清理准备
+    log_update "--- 第一阶段: 系统准备 ---"
     wait_for_dpkg
-    check_boot_space
     ensure_packages_configured
+    check_boot_space
+    
+    # 第二阶段: 系统更新
+    log_update "--- 第二阶段: 系统更新 ---"
+    wait_for_dpkg
     
     log_update "更新软件包列表..."
-    apt-get update >> "$LOGFILE" 2>&1
+    if ! apt-get update >> "$LOGFILE" 2>&1; then
+        log_update "警告: 软件包列表更新失败，重试..."
+        sleep 5
+        apt-get update >> "$LOGFILE" 2>&1 || true
+    fi
+    
+    wait_for_dpkg
     
     log_update "升级系统软件包..."
-    DEBIAN_FRONTEND=noninteractive apt-get dist-upgrade $APT_OPTIONS >> "$LOGFILE" 2>&1
+    if ! DEBIAN_FRONTEND=noninteractive apt-get dist-upgrade $APT_OPTIONS >> "$LOGFILE" 2>&1; then
+        log_update "警告: 系统升级出现问题，尝试修复..."
+        sleep 5
+        wait_for_dpkg
+        apt-get install -f -y >> "$LOGFILE" 2>&1 || true
+        wait_for_dpkg
+        DEBIAN_FRONTEND=noninteractive apt-get dist-upgrade $APT_OPTIONS >> "$LOGFILE" 2>&1 || true
+    fi
     
-    log_update "确保所有包配置完成..."
+    # 第三阶段: 清理验证
+    log_update "--- 第三阶段: 清理验证 ---"
+    wait_for_dpkg
+    sleep 3
+    
     ensure_packages_configured
+    wait_for_dpkg
     
+    check_boot_space
+    wait_for_dpkg
+    
+    # 第四阶段: 检查重启
+    log_update "--- 第四阶段: 检查重启 ---"
     if check_kernel_update; then
         safe_reboot
     else
         log_update "无需重启（未检测到内核更新）"
     fi
     
-    log_update "清理系统缓存..."
-    apt-get autoremove -y >> "$LOGFILE" 2>&1
-    apt-get autoclean >> "$LOGFILE" 2>&1
+    # 第五阶段: 最终清理
+    log_update "--- 第五阶段: 最终清理 ---"
+    wait_for_dpkg
+    
+    log_update "清理不需要的软件包..."
+    apt-get autoremove -y >> "$LOGFILE" 2>&1 || true
+    
+    wait_for_dpkg
+    
+    log_update "清理软件包缓存..."
+    apt-get autoclean >> "$LOGFILE" 2>&1 || true
     
     log_update "=== 自动更新完成 ==="
+    log_update "最终包状态:"
+    dpkg -l 2>/dev/null | awk 'NR>5 && $1 ~ /^[a-z]/ {print $1}' | sort | uniq -c >> "$LOGFILE"
 }
 
 trap 'log_update "✗ 更新过程中发生错误（行号: $LINENO）"' ERR
@@ -468,7 +572,7 @@ main() {
     
     echo
     echo "功能: 定时自动更新系统软件包和安全补丁"
-    echo "版本: v4.6.1 (修复计数bug)"
+    echo "版本: v4.7.0 (修复dpkg冲突和计数bug)"
     
     echo
     if ! ensure_cron_installed; then
@@ -500,9 +604,11 @@ main() {
     log "常用命令:" "info"
     echo "  手动执行: $UPDATE_SCRIPT"
     echo "  查看日志: tail -f $UPDATE_LOG"
+    echo "  实时监控: watch -n1 'tail -20 $UPDATE_LOG'"
     echo "  管理任务: crontab -l"
     echo "  删除任务: crontab -l | grep -v '$UPDATE_SCRIPT' | crontab -"
     echo "  检查状态: dpkg -l | awk 'NR>5 {print \$1}' | sort | uniq -c"
+    echo "  检查锁状态: fuser /var/lib/dpkg/lock-frontend"
     
     return 0
 }
