@@ -130,8 +130,15 @@ backup_config() {
 }
 
 restore_config() {
-    local file="$1" backup="${file}.initial_backup"
-    [[ -f "$backup" ]] && cp "$backup" "$file" && info "恢复: $(basename "$file")" || error "备份不存在: $file"
+    local file="$1" 
+    local backup="${file}.initial_backup"
+    
+    if [[ -f "$backup" ]]; then
+        cp "$backup" "$file"
+        info "恢复: $(basename "$file")"
+    else
+        error "备份不存在: $file"
+    fi
 }
 
 # === 系统资源限制 ===
@@ -425,10 +432,8 @@ restore_optimization() {
     local interface
     interface=$(detect_interface) && command -v tc >/dev/null 2>&1 && tc qdisc del dev "$interface" root 2>/dev/null || true
     
-    # 恢复被禁用的文件
-    local disabled_file
-    for disabled_file in /etc/security/limits.d/*.conf.disabled; do
-        [[ -f "$disabled_file" ]] && mv "$disabled_file" "${disabled_file%.disabled}" 2>/dev/null || true
+    for file in /etc/security/limits.d/*.conf.disabled; do
+        [[ -f "$file" ]] && mv "$file" "${file%.disabled}" 2>/dev/null || true
     done
     
     sysctl --system >/dev/null 2>&1 || true
