@@ -341,15 +341,45 @@ ensure_packages_configured() {
         log_update "包配置状态: 正常"
     fi
     
+    # 改进的残留配置文件清理 - 用数组避免卡死
     local rc_count=$(dpkg -l 2>/dev/null | awk '$1 == "rc"' | wc -l)
     if [[ $rc_count -gt 0 ]]; then
         log_update "提示: 有 $rc_count 个已删除包的配置文件残留（不影响系统）"
         
         if [[ $rc_count -lt 20 ]]; then
             log_update "清理残留配置文件..."
-            dpkg -l | awk '$1 == "rc" {print $2}' | while read rc_pkg; do
-                dpkg --purge "$rc_pkg" >> "$LOGFILE" 2>&1 || true
+            
+            # 使用数组避免子 shell 卡死
+            local rc_packages=()
+            mapfile -t rc_packages < <(dpkg -l 2>/dev/null | awk '$1 == "rc" {print $2}')
+            
+            local total=${#rc_packages[@]}
+            local cleaned=0
+            local failed=0
+            
+            for i in "${!rc_packages[@]}"; do
+                local rc_pkg="${rc_packages[$i]}"
+                [[ -z "$rc_pkg" ]] && continue
+                
+                local current=$((i + 1))
+                
+                # 每个包超时30秒，避免卡死
+                if timeout 30 dpkg --purge "$rc_pkg" >> "$LOGFILE" 2>&1; then
+                    cleaned=$((cleaned + 1))
+                    log_update "  [$current/$total] ✓ $rc_pkg"
+                else
+                    failed=$((failed + 1))
+                    log_update "  [$current/$total] ✗ $rc_pkg (超时)"
+                fi
+                
+                # 避免 dpkg 锁冲突
+                sleep 0.2
             done
+            
+            log_update "残留配置清理完成 (成功: $cleaned, 失败: $failed)"
+        else
+            log_update "残留配置文件过多 ($rc_count 个)，跳过自动清理"
+            log_update "可手动执行: apt-get purge \$(dpkg -l | awk '\$1==\"rc\" {print \$2}')"
         fi
     fi
 }
