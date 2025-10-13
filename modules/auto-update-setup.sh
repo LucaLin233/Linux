@@ -247,10 +247,32 @@ ensure_packages_configured() {
         log_update "发现 $reinstall_count 个需要重装的包，尝试修复..."
         echo "$reinstall_pkgs" | while read pkg; do
             [[ -z "$pkg" ]] && continue
+            
+            # 内核包特殊处理
+            if [[ "$pkg" =~ ^linux-(image|headers|modules) ]]; then
+                log_update "检测到损坏的内核包: $pkg"
+                log_update "建议手动处理或直接清理"
+                
+                wait_for_dpkg
+                if timeout 60 apt-get purge -y "$pkg" >> "$LOGFILE" 2>&1; then
+                    log_update "已清理: $pkg"
+                else
+                    log_update "警告: 清理失败 $pkg"
+                fi
+                continue
+            fi
+            
             log_update "重装: $pkg"
             wait_for_dpkg
-            apt-get install --reinstall -y "$pkg" >> "$LOGFILE" 2>&1 || \
-                log_update "警告: $pkg 重装失败"
+            
+            if ! timeout 300 apt-get install --reinstall -y \
+                -o Dpkg::Options::="--force-confdef" \
+                -o Dpkg::Options::="--force-confold" \
+                "$pkg" >> "$LOGFILE" 2>&1; then
+                log_update "警告: $pkg 重装失败或超时"
+            fi
+            
+            sleep 2
         done
     fi
     
