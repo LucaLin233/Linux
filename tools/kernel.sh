@@ -425,8 +425,10 @@ restore_optimization() {
     local interface
     interface=$(detect_interface) && command -v tc >/dev/null 2>&1 && tc qdisc del dev "$interface" root 2>/dev/null || true
     
-    for file in /etc/security/limits.d/*.conf.disabled; do
-        [[ -f "$file" ]] && mv "$file" "${file%.disabled}" 2>/dev/null || true
+    # 恢复被禁用的文件
+    local disabled_file
+    for disabled_file in /etc/security/limits.d/*.conf.disabled; do
+        [[ -f "$disabled_file" ]] && mv "$disabled_file" "${disabled_file%.disabled}" 2>/dev/null || true
     done
     
     sysctl --system >/dev/null 2>&1 || true
