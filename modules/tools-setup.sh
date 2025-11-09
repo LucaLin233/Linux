@@ -172,16 +172,47 @@ install_single_tool() {
         fi
         
         # 添加官方apt源（如果不存在）
-        if [[ ! -f /etc/apt/sources.list.d/nexttrace.list ]]; then
+        if [[ ! -f /etc/apt/sources.list.d/nexttrace.sources ]]; then
             debug_log "添加nexttrace官方apt源"
             echo "正在配置nexttrace官方源..." >&2
-            if echo "deb [trusted=yes] https://github.com/nxtrace/nexttrace-debs/releases/latest/download ./" | \
-                tee /etc/apt/sources.list.d/nexttrace.list >/dev/null 2>&1; then
-                debug_log "nexttrace apt源配置成功"
+            
+            # 创建 keyrings 目录
+            mkdir -p /etc/apt/keyrings
+            
+            # 下载并安装 GPG 密钥
+            if curl -fsSL https://github.com/nxtrace/nexttrace-debs/releases/latest/download/nexttrace-archive-keyring.gpg \
+                -o /etc/apt/keyrings/nexttrace.gpg 2>&1; then
+                debug_log "GPG密钥下载成功"
+                
+                # 创建 sources 文件（新格式）
+                cat > /etc/apt/sources.list.d/nexttrace.sources <<'EOF'
+Types: deb
+URIs: https://github.com/nxtrace/nexttrace-debs/releases/latest/download/
+Suites: ./
+Signed-By: /etc/apt/keyrings/nexttrace.gpg
+EOF
+                debug_log "nexttrace apt源配置成功（带GPG验证）"
             else
-                debug_log "nexttrace apt源配置失败"
-                return 1
+                debug_log "GPG密钥下载失败，使用降级方案"
+                echo "GPG密钥下载失败，使用备用配置..." >&2
+                
+                # 降级方案：使用 trusted=yes（保持向后兼容）
+                cat > /etc/apt/sources.list.d/nexttrace.sources <<'EOF'
+Types: deb
+URIs: https://github.com/nxtrace/nexttrace-debs/releases/latest/download/
+Suites: ./
+Trusted: yes
+EOF
+                debug_log "nexttrace apt源配置成功（降级模式）"
             fi
+            
+            # 清理旧配置（如果存在）
+            if [[ -f /etc/apt/sources.list.d/nexttrace.list ]]; then
+                debug_log "清理旧的.list配置文件"
+                rm -f /etc/apt/sources.list.d/nexttrace.list 2>/dev/null || true
+            fi
+        else
+            debug_log "nexttrace apt源已存在，跳过配置"
         fi
         
         # 更新包列表并安装
