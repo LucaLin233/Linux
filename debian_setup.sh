@@ -325,38 +325,37 @@ download_module() {
     return 1
 }
 
-#--- 执行模块 --- 
-execute_module() { 
-    local module="$1" 
-    local module_file="$TEMP_DIR/${module}.sh" 
+#--- 执行模块 ---
+execute_module() {
+    local module="$1"
+    local module_file="$TEMP_DIR/${module}.sh"
     
     if [[ ! -f "$module_file" ]]; then
-        log "模块文件不存在: $module" "error" 
-        FAILED_MODULES+=("$module") 
+        log "模块文件不存在: $module" "error"
+        FAILED_MODULES+=("$module")
         return 1
     fi
     
-    log "执行模块: ${MODULES[$module]}" 
+    log "执行模块: ${MODULES[$module]}"
     
     local start_time
-    start_time=$(date +%s 2>/dev/null || echo "0") 
+    start_time=$(date +%s 2>/dev/null || echo "0")
     local exec_result=0
     
-    # 【修改点】关闭stdin，添加超时
-    timeout 600 bash "$module_file" < /dev/null || exec_result=$? 
+    bash "$module_file" || exec_result=$?
     
     local end_time
-    end_time=$(date +%s 2>/dev/null || echo "$start_time") 
-    local duration=$((end_time - start_time)) 
+    end_time=$(date +%s 2>/dev/null || echo "$start_time")
+    local duration=$((end_time - start_time))
     MODULE_EXEC_TIME[$module]=$duration
     
     if (( exec_result == 0 )); then
-        EXECUTED_MODULES+=("$module") 
-        log "模块 $module 执行成功 (${duration}s)" "success" 
+        EXECUTED_MODULES+=("$module")
+        log "模块 $module 执行成功 (${duration}s)" "success"
         return 0
     else
-        FAILED_MODULES+=("$module") 
-        log "模块 $module 执行失败 (${duration}s)" "error" 
+        FAILED_MODULES+=("$module")
+        log "模块 $module 执行失败 (${duration}s)" "error"
         return 1
     fi
 }
