@@ -626,56 +626,58 @@ show_update_summary() {
     return 0  
 }  
   
-main() {  
-    debug_log "开始自动更新系统配置"  
-    log "🔄 配置自动更新系统..." "info"  
-      
-    echo  
-    echo "功能: 定时自动更新系统软件包和安全补丁"  
-    echo "版本: v4.7.2 (修复dpkg冲突和锁问题)"  
-      
-    echo  
-    if ! ensure_cron_installed; then  
-        log "✗ cron服务配置失败" "error"  
-        exit 1  # 明确退出
-    fi  
-      
-    echo  
-    if ! create_update_script; then  
-        log "✗ 更新脚本创建失败" "error"  
-        exit 1  
-    fi  
-      
-    echo  
-    if ! setup_cron_job; then  
-        log "✗ 定时任务配置失败" "error"  
-        exit 1  
-    fi  
-      
-    echo  
-    test_update_script || true  
-      
-    show_update_summary  
-      
-    echo  
-    log "✅ 自动更新系统配置完成!" "info"  
-      
-    echo  
-    log "常用命令:" "info"  
-    echo "  手动执行: $UPDATE_SCRIPT"  
-    echo "  查看日志: tail -f $UPDATE_LOG"  
-    echo "  实时监控: watch -n1 'tail -20 $UPDATE_LOG'"  
-    echo "  管理任务: crontab -l"  
-    echo "  删除任务: crontab -l | grep -v '$UPDATE_SCRIPT' | crontab -"  
-    echo "  检查状态: dpkg -l | awk 'NR>5 {print \$1}' | sort | uniq -c"  
-    echo "  检查锁状态: lsof /var/lib/dpkg/lock-frontend"  
+main() {    
+    debug_log "开始自动更新系统配置"    
+    log "🔄 配置自动更新系统..." "info"    
+        
+    echo    
+    echo "功能: 定时自动更新系统软件包和安全补丁"    
+    echo "版本: v4.7.2 (修复dpkg冲突和锁问题)"    
+        
+    echo    
+    if ! ensure_cron_installed; then    
+        log "✗ cron服务配置失败" "error"    
+        return 1  # ← 改成 return
+    fi    
+        
+    echo    
+    if ! create_update_script; then    
+        log "✗ 更新脚本创建失败" "error"    
+        return 1  # ← 改成 return
+    fi    
+        
+    echo    
+    if ! setup_cron_job; then    
+        log "✗ 定时任务配置失败" "error"    
+        return 1  # ← 改成 return
+    fi    
+        
+    echo    
+    test_update_script || true    
+        
+    show_update_summary || true  # ← 加上 || true 更保险
+        
+    echo    
+    log "✅ 自动更新系统配置完成!" "info"    
+        
+    echo    
+    log "常用命令:" "info"    
+    echo "  手动执行: $UPDATE_SCRIPT"    
+    echo "  查看日志: tail -f $UPDATE_LOG"    
+    echo "  实时监控: watch -n1 'tail -20 $UPDATE_LOG'"    
+    echo "  管理任务: crontab -l"    
+    echo "  删除任务: crontab -l | grep -v '$UPDATE_SCRIPT' | crontab -"    
+    echo "  检查状态: dpkg -l | awk 'NR>5 {print \$1}' | sort | uniq -c"    
+    echo "  检查锁状态: lsof /var/lib/dpkg/lock-frontend"    
     echo "  检查进程: pgrep -a apt"
-}
-
-# 改进的 trap：只记录真正的错误，不影响正常退出
-trap 'exit_code=$?; if [[ $exit_code -ne 0 && $exit_code -ne 130 ]]; then log "脚本异常退出，行号: $LINENO，退出码: $exit_code" "error"; fi' ERR
-
-main "$@"
-
-# 明确成功退出
+    
+    return 0  # ← 明确返回成功
+}  
+  
+# 改进的 trap：只记录真正的错误，不影响正常退出  
+trap 'exit_code=$?; if [[ $exit_code -ne 0 && $exit_code -ne 130 ]]; then log "脚本异常退出，行号: $LINENO，退出码: $exit_code" "error"; fi' ERR  
+  
+main "$@"  
+  
+# 明确成功退出  
 exit 0
