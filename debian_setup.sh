@@ -918,45 +918,57 @@ main() {
         log "所有模块下载完成" "success"
     fi
     
-    # 执行模块
+    # 执行模块（调试版）
     echo
     echo "$LINE"
     log "开始执行模块"
     echo "$LINE"
     
+    echo "DEBUG: 准备执行模块..."
+    echo "DEBUG: SELECTED_MODULES = ${SELECTED_MODULES[*]}"
+    echo "DEBUG: 模块数量 = ${#SELECTED_MODULES[@]}"
+    
+    # 检查 MODULE_STATUS
+    echo "DEBUG: MODULE_STATUS 内容:"
+    for key in "${!MODULE_STATUS[@]}"; do
+        echo "  $key = ${MODULE_STATUS[$key]}"
+    done
+    
+    echo "DEBUG: 开始循环..."
+    
     local current=0
     local total=${#SELECTED_MODULES[@]}
-    local success_count=0
-    local failed_count=0
+    
+    set +e  # 临时关闭严格模式
     
     for module in "${SELECTED_MODULES[@]}"; do
+        echo "DEBUG: 进入循环，模块 = $module"
         current=$((current + 1))
+        echo "DEBUG: current = $current"
         
         # 跳过下载失败的模块
         if [[ "${MODULE_STATUS[$module]:-}" == "failed" ]]; then
+            echo "DEBUG: 跳过失败模块 $module"
             log "跳过模块 $module (下载失败)" "warn"
-            failed_count=$((failed_count + 1))
             continue
         fi
         
         echo
         echo "[$current/$total] 执行模块: ${MODULES[$module]}"
         
-        set +e
+        echo "DEBUG: 准备执行 execute_module $module"
         execute_module "$module"
         local result=$?
-        set -e
+        echo "DEBUG: execute_module 返回码 = $result"
         
-        if (( result == 0 )); then
-            success_count=$((success_count + 1))
-        else
-            failed_count=$((failed_count + 1))
-            log "模块 $module 执行失败，继续执行其他模块..." "warn"
+        if (( result != 0 )); then
+            log "模块 $module 执行失败" "warn"
         fi
     done
     
-    echo
-    log "模块执行完成: 成功 $success_count, 失败 $failed_count"
+    set -e  # 恢复严格模式
+    
+    echo "DEBUG: 循环结束"
     
     # 完成
     generate_summary
