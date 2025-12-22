@@ -538,41 +538,53 @@ setup_cron_job() {
     fi  
 }  
   
-test_update_script() {  
-    debug_log "询问是否测试更新脚本"  
-      
-    local test_choice  
-    read -p "是否测试自动更新脚本? [y/N] (默认: N): " -r test_choice || test_choice="N"  
-    test_choice=${test_choice:-N}  
-      
-    if [[ "$test_choice" =~ ^[Yy]$ ]]; then  
-        debug_log "用户选择测试脚本"  
-        echo "警告: 将执行真实的系统更新"  
-        local confirm  
-        read -p "确认继续? [y/N] (默认: N): " -r confirm || confirm="N"  
-        confirm=${confirm:-N}  
-          
-        if [[ "$confirm" =~ ^[Yy]$ ]]; then  
-            debug_log "开始执行测试脚本"  
-            echo "开始测试更新脚本..."  
-            echo "========================================="  
-            if "$UPDATE_SCRIPT"; then  
-                debug_log "测试脚本执行成功"  
-            else  
-                debug_log "测试脚本执行失败"  
-            fi  
-            echo "========================================="  
-            echo "测试完成，详细日志: $UPDATE_LOG"  
-        else  
-            echo "已取消测试"  
-            debug_log "用户取消测试"  
-        fi  
-    else  
-        echo "跳过脚本测试"  
-        debug_log "用户跳过脚本测试"  
-    fi  
-    return 0  
-}  
+test_update_script() {
+    debug_log "询问是否测试更新脚本"
+    
+    local test_choice
+    read -p "是否测试自动更新脚本? [y/N] (默认: N): " -r test_choice || test_choice="N"
+    test_choice=${test_choice:-N}
+    
+    if [[ "$test_choice" =~ ^[Yy]$ ]]; then
+        debug_log "用户选择测试脚本"
+        echo "警告: 将执行真实的系统更新"
+        local confirm
+        read -p "确认继续? [y/N] (默认: N): " -r confirm || confirm="N"
+        confirm=${confirm:-N}
+        
+        if [[ "$confirm" =~ ^[Yy]$ ]]; then
+            debug_log "开始执行测试脚本"
+            echo "开始测试更新脚本..."
+            echo "========================================="
+            
+            # 临时禁用错误退出，避免影响主流程
+            set +e
+            "$UPDATE_SCRIPT"
+            local test_exit_code=$?
+            set -e
+            
+            echo "========================================="
+            
+            if [[ $test_exit_code -eq 0 ]]; then
+                echo "✅ 测试执行成功，详细日志: $UPDATE_LOG"
+                debug_log "测试脚本执行成功"
+            else
+                echo "⚠️  测试完成但返回非零退出码 ($test_exit_code)"
+                echo "   详细日志: $UPDATE_LOG"
+                debug_log "测试脚本退出码: $test_exit_code"
+            fi
+        else
+            echo "已取消测试"
+            debug_log "用户取消测试"
+        fi
+    else
+        echo "跳过脚本测试"
+        debug_log "用户跳过脚本测试"
+    fi
+    
+    # 无论测试结果如何，都返回成功
+    return 0
+}
   
 show_update_summary() {  
     debug_log "显示自动更新配置摘要"  
@@ -614,53 +626,54 @@ show_update_summary() {
     return 0  
 }  
   
-main() {  
-    debug_log "开始自动更新系统配置"  
-    log "🔄 配置自动更新系统..." "info"  
-      
-    echo  
-    echo "功能: 定时自动更新系统软件包和安全补丁"  
-    echo "版本: v4.7.2 (修复dpkg冲突和锁问题)"  
-      
-    echo  
-    if ! ensure_cron_installed; then  
-        log "✗ cron服务配置失败" "error"  
-        return 1  
-    fi  
-      
-    echo  
-    if ! create_update_script; then  
-        log "✗ 更新脚本创建失败" "error"  
-        return 1  
-    fi  
-      
-    echo  
-    if ! setup_cron_job; then  
-        log "✗ 定时任务配置失败" "error"  
-        return 1  
-    fi  
-      
-    echo  
-    test_update_script  
-      
-    show_update_summary  
-      
-    echo  
-    log "✅ 自动更新系统配置完成!" "info"  
-      
-    echo  
-    log "常用命令:" "info"  
-    echo "  手动执行: $UPDATE_SCRIPT"  
-    echo "  查看日志: tail -f $UPDATE_LOG"  
-    echo "  实时监控: watch -n1 'tail -20 $UPDATE_LOG'"  
-    echo "  管理任务: crontab -l"  
-    echo "  删除任务: crontab -l | grep -v '$UPDATE_SCRIPT' | crontab -"  
-    echo "  检查状态: dpkg -l | awk 'NR>5 {print \\$1}' | sort | uniq -c"  
-    echo "  检查锁状态: lsof /var/lib/dpkg/lock-frontend"  
+main() {
+    debug_log "开始自动更新系统配置"
+    log "🔄 配置自动更新系统..." "info"
+    
+    echo
+    echo "功能: 定时自动更新系统软件包和安全补丁"
+    echo "版本: v4.7.2 (修复dpkg冲突和锁问题)"
+    
+    echo
+    if ! ensure_cron_installed; then
+        log "✗ cron服务配置失败" "error"
+        return 1
+    fi
+    
+    echo
+    if ! create_update_script; then
+        log "✗ 更新脚本创建失败" "error"
+        return 1
+    fi
+    
+    echo
+    if ! setup_cron_job; then
+        log "✗ 定时任务配置失败" "error"
+        return 1
+    fi
+    
+    echo
+    # 确保测试不影响主流程
+    test_update_script || true
+    
+    show_update_summary
+    
+    echo
+    log "✅ 自动更新系统配置完成!" "info"
+    
+    echo
+    log "常用命令:" "info"
+    echo "  手动执行: $UPDATE_SCRIPT"
+    echo "  查看日志: tail -f $UPDATE_LOG"
+    echo "  实时监控: watch -n1 'tail -20 $UPDATE_LOG'"
+    echo "  管理任务: crontab -l"
+    echo "  删除任务: crontab -l | grep -v '$UPDATE_SCRIPT' | crontab -"
+    echo "  检查状态: dpkg -l | awk 'NR>5 {print \$1}' | sort | uniq -c"
+    echo "  检查锁状态: lsof /var/lib/dpkg/lock-frontend"
     echo "  检查进程: pgrep -a apt"
-      
-    return 0  
-}  
+    
+    return 0
+}
   
 trap 'log "脚本执行出错，行号: $LINENO" "error"; exit 1' ERR  
   
