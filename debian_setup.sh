@@ -500,7 +500,7 @@ self_update() {
 #=============================================================================
 
 execute_module() {
-    local module="\$1"
+    local module="$1"
     local module_file="$TEMP_DIR/${module}.sh"
     
     if [[ ! -f "$module_file" ]]; then
@@ -540,12 +540,12 @@ execute_module() {
 
 get_basic_info() {
     local cpu_cores=$(nproc 2>/dev/null || echo "未知")
-    local mem_info=$(get_info free -h | grep Mem | awk '{print \$3"/"\$2}')
-    local disk_usage=$(get_info df -h / | awk 'NR==2 {print \$5}')
+    local mem_info=$(get_info free -h | grep Mem | awk '{print $3"/"$2}')
+    local disk_usage=$(get_info df -h / | awk 'NR==2 {print $5}')
     local uptime_info=$(get_info uptime -p)
     local kernel=$(get_info uname -r)
     
-    echo "💻 CPU: ${cpu_cores}核心 \vert{} 内存: $mem_info | 磁盘: $disk_usage"
+    echo "💻 CPU: ${cpu_cores}核心 | 内存: $mem_info | 磁盘: $disk_usage"
     echo "⏰ 运行时间: $uptime_info"
     echo "🔧 内核: $kernel"
 }
@@ -556,7 +556,7 @@ get_zsh_status() {
         return
     fi
     
-    local zsh_version=$(get_info zsh --version | awk '{print \$2}')
+    local zsh_version=$(get_info zsh --version | awk '{print $2}')
     local root_shell=$(getent passwd root 2>/dev/null | cut -d: -f7)
     
     if [[ "$root_shell" == "$(which zsh 2>/dev/null)" ]]; then
@@ -572,14 +572,14 @@ get_docker_status() {
         return
     fi
     
-    local docker_version=$(get_info docker --version | awk '{print \$3}' | tr -d ',')
+    local docker_version=$(get_info docker --version | awk '{print $3}' | tr -d ',')
     local containers_count=$(get_info docker ps -q | wc -l)
     local images_count=$(get_info docker images -q | wc -l)
     
     if systemctl is-active --quiet docker 2>/dev/null; then
-        echo "🐳 Docker: v$docker_version (运行中) \vert{} 容器: $containers_count | 镜像: $images_count"
+        echo "🐳 Docker: v$docker_version (运行中) | 容器: $containers_count | 镜像: $images_count"
     else
-        echo "🐳 Docker: v$docker_version (已安装但未运行) \vert{} 容器: $containers_count | 镜像: $images_count"
+        echo "🐳 Docker: v$docker_version (已安装但未运行) | 容器: $containers_count | 镜像: $images_count"
     fi
 }
 
@@ -608,14 +608,14 @@ get_tools_status() {
 }
 
 get_ssh_status() {
-    local ssh_port=$(grep "^Port " /etc/ssh/sshd_config 2>/dev/null | awk '{print \$2}' || echo "22")
-    local ssh_root_login=$(grep "^PermitRootLogin " /etc/ssh/sshd_config 2>/dev/null | awk '{print \$2}' || echo "默认")
-    echo "🔒 SSH: 端口=$ssh_port \vert{} Root登录=$ssh_root_login"
+    local ssh_port=$(grep "^Port " /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}' || echo "22")
+    local ssh_root_login=$(grep "^PermitRootLogin " /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}' || echo "默认")
+    echo "🔒 SSH: 端口=$ssh_port | Root登录=$ssh_root_login"
 }
 
 get_network_info() {
-    local network_ip=$(get_info hostname -I | awk '{print \$1}')
-    local network_interface=$(get_info ip route | grep default | awk '{print \$5}' | head -1)
+    local network_ip=$(get_info hostname -I | awk '{print $1}')
+    local network_interface=$(get_info ip route | grep default | awk '{print $5}' | head -1)
     echo "🌐 网络: $network_ip via $network_interface"
 }
 
@@ -664,13 +664,13 @@ generate_summary() {
 📋 基本信息:
    🔢 脚本版本: $SCRIPT_VERSION
    📅 部署时间: $(date '+%Y-%m-%d %H:%M:%S %Z')
-   ⏱️  总耗时: ${total_time}秒 \vert{} 平均耗时: ${avg_time}秒/模块
+   ⏱️  总耗时: ${total_time}秒 | 平均耗时: ${avg_time}秒/模块
    🏠 主机名: $(hostname)
    💻 系统: $(grep 'PRETTY_NAME' /etc/os-release 2>/dev/null | cut -d= -f2 | tr -d '"' || echo 'Debian')
-   🌐 IP地址: $(hostname -I 2>/dev/null | awk '{print \$1}' || echo '未知')
+   🌐 IP地址: $(hostname -I 2>/dev/null | awk '{print $1}' || echo '未知')
 
 📊 执行统计:
-   📦 总模块: $total_modules \vert{} ✅ 成功: $success_count | ❌ 失败: $failed_count \vert{} 📈 成功率: ${success_rate}%
+   📦 总模块: $total_modules | ✅ 成功: $success_count | ❌ 失败: $failed_count | 📈 成功率: ${success_rate}%
 
 EOF
 
@@ -714,7 +714,7 @@ EOF
         echo "总耗时: ${total_time}秒"
         echo "主机: $(hostname)"
         echo "系统: $(grep 'PRETTY_NAME' /etc/os-release 2>/dev/null | cut -d= -f2 | tr -d '"' || echo 'Debian')"
-        echo "IP地址: $(hostname -I 2>/dev/null | awk '{print \$1}' || echo '未知')"
+        echo "IP地址: $(hostname -I 2>/dev/null | awk '{print $1}' || echo '未知')"
         echo ""
         echo "执行统计:"
         echo "总模块: $total_modules, 成功: $success_count, 失败: $failed_count, 成功率: ${success_rate}%"
@@ -759,11 +759,11 @@ show_recommendations() {
     
     # SSH 安全提醒
     if [[ "${MODULE_STATUS[ssh-security]:-}" == "success" ]]; then
-        local new_ssh_port=$(grep "^Port " /etc/ssh/sshd_config 2>/dev/null | awk '{print \$2}' || echo "22")
+        local new_ssh_port=$(grep "^Port " /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}' || echo "22")
         if [[ "$new_ssh_port" != "22" ]]; then
             echo
             echo "⚠️  重要: SSH端口已更改为 $new_ssh_port"
-            echo "   新连接: ssh -p $new_ssh_port user@$(hostname -I | awk '{print \$1}')"
+            echo "   新连接: ssh -p $new_ssh_port user@$(hostname -I | awk '{print $1}')"
         fi
     fi
     
@@ -782,7 +782,7 @@ show_help() {
     cat << EOF
 Debian 系统部署脚本 v$SCRIPT_VERSION
 
-用法: \$0 [选项]
+用法: $0 [选项]
 
 选项:
   --check-status    查看部署状态
@@ -805,7 +805,7 @@ EOF
 
 handle_arguments() {
     while [[ $# -gt 0 ]]; do
-        case \$1 in
+        case $1 in
             --check-status)
                 if [[ -f "$SUMMARY_FILE" ]]; then
                     cat "$SUMMARY_FILE"
@@ -823,7 +823,7 @@ handle_arguments() {
                 exit 0
                 ;;
             *)
-                echo "❌ 未知参数: \$1"
+                echo "❌ 未知参数: $1"
                 echo "使用 --help 查看帮助"
                 exit 1
                 ;;
