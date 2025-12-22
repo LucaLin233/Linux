@@ -420,54 +420,70 @@ self_update() {
     log "检查脚本更新..."
     
     # 获取最新 commit
-    local latest_commit=$(get_latest_commit)
+    local latest_commit
+    latest_commit=$(curl -s --connect-timeout 5 --max-time 10 \
+        "https://api.github.com/repos/LucaLin233/Linux/commits/main" 2>/dev/null | \
+        grep '"sha"' | head -1 | cut -d'"' -f4 | cut -c1-7 2>/dev/null)
     
-    if [[ "$latest_commit" == "main" ]]; then
+    if [[ -z "$latest_commit" || ${#latest_commit} -ne 7 ]]; then
         log "无法获取最新版本信息，跳过更新检查" "warn"
         return 0
     fi
     
+    log "最新 commit: $latest_commit"
+    
     local temp_script="/tmp/debian_setup_latest.sh"
-    local script_url="$MODULE_BASE_URL/$latest_commit/debian_setup.sh"
+    local script_url="https://raw.githubusercontent.com/LucaLin233/Linux/$latest_commit/debian_setup.sh"
     
-    # 下载最新版本
-    if ! download_with_retry "$script_url" "$temp_script"; then
-        log "无法下载最新版本，继续使用当前版本" "warn"
-        return 0
-    fi
-    
-    # 提取远程版本号
-    local remote_version=$(grep "^readonly SCRIPT_VERSION=" "$temp_script" 2>/dev/null | cut -d'"' -f2)
-    
-    if [[ -z "$remote_version" ]]; then
-        log "无法识别远程版本，跳过更新" "warn"
-        rm -f "$temp_script"
-        return 0
-    fi
-    
-    # 比较版本
-    if [[ "$remote_version" == "$SCRIPT_VERSION" ]]; then
-        log "已是最新版本: $SCRIPT_VERSION"
-        rm -f "$temp_script"
-        return 0
-    fi
-    
-    # 发现新版本
-    echo
-    log "发现新版本: $remote_version (当前: $SCRIPT_VERSION)" "warn"
-    read -p "是否更新并重新运行? [Y/n]: " -r choice
-    choice="${choice:-Y}"
-    
-    if [[ "$choice" =~ ^[Yy]$ ]]; then
-        log "更新脚本到 v$remote_version..."
-        chmod +x "$temp_script"
+    # 直接用 curl，不用 download_with_retry（避免检查问题）
+    if curl -fsSL --connect-timeout 10 --max-time 30 "$script_url" -o "$temp_script" 2>/dev/null; then
+        # 检查文件是否下载成功
+        if [[ ! -s "$temp_script" ]]; then
+            log "下载的文件为空，跳过更新" "warn"
+            rm -f "$temp_script"
+            return 0
+        fi
         
-        # 保存当前参数并重新执行新版本
-        log "重新启动脚本..." "success"
-        exec bash "$temp_script" "$@"
+        # 检查是否是有效的 bash 脚本
+        if ! head -1 "$temp_script" | grep -q "^#!/bin/bash" 2>/dev/null; then
+            log "下载的文件格式不正确，跳过更新" "warn"
+            rm -f "$temp_script"
+            return 0
+        fi
+        
+        # 提取远程版本号
+        local remote_version=$(grep "^readonly SCRIPT_VERSION=" "$temp_script" 2>/dev/null | cut -d'"' -f2)
+        
+        if [[ -z "$remote_version" ]]; then
+            log "无法识别远程版本，跳过更新" "warn"
+            rm -f "$temp_script"
+            return 0
+        fi
+        
+        # 比较版本
+        if [[ "$remote_version" == "$SCRIPT_VERSION" ]]; then
+            log "已是最新版本: $SCRIPT_VERSION"
+            rm -f "$temp_script"
+            return 0
+        fi
+        
+        # 发现新版本
+        echo
+        log "发现新版本: $remote_version (当前: $SCRIPT_VERSION)" "warn"
+        read -p "是否更新并重新运行? [Y/n]: " -r choice
+        choice="${choice:-Y}"
+        
+        if [[ "$choice" =~ ^[Yy]$ ]]; then
+            log "更新脚本到 v$remote_version..."
+            chmod +x "$temp_script"
+            log "重新启动脚本..." "success"
+            exec bash "$temp_script" "$@"
+        else
+            log "跳过更新，继续使用 v$SCRIPT_VERSION"
+            rm -f "$temp_script"
+        fi
     else
-        log "跳过更新，继续使用 v$SCRIPT_VERSION"
-        rm -f "$temp_script"
+        log "无法下载最新版本，继续使用当前版本" "warn"
     fi
 }
 
