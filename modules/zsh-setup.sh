@@ -152,55 +152,59 @@ configure_zshrc() {
         return 1  
     fi  
       
-    debug_log "写入.zshrc配置文件"   
-    if ! cat > "$HOME/.zshrc" << 'EOF'; then  
-# Oh My Zsh 配置  
-export ZSH="$HOME/.oh-my-zsh"   
-ZSH_THEME="powerlevel10k/powerlevel10k"   
-  
-# 禁用自动更新提示  
-DISABLE_UPDATE_PROMPT="true"   
-UPDATE_ZSH_DAYS=7  
-  
-plugins=(   
-    git  
-    zsh-autosuggestions  
-    zsh-syntax-highlighting  
-    zsh-completions  
-    sudo  
-    docker  
-    kubectl  
-    web-search  
-    history  
-    colored-man-pages  
-    command-not-found  
-)   
-  
-source $ZSH/oh-my-zsh.sh  
-autoload -U compinit && compinit  
-# Zsh 脚本修复：确保 ~/.local/bin 在 PATH 末尾，系统工具优先
-export PATH="$PATH:$HOME/.local/bin" 
-  
-# mise 版本管理器配置 (使用安全的 init -s 模式，只注入 Shell 函数和补全，不劫持 PATH)  
-command -v mise >/dev/null 2>&1 && eval "$(mise init -s zsh)"   
-  
-# Powerlevel10k 配置  
-[[ ! -f ~/.p10k.zsh ]] || source ~/.p10k.zsh  
-  
-# 实用别名  
-alias upgrade='apt update && apt full-upgrade -y'   
-alias update='apt update -y'   
-alias reproxy='cd /root/proxy && docker compose down && docker compose pull && docker compose up -d --remove-orphans'   
-alias dlog='docker logs -f'   
-alias autodel='docker system prune -a -f && apt autoremove -y && apt clean'   
-alias sstop='systemctl stop'   
-alias sre='systemctl restart'   
-alias sst='systemctl status'   
-alias sdre='systemctl daemon-reload'   
-EOF
+    debug_log "使用printf写入.zshrc配置文件"
+    local zshrc_content=(
+"# Oh My Zsh 配置"
+"export ZSH=\"\$HOME/.oh-my-zsh\""
+"ZSH_THEME=\"powerlevel10k/powerlevel10k\""
+
+"# 禁用自动更新提示"
+"DISABLE_UPDATE_PROMPT=\"true\""
+"UPDATE_ZSH_DAYS=7"
+
+"plugins=("
+"    git"
+"    zsh-autosuggestions"
+"    zsh-syntax-highlighting"
+"    zsh-completions"
+"    sudo"
+"    docker"
+"    kubectl"
+"    web-search"
+"    history"
+"    colored-man-pages"
+"    command-not-found"
+")"
+
+"source \$ZSH/oh-my-zsh.sh"
+"autoload -U compinit && compinit"
+
+"# Zsh 脚本修复：确保 ~/.local/bin 在 PATH 末尾，系统工具优先"
+"export PATH=\"\$PATH:\$HOME/.local/bin\""
+
+"# mise 版本管理器配置 (使用安全的 init -s 模式)"
+"command -v mise >/dev/null 2>&1 && eval \"\$(mise init -s zsh)\""
+
+"# Powerlevel10k 配置"
+"[[ ! -f ~/.p10k.zsh ]] || source ~/.p10k.zsh"
+
+"# 实用别名"
+"alias upgrade='apt update && apt full-upgrade -y'"
+"alias update='apt update -y'"
+"alias reproxy='cd /root/proxy && docker compose down && docker compose pull && docker compose up -d --remove-orphans'"
+"alias dlog='docker logs -f'"
+"alias autodel='docker system prune -a -f && apt autoremove -y && apt clean'"
+"alias sstop='systemctl stop'"
+"alias sre='systemctl restart'"
+"alias sst='systemctl status'"
+"alias sdre='systemctl daemon-reload'"
+)
+
+    # 写入文件
+    if ! printf "%s\n" "${zshrc_content[@]}" > "$HOME/.zshrc"; then
         log ".zshrc配置写入失败" "error"   
         return 1  
-    fi  
+    fi
       
     debug_log ".zshrc配置完成"   
     return 0  
