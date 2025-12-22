@@ -429,13 +429,11 @@ download_module() {
 self_update() {
     log "检查脚本更新..."
     
-    # 获取最新 commit
+    # 使用改进的 get_latest_commit 函数
     local latest_commit
-    latest_commit=$(curl -s --connect-timeout 5 --max-time 10 \
-        "https://api.github.com/repos/LucaLin233/Linux/commits/main" 2>/dev/null | \
-        grep '"sha"' | head -1 | cut -d'"' -f4 | cut -c1-7 2>/dev/null)
+    latest_commit=$(get_latest_commit)
     
-    if [[ -z "$latest_commit" || ${#latest_commit} -ne 7 ]]; then
+    if [[ "$latest_commit" == "main" ]]; then
         log "无法获取最新版本信息，跳过更新检查" "warn"
         return 0
     fi
@@ -447,6 +445,26 @@ self_update() {
     if [[ "$latest_commit" == "$SCRIPT_COMMIT" ]]; then
         log "已是最新版本 (commit: $SCRIPT_COMMIT)"
         return 0
+    fi
+    
+    # ===== 新增：检查本地缓存 =====
+    local cache_dir="/var/cache/debian-setup"
+    local cached_script="$cache_dir/debian_setup_${latest_commit}.sh"
+    
+    # 如果缓存存在且有效，直接使用
+    if [[ -f "$cached_script" ]] && [[ -s "$cached_script" ]]; then
+        log "使用缓存的脚本 (commit: $latest_commit)"
+        
+        # 验证缓存文件
+        if head -1 "$cached_script" | grep -qE "^#!/bin/(bash|sh)" 2>/dev/null; then
+            chmod +x "$cached_script"
+            
+            log "重新启动脚本..." "success"
+            exec bash "$cached_script" "${FILTERED_ARGS[@]}"
+        else
+            log "缓存文件损坏，重新下载" "warn"
+            rm -f "$cached_script"
+        fi
     fi
     
     # 下载最新版本
@@ -490,11 +508,32 @@ self_update() {
     
     if [[ "$choice" =~ ^[Yy]$ ]]; then
         log "更新脚本..."
-        chmod +x "$temp_script"
         
+        # 在脚本中嵌入 commit hash
+        sed -i "13a SCRIPT_COMMIT=\"$latest_commit\"" "$temp_script"
+        
+        # ===== 保存到缓存目录 =====
+        mkdir -p "$cache_dir" 2>/dev/null || true
+        
+        if [[ -d "$cache_dir" ]]; then
+            chmod +x "$temp_script"
+            cp "$temp_script" "$cached_script" 2>/dev/null || true
+            
+            # 清理旧缓存（保留最近3个版本）
+            ls -t "$cache_dir"/debian_setup_*.sh 2>/dev/null | tail -n +4 | xargs rm -f 2>/dev/null || true
+            
+            log "脚本已缓存到: $cached_script"
+        fi
+        
+        log "脚本已更新到 v$remote_version (commit: $latest_commit)" "success"
         log "重新启动脚本..." "success"
-        # 只传递过滤后的参数，避免重复传递 --internal-commit
-        exec bash "$temp_script" --internal-commit="$latest_commit" "${FILTERED_ARGS[@]}"
+        
+        # 使用缓存的脚本执行
+        if [[ -f "$cached_script" ]]; then
+            exec bash "$cached_script" "${FILTERED_ARGS[@]}"
+        else
+            exec bash "$temp_script" "${FILTERED_ARGS[@]}"
+        fi
     else
         log "跳过更新，继续使用当前版本"
         rm -f "$temp_script"
@@ -799,6 +838,7 @@ Debian 系统部署脚本 v$SCRIPT_VERSION
 
 选项:
   --check-status    查看部署状态
+  --clean-cache     清理脚本缓存
   --help, -h        显示帮助信息
   --version, -v     显示版本信息
 
@@ -809,6 +849,7 @@ Debian 系统部署脚本 v$SCRIPT_VERSION
 文件位置:
   日志: $LOG_FILE
   摘要: $SUMMARY_FILE
+  缓存: /var/cache/debian-setup/
 EOF
 }
 
@@ -823,10 +864,15 @@ handle_arguments() {
     while [[ $# -gt 0 ]]; do
         case $1 in
             --internal-commit=*)
-                # 内部参数：用于传递 commit hash，不传递给后续
                 SCRIPT_COMMIT="${1#*=}"
                 readonly SCRIPT_COMMIT
                 shift
+                ;;
+            --clean-cache)
+                log "清理脚本缓存..."
+                rm -rf /var/cache/debian-setup/ 2>/dev/null || true
+                log "缓存已清理" "success"
+                exit 0
                 ;;
             --check-status)
                 if [[ -f "$SUMMARY_FILE" ]]; then
@@ -846,7 +892,6 @@ handle_arguments() {
                 exit 0
                 ;;
             *)
-                # 保存其他参数
                 FILTERED_ARGS+=("$1")
                 shift
                 ;;
