@@ -835,8 +835,89 @@ handle_arguments() {
 #=============================================================================
 # 主程序
 #=============================================================================
-
-# 执行模块
+main() {  
+    handle_arguments "$@"  
+      
+    # 初始化  
+    init_logging  
+    mkdir -p "$TEMP_DIR" 2>/dev/null || true  
+    TOTAL_START_TIME=$(date +%s)  
+      
+    # 启动  
+    clear 2>/dev/null || true  
+    echo "$LINE"  
+    echo "Debian 系统部署脚本 v$SCRIPT_VERSION"  
+    echo "$LINE"  
+      
+    # ===== 新增：自我更新检查 =====  
+    self_update "$@"  
+    echo  
+      
+    # 检查和准备  
+    pre_check  
+    install_dependencies  
+    system_update  
+      
+    # 获取最新代码版本（只调用一次）  
+    log "获取 GitHub 最新代码版本..."  
+    LATEST_COMMIT=$(get_latest_commit)  
+    readonly LATEST_COMMIT  
+    log "当前版本: $LATEST_COMMIT"  
+      
+    # 模块选择  
+    select_deployment_mode  
+      
+    if (( ${#SELECTED_MODULES[@]} == 0 )); then  
+        log "未选择任何模块，退出" "warn"  
+        exit 0  
+    fi  
+      
+    resolve_dependencies  
+      
+    echo  
+    echo "最终执行计划: ${SELECTED_MODULES[*]}"  
+    read -p "确认执行? [Y/n]: " -r choice  
+    choice="${choice:-Y}"  
+    [[ "$choice" =~ ^[Yy]$ ]] || exit 0  
+      
+    # 下载模块  
+    echo  
+    echo "$LINE"  
+    log "开始下载 ${#SELECTED_MODULES[@]} 个模块"  
+    echo "$LINE"  
+      
+    local download_failed=0  
+    local downloaded=0  
+      
+    for module in "${SELECTED_MODULES[@]}"; do  
+        downloaded=$((downloaded + 1))  # ← 改用这种方式，更安全  
+        echo  
+        echo "[$downloaded/${#SELECTED_MODULES[@]}] 下载模块: $module"  
+          
+        set +e  # 临时关闭严格模式  
+        download_module "$module"  
+        local result=$?  
+        set -e  # 恢复严格模式  
+          
+        if (( result == 0 )); then  
+            log "✓ $module 下载成功"  
+        else  
+            MODULE_STATUS[$module]="failed"  
+            download_failed=$((download_failed + 1))  
+            log "✗ $module 下载失败" "error"  
+        fi  
+    done  
+      
+    echo  
+    if (( download_failed > 0 )); then  
+        log "有 $download_failed 个模块下载失败" "warn"  
+        read -p "是否继续执行已下载的模块? [y/N]: " -r choice  
+        [[ "$choice" =~ ^[Yy]$ ]] || exit 1  
+    else  
+        log "所有模块下载完成" "success"  
+    fi  
+      
+    # 执行模块
     echo
     echo "$LINE"
     log "开始执行模块"
