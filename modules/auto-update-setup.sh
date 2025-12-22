@@ -169,22 +169,16 @@ log_update() {
     echo "[$timestamp] $msg" | tee -a "$LOGFILE"  
 }  
 
-# === 关键修复：彻底的锁管理 ===
 stop_conflicting_services() {
     log_update "停止可能冲突的自动更新服务..."
     
-    # 停止定时器
     systemctl stop apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true
     systemctl disable apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true
     
-    # 停止正在运行的服务
     systemctl stop apt-daily.service apt-daily-upgrade.service 2>/dev/null || true
     systemctl kill --kill-who=all apt-daily.service apt-daily-upgrade.service 2>/dev/null || true
     
-    # 停止 unattended-upgrades
     systemctl stop unattended-upgrades 2>/dev/null || true
-    
-    # 停止 packagekit
     systemctl stop packagekit 2>/dev/null || true
     
     log_update "等待所有 apt/dpkg 进程结束..."
@@ -214,14 +208,12 @@ wait_for_dpkg() {
     while [[ $waited -lt $MAX_WAIT_LOCK ]]; do
         local locked=false
         
-        # 使用 lsof 更可靠
         if lsof /var/lib/dpkg/lock-frontend 2>/dev/null | grep -q dpkg || \
            lsof /var/lib/apt/lists/lock 2>/dev/null | grep -q apt || \
            lsof /var/cache/apt/archives/lock 2>/dev/null | grep -q apt; then
             locked=true
         fi
         
-        # 检查进程
         if pgrep -x "apt-get|apt|dpkg" >/dev/null 2>&1; then
             locked=true
         fi
@@ -236,7 +228,6 @@ wait_for_dpkg() {
         waited=$((waited + LOCK_CHECK_INTERVAL))
     done
     
-    # 超时后强制清理
     log_update "警告: 等待超时，强制清理锁文件..."
     
     pkill -9 -x apt-get || true
@@ -259,13 +250,11 @@ ensure_packages_configured() {
       
     wait_for_dpkg  
     
-    # 不要吞掉错误
     log_update "执行 dpkg --configure -a..."
     if ! dpkg --configure -a 2>&1 | tee -a "$LOGFILE"; then  
         log_update "警告: dpkg 配置失败，检查问题包..."
         
-        # 找出问题包
-        local broken_pkgs=$(dpkg -l 2>/dev/null \vert{} awk '$1 ~ /^i[UFH]/ {print $2}')
+        local broken_pkgs=$(dpkg -l 2>/dev/null | awk '$1 ~ /^i[UFH]/ {print $2}')
         
         if [[ -n "$broken_pkgs" ]]; then
             log_update "发现配置异常的包，尝试修复..."
@@ -275,47 +264,43 @@ ensure_packages_configured() {
                 
                 wait_for_dpkg
                 
-                # 先尝试重装
                 if timeout 300 apt-get install --reinstall $APT_OPTIONS "$pkg" 2>&1 | tee -a "$LOGFILE"; then
                     log_update "✓ 重装成功: $pkg"
                 else
                     log_update "重装失败，尝试删除: $pkg"
                     wait_for_dpkg
-                    apt-get purge -y --force-yes "$pkg" 2>&1 \vert{} tee -a "$LOGFILE" || true
+                    apt-get purge -y --force-yes "$pkg" 2>&1 | tee -a "$LOGFILE" || true
                 fi
                 
                 sleep 2
             done
         fi
         
-        # 再次尝试配置
         wait_for_dpkg
         dpkg --configure -a 2>&1 | tee -a "$LOGFILE" || true
     fi  
       
     wait_for_dpkg  
     
-    # 修复依赖
     log_update "修复依赖关系..."
-    if ! apt-get install -f $APT_OPTIONS 2>&1 \vert{} tee -a "$LOGFILE"; then  
+    if ! apt-get install -f $APT_OPTIONS 2>&1 | tee -a "$LOGFILE"; then  
         log_update "警告: 依赖修复出现问题，重试..."
         sleep 5  
         wait_for_dpkg
-        apt-get install -f $APT_OPTIONS 2>&1 \vert{} tee -a "$LOGFILE" || true  
+        apt-get install -f $APT_OPTIONS 2>&1 | tee -a "$LOGFILE" || true  
     fi  
       
     wait_for_dpkg  
       
     log_update "包状态统计:"  
-    local status_summary=$(dpkg -l 2>/dev/null \vert{} awk 'NR>5 && $1 ~ /^[a-z]/ {print $1}' | sort | uniq -c)  
+    local status_summary=$(dpkg -l 2>/dev/null | awk 'NR>5 && $1 ~ /^[a-z]/ {print $1}' | sort | uniq -c)  
     if [[ -n "$status_summary" ]]; then  
         echo "$status_summary" | while read count status; do  
             log_update "  $count [$status]"  
         done  
     fi  
     
-    # 清理残留配置 - 改进版
-    local rc_count=$(dpkg -l 2>/dev/null \vert{} awk '$1 == "rc"' | wc -l)
+    local rc_count=$(dpkg -l 2>/dev/null | awk '$1 == "rc"' | wc -l)
     if [[ $rc_count -gt 0 ]]; then
         log_update "发现 $rc_count 个残留配置文件"
         
@@ -323,7 +308,6 @@ ensure_packages_configured() {
             log_update "批量清理残留配置..."
             wait_for_dpkg
             
-            # 使用 xargs 批量处理，更安全
             dpkg -l 2>/dev/null | awk '$1 == "rc" {print $2}' | \
                 xargs -r -n 10 dpkg --purge --force-all 2>&1 | tee -a "$LOGFILE" || true
             
@@ -335,7 +319,7 @@ ensure_packages_configured() {
 }  
   
 check_boot_space() {  
-    local boot_usage=$(df /boot 2>/dev/null \vert{} tail -1 \vert{} awk '{print $5}' | sed 's/%//' || echo 0)  
+    local boot_usage=$(df /boot 2>/dev/null | tail -1 | awk '{print $5}' | sed 's/%//' || echo 0)  
       
     log_update "/boot 空间使用率: ${boot_usage}%"  
       
@@ -345,7 +329,7 @@ check_boot_space() {
         local current_kernel=$(uname -r)  
         log_update "当前内核: $current_kernel"  
           
-        local all_kernels=$(dpkg -l \vert{} grep '^ii' \vert{} grep 'linux-image-[0-9]' \vert{} awk '{print $2}' | sort -V)  
+        local all_kernels=$(dpkg -l | grep '^ii' | grep 'linux-image-[0-9]' | awk '{print $2}' | sort -V)  
         local kernel_count=$(echo "$all_kernels" | wc -l)  
           
         log_update "已安装内核数量: $kernel_count"  
@@ -357,7 +341,7 @@ check_boot_space() {
           
         wait_for_dpkg  
           
-        echo "$all_kernels" \vert{} grep -v "$current_kernel" | head -n -2 | while read old_kernel; do  
+        echo "$all_kernels" | grep -v "$current_kernel" | head -n -2 | while read old_kernel; do  
             [[ -z "$old_kernel" ]] && continue  
             log_update "准备移除旧内核: $old_kernel"  
               
@@ -374,7 +358,7 @@ check_boot_space() {
           
         wait_for_dpkg  
           
-        boot_usage=$(df /boot 2>/dev/null \vert{} tail -1 \vert{} awk '{print $5}' | sed 's/%//' || echo 0)  
+        boot_usage=$(df /boot 2>/dev/null | tail -1 | awk '{print $5}' | sed 's/%//' || echo 0)  
         log_update "/boot 清理后使用率: ${boot_usage}%"  
     else  
         log_update "/boot 空间充足，无需清理"  
@@ -444,7 +428,6 @@ main() {
     log_update "内核: $(uname -r)"  
     log_update "脚本版本: v4.7.2"  
     
-    # === 关键：先停止所有冲突服务 ===
     stop_conflicting_services
     sleep 5
       
@@ -467,13 +450,13 @@ main() {
     wait_for_dpkg  
       
     log_update "升级系统软件包..."  
-    if ! DEBIAN_FRONTEND=noninteractive apt-get dist-upgrade $APT_OPTIONS 2>&1 \vert{} tee -a "$LOGFILE"; then  
+    if ! DEBIAN_FRONTEND=noninteractive apt-get dist-upgrade $APT_OPTIONS 2>&1 | tee -a "$LOGFILE"; then  
         log_update "警告: 系统升级出现问题，尝试修复..."  
         sleep 5  
         wait_for_dpkg  
-        apt-get install -f $APT_OPTIONS 2>&1 \vert{} tee -a "$LOGFILE" || true  
+        apt-get install -f $APT_OPTIONS 2>&1 | tee -a "$LOGFILE" || true  
         wait_for_dpkg  
-        DEBIAN_FRONTEND=noninteractive apt-get dist-upgrade $APT_OPTIONS 2>&1 \vert{} tee -a "$LOGFILE" || true  
+        DEBIAN_FRONTEND=noninteractive apt-get dist-upgrade $APT_OPTIONS 2>&1 | tee -a "$LOGFILE" || true  
     fi  
       
     log_update "--- 第三阶段: 清理验证 ---"  
@@ -497,34 +480,32 @@ main() {
     wait_for_dpkg  
       
     log_update "清理不需要的软件包..."  
-    apt-get autoremove $APT_OPTIONS 2>&1 \vert{} tee -a "$LOGFILE" || true  
+    apt-get autoremove $APT_OPTIONS 2>&1 | tee -a "$LOGFILE" || true  
       
     wait_for_dpkg  
       
     log_update "清理软件包缓存..."  
     apt-get autoclean 2>&1 | tee -a "$LOGFILE" || true  
     
-    # 重新启用自动更新服务
     log_update "恢复系统自动更新服务..."
     systemctl enable apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true
     systemctl start unattended-upgrades 2>/dev/null || true
       
     log_update "=== 自动更新完成 ==="  
 }  
-  
-# 确保退出时恢复服务
+
 trap 'systemctl start unattended-upgrades 2>/dev/null || true; systemctl enable apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true' EXIT
 
 trap 'log_update "✗ 更新过程中发生错误（行号: $LINENO）"' ERR  
   
 main "$@"
-EOF  
+EOF
       
     chmod +x "$UPDATE_SCRIPT"  
     echo "更新脚本: 创建完成"  
     debug_log "自动更新脚本创建成功"  
     return 0  
-}  
+}
   
 setup_cron_job() {  
     debug_log "开始配置Cron任务"  
