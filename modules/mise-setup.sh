@@ -147,54 +147,57 @@ ensure_system_python() {
     fi
 }
 
-# 检测当前Python链接状态
-detect_python_status() {
-    debug_log "检测Python状态"
-    ensure_system_python || { debug_log "系统Python不可用"; return 1; }
+# 检测当前Python链接状态  
+detect_python_status() {  
+    debug_log "检测Python状态"  
+    ensure_system_python || { debug_log "系统Python不可用"; return 1; }  
+      
+    local link_status="正常" path_priority="正常" is_hijacked=false  
+    local needs_shell_fix=false # 引入一个标志来标记shell配置需要修复  
+      
+    # 检查系统链接是否被直接劫持  
+    if [[ -L /usr/bin/python3 ]]; then  
+        local python3_target=$(readlink /usr/bin/python3 2>/dev/null || echo "")  
+        if [[ -n "$python3_target" && "$python3_target" == *"mise"* ]]; then  
+            link_status="劫持"  
+            is_hijacked=true  
+            debug_log "检测到系统Python链接被劫持: $python3_target"  
+        fi  
+    fi  
+
+    # 检查PATH优先级 (更保守地只检查启动文件)
+    # 目的: 检测是否在启动文件中配置了高优先级的全局 mise PATH，这会劫持系统工具
+    local check_files=("$HOME/.bashrc" "$HOME/.zshrc")
     
-    local link_status="正常" path_priority="正常" is_hijacked=false
-    
-    # 检查系统链接是否被直接劫持
-    if [[ -L /usr/bin/python3 ]]; then
-        local python3_target=$(readlink /usr/bin/python3 2>/dev/null || echo "")
-        if [[ -n "$python3_target" && "$python3_target" == *"mise"* ]]; then
-            link_status="劫持"
-            is_hijacked=true
-            debug_log "检测到系统Python链接被劫持"
+    for config_file in "${check_files[@]}"; do
+        if [[ -f "$config_file" ]]; then
+            # 查找是否有非 mise activate 导致的 PATH 劫持，例如设置了 ~/.local/bin 为高优先级，或者直接在启动文件中使用了 mise exec
+            if grep -E 'export PATH="?([^"]*mise[^"]*):([^"]*)"?|mise use -g' "$config_file" /dev/null 2>&1; then
+                 # 排除安全的 PATH 配置行
+                if ! grep -q 'export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$HOME/.local/bin"' "$config_file" 2>/dev/null; then
+                    path_priority="高优先级mise"
+                    needs_shell_fix=true
+                    debug_log "检测到启动文件 $config_file 中存在高优先级 mise 相关的 PATH 配置"
+                    break # 找到一处就足够了
+                fi
+            fi
         fi
+    done
+    
+    if $needs_shell_fix; then
+        is_hijacked=true
     fi
-    
-    # 检查PATH优先级
-    local which_python_current=$(which python3 2>/dev/null || echo "")
-    local which_python_clean=$(PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" which python3 2>/dev/null || echo "")
-    
-    debug_log "当前python3路径: $which_python_current"
-    debug_log "系统python3路径: $which_python_clean"
-    
-    # 如果当前指向mise相关路径，且与系统路径不同，则认为被劫持
-    if [[ "$which_python_current" == *"mise"* ]] && [[ "$which_python_current" != "$which_python_clean" ]]; then
-        # 检查是否是mise shell集成造成的临时效果
-        if [[ -z "$MISE_SHELL" ]] && ! (command -v mise >/dev/null && mise current python >/dev/null 2>&1 && [[ -n "$MISE_ACTIVATED" ]]); then
-            path_priority="劫持"
-            is_hijacked=true
-            debug_log "检测到PATH被mise劫持"
-        else
-            path_priority="mise集成异常"
-            is_hijacked=true
-            debug_log "检测到mise集成PATH配置异常"
-        fi
-    fi
-    
-    echo "Python状态: 链接($link_status) PATH($path_priority)" >&2
-    
-    # 只要检测到劫持就返回0（需要修复）
-    if $is_hijacked && [[ ! "${1:-}" == "allow_global" ]]; then
-        debug_log "Python状态需要修复"
+      
+    echo "Python状态: 链接($link_status) PATH($path_priority)" >&2  
+      
+    # 只要检测到持久性劫持就返回0（需要修复）  
+    if $is_hijacked; then  
+        debug_log "Python状态需要修复"  
         return 0  # 需要修复
-    else
-        debug_log "Python状态正常"
-        return 1  # 状态正常
-    fi
+    else  
+        debug_log "Python状态正常"  
+        return 1  # 状态正常  
+    fi  
 }
 
 # 智能的系统模块修复
