@@ -1,8 +1,3 @@
-好的！给你完整的修复版本：
-
-## 修复后的配置脚本（外层）
-
-```bash
 #!/bin/bash  
 # 自动更新系统配置模块 v4.7.2 - 修复dpkg冲突
 # 功能: 配置定时自动更新系统  
@@ -131,7 +126,7 @@ add_cron_job() {
         return 1  
     fi  
       
-    crontab -l 2>/dev/null | grep -v "$UPDATE_SCRIPT" | grep -v "Auto-update managed" > "$temp_cron" || true  
+    crontab -l 2>/dev/null | grep -v "$UPDATE_SCRIPT" \vert{} grep -v "Auto-update managed" > "$temp_cron" || true  
     echo "$CRON_COMMENT" >> "$temp_cron"  
     echo "$cron_expr $UPDATE_SCRIPT" >> "$temp_cron"  
       
@@ -270,7 +265,7 @@ ensure_packages_configured() {
         log_update "警告: dpkg 配置失败，检查问题包..."
         
         # 找出问题包
-        local broken_pkgs=$(dpkg -l 2>/dev/null | awk '$1 ~ /^i[UFH]/ {print $2}')
+        local broken_pkgs=$(dpkg -l 2>/dev/null \vert{} awk '$1 ~ /^i[UFH]/ {print $2}')
         
         if [[ -n "$broken_pkgs" ]]; then
             log_update "发现配置异常的包，尝试修复..."
@@ -286,7 +281,7 @@ ensure_packages_configured() {
                 else
                     log_update "重装失败，尝试删除: $pkg"
                     wait_for_dpkg
-                    apt-get purge -y --force-yes "$pkg" 2>&1 | tee -a "$LOGFILE" || true
+                    apt-get purge -y --force-yes "$pkg" 2>&1 \vert{} tee -a "$LOGFILE" || true
                 fi
                 
                 sleep 2
@@ -302,17 +297,17 @@ ensure_packages_configured() {
     
     # 修复依赖
     log_update "修复依赖关系..."
-    if ! apt-get install -f $APT_OPTIONS 2>&1 | tee -a "$LOGFILE"; then  
+    if ! apt-get install -f $APT_OPTIONS 2>&1 \vert{} tee -a "$LOGFILE"; then  
         log_update "警告: 依赖修复出现问题，重试..."
         sleep 5  
         wait_for_dpkg
-        apt-get install -f $APT_OPTIONS 2>&1 | tee -a "$LOGFILE" || true  
+        apt-get install -f $APT_OPTIONS 2>&1 \vert{} tee -a "$LOGFILE" || true  
     fi  
       
     wait_for_dpkg  
       
     log_update "包状态统计:"  
-    local status_summary=$(dpkg -l 2>/dev/null | awk 'NR>5 && $1 ~ /^[a-z]/ {print $1}' | sort | uniq -c)  
+    local status_summary=$(dpkg -l 2>/dev/null \vert{} awk 'NR>5 && $1 ~ /^[a-z]/ {print $1}' | sort | uniq -c)  
     if [[ -n "$status_summary" ]]; then  
         echo "$status_summary" | while read count status; do  
             log_update "  $count [$status]"  
@@ -320,7 +315,7 @@ ensure_packages_configured() {
     fi  
     
     # 清理残留配置 - 改进版
-    local rc_count=$(dpkg -l 2>/dev/null | awk '$1 == "rc"' | wc -l)
+    local rc_count=$(dpkg -l 2>/dev/null \vert{} awk '$1 == "rc"' | wc -l)
     if [[ $rc_count -gt 0 ]]; then
         log_update "发现 $rc_count 个残留配置文件"
         
@@ -340,7 +335,7 @@ ensure_packages_configured() {
 }  
   
 check_boot_space() {  
-    local boot_usage=$(df /boot 2>/dev/null | tail -1 | awk '{print $5}' | sed 's/%//' || echo 0)  
+    local boot_usage=$(df /boot 2>/dev/null \vert{} tail -1 \vert{} awk '{print $5}' | sed 's/%//' || echo 0)  
       
     log_update "/boot 空间使用率: ${boot_usage}%"  
       
@@ -350,7 +345,7 @@ check_boot_space() {
         local current_kernel=$(uname -r)  
         log_update "当前内核: $current_kernel"  
           
-        local all_kernels=$(dpkg -l | grep '^ii' | grep 'linux-image-[0-9]' | awk '{print $2}' | sort -V)  
+        local all_kernels=$(dpkg -l \vert{} grep '^ii' \vert{} grep 'linux-image-[0-9]' \vert{} awk '{print $2}' | sort -V)  
         local kernel_count=$(echo "$all_kernels" | wc -l)  
           
         log_update "已安装内核数量: $kernel_count"  
@@ -362,7 +357,7 @@ check_boot_space() {
           
         wait_for_dpkg  
           
-        echo "$all_kernels" | grep -v "$current_kernel" | head -n -2 | while read old_kernel; do  
+        echo "$all_kernels" \vert{} grep -v "$current_kernel" | head -n -2 | while read old_kernel; do  
             [[ -z "$old_kernel" ]] && continue  
             log_update "准备移除旧内核: $old_kernel"  
               
@@ -379,7 +374,7 @@ check_boot_space() {
           
         wait_for_dpkg  
           
-        boot_usage=$(df /boot 2>/dev/null | tail -1 | awk '{print $5}' | sed 's/%//' || echo 0)  
+        boot_usage=$(df /boot 2>/dev/null \vert{} tail -1 \vert{} awk '{print $5}' | sed 's/%//' || echo 0)  
         log_update "/boot 清理后使用率: ${boot_usage}%"  
     else  
         log_update "/boot 空间充足，无需清理"  
@@ -472,13 +467,13 @@ main() {
     wait_for_dpkg  
       
     log_update "升级系统软件包..."  
-    if ! DEBIAN_FRONTEND=noninteractive apt-get dist-upgrade $APT_OPTIONS 2>&1 | tee -a "$LOGFILE"; then  
+    if ! DEBIAN_FRONTEND=noninteractive apt-get dist-upgrade $APT_OPTIONS 2>&1 \vert{} tee -a "$LOGFILE"; then  
         log_update "警告: 系统升级出现问题，尝试修复..."  
         sleep 5  
         wait_for_dpkg  
-        apt-get install -f $APT_OPTIONS 2>&1 | tee -a "$LOGFILE" || true  
+        apt-get install -f $APT_OPTIONS 2>&1 \vert{} tee -a "$LOGFILE" || true  
         wait_for_dpkg  
-        DEBIAN_FRONTEND=noninteractive apt-get dist-upgrade $APT_OPTIONS 2>&1 | tee -a "$LOGFILE" || true  
+        DEBIAN_FRONTEND=noninteractive apt-get dist-upgrade $APT_OPTIONS 2>&1 \vert{} tee -a "$LOGFILE" || true  
     fi  
       
     log_update "--- 第三阶段: 清理验证 ---"  
@@ -502,7 +497,7 @@ main() {
     wait_for_dpkg  
       
     log_update "清理不需要的软件包..."  
-    apt-get autoremove $APT_OPTIONS 2>&1 | tee -a "$LOGFILE" || true  
+    apt-get autoremove $APT_OPTIONS 2>&1 \vert{} tee -a "$LOGFILE" || true  
       
     wait_for_dpkg  
       
@@ -605,7 +600,7 @@ show_update_summary() {
       
     if has_cron_job; then  
         local cron_line  
-        cron_line=$(crontab -l 2>/dev/null | grep "$UPDATE_SCRIPT" | head -1)  
+        cron_line=$(crontab -l 2>/dev/null \vert{} grep "$UPDATE_SCRIPT" | head -1)  
         local cron_time  
         cron_time=$(echo "$cron_line" | awk '{print $1, $2, $3, $4, $5}')  
         echo "  定时任务: 已配置"  
@@ -679,7 +674,7 @@ main() {
     echo "  实时监控: watch -n1 'tail -20 $UPDATE_LOG'"  
     echo "  管理任务: crontab -l"  
     echo "  删除任务: crontab -l | grep -v '$UPDATE_SCRIPT' | crontab -"  
-    echo "  检查状态: dpkg -l | awk 'NR>5 {print \$1}' | sort | uniq -c"  
+    echo "  检查状态: dpkg -l | awk 'NR>5 {print \\$1}' | sort | uniq -c"  
     echo "  检查锁状态: lsof /var/lib/dpkg/lock-frontend"  
     echo "  检查进程: pgrep -a apt"
       
