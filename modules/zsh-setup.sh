@@ -152,75 +152,58 @@ configure_zshrc() {
         return 1  
     fi  
       
-    debug_log "使用原生cat写入并修复换行符"
-    
-    # 纯文本内容，每行用 \n 连接，并确保不包含任何隐式字符。
-    # 我们使用 /bin/echo -e 来处理 \n 转义，然后用 cat 一次性写入
-    local zshrc_content="/bin/echo -e \"\
-# Oh My Zsh 配置\n\
-export ZSH=\"\$HOME/.oh-my-zsh\"\n\
-ZSH_THEME=\"powerlevel10k/powerlevel10k\"\n\
-\n\
-# 禁用自动更新提示\n\
-DISABLE_UPDATE_PROMPT=\"true\"\n\
-UPDATE_ZSH_DAYS=7\n\
-\n\
-plugins=(\n\
-    git\n\
-    zsh-autosuggestions\n\
-    zsh-syntax-highlighting\n\
-    zsh-completions\n\
-    sudo\n\
-    docker\n\
-    kubectl\n\
-    web-search\n\
-    history\n\
-    colored-man-pages\n\
-    command-not-found\n\
-)\n\
-\n\
-source \$ZSH/oh-my-zsh.sh\n\
-autoload -U compinit && compinit\n\
-\n\
-# Zsh 脚本修复：确保 ~/.local/bin 在 PATH 末尾，系统工具优先\n\
-export PATH=\"\$PATH:\$HOME/.local/bin\"\n\
-\n\
-# mise 版本管理器配置 (使用安全的 init -s 模式)\n\
-command -v mise >/dev/null 2>&1 && eval \"\$(mise init -s zsh)\"\n\
-\n\
-# Powerlevel10k 配置\n\
-[[ ! -f ~/.p10k.zsh ]] || source ~/.p10k.zsh\n\
-\n\
-# 实用别名\n\
-alias upgrade='apt update && apt full-upgrade -y'\n\
-alias update='apt update -y'\n\
-alias reproxy='cd /root/proxy && docker compose down && docker compose pull && docker compose up -d --remove-orphans'\n\
-alias dlog='docker logs -f'\n\
-/bin/sh -c 'docker system prune -a -f && apt autoremove -y && apt clean'\n\
-alias sstop='systemctl stop'\n\
-alias sre='systemctl restart'\n\
-alias sst='systemctl status'\n\
-alias sdre='systemctl daemon-reload'\n\
-\"" | /usr/bin/env sh -c 'cat > "$0"' -- "$HOME/.zshrc" || true
-
-    # 修复 autodel：由于转义问题，autodel 可能需要在写入后单独修复
-    if ! grep -q 'alias autodel' "$HOME/.zshrc"; then
-         /bin/echo -e "alias autodel='docker system prune -a -f && apt autoremove -y && apt clean'" >> "$HOME/.zshrc"
-    fi
-
-    if [[ $? -ne 0 ]]; then
+    debug_log "写入.zshrc配置文件"   
+    # ⚠️ 严格使用原始脚本的立即文档格式，只修改内部配置行
+    if ! cat > "$HOME/.zshrc" << 'EOF'; then  
+# Oh My Zsh 配置  
+export ZSH="$HOME/.oh-my-zsh"   
+ZSH_THEME="powerlevel10k/powerlevel10k"   
+  
+# 禁用自动更新提示  
+DISABLE_UPDATE_PROMPT="true"   
+UPDATE_ZSH_DAYS=7  
+  
+plugins=(   
+    git  
+    zsh-autosuggestions  
+    zsh-syntax-highlighting  
+    zsh-completions  
+    sudo  
+    docker  
+    kubectl  
+    web-search  
+    history  
+    colored-man-pages  
+    command-not-found  
+)   
+  
+source $ZSH/oh-my-zsh.sh  
+autoload -U compinit && compinit  
+# 修正 1：确保 ~/.local/bin 被放在 PATH 的末尾 (安全)
+export PATH="$PATH:$HOME/.local/bin"   
+  
+# 修正 2：使用安全的 init -s 模式，只注入 Shell 函数和补全，不劫持 PATH
+command -v mise >/dev/null 2>&1 && eval "$(mise init -s zsh)"   
+  
+# Powerlevel10k 配置  
+[[ ! -f ~/.p10k.zsh ]] || source ~/.p10k.zsh  
+  
+# 实用别名  
+alias upgrade='apt update && apt full-upgrade -y'   
+alias update='apt update -y'   
+alias reproxy='cd /root/proxy && docker compose down && docker compose pull && docker compose up -d --remove-orphans'   
+alias dlog='docker logs -f'   
+alias autodel='docker system prune -a -f && apt autoremove -y && apt clean'   
+alias sstop='systemctl stop'   
+alias sre='systemctl restart'   
+alias sst='systemctl status'   
+alias sdre='systemctl daemon-reload'   
+EOF
         log ".zshrc配置写入失败" "error"   
         return 1  
-    fi
-
-    # 这一步是关键！检查文件是否有 DOS/Windows 换行符，并强制转换为 Unix  LF
-    if command -v dos2unix &>/dev/null; then
-         dos2unix -f "$HOME/.zshrc" >/dev/null 2>&1 || true
-    elif command -v sed &>/dev/null; then
-        sed -i 's/\r$//' "$HOME/.zshrc" || true
-    fi
+    fi  
       
-    debug_log ".zshrc配置完成 (强制Unix换行符处理)"   
+    debug_log ".zshrc配置完成"   
     return 0  
 }
 
