@@ -178,7 +178,7 @@ plugins=(
 
 source $ZSH/oh-my-zsh.sh
 autoload -U compinit && compinit
-export PATH="$HOME/.local/bin:$PATH" 
+export PATH="$PATH:$HOME/.local/bin" 
 
 # mise 版本管理器配置
 command -v mise >/dev/null 2>&1 && eval "$(mise activate zsh)" 
