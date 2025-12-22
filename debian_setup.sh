@@ -634,7 +634,6 @@ get_system_status() {
 #=============================================================================
 
 generate_summary() {
-    set -x  # 打开调试
     log "生成部署摘要"
     
     # 统计数据
@@ -642,17 +641,24 @@ generate_summary() {
     local failed_count=0
     
     for module in "${!MODULE_STATUS[@]}"; do
-        [[ "${MODULE_STATUS[$module]}" == "success" ]] && ((success_count++))
-        [[ "${MODULE_STATUS[$module]}" == "failed" ]] && ((failed_count++))
+        if [[ "${MODULE_STATUS[$module]}" == "success" ]]; then
+            success_count=$((success_count + 1))
+        elif [[ "${MODULE_STATUS[$module]}" == "failed" ]]; then
+            failed_count=$((failed_count + 1))
+        fi
     done
     
     local total_modules=$((success_count + failed_count))
     local success_rate=0
-    (( total_modules > 0 )) && success_rate=$((success_count * 100 / total_modules))
+    if [[ $total_modules -gt 0 ]]; then
+        success_rate=$((success_count * 100 / total_modules))
+    fi
     
     local total_time=$(( $(date +%s) - TOTAL_START_TIME ))
     local avg_time=0
-    (( success_count > 0 )) && avg_time=$((total_time / success_count))
+    if [[ $success_count -gt 0 ]]; then
+        avg_time=$((total_time / success_count))
+    fi
     
     # 终端输出
     echo
@@ -674,13 +680,13 @@ generate_summary() {
    📦 总模块: $total_modules | ✅ 成功: $success_count | ❌ 失败: $failed_count | 📈 成功率: ${success_rate}%
 
 EOF
-
+    
     # 成功模块
-    if (( success_count > 0 )); then
+    if [[ $success_count -gt 0 ]]; then
         echo "✅ 成功模块:"
         for module in "${MODULE_ORDER[@]}"; do
             if [[ "${MODULE_STATUS[$module]:-}" == "success" ]]; then
-                local exec_time=${MODULE_EXEC_TIME[$module]}
+                local exec_time=${MODULE_EXEC_TIME[$module]:-0}
                 echo "   🟢 $module: ${MODULES[$module]} (${exec_time}s)"
             fi
         done
@@ -688,7 +694,7 @@ EOF
     fi
     
     # 失败模块
-    if (( failed_count > 0 )); then
+    if [[ $failed_count -gt 0 ]]; then
         echo "❌ 失败模块:"
         for module in "${MODULE_ORDER[@]}"; do
             if [[ "${MODULE_STATUS[$module]:-}" == "failed" ]]; then
@@ -721,14 +727,14 @@ EOF
         echo "总模块: $total_modules, 成功: $success_count, 失败: $failed_count, 成功率: ${success_rate}%"
         echo ""
         
-        if (( success_count > 0 )); then
+        if [[ $success_count -gt 0 ]]; then
             echo "成功模块:"
             for module in "${MODULE_ORDER[@]}"; do
-                [[ "${MODULE_STATUS[$module]:-}" == "success" ]] && echo "  $module (${MODULE_EXEC_TIME[$module]}s)"
+                [[ "${MODULE_STATUS[$module]:-}" == "success" ]] && echo "  $module (${MODULE_EXEC_TIME[$module]:-0}s)"
             done
         fi
         
-        if (( failed_count > 0 )); then
+        if [[ $failed_count -gt 0 ]]; then
             echo ""
             echo "失败模块:"
             for module in "${MODULE_ORDER[@]}"; do
