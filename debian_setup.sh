@@ -924,22 +924,39 @@ main() {
     log "开始执行模块"
     echo "$LINE"
     
-    local executed=0
+    local current=0
+    local total=${#SELECTED_MODULES[@]}
+    local success_count=0
+    local failed_count=0
+    
     for module in "${SELECTED_MODULES[@]}"; do
+        current=$((current + 1))
+        
         # 跳过下载失败的模块
         if [[ "${MODULE_STATUS[$module]:-}" == "failed" ]]; then
             log "跳过模块 $module (下载失败)" "warn"
+            failed_count=$((failed_count + 1))
             continue
         fi
         
-        ((executed++))
         echo
-        echo "[$executed/${#SELECTED_MODULES[@]}] 处理模块: ${MODULES[$module]}"
+        echo "[$current/$total] 执行模块: ${MODULES[$module]}"
         
         set +e
         execute_module "$module"
+        local result=$?
         set -e
+        
+        if (( result == 0 )); then
+            success_count=$((success_count + 1))
+        else
+            failed_count=$((failed_count + 1))
+            log "模块 $module 执行失败，继续执行其他模块..." "warn"
+        fi
     done
+    
+    echo
+    log "模块执行完成: 成功 $success_count, 失败 $failed_count"
     
     # 完成
     generate_summary
