@@ -10,8 +10,7 @@ set -uo pipefail
 
 # 全局常量
 readonly SCRIPT_VERSION="3.4.0"
-# SCRIPT_COMMIT 会在 handle_arguments 中设置，这里先声明
-SCRIPT_COMMIT="${SCRIPT_COMMIT:-unknown}"
+SCRIPT_COMMIT="${SCRIPT_COMMIT:-unknown}"  # 会在 handle_arguments 中设置为 readonly
 readonly MODULE_BASE_URL="https://raw.githubusercontent.com/LucaLin233/Linux"
 readonly TEMP_DIR="/tmp/debian-setup-modules"
 readonly LOG_FILE="/var/log/debian-setup.log"
@@ -52,6 +51,7 @@ declare -A MODULE_EXEC_TIME
 SELECTED_MODULES=()
 TOTAL_START_TIME=0
 LATEST_COMMIT=""
+FILTERED_ARGS=()  # 新增：存储过滤后的命令行参数
 
 # 颜色定义
 readonly C_RED='\033[0;31m'
@@ -493,8 +493,8 @@ self_update() {
         chmod +x "$temp_script"
         
         log "重新启动脚本..." "success"
-        # ← 改用命令行参数传递 commit
-        exec bash "$temp_script" --internal-commit="$latest_commit" "$@"
+        # 只传递过滤后的参数，避免重复传递 --internal-commit
+        exec bash "$temp_script" --internal-commit="$latest_commit" "${FILTERED_ARGS[@]}"
     else
         log "跳过更新，继续使用当前版本"
         rm -f "$temp_script"
@@ -817,10 +817,13 @@ EOF
 #=============================================================================
 
 handle_arguments() {
+    # 用于存储过滤后的参数
+    FILTERED_ARGS=()
+    
     while [[ $# -gt 0 ]]; do
         case $1 in
             --internal-commit=*)
-                # 内部参数：用于传递 commit hash
+                # 内部参数：用于传递 commit hash，不传递给后续
                 SCRIPT_COMMIT="${1#*=}"
                 readonly SCRIPT_COMMIT
                 shift
@@ -843,9 +846,9 @@ handle_arguments() {
                 exit 0
                 ;;
             *)
-                echo "❌ 未知参数: $1"
-                echo "使用 --help 查看帮助"
-                exit 1
+                # 保存其他参数
+                FILTERED_ARGS+=("$1")
+                shift
                 ;;
         esac
     done
@@ -856,7 +859,7 @@ handle_arguments() {
 #=============================================================================
 
 main() {
-    # ← 先处理参数（包括 --internal-commit）
+    # 先处理参数（包括 --internal-commit）
     handle_arguments "$@"
     
     # 初始化
@@ -872,7 +875,7 @@ main() {
     echo "$LINE"
     
     # ===== 自我更新检查 =====
-    self_update "$@"
+    self_update  # ← 不传参数，用全局变量 FILTERED_ARGS
     echo
       
     # 检查和准备  
