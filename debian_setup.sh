@@ -10,7 +10,8 @@ set -uo pipefail
 
 # 全局常量
 readonly SCRIPT_VERSION="3.4.0"
-readonly SCRIPT_COMMIT="${SCRIPT_COMMIT:-unknown}"  # ← 新增这行
+# SCRIPT_COMMIT 会在 handle_arguments 中设置，这里先声明
+SCRIPT_COMMIT="${SCRIPT_COMMIT:-unknown}"
 readonly MODULE_BASE_URL="https://raw.githubusercontent.com/LucaLin233/Linux"
 readonly TEMP_DIR="/tmp/debian-setup-modules"
 readonly LOG_FILE="/var/log/debian-setup.log"
@@ -491,11 +492,9 @@ self_update() {
         log "更新脚本..."
         chmod +x "$temp_script"
         
-        # 传递新的 commit hash 给新脚本
-        export SCRIPT_COMMIT="$latest_commit"
-        
         log "重新启动脚本..." "success"
-        exec bash "$temp_script" "$@"
+        # ← 改用命令行参数传递 commit
+        exec bash "$temp_script" --internal-commit="$latest_commit" "$@"
     else
         log "跳过更新，继续使用当前版本"
         rm -f "$temp_script"
@@ -820,6 +819,12 @@ EOF
 handle_arguments() {
     while [[ $# -gt 0 ]]; do
         case $1 in
+            --internal-commit=*)
+                # 内部参数：用于传递 commit hash
+                SCRIPT_COMMIT="${1#*=}"
+                readonly SCRIPT_COMMIT
+                shift
+                ;;
             --check-status)
                 if [[ -f "$SUMMARY_FILE" ]]; then
                     cat "$SUMMARY_FILE"
@@ -834,6 +839,7 @@ handle_arguments() {
                 ;;
             --version|-v)
                 echo "Debian 部署脚本 v$SCRIPT_VERSION"
+                [[ "$SCRIPT_COMMIT" != "unknown" ]] && echo "Commit: $SCRIPT_COMMIT"
                 exit 0
                 ;;
             *)
@@ -842,14 +848,15 @@ handle_arguments() {
                 exit 1
                 ;;
         esac
-        shift
     done
 }
 
 #=============================================================================
 # 主程序
 #=============================================================================
+
 main() {
+    # ← 先处理参数（包括 --internal-commit）
     handle_arguments "$@"
     
     # 初始化
@@ -861,12 +868,12 @@ main() {
     clear 2>/dev/null || true
     echo "$LINE"
     echo "Debian 系统部署脚本 v$SCRIPT_VERSION"
-    [[ "$SCRIPT_COMMIT" != "unknown" ]] && echo "Commit: $SCRIPT_COMMIT"  # ← 新增这行
+    [[ "$SCRIPT_COMMIT" != "unknown" ]] && echo "Commit: $SCRIPT_COMMIT"
     echo "$LINE"
     
     # ===== 自我更新检查 =====
     self_update "$@"
-    echo 
+    echo
       
     # 检查和准备  
     pre_check  
