@@ -586,45 +586,50 @@ test_update_script() {
     return 0
 }
   
-show_update_summary() {  
-    debug_log "显示自动更新配置摘要"  
-    echo  
-    log "🎯 自动更新摘要:" "info"  
-      
-    if has_cron_job; then  
-        local cron_line  
-        cron_line=$(crontab -l 2>/dev/null \vert{} grep "$UPDATE_SCRIPT" | head -1)  
-        local cron_time  
-        cron_time=$(echo "$cron_line" | awk '{print $1, $2, $3, $4, $5}')  
-        echo "  定时任务: 已配置"  
-        if [[ "$cron_time" == "$DEFAULT_CRON" ]]; then  
-            echo "  执行时间: 每周日凌晨2点"  
-        else  
-            echo "  执行时间: 自定义 ($cron_time)"  
-        fi  
-    else  
-        echo "  定时任务: 未配置"  
-    fi  
-      
-    if [[ -x "$UPDATE_SCRIPT" ]]; then  
-        echo "  更新脚本: 已创建"  
-    else  
-        echo "  更新脚本: 未找到"  
-    fi  
-      
-    if systemctl is-active cron >/dev/null 2>&1; then  
-        echo "  Cron服务: 运行中"  
-    else  
-        echo "  Cron服务: 未运行"  
-    fi  
-      
-    if [[ -f "$UPDATE_LOG" ]]; then  
-        echo "  更新日志: 存在"  
-    else  
-        echo "  更新日志: 待生成"  
-    fi  
-    return 0  
-}  
+show_update_summary() {    
+    debug_log "显示自动更新配置摘要"    
+    echo    
+    log "🎯 自动更新摘要:" "info"    
+        
+    if has_cron_job; then    
+        local cron_line    
+        # 排除注释行
+        cron_line=$(crontab -l 2>/dev/null | grep -v "^#" | grep "$UPDATE_SCRIPT" | head -1)
+        local cron_time
+        # 提取前5个字段（分 时 日 月 周）
+        cron_time=$(echo "$cron_line" | awk '{print $1, $2, $3, $4, $5}')
+        
+        echo "  定时任务: 已配置"    
+        if [[ "$cron_time" == "$DEFAULT_CRON" ]]; then    
+            echo "  执行时间: 每周日凌晨2点"    
+        elif [[ -n "$cron_time" ]]; then
+            echo "  执行时间: 自定义 ($cron_time)"
+        else
+            echo "  执行时间: 已配置（查看详情: crontab -l）"
+        fi    
+    else    
+        echo "  定时任务: 未配置"    
+    fi    
+        
+    if [[ -x "$UPDATE_SCRIPT" ]]; then    
+        echo "  更新脚本: 已创建"    
+    else    
+        echo "  更新脚本: 未找到"    
+    fi    
+        
+    if systemctl is-active cron >/dev/null 2>&1; then    
+        echo "  Cron服务: 运行中"    
+    else    
+        echo "  Cron服务: 未运行"    
+    fi    
+        
+    if [[ -f "$UPDATE_LOG" ]]; then    
+        echo "  更新日志: 存在"    
+    else    
+        echo "  更新日志: 待生成"    
+    fi    
+    return 0    
+}
   
 main() {    
     debug_log "开始自动更新系统配置"    
