@@ -10,6 +10,7 @@ set -uo pipefail
 
 # 全局常量
 readonly SCRIPT_VERSION="3.4.0"
+readonly SCRIPT_COMMIT="${SCRIPT_COMMIT:-unknown}"  # ← 新增这行
 readonly MODULE_BASE_URL="https://raw.githubusercontent.com/LucaLin233/Linux"
 readonly TEMP_DIR="/tmp/debian-setup-modules"
 readonly LOG_FILE="/var/log/debian-setup.log"
@@ -438,60 +439,66 @@ self_update() {
         return 0
     fi
     
+    log "当前 commit: $SCRIPT_COMMIT"
     log "最新 commit: $latest_commit"
     
+    # 用 commit 判断是否需要更新
+    if [[ "$latest_commit" == "$SCRIPT_COMMIT" ]]; then
+        log "已是最新版本 (commit: $SCRIPT_COMMIT)"
+        return 0
+    fi
+    
+    # 下载最新版本
     local temp_script="/tmp/debian_setup_latest.sh"
     local script_url="https://raw.githubusercontent.com/LucaLin233/Linux/$latest_commit/debian_setup.sh"
     
-    # 直接用 curl，不用 download_with_retry（避免检查问题）
-    if curl -fsSL --connect-timeout 10 --max-time 30 "$script_url" -o "$temp_script" 2>/dev/null; then
-        # 检查文件是否下载成功
-        if [[ ! -s "$temp_script" ]]; then
-            log "下载的文件为空，跳过更新" "warn"
-            rm -f "$temp_script"
-            return 0
-        fi
-        
-        # 检查是否是有效的 bash 脚本
-        if ! head -1 "$temp_script" | grep -q "^#!/bin/bash" 2>/dev/null; then
-            log "下载的文件格式不正确，跳过更新" "warn"
-            rm -f "$temp_script"
-            return 0
-        fi
-        
-        # 提取远程版本号
-        local remote_version=$(grep "^readonly SCRIPT_VERSION=" "$temp_script" 2>/dev/null | cut -d'"' -f2)
-        
-        if [[ -z "$remote_version" ]]; then
-            log "无法识别远程版本，跳过更新" "warn"
-            rm -f "$temp_script"
-            return 0
-        fi
-        
-        # 比较版本
-        if [[ "$remote_version" == "$SCRIPT_VERSION" ]]; then
-            log "已是最新版本: $SCRIPT_VERSION"
-            rm -f "$temp_script"
-            return 0
-        fi
-        
-        # 发现新版本
-        echo
-        log "发现新版本: $remote_version (当前: $SCRIPT_VERSION)" "warn"
-        read -p "是否更新并重新运行? [Y/n]: " -r choice
-        choice="${choice:-Y}"
-        
-        if [[ "$choice" =~ ^[Yy]$ ]]; then
-            log "更新脚本到 v$remote_version..."
-            chmod +x "$temp_script"
-            log "重新启动脚本..." "success"
-            exec bash "$temp_script" "$@"
-        else
-            log "跳过更新，继续使用 v$SCRIPT_VERSION"
-            rm -f "$temp_script"
-        fi
-    else
+    log "下载最新版本..."
+    
+    if ! curl -fsSL --connect-timeout 10 --max-time 30 "$script_url" -o "$temp_script" 2>/dev/null; then
         log "无法下载最新版本，继续使用当前版本" "warn"
+        return 0
+    fi
+    
+    # 验证下载的文件
+    if [[ ! -s "$temp_script" ]]; then
+        log "下载的文件为空，跳过更新" "warn"
+        rm -f "$temp_script"
+        return 0
+    fi
+    
+    if ! head -1 "$temp_script" | grep -qE "^#!/bin/(bash|sh)" 2>/dev/null; then
+        log "下载的文件格式不正确，跳过更新" "warn"
+        rm -f "$temp_script"
+        return 0
+    fi
+    
+    # 提取远程版本号（用于显示）
+    local remote_version
+    remote_version=$(grep "^readonly SCRIPT_VERSION=" "$temp_script" 2>/dev/null | cut -d'"' -f2)
+    remote_version="${remote_version:-未知}"
+    
+    # 提示用户
+    echo
+    log "发现新版本!" "warn"
+    echo "  当前: v$SCRIPT_VERSION (commit: $SCRIPT_COMMIT)"
+    echo "  最新: v$remote_version (commit: $latest_commit)"
+    echo
+    
+    read -p "是否更新并重新运行? [Y/n]: " -r choice
+    choice="${choice:-Y}"
+    
+    if [[ "$choice" =~ ^[Yy]$ ]]; then
+        log "更新脚本..."
+        chmod +x "$temp_script"
+        
+        # 传递新的 commit hash 给新脚本
+        export SCRIPT_COMMIT="$latest_commit"
+        
+        log "重新启动脚本..." "success"
+        exec bash "$temp_script" "$@"
+    else
+        log "跳过更新，继续使用当前版本"
+        rm -f "$temp_script"
     fi
 }
 
@@ -669,7 +676,7 @@ generate_summary() {
     cat << EOF
 
 📋 基本信息:
-   🔢 脚本版本: $SCRIPT_VERSION
+   🔢 脚本版本: $SCRIPT_VERSION (commit: $SCRIPT_COMMIT)
    📅 部署时间: $(date '+%Y-%m-%d %H:%M:%S %Z')
    ⏱️  总耗时: ${total_time}秒 | 平均耗时: ${avg_time}秒/模块
    🏠 主机名: $(hostname)
@@ -716,7 +723,7 @@ EOF
         echo "$LINE"
         echo "Debian 系统部署摘要"
         echo "$LINE"
-        echo "脚本版本: $SCRIPT_VERSION"
+        echo "脚本版本: $SCRIPT_VERSION (commit: $SCRIPT_COMMIT)"
         echo "部署时间: $(date '+%Y-%m-%d %H:%M:%S %Z')"
         echo "总耗时: ${total_time}秒"
         echo "主机: $(hostname)"
