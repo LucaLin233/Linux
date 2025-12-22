@@ -849,23 +849,24 @@ handle_arguments() {
 #=============================================================================
 # 主程序
 #=============================================================================
-main() {  
-    handle_arguments "$@"  
-      
-    # 初始化  
-    init_logging  
-    mkdir -p "$TEMP_DIR" 2>/dev/null || true  
-    TOTAL_START_TIME=$(date +%s)  
-      
-    # 启动  
-    clear 2>/dev/null || true  
-    echo "$LINE"  
-    echo "Debian 系统部署脚本 v$SCRIPT_VERSION"  
-    echo "$LINE"  
-      
-    # ===== 新增：自我更新检查 =====  
-    self_update "$@"  
-    echo  
+main() {
+    handle_arguments "$@"
+    
+    # 初始化
+    init_logging
+    mkdir -p "$TEMP_DIR" 2>/dev/null || true
+    TOTAL_START_TIME=$(date +%s)
+    
+    # 启动
+    clear 2>/dev/null || true
+    echo "$LINE"
+    echo "Debian 系统部署脚本 v$SCRIPT_VERSION"
+    [[ "$SCRIPT_COMMIT" != "unknown" ]] && echo "Commit: $SCRIPT_COMMIT"  # ← 新增这行
+    echo "$LINE"
+    
+    # ===== 自我更新检查 =====
+    self_update "$@"
+    echo 
       
     # 检查和准备  
     pre_check  
