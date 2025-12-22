@@ -153,7 +153,6 @@ configure_zshrc() {
     fi  
       
     debug_log "写入.zshrc配置文件"   
-    # ⚠️ 注意: 结束标记 EOF (在本函数末尾) 必须严格在行首，前面不能有空格或 Tab
     if ! cat > "$HOME/.zshrc" << 'EOF'; then  
 # Oh My Zsh 配置  
 export ZSH="$HOME/.oh-my-zsh"   
@@ -179,11 +178,10 @@ plugins=(
   
 source $ZSH/oh-my-zsh.sh  
 autoload -U compinit && compinit  
-# 【Zsh 脚本修复】：确保 ~/.local/bin 在 PATH 末尾，系统工具优先
+# Zsh 脚本修复：确保 ~/.local/bin 在 PATH 末尾，系统工具优先
 export PATH="$PATH:$HOME/.local/bin" 
   
 # mise 版本管理器配置 (使用安全的 init -s 模式，只注入 Shell 函数和补全，不劫持 PATH)  
-# 解决劫持问题: 将 activate zsh 替换为 init -s zsh
 command -v mise >/dev/null 2>&1 && eval "$(mise init -s zsh)"   
   
 # Powerlevel10k 配置  
