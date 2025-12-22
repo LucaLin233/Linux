@@ -115,7 +115,7 @@ init_logging() {
 }
 
 #=============================================================================
-# 系统检查
+# 系统检查（修复版）
 #=============================================================================
 
 pre_check() {
@@ -134,8 +134,12 @@ pre_check() {
     fi
     
     # 磁盘空间检查
-    local free_space_kb=$(df / \vert{} awk 'NR==2 {print $4}')
-    if (( free_space_kb < 1048576 )); then
+    local free_space_kb
+    free_space_kb=$(df / 2>/dev/null | awk 'NR==2 {print $4}')
+    
+    if [[ -z "$free_space_kb" || ! "$free_space_kb" =~ ^[0-9]+$ ]]; then
+        log "无法获取磁盘空间信息，跳过检查" "warn"
+    elif (( free_space_kb < 1048576 )); then
         log "磁盘空间不足 (需要至少1GB)" "error"
         exit 1
     fi
@@ -797,17 +801,28 @@ main() {
     echo "$LINE"
     
     local download_failed=0
+    local downloaded=0
+    
     for module in "${SELECTED_MODULES[@]}"; do
-        download_module "$module" || {
+        ((downloaded++))
+        echo
+        echo "[$downloaded/${#SELECTED_MODULES[@]}] 下载: $module"
+        
+        if download_module "$module"; then
+            log "✓ $module 下载成功"
+        else
             MODULE_STATUS[$module]="failed"
             ((download_failed++))
-        }
+        fi
     done
     
+    echo
     if (( download_failed > 0 )); then
-        log "部分模块下载失败，是否继续执行已下载的模块？" "warn"
-        read -p "继续? [y/N]: " -r choice
+        log "有 $download_failed 个模块下载失败" "warn"
+        read -p "是否继续执行已下载的模块? [y/N]: " -r choice
         [[ "$choice" =~ ^[Yy]$ ]] || exit 1
+    else
+        log "所有模块下载完成" "success"
     fi
     
     # 执行模块
