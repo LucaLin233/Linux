@@ -375,14 +375,22 @@ get_latest_commit() {
 }
 
 download_with_retry() {
-    local url="\$1"
-    local output="\$2"
+    local url="$1"
+    local output="$2"
     local max_attempts=3
     
     for i in $(seq 1 $max_attempts); do
         if curl -fsSL --connect-timeout 10 --max-time 30 "$url" -o "$output" 2>/dev/null; then
-            if [[ -s "$output" ]] && head -1 "$output" | grep -q "#!/bin/bash" 2>/dev/null; then
-                return 0
+            if [[ -s "$output" ]]; then
+                local first_line
+                first_line=$(head -1 "$output" 2>/dev/null)
+                
+                # 支持多种 shebang 格式
+                if [[ "$first_line" == "#!/bin/bash"* ]] || \
+                   [[ "$first_line" == "#!/usr/bin/env bash"* ]] || \
+                   [[ "$first_line" == "#!/bin/sh"* ]]; then
+                    return 0
+                fi
             fi
         fi
         
