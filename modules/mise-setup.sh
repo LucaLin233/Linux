@@ -188,6 +188,7 @@ detect_python_status() {
         is_hijacked=true  
     fi  
         
+    # 核心修改点 1：将状态输出到 STDERR，保证在函数被重定向时依然显示
     echo "Python状态: 链接($link_status) PATH($path_priority)" >&2    
         
     # 只要检测到持久性劫持就返回0（需要修复）    
@@ -198,7 +199,7 @@ detect_python_status() {
         debug_log "Python状态正常"    
         return 1  # 状态正常    
     fi    
-}  
+}
   
 # 智能的系统模块修复  
 fix_system_modules() {  
@@ -532,8 +533,13 @@ setup_python_usage() {
     # 直接配置为项目级使用  
     configure_safe_path_priority  
       
+    # 核心修改点 2：在检测前刷新环境，确保 which 识别最新的 PATH/mise 配置
+    export PATH="$MISE_BIN_DIR:$PATH"
+    hash -r 2>/dev/null || true
+      
     # 检测是否需要修复  
-    if detect_python_status >/dev/null 2>&1; then  
+    # 移除非必要的 >/dev/null 2>&1，让 detect_python_status 的诊断信息正常显示 (因为它也是输出到 STDERR 的)
+    if detect_python_status; then  
         echo  
         log "⚠️ 检测到系统Python被劫持" "warn"  
         read -p "是否立即修复系统配置? [Y/n]: " -r fix_choice  
@@ -600,6 +606,7 @@ configure_shell_integration() {
 
             # 尝试找到第一个 export PATH 语句后插入，如果找不到则追加
             if grep -q "export PATH" "$config_file" 2>/dev/null; then
+                # 在第一个 export PATH 后新增
                 sed -i "/export PATH/a $append_content" "$config_file" 2>/dev/null || \
                 echo -e "$append_content" >> "$config_file"
             else
@@ -649,7 +656,6 @@ configure_mise_cron() {
     fi
     
     # 清理旧的 mise 自动更新任务行，然后添加新的
-    # 注意: grep -v 使用了一个不常见的串来防止误删除其他任务
     (crontab -l 2>/dev/null | grep -v 'Mise Weekly Auto Update' || true; echo "$job_entry") > "$temp_cron"
 
     if crontab "$temp_cron"; then
@@ -683,6 +689,9 @@ show_mise_summary() {
         fi  
           
         # 使用系统Python检查版本  
+        # 刷新环境，以防其他函数依赖旧的 PATH/hash
+        export PATH="$MISE_BIN_DIR:$PATH"
+        hash -r 2>/dev/null || true
         local system_python_version=$(/usr/bin/python3 --version 2>/dev/null || echo "无法获取")  
         echo "  系统Python: $system_python_version"  
           
@@ -735,7 +744,8 @@ main() {
     log "🔧 配置Mise版本管理器..." "info"  
       
     echo  
-    get_mise_executable >/dev/null 2>&1 && detect_python_status >/dev/null 2>&1 || true  
+    # 核心修改点 3：移除冗余且带重定向的调用
+    # get_mise_executable >/dev/null 2>&1 && detect_python_status >/dev/null 2>&1 || true 
       
     install_mise || exit 1  
       
