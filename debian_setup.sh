@@ -396,7 +396,7 @@ download_with_retry() {
 }
 
 download_module() {
-    local module="\$1"
+    local module="$1"  # ← 去掉反斜杠
     local module_file="$TEMP_DIR/${module}.sh"
     
     log "获取模块 $module (commit: $LATEST_COMMIT)"
@@ -883,15 +883,21 @@ main() {
     local downloaded=0
     
     for module in "${SELECTED_MODULES[@]}"; do
-        ((downloaded++))
+        downloaded=$((downloaded + 1))  # ← 改用这种方式，更安全
         echo
-        echo "[$downloaded/${#SELECTED_MODULES[@]}] 下载: $module"
+        echo "[$downloaded/${#SELECTED_MODULES[@]}] 下载模块: $module"
         
-        if download_module "$module"; then
+        set +e  # 临时关闭严格模式
+        download_module "$module"
+        local result=$?
+        set -e  # 恢复严格模式
+        
+        if (( result == 0 )); then
             log "✓ $module 下载成功"
         else
             MODULE_STATUS[$module]="failed"
-            ((download_failed++))
+            download_failed=$((download_failed + 1))
+            log "✗ $module 下载失败" "error"
         fi
     done
     
