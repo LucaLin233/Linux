@@ -1,7 +1,7 @@
 #!/bin/bash
 
 #=============================================================================
-# Debian 系统部署脚本 v3.4.0
+# Debian 系统部署脚本 v3.5.0
 # 适用系统: Debian 12+, 作者: LucaLin233
 # 功能: 模块化部署，智能依赖处理
 #=============================================================================
@@ -9,7 +9,7 @@
 set -uo pipefail
 
 # 全局常量
-readonly SCRIPT_VERSION="3.4.0"
+readonly SCRIPT_VERSION="3.5.0"
 SCRIPT_COMMIT="${SCRIPT_COMMIT:-unknown}"  # 会在 handle_arguments 中设置为 readonly
 readonly MODULE_BASE_URL="https://raw.githubusercontent.com/LucaLin233/Linux"
 readonly TEMP_DIR="/tmp/debian-setup-modules"
@@ -51,7 +51,7 @@ declare -A MODULE_EXEC_TIME
 SELECTED_MODULES=()
 TOTAL_START_TIME=0
 LATEST_COMMIT=""
-FILTERED_ARGS=()  # 新增：存储过滤后的命令行参数
+FILTERED_ARGS=()  # 存储过滤后的命令行参数
 
 # 颜色定义
 readonly C_RED='\033[0;31m'
@@ -68,13 +68,11 @@ log() {
     local level="${2:-info}"
     local timestamp=$(date '+%H:%M:%S')
     
-    case "$level" in
-        info)    echo -e "${C_GREEN}✅ $msg${C_NC}" ;;
-        warn)    echo -e "${C_YELLOW}⚠️  $msg${C_NC}" ;;
-        error)   echo -e "${C_RED}❌ $msg${C_NC}" ;;
-        success) echo -e "${C_GREEN}🎉 $msg${C_NC}" ;;
-    esac
+    # 定义图标和颜色映射
+    local -A icons=([info]="✅" [warn]="⚠️ " [error]="❌" [success]="🎉")
+    local -A colors=([info]=$C_GREEN [warn]=$C_YELLOW [error]=$C_RED [success]=$C_GREEN)
     
+    echo -e "${colors[$level]}${icons[$level]} $msg${C_NC}"
     echo "[$timestamp] [$level] $msg" >> "$LOG_FILE"
 }
 
@@ -117,7 +115,7 @@ init_logging() {
 }
 
 #=============================================================================
-# 系统检查（修复版）
+# 系统检查
 #=============================================================================
 
 pre_check() {
@@ -137,9 +135,9 @@ pre_check() {
     
     # 磁盘空间检查
     local free_space_kb
-    free_space_kb=$(df / 2>/dev/null | awk 'NR==2 {print $4}')
+    free_space_kb=$(df / 2>/dev/null \vert{} awk 'NR==2 {print $4}')
     
-    if [[ -z "$free_space_kb" || ! "$free_space_kb" =~ ^[0-9]+$ ]]; then
+    if [[ -z "$free_space_kb" \vert{}\vert{} ! "$free_space_kb" =~ ^[0-9]+$ ]]; then
         log "无法获取磁盘空间信息，跳过检查" "warn"
     elif (( free_space_kb < 1048576 )); then
         log "磁盘空间不足 (需要至少1GB)" "error"
@@ -188,13 +186,7 @@ install_dependencies() {
     if (( ${#missing_packages[@]} > 0 )); then
         log "安装缺失依赖: ${missing_packages[*]}"
         
-        set +e
-        apt-get update -qq
-        apt-get install -y "${missing_packages[@]}"
-        local result=$?
-        set -e
-        
-        if (( result != 0 )); then
+        if ! apt-get update -qq || ! apt-get install -y "${missing_packages[@]}"; then
             log "依赖安装失败" "error"
             exit 1
         fi
@@ -210,10 +202,8 @@ install_dependencies() {
 system_update() {
     log "系统更新"
     
-    set +e
     apt-get update 2>/dev/null || log "软件包列表更新失败" "warn"
     apt-get upgrade -y 2>/dev/null || log "系统升级失败" "warn"
-    set -e
     
     fix_hosts_file
     
@@ -382,31 +372,20 @@ download_with_retry() {
     local max_attempts=3
     
     for i in $(seq 1 $max_attempts); do
-        if curl -fsSL --connect-timeout 10 --max-time 30 "$url" -o "$output" 2>/dev/null; then
-            if [[ -s "$output" ]]; then
-                local first_line
-                first_line=$(head -1 "$output" 2>/dev/null)
-                
-                # 支持多种 shebang 格式
-                if [[ "$first_line" == "#!/bin/bash"* ]] || \
-                   [[ "$first_line" == "#!/usr/bin/env bash"* ]] || \
-                   [[ "$first_line" == "#!/bin/sh"* ]]; then
-                    return 0
-                fi
-            fi
+        if curl -fsSL --connect-timeout 10 --max-time 30 "$url" -o "$output" 2>/dev/null && \
+           [[ -s "$output" ]] && \
+           head -1 "$output" 2>/dev/null | grep -qE "^#!/(bin/(bash|sh)|usr/bin/env bash)"; then
+            return 0
         fi
         
-        if (( i < max_attempts )); then
-            log "下载失败，2秒后重试 ($i/$max_attempts)..." "warn"
-            sleep 2
-        fi
+        (( i < max_attempts )) && log "下载失败，2秒后重试 ($i/$max_attempts)..." "warn" && sleep 2
     done
     
     return 1
 }
 
 download_module() {
-    local module="$1"  # ← 去掉反斜杠
+    local module="$1"
     local module_file="$TEMP_DIR/${module}.sh"
     
     log "获取模块 $module (commit: $LATEST_COMMIT)"
@@ -425,6 +404,25 @@ download_module() {
 #=============================================================================
 # 脚本自我更新
 #=============================================================================
+
+# 检查并使用缓存脚本
+try_cached_script() {
+    local commit="$1"
+    local cached_script="/var/cache/debian-setup/debian_setup_${commit}.sh"
+    
+    if [[ -f "$cached_script" ]] && [[ -s "$cached_script" ]]; then
+        if head -1 "$cached_script" 2>/dev/null | grep -qE "^#!/bin/(bash|sh)"; then
+            log "使用缓存的脚本 (commit: $commit)"
+            chmod +x "$cached_script"
+            exec bash "$cached_script" "${FILTERED_ARGS[@]}"
+        else
+            log "缓存文件损坏，删除" "warn"
+            rm -f "$cached_script"
+            return 1
+        fi
+    fi
+    return 1
+}
 
 self_update() {
     log "检查脚本更新..."
@@ -447,25 +445,8 @@ self_update() {
         return 0
     fi
     
-    # ===== 新增：检查本地缓存 =====
-    local cache_dir="/var/cache/debian-setup"
-    local cached_script="$cache_dir/debian_setup_${latest_commit}.sh"
-    
-    # 如果缓存存在且有效，直接使用
-    if [[ -f "$cached_script" ]] && [[ -s "$cached_script" ]]; then
-        log "使用缓存的脚本 (commit: $latest_commit)"
-        
-        # 验证缓存文件
-        if head -1 "$cached_script" | grep -qE "^#!/bin/(bash|sh)" 2>/dev/null; then
-            chmod +x "$cached_script"
-            
-            log "重新启动脚本..." "success"
-            exec bash "$cached_script" "${FILTERED_ARGS[@]}"
-        else
-            log "缓存文件损坏，重新下载" "warn"
-            rm -f "$cached_script"
-        fi
-    fi
+    # 尝试使用缓存
+    try_cached_script "$latest_commit" && return 0
     
     # 下载最新版本
     local temp_script="/tmp/debian_setup_latest.sh"
@@ -479,13 +460,7 @@ self_update() {
     fi
     
     # 验证下载的文件
-    if [[ ! -s "$temp_script" ]]; then
-        log "下载的文件为空，跳过更新" "warn"
-        rm -f "$temp_script"
-        return 0
-    fi
-    
-    if ! head -1 "$temp_script" | grep -qE "^#!/bin/(bash|sh)" 2>/dev/null; then
+    if [[ ! -s "$temp_script" ]] \vert{}\vert{} ! head -1 "$temp_script" | grep -qE "^#!/bin/(bash|sh)" 2>/dev/null; then
         log "下载的文件格式不正确，跳过更新" "warn"
         rm -f "$temp_script"
         return 0
@@ -512,11 +487,13 @@ self_update() {
         # 在脚本中嵌入 commit hash
         sed -i "13a SCRIPT_COMMIT=\"$latest_commit\"" "$temp_script"
         
-        # ===== 保存到缓存目录 =====
+        # 保存到缓存目录
+        local cache_dir="/var/cache/debian-setup"
         mkdir -p "$cache_dir" 2>/dev/null || true
         
         if [[ -d "$cache_dir" ]]; then
             chmod +x "$temp_script"
+            local cached_script="$cache_dir/debian_setup_${latest_commit}.sh"
             cp "$temp_script" "$cached_script" 2>/dev/null || true
             
             # 清理旧缓存（保留最近3个版本）
@@ -545,7 +522,7 @@ self_update() {
 #=============================================================================
 
 execute_module() {
-    local module="$1"
+    local module="\$1"
     local module_file="$TEMP_DIR/${module}.sh"
     
     if [[ ! -f "$module_file" ]]; then
@@ -580,98 +557,78 @@ execute_module() {
 }
 
 #=============================================================================
-# 系统状态获取（拆分成小函数）
+# 系统状态获取
 #=============================================================================
 
-get_basic_info() {
+get_system_status() {
+    # 基础信息
     local cpu_cores=$(nproc 2>/dev/null || echo "未知")
-    local mem_info=$(get_info free -h | grep Mem | awk '{print $3"/"$2}')
-    local disk_usage=$(get_info df -h / | awk 'NR==2 {print $5}')
-    local uptime_info=$(get_info uptime -p)
-    local kernel=$(get_info uname -r)
+    local mem_info=$(free -h 2>/dev/null | grep Mem | awk '{print \$3"/"\$2}' || echo "未知")
+    local disk_usage=$(df -h / 2>/dev/null | awk 'NR==2 {print \$5}' || echo "未知")
+    local uptime_info=$(uptime -p 2>/dev/null || echo "未知")
+    local kernel=$(uname -r 2>/dev/null || echo "未知")
     
-    echo "💻 CPU: ${cpu_cores}核心 | 内存: $mem_info | 磁盘: $disk_usage"
+    echo "💻 CPU: ${cpu_cores}核心 \vert{} 内存: $mem_info | 磁盘: $disk_usage"
     echo "⏰ 运行时间: $uptime_info"
     echo "🔧 内核: $kernel"
-}
-
-get_zsh_status() {
-    if ! check_command zsh; then
+    
+    # Zsh 状态
+    if check_command zsh; then
+        local zsh_version=$(zsh --version 2>/dev/null | awk '{print \$2}' || echo "未知")
+        local root_shell=$(getent passwd root 2>/dev/null | cut -d: -f7)
+        if [[ "$root_shell" == "$(which zsh 2>/dev/null)" ]]; then
+            echo "🐚 Zsh: v$zsh_version (已设为默认)"
+        else
+            echo "🐚 Zsh: v$zsh_version (已安装但未设为默认)"
+        fi
+    else
         echo "🐚 Zsh: 未安装"
-        return
     fi
     
-    local zsh_version=$(get_info zsh --version | awk '{print $2}')
-    local root_shell=$(getent passwd root 2>/dev/null | cut -d: -f7)
-    
-    if [[ "$root_shell" == "$(which zsh 2>/dev/null)" ]]; then
-        echo "🐚 Zsh: v$zsh_version (已设为默认)"
+    # Docker 状态
+    if check_command docker; then
+        local docker_version=$(docker --version 2>/dev/null | awk '{print \$3}' | tr -d ',' || echo "未知")
+        local containers_count=$(docker ps -q 2>/dev/null | wc -l || echo "0")
+        local images_count=$(docker images -q 2>/dev/null | wc -l || echo "0")
+        if systemctl is-active --quiet docker 2>/dev/null; then
+            echo "🐳 Docker: v$docker_version (运行中) \vert{} 容器: $containers_count | 镜像: $images_count"
+        else
+            echo "🐳 Docker: v$docker_version (已安装但未运行) \vert{} 容器: $containers_count | 镜像: $images_count"
+        fi
     else
-        echo "🐚 Zsh: v$zsh_version (已安装但未设为默认)"
-    fi
-}
-
-get_docker_status() {
-    if ! check_command docker; then
         echo "🐳 Docker: 未安装"
-        return
     fi
     
-    local docker_version=$(get_info docker --version | awk '{print $3}' | tr -d ',')
-    local containers_count=$(get_info docker ps -q | wc -l)
-    local images_count=$(get_info docker images -q | wc -l)
-    
-    if systemctl is-active --quiet docker 2>/dev/null; then
-        echo "🐳 Docker: v$docker_version (运行中) | 容器: $containers_count | 镜像: $images_count"
-    else
-        echo "🐳 Docker: v$docker_version (已安装但未运行) | 容器: $containers_count | 镜像: $images_count"
-    fi
-}
-
-get_mise_status() {
+    # Mise 状态
     if [[ -f "$HOME/.local/bin/mise" ]]; then
-        local mise_version=$(get_info "$HOME/.local/bin/mise" --version | head -1)
+        local mise_version=$("$HOME/.local/bin/mise" --version 2>/dev/null | head -1 || echo "未知")
         echo "📦 Mise: v$mise_version"
     else
         echo "📦 Mise: 未安装"
     fi
-}
-
-get_tools_status() {
+    
+    # 工具状态
     local tools_status=()
     check_command nexttrace && tools_status+=("NextTrace")
     check_command speedtest && tools_status+=("SpeedTest")
     check_command htop && tools_status+=("htop")
     check_command tree && tools_status+=("tree")
     check_command jq && tools_status+=("jq")
-    
     if (( ${#tools_status[@]} > 0 )); then
         echo "🛠️ 工具: ${tools_status[*]}"
     else
         echo "🛠️ 工具: 未安装"
     fi
-}
-
-get_ssh_status() {
-    local ssh_port=$(grep "^Port " /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}' || echo "22")
-    local ssh_root_login=$(grep "^PermitRootLogin " /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}' || echo "默认")
-    echo "🔒 SSH: 端口=$ssh_port | Root登录=$ssh_root_login"
-}
-
-get_network_info() {
-    local network_ip=$(get_info hostname -I | awk '{print $1}')
-    local network_interface=$(get_info ip route | grep default | awk '{print $5}' | head -1)
+    
+    # SSH 状态
+    local ssh_port=$(grep "^Port " /etc/ssh/sshd_config 2>/dev/null | awk '{print \$2}' || echo "22")
+    local ssh_root_login=$(grep "^PermitRootLogin " /etc/ssh/sshd_config 2>/dev/null | awk '{print \$2}' || echo "默认")
+    echo "🔒 SSH: 端口=$ssh_port \vert{} Root登录=$ssh_root_login"
+    
+    # 网络信息
+    local network_ip=$(hostname -I 2>/dev/null | awk '{print \$1}' || echo "未知")
+    local network_interface=$(ip route 2>/dev/null | grep default | awk '{print \$5}' | head -1 || echo "未知")
     echo "🌐 网络: $network_ip via $network_interface"
-}
-
-get_system_status() {
-    get_basic_info
-    get_zsh_status
-    get_docker_status
-    get_mise_status
-    get_tools_status
-    get_ssh_status
-    get_network_info
 }
 
 #=============================================================================
@@ -716,13 +673,13 @@ generate_summary() {
 📋 基本信息:
    🔢 脚本版本: $SCRIPT_VERSION (commit: $SCRIPT_COMMIT)
    📅 部署时间: $(date '+%Y-%m-%d %H:%M:%S %Z')
-   ⏱️  总耗时: ${total_time}秒 | 平均耗时: ${avg_time}秒/模块
+   ⏱️  总耗时: ${total_time}秒 \vert{} 平均耗时: ${avg_time}秒/模块
    🏠 主机名: $(hostname)
    💻 系统: $(grep 'PRETTY_NAME' /etc/os-release 2>/dev/null | cut -d= -f2 | tr -d '"' || echo 'Debian')
-   🌐 IP地址: $(hostname -I 2>/dev/null | awk '{print $1}' || echo '未知')
+   🌐 IP地址: $(hostname -I 2>/dev/null | awk '{print \$1}' || echo '未知')
 
 📊 执行统计:
-   📦 总模块: $total_modules | ✅ 成功: $success_count | ❌ 失败: $failed_count | 📈 成功率: ${success_rate}%
+   📦 总模块: $total_modules \vert{} ✅ 成功: $success_count | ❌ 失败: $failed_count \vert{} 📈 成功率: ${success_rate}%
 
 EOF
     
@@ -766,7 +723,7 @@ EOF
         echo "总耗时: ${total_time}秒"
         echo "主机: $(hostname)"
         echo "系统: $(grep 'PRETTY_NAME' /etc/os-release 2>/dev/null | cut -d= -f2 | tr -d '"' || echo 'Debian')"
-        echo "IP地址: $(hostname -I 2>/dev/null | awk '{print $1}' || echo '未知')"
+        echo "IP地址: $(hostname -I 2>/dev/null | awk '{print \$1}' || echo '未知')"
         echo ""
         echo "执行统计:"
         echo "总模块: $total_modules, 成功: $success_count, 失败: $failed_count, 成功率: ${success_rate}%"
@@ -796,6 +753,7 @@ EOF
         echo "  摘要: $SUMMARY_FILE"
     } > "$SUMMARY_FILE" 2>/dev/null || true
     
+    echo
     echo
     echo "📁 详细摘要已保存至: $SUMMARY_FILE"
     echo "$LINE"
@@ -919,74 +877,74 @@ main() {
     [[ "$SCRIPT_COMMIT" != "unknown" ]] && echo "Commit: $SCRIPT_COMMIT"
     echo "$LINE"
     
-    # ===== 自我更新检查 =====
-    self_update  # ← 不传参数，用全局变量 FILTERED_ARGS
+    # 自我更新检查
+    self_update
     echo
-      
-    # 检查和准备  
-    pre_check  
-    install_dependencies  
-    system_update  
-      
-    # 获取最新代码版本（只调用一次）  
-    log "获取 GitHub 最新代码版本..."  
-    LATEST_COMMIT=$(get_latest_commit)  
-    readonly LATEST_COMMIT  
-    log "当前版本: $LATEST_COMMIT"  
-      
-    # 模块选择  
-    select_deployment_mode  
-      
-    if (( ${#SELECTED_MODULES[@]} == 0 )); then  
-        log "未选择任何模块，退出" "warn"  
-        exit 0  
-    fi  
-      
-    resolve_dependencies  
-      
-    echo  
-    echo "最终执行计划: ${SELECTED_MODULES[*]}"  
-    read -p "确认执行? [Y/n]: " -r choice  
-    choice="${choice:-Y}"  
-    [[ "$choice" =~ ^[Yy]$ ]] || exit 0  
-      
-    # 下载模块  
-    echo  
-    echo "$LINE"  
-    log "开始下载 ${#SELECTED_MODULES[@]} 个模块"  
-    echo "$LINE"  
-      
-    local download_failed=0  
-    local downloaded=0  
-      
-    for module in "${SELECTED_MODULES[@]}"; do  
-        downloaded=$((downloaded + 1))  # ← 改用这种方式，更安全  
-        echo  
-        echo "[$downloaded/${#SELECTED_MODULES[@]}] 下载模块: $module"  
-          
-        set +e  # 临时关闭严格模式  
-        download_module "$module"  
-        local result=$?  
-        set -e  # 恢复严格模式  
-          
-        if (( result == 0 )); then  
-            log "✓ $module 下载成功"  
-        else  
-            MODULE_STATUS[$module]="failed"  
-            download_failed=$((download_failed + 1))  
-            log "✗ $module 下载失败" "error"  
-        fi  
-    done  
-      
-    echo  
-    if (( download_failed > 0 )); then  
-        log "有 $download_failed 个模块下载失败" "warn"  
-        read -p "是否继续执行已下载的模块? [y/N]: " -r choice  
-        [[ "$choice" =~ ^[Yy]$ ]] || exit 1  
-    else  
-        log "所有模块下载完成" "success"  
-    fi  
-      
+    
+    # 检查和准备
+    pre_check
+    install_dependencies
+    system_update
+    
+    # 获取最新代码版本（只调用一次）
+    log "获取 GitHub 最新代码版本..."
+    LATEST_COMMIT=$(get_latest_commit)
+    readonly LATEST_COMMIT
+    log "当前版本: $LATEST_COMMIT"
+    
+    # 模块选择
+    select_deployment_mode
+    
+    if (( ${#SELECTED_MODULES[@]} == 0 )); then
+        log "未选择任何模块，退出" "warn"
+        exit 0
+    fi
+    
+    resolve_dependencies
+    
+    echo
+    echo "最终执行计划: ${SELECTED_MODULES[*]}"
+    read -p "确认执行? [Y/n]: " -r choice
+    choice="${choice:-Y}"
+    [[ "$choice" =~ ^[Yy]$ ]] || exit 0
+    
+    # 下载模块
+    echo
+    echo "$LINE"
+    log "开始下载 ${#SELECTED_MODULES[@]} 个模块"
+    echo "$LINE"
+    
+    local download_failed=0
+    local downloaded=0
+    
+    for module in "${SELECTED_MODULES[@]}"; do
+        downloaded=$((downloaded + 1))
+        echo
+        echo "[$downloaded/${#SELECTED_MODULES[@]}] 下载模块: $module"
+        
+        set +e
+        download_module "$module"
+        local result=$?
+        set -e
+        
+        if (( result == 0 )); then
+            log "✓ $module 下载成功"
+        else
+            MODULE_STATUS[$module]="failed"
+            download_failed=$((download_failed + 1))
+            log "✗ $module 下载失败" "error"
+        fi
+    done
+    
+    echo
+    if (( download_failed > 0 )); then
+        log "有 $download_failed 个模块下载失败" "warn"
+        read -p "是否继续执行已下载的模块? [y/N]: " -r choice
+        [[ "$choice" =~ ^[Yy]$ ]] || exit 1
+    else
+        log "所有模块下载完成" "success"
+    fi
+    
     # 执行模块
     echo
     echo "$LINE"
