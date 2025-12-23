@@ -283,30 +283,38 @@ fix_python_system_priority() {
     debug_log "系统Python优先级修复完成"  
 }  
   
-# 安全的PATH配置  
-configure_safe_path_priority() {  
-    debug_log "配置安全PATH优先级"  
-    local shells=("bash:$HOME/.bashrc" "zsh:$HOME/.zshrc")  
-      
-    for shell_info in "${shells[@]}"; do  
-        local shell_name="${shell_info%%:*}"  
-        local config_file="${shell_info#*:}"  
-          
-        command -v "$shell_name" &>/dev/null || { debug_log "$shell_name 不存在，跳过配置"; continue; }  
-          
-        [[ ! -f "$config_file" ]] && touch "$config_file"  
-        cp "$config_file" "${config_file}.mise.backup" 2>/dev/null || true  
-          
-        # 移除旧的PATH配置  
-        sed -i '/# Mise PATH priority/,+1d' "$config_file" 2>/dev/null || true  
-        sed -i '/# Mise global mode PATH/,+1d' "$config_file" 2>/dev/null || true  
-          
-        debug_log "为 $shell_name 配置安全PATH"  
-        cat >> "$config_file" << 'EOF' 
+# 安全的PATH配置    
+configure_safe_path_priority() {    
+    debug_log "配置安全PATH优先级"    
+    local shells=("bash:$HOME/.bashrc" "zsh:$HOME/.zshrc")    
+        
+    for shell_info in "${shells[@]}"; do    
+        local shell_name="${shell_info%%:*}"    
+        local config_file="${shell_info#*:}"    
+            
+        command -v "$shell_name" &>/dev/null || { debug_log "$shell_name 不存在，跳过配置"; continue; }    
+            
+        [[ ! -f "$config_file" ]] && touch "$config_file"    
+        cp "$config_file" "${config_file}.mise.backup" 2>/dev/null || true    
+            
+        # 移除旧的PATH配置    
+        sed -i '/# Mise PATH priority/,+1d' "$config_file" 2>/dev/null || true    
+        sed -i '/# Mise global mode PATH/,+1d' "$config_file" 2>/dev/null || true    
+            
+        debug_log "为 $shell_name 配置安全PATH"    
+        cat >> "$config_file" << 'EOF'
 # Mise PATH priority - 确保系统工具使用系统Python  
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$HOME/.local/bin:$PATH" # $HOME/.local/bin 放在 PATH 末尾是安全的
+
 EOF
-    done  
+
+        # 【新增】强制清理配置文件的 CRLF 换行符 (对每个文件都清理)
+        if command -v sed &>/dev/null; then
+            sed -i 's/\r//g' "$config_file" 2>/dev/null || true
+            debug_log "清理 $config_file 的 CRLF"
+        fi
+        
+    done    
 }
   
 # 获取Mise版本  
@@ -621,7 +629,7 @@ configure_shell_integration() {
             fi
         fi  
         
-        # 【新增】强制清理：因为是追加内容，所以需要在这里清理一次
+        # 【新增】强制清理配置文件的 CRLF 换行符 (对每个文件都清理)
         if command -v sed &>/dev/null; then
             sed -i 's/\r//g' "$config_file" 2>/dev/null || true
             debug_log "清理 $config_file 的 CRLF"
