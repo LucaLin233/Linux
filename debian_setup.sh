@@ -553,8 +553,8 @@ execute_module() {
 
 get_system_status() {
     local cpu_cores=$(nproc 2>/dev/null || echo "未知")
-    local mem_info=$(free -h 2>/dev/null | grep Mem | awk '{print \$3"/"\$2}' || echo "未知")
-    local disk_usage=$(df -h / 2>/dev/null | awk 'NR==2 {print \$5}' || echo "未知")
+    local mem_info=$(free -h 2>/dev/null | grep Mem | awk '{print $3"/"$2}' || echo "未知")
+    local disk_usage=$(df -h / 2>/dev/null | awk 'NR==2 {print $5}' || echo "未知")
     local uptime_info=$(uptime -p 2>/dev/null || echo "未知")
     local kernel=$(uname -r 2>/dev/null || echo "未知")
     
@@ -563,7 +563,7 @@ get_system_status() {
     echo "🔧 内核: $kernel"
     
     if check_command zsh; then
-        local zsh_version=$(zsh --version 2>/dev/null | awk '{print \$2}' || echo "未知")
+        local zsh_version=$(zsh --version 2>/dev/null | awk '{print $2}' || echo "未知")
         local root_shell=$(getent passwd root 2>/dev/null | cut -d: -f7)
         if [[ "$root_shell" == "$(which zsh 2>/dev/null)" ]]; then
             echo "🐚 Zsh: v$zsh_version (已设为默认)"
@@ -575,7 +575,7 @@ get_system_status() {
     fi
     
     if check_command docker; then
-        local docker_version=$(docker --version 2>/dev/null | awk '{print \$3}' | tr -d ',' || echo "未知")
+        local docker_version=$(docker --version 2>/dev/null | awk '{print $3}' | tr -d ',' || echo "未知")
         local containers_count=$(docker ps -q 2>/dev/null | wc -l || echo "0")
         local images_count=$(docker images -q 2>/dev/null | wc -l || echo "0")
         if systemctl is-active --quiet docker 2>/dev/null; then
@@ -606,12 +606,12 @@ get_system_status() {
         echo "🛠️ 工具: 未安装"
     fi
     
-    local ssh_port=$(grep "^Port " /etc/ssh/sshd_config 2>/dev/null | awk '{print \$2}' || echo "22")
-    local ssh_root_login=$(grep "^PermitRootLogin " /etc/ssh/sshd_config 2>/dev/null | awk '{print \$2}' || echo "默认")
+    local ssh_port=$(grep "^Port " /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}' || echo "22")
+    local ssh_root_login=$(grep "^PermitRootLogin " /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}' || echo "默认")
     echo "🔒 SSH: 端口=$ssh_port | Root登录=$ssh_root_login"
     
-    local network_ip=$(hostname -I 2>/dev/null | awk '{print \$1}' || echo "未知")
-    local network_interface=$(ip route 2>/dev/null | grep default | awk '{print \$5}' | head -1 || echo "未知")
+    local network_ip=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "未知")
+    local network_interface=$(ip route 2>/dev/null | grep default | awk '{print $5}' | head -1 || echo "未知")
     echo "🌐 网络: $network_ip via $network_interface"
 }
 
@@ -658,7 +658,7 @@ generate_summary() {
    ⏱️  总耗时: ${total_time}秒 | 平均耗时: ${avg_time}秒/模块
    🏠 主机名: $(hostname)
    💻 系统: $(grep 'PRETTY_NAME' /etc/os-release 2>/dev/null | cut -d= -f2 | tr -d '"' || echo 'Debian')
-   🌐 IP地址: $(hostname -I 2>/dev/null | awk '{print \$1}' || echo '未知')
+   🌐 IP地址: $(hostname -I 2>/dev/null | awk '{print $1}' || echo '未知')
 
 📊 执行统计:
    📦 总模块: $total_modules | ✅ 成功: $success_count | ❌ 失败: $failed_count | 📈 成功率: ${success_rate}%
@@ -701,7 +701,7 @@ EOF
         echo "总耗时: ${total_time}秒"
         echo "主机: $(hostname)"
         echo "系统: $(grep 'PRETTY_NAME' /etc/os-release 2>/dev/null | cut -d= -f2 | tr -d '"' || echo 'Debian')"
-        echo "IP地址: $(hostname -I 2>/dev/null | awk '{print \$1}' || echo '未知')"
+        echo "IP地址: $(hostname -I 2>/dev/null | awk '{print $1}' || echo '未知')"
         echo ""
         echo "执行统计:"
         echo "总模块: $total_modules, 成功: $success_count, 失败: $failed_count, 成功率: ${success_rate}%"
@@ -745,11 +745,11 @@ show_recommendations() {
     log "部署完成！" "success"
     
     if [[ "${MODULE_STATUS[ssh-security]:-}" == "success" ]]; then
-        local new_ssh_port=$(grep "^Port " /etc/ssh/sshd_config 2>/dev/null | awk '{print \$2}' || echo "22")
+        local new_ssh_port=$(grep "^Port " /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}' || echo "22")
         if [[ "$new_ssh_port" != "22" ]]; then
             echo
             echo "⚠️  重要: SSH端口已更改为 $new_ssh_port"
-            echo "   新连接: ssh -p $new_ssh_port user@$(hostname -I | awk '{print \$1}')"
+            echo "   新连接: ssh -p $new_ssh_port user@$(hostname -I | awk '{print $1}')"
         fi
     fi
     
