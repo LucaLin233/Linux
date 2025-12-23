@@ -596,52 +596,63 @@ configure_shell_integration() {
     local mise_cmd=""   
     mise_cmd=$(get_mise_executable) || { debug_log "找不到mise可执行文件，跳过Shell集成"; return 1; }    
       
-    # 【修复 1】简化数组结构：只保留 shell name 和 config file 路径  
     local shells=("bash:$HOME/.bashrc" "zsh:$HOME/.zshrc")   
     local integration_success=true    
         
     for shell_info in "${shells[@]}"; do    
         local shell_name="${shell_info%%:*}"    
-        local config_file="${shell_info#*:}"   
+        local config_file="${shell_info#*:}"
             
         command -v "$shell_name" &>/dev/null || { debug_log "$shell_name 不存在，跳过配置"; continue; }    
             
         [[ ! -f "$config_file" ]] && touch "$config_file"    
-            
-        # 检查集成是否已存在    
-        if grep -q "mise activate $shell_name" "$config_file" 2>/dev/null; then    
-            echo "$shell_name集成: 已存在"    
-            debug_log "$shell_name 集成已存在"    
-        else    
-            debug_log "为 $shell_name 配置集成"    
-            
-            # 【修复 2】构建安全的字面激活命令（将 $HOME/.local/bin/mise 路径写入文件）
-            local activation_command="eval \"\$($HOME/.local/bin/mise activate $shell_name)\""
-            local append_content="\n# Mise version manager\n$activation_command"
-  
-            # 尝试找到第一个 export PATH 语句后插入，如果找不到则追加  
-            if grep -q "export PATH" "$config_file" 2>/dev/null; then  
-                # 在第一个 export PATH 后新增  
-                sed -i "/export PATH/a $append_content" "$config_file" 2>/dev/null || \   
-                echo -e "$append_content" >> "$config_file"   
-            else  
-                echo -e "$append_content" >> "$config_file"   
-            fi  
-  
-            if [[ $? -eq 0 ]]; then  
-                echo "$shell_name集成: 已配置"    
-                debug_log "$shell_name 集成配置完成"    
-            else  
-                echo "$shell_name集成: 配置失败"   
-                integration_success=false  
-            fi  
-        fi    
-          
-        # 【新增/保留】强制清理配置文件的 CRLF 换行符 (对每个文件都清理)  
+        
+        # 【核心修复 1】清除所有旧的 Mise activation lines
+        # Zsh 脚本在底部做了清理，但 Mise 脚本的激活放在了顶部，这里必须清除
+        sed -i '/eval "\$([^\)]*mise activate[^\)]*)"/d' "$config_file" 2>/dev/null || true
+        sed -i '/# Mise version manager/d' "$config_file" 2>/dev/null || true
+        # 强制清理 CRLF 以移除 n# 带来的不可见字符
         if command -v sed &>/dev/null; then  
             sed -i 's/\r//g' "$config_file" 2>/dev/null || true  
-            debug_log "清理 $config_file 的 CRLF"  
-        fi  
+            debug_log "清理 $config_file 的 CRLF 前缀"  
+        fi
+          
+        # 检查集成是否已存在 (注意：这里的检查现在是清除旧条目后的检查)
+        if grep -q "mise activate $shell_name" "$config_file" 2>/dev/null; then
+            echo "$shell_name集成: 已存在 (已清理旧条目)"
+            debug_log "$shell_name 集成已存在"
+        else
+            debug_log "为 $shell_name 配置集成"
+            
+            # 【核心修复 2】构建安全的字面激活命令 (Mise 路径和 Shell Name 必须是字面值)
+            local activation_command="eval \"\$($HOME/.local/bin/mise activate $shell_name)\""
+            local append_content="\n# Mise version manager\n$activation_command"
+
+            # 尝试找到第一个 export PATH 语句后插入，如果找不到则追加
+            if grep -q "export PATH" "$config_file" 2>/dev/null; then
+                # 在第一个 export PATH 后新增
+                # 使用 sed /a 插入会在行前自动添加一个 LF，然后我们再追加内容
+                # 注意：这里我们插入到文件的开头，而不是第一个 export PATH 后面
+                sed -i "1s/^/$append_content\n/" "$config_file" 2>/dev/null || \
+                echo -e "$append_content" >> "$config_file"
+            else
+                echo -e "$append_content" >> "$config_file"
+            fi
+
+            if [[ $? -eq 0 ]]; then
+                echo "$shell_name集成: 已配置"
+                debug_log "$shell_name 集成配置完成"
+            else
+                echo "$shell_name集成: 配置失败"
+                integration_success=false
+            fi
+        fi
+        
+        # 再次执行清理，以防最新的追加又带入了 CRLF
+        if command -v sed &>/dev/null; then  
+            sed -i 's/\r//g' "$config_file" 2>/dev/null || true  
+            debug_log "清理 $config_file 的 CRLF 后缀"  
+        fi 
           
     done    
         
