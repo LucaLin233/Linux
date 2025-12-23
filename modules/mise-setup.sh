@@ -305,7 +305,6 @@ configure_safe_path_priority() {
         cat >> "$config_file" << 'EOF'
 # Mise PATH priority - 确保系统工具使用系统Python  
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$HOME/.local/bin:$PATH" # $HOME/.local/bin 放在 PATH 末尾是安全的
-
 EOF
     done  
 }  
