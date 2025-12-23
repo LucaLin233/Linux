@@ -161,7 +161,7 @@ ZSH_THEME="powerlevel10k/powerlevel10k"
 # 禁用自动更新提示    
 DISABLE_UPDATE_PROMPT="true"     
 UPDATE_ZSH_DAYS=7    
-# ... (plugins list area)  
+# ... (plugins list area) 
 plugins=(     
     git    
     zsh-autosuggestions    
@@ -202,6 +202,12 @@ EOF
         return 1    
     fi    
         
+    # 🚨 终极安全网：强制将文件转换为 Unix LF 格式，解决 'n#' 错误 
+    if command -v sed &>/dev/null; then  
+        sed -i 's/\r//g' "$HOME/.zshrc" 2>/dev/null || true  
+        debug_log "强制 zshrc 文件为 Unix LF 格式"  
+    fi  
+  
     # 修复后重新设置权限  
     chmod 644 "$HOME/.zshrc" 2>/dev/null || true  
   
