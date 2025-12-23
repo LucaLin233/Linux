@@ -297,22 +297,30 @@ configure_safe_path_priority() {
         [[ ! -f "$config_file" ]] && touch "$config_file"      
         cp "$config_file" "${config_file}.mise.backup" 2>/dev/null || true      
               
-        # 移除旧的PATH配置      
+        # 【新增/关键修复】移除所有旧的、错误的 MISC-VERSION LINES (包括你看到的 n# 和 eval)
+        sed -i '/eval "\$([^\)]*mise activate[^\)]*)"/d' "$config_file" 2>/dev/null || true
+        sed -i 's/^n# Mise version manager$//g' "$config_file" 2>/dev/null || true
+        sed -i '/# Mise version manager/d' "$config_file" 2>/dev/null || true
+              
+        # 移除旧的PATH配置 (保留原有的逻辑)
         sed -i '/# Mise PATH priority/,+1d' "$config_file" 2>/dev/null || true      
-        sed -i '/# Mise global mode PATH/,+1d' "$config_file" 2>/dev/null || true      
+        sed -i '/# Mise global mode PATH/,+1d' "$config_file" 2>/dev/null || true
+        
+        # 🚨 终极清理：清除所有已知的 CRLF 污染（这是防止 n# 的根本，必须保留）
+        if command -v sed &>/dev/null; then  
+            sed -i 's/\r//g' "$config_file" 2>/dev/null || true  
+            debug_log "强制清理 $config_file 的 CRLF"  
+        fi
               
         debug_log "为 $shell_name 配置安全PATH"      
+        # ... (cat >> 'EOF' BLOCK 不变)
         cat >> "$config_file" << 'EOF'
 # Mise PATH priority - 确保系统工具使用系统Python    
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$HOME/.local/bin:$PATH" # $HOME/.local/bin 放在 PATH 末尾是安全的
   
 EOF
   
-        # 【新增/保留】强制清理配置文件的 CRLF 换行符 (对每个文件都清理)
-        if command -v sed &>/dev/null; then  
-            sed -i 's/\r//g' "$config_file" 2>/dev/null || true  
-            debug_log "清理 $config_file 的 CRLF"  
-        fi  
+        # Mise脚本中的这个函数不再包含额外的 sed 清理，因为它在开头已经做了最彻底的清除+清理
           
     done      
 }
