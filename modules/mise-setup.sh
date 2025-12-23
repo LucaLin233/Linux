@@ -302,12 +302,12 @@ configure_safe_path_priority() {
         sed -i '/# Mise global mode PATH/,+1d' "$config_file" 2>/dev/null || true  
           
         debug_log "为 $shell_name 配置安全PATH"  
-        cat >> "$config_file" << 'EOF'
+        cat >> "$config_file" << 'EOF' 
 # Mise PATH priority - 确保系统工具使用系统Python  
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$HOME/.local/bin:$PATH" # $HOME/.local/bin 放在 PATH 末尾是安全的
 EOF
     done  
-}  
+}
   
 # 获取Mise版本  
 get_mise_version() {  
