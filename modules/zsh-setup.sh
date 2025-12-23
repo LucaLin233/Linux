@@ -199,7 +199,7 @@ alias sstop='systemctl stop'
 alias sre='systemctl restart'     
 alias sst='systemctl status'     
 alias sdre='systemctl daemon-reload'     
-EOF  
+EOF
         log ".zshrc配置写入失败" "error"     
         return 1    
     fi    
