@@ -360,8 +360,8 @@ resolve_dependencies() {
 
 get_latest_commit() {
     local commit_hash
-    commit_hash=$(curl -s --connect-timeout 5 --max-time 10 $
-        "https://api.github.com/repos/LucaLin233/Linux/commits/main" 2>/dev/null | $
+    commit_hash=$(curl -s --connect-timeout 5 --max-time 10 \
+        "https://api.github.com/repos/LucaLin233/Linux/commits/main" 2>/dev/null | \
         grep '"sha"' | head -1 | cut -d'"' -f4 | cut -c1-7 2>/dev/null)
     
     if [[ -n "$commit_hash" ]] && [[ ${#commit_hash} -eq 7 ]]; then
@@ -382,8 +382,8 @@ download_with_retry() {
                 local first_line
                 first_line=$(head -1 "$output" 2>/dev/null)
                 
-                if [[ "$first_line" == "#!/bin/bash"* ]] || $
-                   [[ "$first_line" == "#!/usr/bin/env bash"* ]] || $
+                if [[ "$first_line" == "#!/bin/bash"* ]] || \
+                   [[ "$first_line" == "#!/usr/bin/env bash"* ]] || \
                    [[ "$first_line" == "#!/bin/sh"* ]]; then
                     return 0
                 fi
