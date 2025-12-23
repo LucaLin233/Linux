@@ -553,7 +553,7 @@ execute_module() {
 
 get_system_status() {
     local cpu_cores=$(nproc 2>/dev/null || echo "未知")
-    local mem_info=$(free -h 2>/dev/null | grep Mem | awk '{print $3"/"$2}' || echo "未知")
+    local mem_info=$(LANG=C free -h 2>/dev/null | awk 'NR==2 {print $3"/"$2}' || echo "未知")
     local disk_usage=$(df -h / 2>/dev/null | awk 'NR==2 {print $5}' || echo "未知")
     local uptime_info=$(uptime -p 2>/dev/null || echo "未知")
     local kernel=$(uname -r 2>/dev/null || echo "未知")
