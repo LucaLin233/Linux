@@ -457,7 +457,7 @@ self_update() {
         return 0
     fi
     
-    if [[ ! -s "$temp_script" ]] \vert{}\vert{} ! head -1 "$temp_script" | grep -qE "^#!/bin/(bash|sh)" 2>/dev/null; then
+    if [[ ! -s "$temp_script" ]] || ! head -1 "$temp_script" | grep -qE "^#!/bin/(bash|sh)" 2>/dev/null; then
         log "下载的文件格式不正确，跳过更新" "warn"
         rm -f "$temp_script"
         return 0
