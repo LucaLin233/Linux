@@ -153,8 +153,6 @@ configure_zshrc() {
     fi    
         
     debug_log "写入.zshrc配置文件"     
-    # 警告：此立即文档区块包含导致你出现 'n#' 错误的敏感内容。  
-    # 关键点：我们依赖原始脚本的格式，只修改内部内容。  
     if ! cat > "$HOME/.zshrc" << 'EOF'; then    
 # Oh My Zsh 配置    
 export ZSH="$HOME/.oh-my-zsh"     
@@ -163,7 +161,7 @@ ZSH_THEME="powerlevel10k/powerlevel10k"
 # 禁用自动更新提示    
 DISABLE_UPDATE_PROMPT="true"     
 UPDATE_ZSH_DAYS=7    
-# ... (为节省篇幅，这里应该包含所有 plugins 列表，保持和你原始脚本一致)  
+# ... (plugins list area)  
 plugins=(     
     git    
     zsh-autosuggestions    
@@ -204,14 +202,6 @@ EOF
         return 1    
     fi    
         
-    # 🚨 换行符和隐藏字符清理：强制将文件转换为 Unix LF 格式 (终极安全网)  
-    # 目标：抹平所有不可见的 \r 字符，解决 'n#' 错误  
-    if command -v sed &>/dev/null; then  
-        # 标准的 DOS/Windows 换行符转 Unix 换行符  
-        sed -i 's/\r//g' "$HOME/.zshrc" 2>/dev/null || true  
-        debug_log "强制 zshrc 文件为 Unix LF 格式"  
-    fi  
-  
     # 修复后重新设置权限  
     chmod 644 "$HOME/.zshrc" 2>/dev/null || true  
   
@@ -337,11 +327,6 @@ setup_default_shell() {
 
 # === 主流程 ===  
 main() {   
-    # 【新增 / 强烈推荐】防御性编程：清理脚本自身的 CRLF 换行符（防止 'n#' 错误）
-    if command -v sed &>/dev/null; then
-        sed -i 's/\r//g' "$0" 2>/dev/null || true
-    fi
-      
     log "🐚 配置Zsh环境..." "info"   
       
     echo  
