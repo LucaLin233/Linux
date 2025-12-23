@@ -144,79 +144,79 @@ install_components() {
     return 0  # 不让错误中断整个流程
 } 
 
-# 配置zshrc文件  
-configure_zshrc() {   
-    debug_log "开始配置.zshrc"   
-      
-    if ! backup_zshrc; then  
-        return 1  
+# 配置zshrc文件    
+configure_zshrc() {     
+    debug_log "开始配置.zshrc"     
+        
+    if ! backup_zshrc; then    
+        return 1    
+    fi    
+        
+    debug_log "写入.zshrc配置文件"     
+    # 警告：此立即文档区块包含导致你出现 'n#' 错误的敏感内容。  
+    # 关键点：我们依赖原始脚本的格式，只修改内部内容。  
+    if ! cat > "$HOME/.zshrc" << 'EOF'; then    
+# Oh My Zsh 配置    
+export ZSH="$HOME/.oh-my-zsh"     
+ZSH_THEME="powerlevel10k/powerlevel10k"     
+    
+# 禁用自动更新提示    
+DISABLE_UPDATE_PROMPT="true"     
+UPDATE_ZSH_DAYS=7    
+# ... (为节省篇幅，这里应该包含所有 plugins 列表，保持和你原始脚本一致)  
+plugins=(     
+    git    
+    zsh-autosuggestions    
+    zsh-syntax-highlighting    
+    zsh-completions    
+    sudo    
+    docker    
+    kubectl    
+    web-search    
+    history    
+    colored-man-pages    
+    command-not-found    
+)     
+    
+source $ZSH/oh-my-zsh.sh    
+autoload -U compinit && compinit    
+# 修正 1：确保 ~/.local/bin 被放在 PATH 的末尾 (安全)  
+export PATH="$PATH:$HOME/.local/bin"     
+    
+# 修正 2：使用安全的 init -s 模式，只注入 Shell 函数和补全，不劫持 PATH (静默启动警告)  
+command -v mise >/dev/null 2>&1 && eval "$(mise init -s zsh 2>/dev/null)"     
+    
+# Powerlevel10k 配置    
+[[ ! -f ~/.p10k.zsh ]] || source ~/.p10k.zsh    
+    
+# 实用别名    
+alias upgrade='apt update && apt full-upgrade -y'     
+alias update='apt update -y'     
+alias reproxy='cd /root/proxy && docker compose down && docker compose pull && docker compose up -d --remove-orphans'     
+alias dlog='docker logs -f'     
+alias autodel='docker system prune -a -f && apt autoremove -y && apt clean'     
+alias sstop='systemctl stop'     
+alias sre='systemctl restart'     
+alias sst='systemctl status'     
+alias sdre='systemctl daemon-reload'     
+EOF  
+        log ".zshrc配置写入失败" "error"     
+        return 1    
+    fi    
+        
+    # 🚨 换行符和隐藏字符清理：强制将文件转换为 Unix LF 格式 (终极安全网)  
+    # 目标：抹平所有不可见的 \r 字符，解决 'n#' 错误  
+    if command -v sed &>/dev/null; then  
+        # 标准的 DOS/Windows 换行符转 Unix 换行符  
+        sed -i 's/\r//g' "$HOME/.zshrc" 2>/dev/null || true  
+        debug_log "强制 zshrc 文件为 Unix LF 格式"  
     fi  
-      
-    debug_log "写入.zshrc配置文件"   
-    # 警告：此立即文档区块包含导致你出现 'n#' 错误的敏感内容。
-    # 关键点：我们依赖原始脚本的格式，只修改内部内容。
-    if ! cat > "$HOME/.zshrc" << 'EOF'; then  
-# Oh My Zsh 配置  
-export ZSH="$HOME/.oh-my-zsh"   
-ZSH_THEME="powerlevel10k/powerlevel10k"   
   
-# 禁用自动更新提示  
-DISABLE_UPDATE_PROMPT="true"   
-UPDATE_ZSH_DAYS=7  
-# ... (为节省篇幅，这里应该包含所有 plugins 列表，保持和你原始脚本一致)
-plugins=(   
-    git  
-    zsh-autosuggestions  
-    zsh-syntax-highlighting  
-    zsh-completions  
-    sudo  
-    docker  
-    kubectl  
-    web-search  
-    history  
-    colored-man-pages  
-    command-not-found  
-)   
+    # 修复后重新设置权限  
+    chmod 644 "$HOME/.zshrc" 2>/dev/null || true  
   
-source $ZSH/oh-my-zsh.sh  
-autoload -U compinit && compinit  
-# 修正 1：确保 ~/.local/bin 被放在 PATH 的末尾 (安全)
-export PATH="$PATH:$HOME/.local/bin"   
-  
-# 修正 2：使用安全的 init -s 模式，只注入 Shell 函数和补全，不劫持 PATH
-command -v mise >/dev/null 2>&1 && eval "$(mise init -s zsh)"   
-  
-# Powerlevel10k 配置  
-[[ ! -f ~/.p10k.zsh ]] || source ~/.p10k.zsh  
-  
-# 实用别名  
-alias upgrade='apt update && apt full-upgrade -y'   
-alias update='apt update -y'   
-alias reproxy='cd /root/proxy && docker compose down && docker compose pull && docker compose up -d --remove-orphans'   
-alias dlog='docker logs -f'   
-alias autodel='docker system prune -a -f && apt autoremove -y && apt clean'   
-alias sstop='systemctl stop'   
-alias sre='systemctl restart'   
-alias sst='systemctl status'   
-alias sdre='systemctl daemon-reload'   
-EOF
-        log ".zshrc配置写入失败" "error"   
-        return 1  
-    fi  
-      
-    # 🚨 换行符和隐藏字符清理：强制将文件转换为 Unix LF 格式 (终极安全网)
-    # 目标：抹平所有不可见的 \r 字符，解决 'n#' 错误
-    if command -v sed &>/dev/null; then
-        # 标准的 DOS/Windows 换行符转 Unix 换行符
-        sed -i 's/\r//g' "$HOME/.zshrc" 2>/dev/null || true
-        debug_log "强制 zshrc 文件为 Unix LF 格式"
-    fi
-
-    # 修复后重新设置权限
-    chmod 644 "$HOME/.zshrc" 2>/dev/null || true
-
-    debug_log ".zshrc配置完成"   
-    return 0  
+    debug_log ".zshrc配置完成"     
+    return 0    
 }
 
 # 选择并配置主题
@@ -335,38 +335,43 @@ setup_default_shell() {
 } 
 # === 核心功能函数结束 ===
 
-# === 主流程 ===
-main() { 
-    log "🐚 配置Zsh环境..." "info" 
-    
-    echo
-    install_components || { 
-        log "组件安装出现问题，但继续执行" "warn" 
-    } 
-    
-    echo
-    if configure_zshrc; then
-        echo "配置文件: .zshrc 已更新" 
-    else
-        log "zshrc配置失败" "error" 
-        return 1
+# === 主流程 ===  
+main() {   
+    # 【新增 / 强烈推荐】防御性编程：清理脚本自身的 CRLF 换行符（防止 'n#' 错误）
+    if command -v sed &>/dev/null; then
+        sed -i 's/\r//g' "$0" 2>/dev/null || true
     fi
-    
-    echo
-    setup_theme || { 
-        log "主题设置出现问题，但不影响主要功能" "warn" 
-    } 
-    
-    echo
-    setup_default_shell || { 
-        log "默认Shell设置失败" "warn" 
-    } 
-    
-    echo
-    log "✅ Zsh配置完成，运行 'exec zsh' 体验" "info" 
-    
-    return 0
-} 
+      
+    log "🐚 配置Zsh环境..." "info"   
+      
+    echo  
+    install_components || {   
+        log "组件安装出现问题，但继续执行" "warn"   
+    }   
+      
+    echo  
+    if configure_zshrc; then  
+        echo "配置文件: .zshrc 已更新"   
+    else  
+        log "zshrc配置失败" "error"   
+        return 1  
+    fi  
+      
+    echo  
+    setup_theme || {   
+        log "主题设置出现问题，但不影响主要功能" "warn"   
+    }   
+      
+    echo  
+    setup_default_shell || {   
+        log "默认Shell设置失败" "warn"   
+    }   
+      
+    echo  
+    log "✅ Zsh配置完成，运行 'exec zsh' 体验" "info"   
+      
+    return 0  
+}
 
 # 错误处理 - 修复版
 trap 'echo "❌ Zsh配置脚本在第 $LINENO 行执行失败" >&2; exit 1' ERR
