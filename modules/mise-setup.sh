@@ -283,38 +283,38 @@ fix_python_system_priority() {
     debug_log "系统Python优先级修复完成"  
 }  
   
-# 安全的PATH配置    
-configure_safe_path_priority() {    
-    debug_log "配置安全PATH优先级"    
-    local shells=("bash:$HOME/.bashrc" "zsh:$HOME/.zshrc")    
-        
-    for shell_info in "${shells[@]}"; do    
-        local shell_name="${shell_info%%:*}"    
-        local config_file="${shell_info#*:}"    
-            
-        command -v "$shell_name" &>/dev/null || { debug_log "$shell_name 不存在，跳过配置"; continue; }    
-            
-        [[ ! -f "$config_file" ]] && touch "$config_file"    
-        cp "$config_file" "${config_file}.mise.backup" 2>/dev/null || true    
-            
-        # 移除旧的PATH配置    
-        sed -i '/# Mise PATH priority/,+1d' "$config_file" 2>/dev/null || true    
-        sed -i '/# Mise global mode PATH/,+1d' "$config_file" 2>/dev/null || true    
-            
-        debug_log "为 $shell_name 配置安全PATH"    
+# 安全的PATH配置      
+configure_safe_path_priority() {      
+    debug_log "配置安全PATH优先级"      
+    local shells=("bash:$HOME/.bashrc" "zsh:$HOME/.zshrc")      
+          
+    for shell_info in "${shells[@]}"; do      
+        local shell_name="${shell_info%%:*}"      
+        local config_file="${shell_info#*:}"      
+              
+        command -v "$shell_name" &>/dev/null || { debug_log "$shell_name 不存在，跳过配置"; continue; }      
+              
+        [[ ! -f "$config_file" ]] && touch "$config_file"      
+        cp "$config_file" "${config_file}.mise.backup" 2>/dev/null || true      
+              
+        # 移除旧的PATH配置      
+        sed -i '/# Mise PATH priority/,+1d' "$config_file" 2>/dev/null || true      
+        sed -i '/# Mise global mode PATH/,+1d' "$config_file" 2>/dev/null || true      
+              
+        debug_log "为 $shell_name 配置安全PATH"      
         cat >> "$config_file" << 'EOF'
-# Mise PATH priority - 确保系统工具使用系统Python  
+# Mise PATH priority - 确保系统工具使用系统Python    
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$HOME/.local/bin:$PATH" # $HOME/.local/bin 放在 PATH 末尾是安全的
-
+  
 EOF
-
-        # 【新增】强制清理配置文件的 CRLF 换行符 (对每个文件都清理)
-        if command -v sed &>/dev/null; then
-            sed -i 's/\r//g' "$config_file" 2>/dev/null || true
-            debug_log "清理 $config_file 的 CRLF"
-        fi
-        
-    done    
+  
+        # 【新增/保留】强制清理配置文件的 CRLF 换行符 (对每个文件都清理)
+        if command -v sed &>/dev/null; then  
+            sed -i 's/\r//g' "$config_file" 2>/dev/null || true  
+            debug_log "清理 $config_file 的 CRLF"  
+        fi  
+          
+    done      
 }
   
 # 获取Mise版本  
@@ -588,16 +588,13 @@ configure_shell_integration() {
     local mise_cmd=""   
     mise_cmd=$(get_mise_executable) || { debug_log "找不到mise可执行文件，跳过Shell集成"; return 1; }    
       
-    # 【核心修复点】简化数组：只保留 shell name 和 config file 路径  
+    # 【修复 1】简化数组结构：只保留 shell name 和 config file 路径  
     local shells=("bash:$HOME/.bashrc" "zsh:$HOME/.zshrc")   
     local integration_success=true    
-    
-    # 构建正确的激活命令：eval "$(/path/to/mise activate shell_name)"
-    local mise_activate_cmd="eval \"\$($mise_cmd activate \$shell_name)\""
         
     for shell_info in "${shells[@]}"; do    
         local shell_name="${shell_info%%:*}"    
-        local config_file="${shell_info#*:}" # 这是正确的分隔！
+        local config_file="${shell_info#*:}"   
             
         command -v "$shell_name" &>/dev/null || { debug_log "$shell_name 不存在，跳过配置"; continue; }    
             
@@ -609,31 +606,30 @@ configure_shell_integration() {
             debug_log "$shell_name 集成已存在"    
         else    
             debug_log "为 $shell_name 配置集成"    
-            # 注意：这里的 $mise_activate_cmd 已经是带 eval 的完整命令了
-            local append_content="\n# Mise version manager\n$mise_activate_cmd"   
+            
+            # 【修复 2】构建安全的字面激活命令（将 $HOME/.local/bin/mise 路径写入文件）
+            local activation_command="eval \"\$($HOME/.local/bin/mise activate $shell_name)\""
+            local append_content="\n# Mise version manager\n$activation_command"
   
             # 尝试找到第一个 export PATH 语句后插入，如果找不到则追加  
             if grep -q "export PATH" "$config_file" 2>/dev/null; then  
                 # 在第一个 export PATH 后新增  
-                # 注意：sed -i '/export PATH/a ...' 后面使用 $append_content
                 sed -i "/export PATH/a $append_content" "$config_file" 2>/dev/null || \   
                 echo -e "$append_content" >> "$config_file"   
             else  
                 echo -e "$append_content" >> "$config_file"   
             fi  
-            
-            # 由于 append_content 是一个大的字符串， sed -i 不适合它，我们使用 echo -e 是对的。
-            # 这里是成功/失败的检查逻辑
+  
             if [[ $? -eq 0 ]]; then  
                 echo "$shell_name集成: 已配置"    
                 debug_log "$shell_name 集成配置完成"    
             else  
                 echo "$shell_name集成: 配置失败"   
-                integration_success=false
-            fi
+                integration_success=false  
+            fi  
         fi    
           
-        # 【强制清理】因为追加内容风险高，所以必须在这里清理
+        # 【新增/保留】强制清理配置文件的 CRLF 换行符 (对每个文件都清理)  
         if command -v sed &>/dev/null; then  
             sed -i 's/\r//g' "$config_file" 2>/dev/null || true  
             debug_log "清理 $config_file 的 CRLF"  
