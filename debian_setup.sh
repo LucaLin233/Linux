@@ -513,7 +513,7 @@ self_update() {
 #=============================================================================
 
 execute_module() {
-    local module="\$1"
+    local module="$1"
     local module_file="$TEMP_DIR/${module}.sh"
     
     if [[ ! -f "$module_file" ]]; then
