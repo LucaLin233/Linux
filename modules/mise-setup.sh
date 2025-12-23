@@ -577,7 +577,7 @@ setup_python_usage() {
 # 配置Shell集成  
 configure_shell_integration() {  
     debug_log "配置Shell集成"  
-    local mise_cmd=""
+    local mise_cmd="" 
     mise_cmd=$(get_mise_executable) || { debug_log "找不到mise可执行文件，跳过Shell集成"; return 1; }  
     
     # 使用 mise full-path 来确保路径是准确的，特别是对于 Zsh
@@ -587,9 +587,9 @@ configure_shell_integration() {
       
     for shell_info in "${shells[@]}"; do  
         local shell_name="${shell_info%%:*}"  
-        local config_file_cmd="${shell_info#*:}"
-        local config_file="${config_file_cmd%%:*}"
-        local activate_cmd="eval \"\$($config_file_cmd)\""
+        local config_file_cmd="${shell_info#*:}" 
+        local config_file="${config_file_cmd%%:*}" 
+        local activate_cmd="eval \"\$($config_file_cmd)\"" 
           
         command -v "$shell_name" &>/dev/null || { debug_log "$shell_name 不存在，跳过配置"; continue; }  
           
@@ -601,25 +601,32 @@ configure_shell_integration() {
             debug_log "$shell_name 集成已存在"  
         else  
             debug_log "为 $shell_name 配置集成"  
-            local append_content="\n# Mise version manager\n$activate_cmd"
+            local append_content="\n# Mise version manager\n$activate_cmd" 
 
             # 尝试找到第一个 export PATH 语句后插入，如果找不到则追加
             if grep -q "export PATH" "$config_file" 2>/dev/null; then
                 # 在第一个 export PATH 后新增
-                sed -i "/export PATH/a $append_content" "$config_file" 2>/dev/null || \
-                echo -e "$append_content" >> "$config_file"
+                sed -i "/export PATH/a $append_content" "$config_file" 2>/dev/null || \ 
+                echo -e "$append_content" >> "$config_file" 
             else
-                echo -e "$append_content" >> "$config_file"
+                echo -e "$append_content" >> "$config_file" 
             fi
 
             if [[ $? -eq 0 ]]; then
                 echo "$shell_name集成: 已配置"  
                 debug_log "$shell_name 集成配置完成"  
             else
-                echo "$shell_name集成: 配置失败"
+                echo "$shell_name集成: 配置失败" 
                 integration_success=false
             fi
         fi  
+        
+        # 【新增】强制清理：因为是追加内容，所以需要在这里清理一次
+        if command -v sed &>/dev/null; then
+            sed -i 's/\r//g' "$config_file" 2>/dev/null || true
+            debug_log "清理 $config_file 的 CRLF"
+        fi
+        
     done  
       
     if $integration_success; then  
@@ -629,7 +636,7 @@ configure_shell_integration() {
         debug_log "Shell集成配置部分失败"  
         return 1  
     fi  
-}  
+}
 
 # 新增的函数：配置 mise 每周自动更新的 Crontab 任务
 configure_mise_cron() {
