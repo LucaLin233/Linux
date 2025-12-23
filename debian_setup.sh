@@ -126,14 +126,20 @@ pre_check() {
         exit 1
     fi
     
+    # 磁盘空间检查（兼容中文环境）
     local free_space_kb
-    free_space_kb=$(df / 2>/dev/null \vert{} awk 'NR==2 {print $4}')
+    free_space_kb=$(LANG=C df / 2>/dev/null | awk 'NR==2 {print $4}' | tr -cd '0-9')
     
-    if [[ -z "$free_space_kb" ]] || [[ ! "$free_space_kb" =~ ^[0-9]+$ ]]; then
+    if [[ -z "$free_space_kb" ]] || [[ "$free_space_kb" -eq 0 ]]; then
         log "无法获取磁盘空间信息，跳过检查" "warn"
-    elif (( free_space_kb < 1048576 )); then
-        log "磁盘空间不足 (需要至少1GB)" "error"
-        exit 1
+    else
+        local free_space_gb=$((free_space_kb / 1024 / 1024))
+        log "可用磁盘空间: ${free_space_gb}GB"
+        
+        if (( free_space_kb < 1048576 )); then
+            log "磁盘空间不足 (需要至少1GB)" "error"
+            exit 1
+        fi
     fi
     
     log "检查网络连接..."
