@@ -22,10 +22,10 @@ declare -A MODULES=(
     ["system-optimize"]="系统优化 (Zram, 时区, 时间同步)"
     ["zsh-setup"]="Zsh Shell 环境"
     ["mise-setup"]="Mise 版本管理器"
-    ["docker-setup"]="Docker 容器化平台"
     ["tools-setup"]="系统工具 (NextTrace, SpeedTest等)"
-    ["ssh-security"]="SSH 安全配置"
+    ["docker-setup"]="Docker 容器化平台"
     ["auto-update-setup"]="自动更新系统"
+    ["ssh-security"]="SSH 安全配置"
 )
 
 # 依赖关系
@@ -38,11 +38,11 @@ declare -A MODULE_DEPS=(
 readonly MODULE_ORDER=(
     system-optimize
     zsh-setup
-    docker-setup
-    tools-setup
-    ssh-security
     mise-setup
+    tools-setup
+    docker-setup
     auto-update-setup
+    ssh-security
 )
 
 # 执行状态
