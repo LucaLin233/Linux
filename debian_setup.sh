@@ -558,7 +558,7 @@ get_system_status() {
     local uptime_info=$(uptime -p 2>/dev/null || echo "未知")
     local kernel=$(uname -r 2>/dev/null || echo "未知")
     
-    echo "💻 CPU: ${cpu_cores}核心 \vert{} 内存: $mem_info | 磁盘: $disk_usage"
+    echo "💻 CPU: ${cpu_cores}核心 | 内存: $mem_info | 磁盘: $disk_usage"
     echo "⏰ 运行时间: $uptime_info"
     echo "🔧 内核: $kernel"
     
@@ -579,9 +579,9 @@ get_system_status() {
         local containers_count=$(docker ps -q 2>/dev/null | wc -l || echo "0")
         local images_count=$(docker images -q 2>/dev/null | wc -l || echo "0")
         if systemctl is-active --quiet docker 2>/dev/null; then
-            echo "🐳 Docker: v$docker_version (运行中) \vert{} 容器: $containers_count | 镜像: $images_count"
+            echo "🐳 Docker: v$docker_version (运行中) | 容器: $containers_count | 镜像: $images_count"
         else
-            echo "🐳 Docker: v$docker_version (已安装但未运行) \vert{} 容器: $containers_count | 镜像: $images_count"
+            echo "🐳 Docker: v$docker_version (已安装但未运行) | 容器: $containers_count | 镜像: $images_count"
         fi
     else
         echo "🐳 Docker: 未安装"
@@ -608,7 +608,7 @@ get_system_status() {
     
     local ssh_port=$(grep "^Port " /etc/ssh/sshd_config 2>/dev/null | awk '{print \$2}' || echo "22")
     local ssh_root_login=$(grep "^PermitRootLogin " /etc/ssh/sshd_config 2>/dev/null | awk '{print \$2}' || echo "默认")
-    echo "🔒 SSH: 端口=$ssh_port \vert{} Root登录=$ssh_root_login"
+    echo "🔒 SSH: 端口=$ssh_port | Root登录=$ssh_root_login"
     
     local network_ip=$(hostname -I 2>/dev/null | awk '{print \$1}' || echo "未知")
     local network_interface=$(ip route 2>/dev/null | grep default | awk '{print \$5}' | head -1 || echo "未知")
@@ -655,13 +655,13 @@ generate_summary() {
 📋 基本信息:
    🔢 脚本版本: $SCRIPT_VERSION (commit: $SCRIPT_COMMIT)
    📅 部署时间: $(date '+%Y-%m-%d %H:%M:%S %Z')
-   ⏱️  总耗时: ${total_time}秒 \vert{} 平均耗时: ${avg_time}秒/模块
+   ⏱️  总耗时: ${total_time}秒 | 平均耗时: ${avg_time}秒/模块
    🏠 主机名: $(hostname)
    💻 系统: $(grep 'PRETTY_NAME' /etc/os-release 2>/dev/null | cut -d= -f2 | tr -d '"' || echo 'Debian')
    🌐 IP地址: $(hostname -I 2>/dev/null | awk '{print \$1}' || echo '未知')
 
 📊 执行统计:
-   📦 总模块: $total_modules \vert{} ✅ 成功: $success_count | ❌ 失败: $failed_count \vert{} 📈 成功率: ${success_rate}%
+   📦 总模块: $total_modules | ✅ 成功: $success_count | ❌ 失败: $failed_count | 📈 成功率: ${success_rate}%
 
 EOF
     
