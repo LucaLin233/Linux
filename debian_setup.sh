@@ -204,8 +204,20 @@ install_dependencies() {
 system_update() {
     log "系统更新"
     
-    apt-get update 2>/dev/null || log "软件包列表更新失败" "warn"
-    apt-get upgrade -y 2>/dev/null || log "系统升级失败" "warn"
+    # 静默更新（输出重定向到日志）
+    log "正在更新软件包列表..."
+    if apt-get update >> "$LOG_FILE" 2>&1; then
+        log "软件包列表更新成功"
+    else
+        log "软件包列表更新失败" "warn"
+    fi
+    
+    log "正在升级系统..."
+    if apt-get upgrade -y >> "$LOG_FILE" 2>&1; then
+        log "系统升级成功"
+    else
+        log "系统升级失败" "warn"
+    fi
     
     fix_hosts_file
     
