@@ -582,68 +582,72 @@ setup_python_usage() {
     return 0  
 }  
   
-# 配置Shell集成  
-configure_shell_integration() {  
-    debug_log "配置Shell集成"  
-    local mise_cmd="" 
-    mise_cmd=$(get_mise_executable) || { debug_log "找不到mise可执行文件，跳过Shell集成"; return 1; }  
-    
-    # 使用 mise full-path 来确保路径是准确的，特别是对于 Zsh
-    local mise_activate_path="$mise_cmd" 
-    local shells=("bash:$HOME/.bashrc:$mise_activate_path activate bash" "zsh:$HOME/.zshrc:$mise_activate_path activate zsh") 
-    local integration_success=true  
+# 配置Shell集成    
+configure_shell_integration() {    
+    debug_log "配置Shell集成"    
+    local mise_cmd=""   
+    mise_cmd=$(get_mise_executable) || { debug_log "找不到mise可执行文件，跳过Shell集成"; return 1; }    
       
-    for shell_info in "${shells[@]}"; do  
-        local shell_name="${shell_info%%:*}"  
-        local config_file_cmd="${shell_info#*:}" 
-        local config_file="${config_file_cmd%%:*}" 
-        local activate_cmd="eval \"\$($config_file_cmd)\"" 
-          
-        command -v "$shell_name" &>/dev/null || { debug_log "$shell_name 不存在，跳过配置"; continue; }  
-          
-        [[ ! -f "$config_file" ]] && touch "$config_file"  
-          
-        # 检查集成是否已存在  
-        if grep -q "mise activate $shell_name" "$config_file" 2>/dev/null; then  
-            echo "$shell_name集成: 已存在"  
-            debug_log "$shell_name 集成已存在"  
-        else  
-            debug_log "为 $shell_name 配置集成"  
-            local append_content="\n# Mise version manager\n$activate_cmd" 
-
-            # 尝试找到第一个 export PATH 语句后插入，如果找不到则追加
-            if grep -q "export PATH" "$config_file" 2>/dev/null; then
-                # 在第一个 export PATH 后新增
-                sed -i "/export PATH/a $append_content" "$config_file" 2>/dev/null || \ 
-                echo -e "$append_content" >> "$config_file" 
-            else
-                echo -e "$append_content" >> "$config_file" 
-            fi
-
-            if [[ $? -eq 0 ]]; then
-                echo "$shell_name集成: 已配置"  
-                debug_log "$shell_name 集成配置完成"  
-            else
-                echo "$shell_name集成: 配置失败" 
+    # 【核心修复点】简化数组：只保留 shell name 和 config file 路径  
+    local shells=("bash:$HOME/.bashrc" "zsh:$HOME/.zshrc")   
+    local integration_success=true    
+    
+    # 构建正确的激活命令：eval "$(/path/to/mise activate shell_name)"
+    local mise_activate_cmd="eval \"\$($mise_cmd activate \$shell_name)\""
+        
+    for shell_info in "${shells[@]}"; do    
+        local shell_name="${shell_info%%:*}"    
+        local config_file="${shell_info#*:}" # 这是正确的分隔！
+            
+        command -v "$shell_name" &>/dev/null || { debug_log "$shell_name 不存在，跳过配置"; continue; }    
+            
+        [[ ! -f "$config_file" ]] && touch "$config_file"    
+            
+        # 检查集成是否已存在    
+        if grep -q "mise activate $shell_name" "$config_file" 2>/dev/null; then    
+            echo "$shell_name集成: 已存在"    
+            debug_log "$shell_name 集成已存在"    
+        else    
+            debug_log "为 $shell_name 配置集成"    
+            # 注意：这里的 $mise_activate_cmd 已经是带 eval 的完整命令了
+            local append_content="\n# Mise version manager\n$mise_activate_cmd"   
+  
+            # 尝试找到第一个 export PATH 语句后插入，如果找不到则追加  
+            if grep -q "export PATH" "$config_file" 2>/dev/null; then  
+                # 在第一个 export PATH 后新增  
+                # 注意：sed -i '/export PATH/a ...' 后面使用 $append_content
+                sed -i "/export PATH/a $append_content" "$config_file" 2>/dev/null || \   
+                echo -e "$append_content" >> "$config_file"   
+            else  
+                echo -e "$append_content" >> "$config_file"   
+            fi  
+            
+            # 由于 append_content 是一个大的字符串， sed -i 不适合它，我们使用 echo -e 是对的。
+            # 这里是成功/失败的检查逻辑
+            if [[ $? -eq 0 ]]; then  
+                echo "$shell_name集成: 已配置"    
+                debug_log "$shell_name 集成配置完成"    
+            else  
+                echo "$shell_name集成: 配置失败"   
                 integration_success=false
             fi
+        fi    
+          
+        # 【强制清理】因为追加内容风险高，所以必须在这里清理
+        if command -v sed &>/dev/null; then  
+            sed -i 's/\r//g' "$config_file" 2>/dev/null || true  
+            debug_log "清理 $config_file 的 CRLF"  
         fi  
+          
+    done    
         
-        # 【新增】强制清理配置文件的 CRLF 换行符 (对每个文件都清理)
-        if command -v sed &>/dev/null; then
-            sed -i 's/\r//g' "$config_file" 2>/dev/null || true
-            debug_log "清理 $config_file 的 CRLF"
-        fi
-        
-    done  
-      
-    if $integration_success; then  
-        debug_log "Shell集成配置完成"  
-        return 0  
-    else  
-        debug_log "Shell集成配置部分失败"  
-        return 1  
-    fi  
+    if $integration_success; then    
+        debug_log "Shell集成配置完成"    
+        return 0    
+    else    
+        debug_log "Shell集成配置部分失败"    
+        return 1    
+    fi    
 }
 
 # 新增的函数：配置 mise 每周自动更新的 Crontab 任务
