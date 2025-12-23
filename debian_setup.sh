@@ -135,9 +135,9 @@ pre_check() {
     
     # 磁盘空间检查
     local free_space_kb
-    free_space_kb=$(df / 2>/dev/null \vert{} awk 'NR==2 {print $4}')
+    free_space_kb=$(df / 2>/dev/null | awk 'NR==2 {print $4}')
     
-    if [[ -z "$free_space_kb" \vert{}\vert{} ! "$free_space_kb" =~ ^[0-9]+$ ]]; then
+    if [[ -z "$free_space_kb" || ! "$free_space_kb" =~ ^[0-9]+$ ]]; then
         log "无法获取磁盘空间信息，跳过检查" "warn"
     elif (( free_space_kb < 1048576 )); then
         log "磁盘空间不足 (需要至少1GB)" "error"
