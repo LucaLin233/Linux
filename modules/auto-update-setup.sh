@@ -126,7 +126,7 @@ add_cron_job() {
         return 1  
     fi  
       
-    crontab -l 2>/dev/null | grep -v "$UPDATE_SCRIPT" \vert{} grep -v "Auto-update managed" > "$temp_cron" || true  
+    crontab -l 2>/dev/null | grep -v "$UPDATE_SCRIPT" | grep -v "Auto-update managed" > "$temp_cron" || true  
     echo "$CRON_COMMENT" >> "$temp_cron"  
     echo "$cron_expr $UPDATE_SCRIPT" >> "$temp_cron"  
       
