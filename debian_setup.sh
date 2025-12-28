@@ -166,6 +166,7 @@ install_dependencies() {
         "rsync:rsync"
         "sudo:sudo"
         "dig:dnsutils"
+        "crontab:cron"
     )
     
     local missing_packages=()
