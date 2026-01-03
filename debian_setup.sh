@@ -259,62 +259,76 @@ fix_hosts_file() {
 
 select_deployment_mode() {
     log "选择部署模式"
-    
-    echo
-    echo "$LINE"
-    echo "部署模式选择："
-    echo "1) 🚀 全部安装 (安装所有7个模块)"
-    echo "2) 🎯 自定义选择 (按需选择模块)"
-    echo
-    
-    read -p "请选择模式 [1-2]: " -r mode_choice
-    
-    case "$mode_choice" in
-        1)
-            SELECTED_MODULES=("${MODULE_ORDER[@]}")
-            log "选择: 全部安装"
+      
+    echo  
+    echo "$LINE"  
+    echo "部署模式选择："  
+    echo "1) 🚀 全部安装 (安装所有7个模块)"  
+    echo "2) 🎯 自定义选择 (按需选择模块)"  
+    echo "3) ❌ 退出脚本"
+    echo  
+      
+    read -p "请选择模式 [1-3]: " -r mode_choice  
+      
+    case "$mode_choice" in  
+        1)  
+            SELECTED_MODULES=("${MODULE_ORDER[@]}")  
+            log "选择: 全部安装"  
+            ;;  
+        2)  
+            custom_module_selection  
             ;;
-        2)
-            custom_module_selection
+        3)
+            log "用户选择退出，正在停止..." "info"
+            exit 0
             ;;
-        *)
-            log "无效选择，使用全部安装" "warn"
-            SELECTED_MODULES=("${MODULE_ORDER[@]}")
-            ;;
-    esac
+        *)  
+            log "无效选择，已取消部署" "warn"  
+            exit 1
+            ;;  
+    esac  
 }
 
 custom_module_selection() {
-    echo
-    echo "可用模块："
+    echo  
+    echo "可用模块："  
+      
+    local i=1  
+    for module in "${MODULE_ORDER[@]}"; do  
+        echo "$i) $module - ${MODULES[$module]}"  
+        ((i++))  
+    done  
+      
+    echo  
+    echo "请输入要安装的模块编号 (用空格分隔，如: 1 3 5)"
+    echo "输入 'q' 取消并退出脚本"
+    read -r selection  
     
-    local i=1
-    for module in "${MODULE_ORDER[@]}"; do
-        echo "$i) $module - ${MODULES[$module]}"
-        ((i++))
-    done
-    
-    echo
-    echo "请输入要安装的模块编号 (用空格分隔，如: 1 3 5):"
-    read -r selection
-    
-    local selected=()
-    for num in $selection; do
-        if [[ "$num" =~ ^[1-7]$ ]]; then
-            local index=$((num - 1))
-            selected+=("${MODULE_ORDER[$index]}")
-        else
-            log "跳过无效编号: $num" "warn"
-        fi
-    done
-    
-    if (( ${#selected[@]} == 0 )); then
-        log "未选择有效模块，使用system-optimize" "warn"
-        selected=(system-optimize)
+    if [[ "$selection" == "q" ]]; then
+        log "操作取消，退出脚本" "info"
+        exit 0
     fi
-    
-    SELECTED_MODULES=("${selected[@]}")
-    log "已选择: ${SELECTED_MODULES[*]}"
+      
+    local selected=()  
+    local max_idx=${#MODULE_ORDER[@]} # 动态获取模块总数
+
+    for num in $selection; do  
+        # 使用动态范围判断
+        if [[ "$num" =~ ^[0-9]+$ ]] && (( num >= 1 && num <= max_idx )); then  
+            local index=$((num - 1))  
+            selected+=("${MODULE_ORDER[$index]}")  
+        else  
+            log "跳过无效编号: $num" "warn"  
+        fi  
+    done  
+      
+    if (( ${#selected[@]} == 0 )); then  
+        log "未选择有效模块，操作已取消" "error"  
+        exit 1
+    fi  
+      
+    SELECTED_MODULES=("${selected[@]}")  
+    log "已选择: ${SELECTED_MODULES[*]}"  
 }
 
 #=============================================================================
