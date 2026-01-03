@@ -1,5 +1,5 @@
 #!/bin/bash
-# Linux Network Optimizer v2.9 - 核心参数回归版
+# Linux Network Optimizer v3.0 - 模式显示增强版
   
 set -euo pipefail
 
@@ -78,6 +78,15 @@ apply_sysctl() {
         [[ "$REPLY" =~ ^[Yy]$ ]] && target_scheme="china" || target_scheme="intl"
     fi
     
+    # 醒目的模式展示
+    echo "------------------------------------------------"
+    if [[ "$target_scheme" == "china" ]]; then
+        info "当前方案: [ 中国大陆优化方案 ]"
+    else
+        info "当前方案: [ 海外/国际优化方案 ]"
+    fi
+    echo "------------------------------------------------"
+
     local content=""
     if [[ "$target_scheme" == "intl" ]]; then
         content=$(cat << EOF
