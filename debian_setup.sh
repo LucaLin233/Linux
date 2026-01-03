@@ -225,13 +225,27 @@ system_update() {
 
 fix_hosts_file() {
     local hostname=$(hostname)
-    
+    local cloud_cfg="/etc/cloud/cloud.cfg"
+
+    # 1. 禁用 cloud-init 对 hosts 的接管，防止重启被还原
+    if [[ -f "$cloud_cfg" ]]; then
+        log "检测到 cloud-init，正在禁用 manage_etc_hosts..."
+        # 无论原来是 true 还是没设置，都统一设为 false
+        if grep -q "manage_etc_hosts:" "$cloud_cfg"; then
+            sed -i 's/manage_etc_hosts: .*/manage_etc_hosts: false/' "$cloud_cfg"
+        else
+            echo "manage_etc_hosts: false" >> "$cloud_cfg"
+        fi
+    fi
+
+    # 2. 检查是否已有正确的映射
     if grep -qE "^127\.0\.1\.1[[:space:]]+.*\b$hostname\b" /etc/hosts 2>/dev/null; then
         return 0
     fi
-    
+
+    # 3. 备份并更新 hosts 文件
     cp /etc/hosts "/etc/hosts.backup.$(date +%s)" 2>/dev/null || true
-    
+
     if grep -q "^127.0.1.1" /etc/hosts 2>/dev/null; then
         sed -i "s/^127\.0\.1\.1[[:space:]]\+/127.0.1.1 $hostname /" /etc/hosts
     else
