@@ -1,13 +1,12 @@
 #!/bin/bash
-# Linux Network Optimizer v2.4 - 修复 Read 报错 & 完善解析
+# Linux Network Optimizer v2.5 - 深度备份版
   
 set -euo pipefail
 
-readonly CUSTOM_CONF="/etc/sysctl.d/99-custom.conf"
+readonly KERNEL_CONF="/etc/sysctl.d/99-kernel.conf"
 readonly SYSCTL_FILE="/etc/sysctl.conf"
 readonly LIMITS_CONFIG="/etc/security/limits.conf"
 
-# 全局变量
 AUTO_YES=0
 
 info() { echo "✅ $1"; }
@@ -15,7 +14,6 @@ warn() { echo "⚠️  $1"; }
 error() { echo "❌ $1"; exit 1; }
 success() { echo "🎉 $1"; }
 
-# === 环境检测 ===
 check_env() {
     [[ $EUID -eq 0 ]] || error "需要 root 权限"
     local ver=$(uname -r | cut -d. -f1-2)
@@ -28,7 +26,7 @@ detect_interface() {
     ls /sys/class/net/ 2>/dev/null | grep -v lo | head -1
 }
 
-# === BBR & Limits (保持原版逻辑) ===
+# === 1. BBR & Limits ===
 setup_bbr() {
     info "检查 BBR 支持..."
     modprobe tcp_bbr 2>/dev/null || true
@@ -42,9 +40,14 @@ setup_bbr() {
 }
 
 apply_limits() {
-    info "配置系统资源限制 (Limits & PAM)..."
+    info "配置系统资源限制..."
+    # 完整备份
     [ -f "$LIMITS_CONFIG" ] && [ ! -f "${LIMITS_CONFIG}.bak" ] && cp "$LIMITS_CONFIG" "${LIMITS_CONFIG}.bak"
-    for file in /etc/security/limits.d/*nproc.conf; do [[ -f "$file" ]] && mv "$file" "${file}.disabled" 2>/dev/null || true; done
+    # 禁用冲突项
+    for file in /etc/security/limits.d/*nproc.conf; do 
+        [[ -f "$file" ]] && mv "$file" "${file}.disabled" 2>/dev/null || true
+    done
+    # PAM 启用
     [[ -f /etc/pam.d/common-session ]] && ! grep -q "pam_limits.so" /etc/pam.d/common-session && echo "session required pam_limits.so" >> /etc/pam.d/common-session
 
     sed -i '/# Network Optimizer/,$d' "$LIMITS_CONFIG"
@@ -65,14 +68,12 @@ root  hard   memlock   unlimited
 EOF
 }
 
-# === Sysctl 特化处理 ===
+# === 2. Sysctl 处理 ===
 apply_sysctl() {
     local is_domestic="n"
-
     if [[ "$AUTO_YES" == "1" ]]; then
-        info "检测到 -y 参数，默认使用海外优化方案"
+        info "默认使用海外优化方案"
     else
-        # 兼容管道环境的 read
         printf "是否为国内优化服务器? [y/N]: "
         read -r REPLY < /dev/tty || REPLY="n"
         is_domestic=$(echo "$REPLY" | tr '[:upper:]' '[:lower:]')
@@ -80,7 +81,6 @@ apply_sysctl() {
     
     local content=""
     if [[ "$is_domestic" != "y" ]]; then
-        info "正在写入海外版参数..."
         content=$(cat << EOF
 fs.file-max = 6815744
 net.ipv4.tcp_no_metrics_save=1
@@ -111,7 +111,6 @@ net.ipv4.tcp_fastopen = 1027
 EOF
 )
     else
-        info "正在写入国内版参数..."
         content=$(cat << EOF
 fs.file-max = 6815744
 net.ipv4.tcp_no_metrics_save=1
@@ -137,39 +136,46 @@ EOF
 )
     fi
 
-    # 判断 Debian 13
     source /etc/os-release
     if [[ "${ID:-}" == "debian" && "${VERSION_ID:-}" == "13" ]]; then
-        info "Debian 13 检测成功，执行改名逻辑"
-        [ -f "$SYSCTL_FILE" ] && mv "$SYSCTL_FILE" "${SYSCTL_FILE}.bak" || true
-        echo "$content" > "$CUSTOM_CONF"
+        [ -f "$SYSCTL_FILE" ] && mv "$SYSCTL_FILE" "${SYSCTL_FILE}.bak"
+        echo "$content" > "$KERNEL_CONF"
     else
-        [ -f "$SYSCTL_FILE" ] && cp "$SYSCTL_FILE" "${SYSCTL_FILE}.backup" || true
+        [ -f "$SYSCTL_FILE" ] && [ ! -f "${SYSCTL_FILE}.backup" ] && cp "$SYSCTL_FILE" "${SYSCTL_FILE}.backup"
         echo "$content" > "$SYSCTL_FILE"
     fi
     sysctl --system >/dev/null 2>&1 || true
 }
 
-# === 恢复功能 ===
+# === 3. 恢复逻辑 (Full Restoration) ===
 restore_optimization() {
-    info "正在全面恢复原始状态..."
+    check_root
+    info "全面按备份恢复原始状态..."
+
+    # 恢复 Sysctl
     source /etc/os-release
     if [[ "${ID:-}" == "debian" && "${VERSION_ID:-}" == "13" ]]; then
         [ -f "${SYSCTL_FILE}.bak" ] && mv "${SYSCTL_FILE}.bak" "$SYSCTL_FILE"
-        [ -f "$CUSTOM_CONF" ] && rm -f "$CUSTOM_CONF"
+        [ -f "$KERNEL_CONF" ] && rm -f "$KERNEL_CONF"
     else
         [ -f "${SYSCTL_FILE}.backup" ] && mv "${SYSCTL_FILE}.backup" "$SYSCTL_FILE"
     fi
+
+    # 恢复 Limits
     [ -f "${LIMITS_CONFIG}.bak" ] && mv "${LIMITS_CONFIG}.bak" "$LIMITS_CONFIG"
-    for file in /etc/security/limits.d/*.conf.disabled; do [[ -f "$file" ]] && mv "$file" "${file%.disabled}" 2>/dev/null; done
+    for file in /etc/security/limits.d/*.conf.disabled; do 
+        [[ -f "$file" ]] && mv "$file" "${file%.disabled}" 2>/dev/null || true
+    done
     
+    # 恢复网卡队列
     local interface=$(detect_interface)
     command -v tc >/dev/null 2>&1 && tc qdisc del dev "$interface" root 2>/dev/null || true
+
     sysctl --system >/dev/null 2>&1 || true
-    success "恢复完成"
+    success "恢复完成，系统已回到初始状态"
 }
 
-# === 主程序 ===
+# === 4. 主程序 ===
 CMD="install"
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -187,8 +193,11 @@ case "$CMD" in
         apply_sysctl
         interface=$(detect_interface)
         command -v tc >/dev/null 2>&1 && tc qdisc replace dev "$interface" root fq 2>/dev/null || true
-        success "全套优化已完成"
+        success "优化已成功应用并完成备份！"
         ;;
     restore) restore_optimization ;;
-    status)  echo "BBR: $(sysctl -n net.ipv4.tcp_congestion_control)"; echo "QDisc: $(sysctl -n net.core.default_qdisc)" ;;
+    status)  
+        echo "拥塞控制: $(sysctl -n net.ipv4.tcp_congestion_control)"
+        echo "队列算法: $(sysctl -n net.core.default_qdisc)"
+        ;;
 esac
