@@ -190,9 +190,10 @@ function compinit() {
 
 # ============================================================
 # 3. OMZ 更新配置
-# background = 后台检查并更新，不阻塞启动（节省 ~5ms）
+# auto = 自动更新，无需确认；DISABLE_UPDATE_PROMPT 兼容旧版 OMZ
 # ============================================================
-zstyle ':omz:update' mode background
+DISABLE_UPDATE_PROMPT=true
+zstyle ':omz:update' mode auto
 zstyle ':omz:update' frequency 7
 
 # ============================================================
