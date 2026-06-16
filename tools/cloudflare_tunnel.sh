@@ -2,18 +2,186 @@
 # Cloudflared Tunnel 二进制版本安装与卸载脚本
 # 功能：根据用户参数安装或卸载 Cloudflared 二进制版本及其相关服务和配置。
 
-set -e # 任何命令失败时立即退出脚本执行
+set -e
 
-# --- 辅助函数: 检查命令是否存在 ---
+# ─────────────────────────────────────────────
+#  颜色 & 样式
+# ─────────────────────────────────────────────
+RESET="\033[0m"
+BOLD="\033[1m"
+RED="\033[1;31m"
+GREEN="\033[1;32m"
+YELLOW="\033[1;33m"
+BLUE="\033[1;34m"
+CYAN="\033[1;36m"
+WHITE="\033[1;37m"
+DIM="\033[2m"
+
+# ─────────────────────────────────────────────
+#  日志函数
+# ─────────────────────────────────────────────
+info()    { echo -e "${BLUE}  ℹ ${WHITE}$*${RESET}"; }
+success() { echo -e "${GREEN}  ✔ $*${RESET}"; }
+warn()    { echo -e "${YELLOW}  ⚠ $*${RESET}" >&2; }
+error()   { echo -e "${RED}  ✘ $*${RESET}" >&2; }
+step()    { echo -e "${CYAN}${BOLD}▶ $*${RESET}"; }
+dim()     { echo -e "${DIM}    $*${RESET}"; }
+
+# 分隔线
+hr() { echo -e "${DIM}  ──────────────────────────────────────────${RESET}"; }
+
+# Banner
+banner() {
+    echo ""
+    echo -e "${CYAN}${BOLD}"
+    echo "  ╔══════════════════════════════════════════╗"
+    echo "  ║       Cloudflared Tunnel 管理脚本        ║"
+    echo "  ╚══════════════════════════════════════════╝"
+    echo -e "${RESET}"
+}
+
+# ─────────────────────────────────────────────
+#  辅助函数
+# ─────────────────────────────────────────────
 command_exists() {
     command -v "$@" >/dev/null 2>&1
 }
 
-# --- 安装 Cloudflared 函数 ---
-install_cloudflared() {
-    echo "--- 开始安装 Cloudflared ---"
+# 带进度提示的 curl 下载
+download_with_progress() {
+    local url="$1"
+    local dest="$2"
+    echo -e "${DIM}    源: $url${RESET}"
+    if ! curl -L --progress-bar --fail "$url" -o "$dest"; then
+        return 1
+    fi
+    return 0
+}
 
-    # 检测系统架构并确定下载 URL
+# ─────────────────────────────────────────────
+#  自动更新相关路径
+# ─────────────────────────────────────────────
+UPDATER_SCRIPT="/usr/local/bin/cloudflared-update"
+UPDATER_SERVICE="/etc/systemd/system/cloudflared-updater.service"
+UPDATER_TIMER="/etc/systemd/system/cloudflared-updater.timer"
+
+# ─────────────────────────────────────────────
+#  安装自动更新 (systemd timer)
+# ─────────────────────────────────────────────
+install_autoupdate() {
+    step "配置自动更新 (每日 systemd timer)..."
+
+    # 写入更新脚本
+    cat > "$UPDATER_SCRIPT" << 'UPDATER_EOF'
+#!/bin/bash
+# cloudflared 自动更新脚本 (由安装脚本生成)
+
+TARGET="/usr/local/bin/cloudflared"
+ARCH=$(uname -m)
+
+case $ARCH in
+    x86_64)        URL="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64" ;;
+    aarch64|arm64) URL="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm64" ;;
+    armv7l|armv6l) URL="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm" ;;
+    *) echo "不支持的架构: $ARCH" >&2; exit 1 ;;
+esac
+
+TMP=$(mktemp)
+trap 'rm -f "$TMP"' EXIT
+
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] 开始检查更新..."
+
+if ! curl -L --silent --fail "$URL" -o "$TMP"; then
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] 下载失败，跳过本次更新。" >&2
+    exit 1
+fi
+
+chmod +x "$TMP"
+
+# 比较版本
+CURRENT=$("$TARGET" version 2>/dev/null | awk '{print $3}' || echo "unknown")
+NEW=$("$TMP" version 2>/dev/null | awk '{print $3}' || echo "unknown")
+
+if [ "$CURRENT" = "$NEW" ]; then
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] 当前已是最新版本 ($CURRENT)，无需更新。"
+    exit 0
+fi
+
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] 发现新版本: $CURRENT → $NEW，开始更新..."
+
+# 先停服务再替换，避免 "Text file busy"
+systemctl stop cloudflared.service 2>/dev/null || true
+mv "$TMP" "$TARGET"
+systemctl start cloudflared.service 2>/dev/null || true
+TMP=""  # 防止 trap 删除已移动的文件
+
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] 更新完成，当前版本: $($TARGET version 2>/dev/null | awk '{print $3}')"
+UPDATER_EOF
+
+    chmod +x "$UPDATER_SCRIPT"
+
+    # 写入 systemd service
+    cat > "$UPDATER_SERVICE" << SERVICE_EOF
+[Unit]
+Description=Cloudflared Auto Updater
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=$UPDATER_SCRIPT
+StandardOutput=journal
+StandardError=journal
+SERVICE_EOF
+
+    # 写入 systemd timer（每天 03:00 执行，随机延迟 60 分钟）
+    cat > "$UPDATER_TIMER" << TIMER_EOF
+[Unit]
+Description=Cloudflared Auto Updater Timer
+
+[Timer]
+OnCalendar=*-*-* 03:00:00
+RandomizedDelaySec=3600
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+TIMER_EOF
+
+    systemctl daemon-reload
+    systemctl enable --now cloudflared-updater.timer >/dev/null 2>&1
+    success "自动更新已配置 (每日 03:00 运行)"
+    dim "更新日志: journalctl -u cloudflared-updater.service"
+}
+
+# ─────────────────────────────────────────────
+#  卸载自动更新
+# ─────────────────────────────────────────────
+remove_autoupdate() {
+    local found=0
+    for unit in cloudflared-updater.timer cloudflared-updater.service; do
+        if systemctl list-unit-files --no-pager | grep -q "^$unit"; then
+            systemctl stop    "$unit" >/dev/null 2>&1 || true
+            systemctl disable "$unit" >/dev/null 2>&1 || true
+            found=1
+        fi
+    done
+    for f in "$UPDATER_SCRIPT" "$UPDATER_SERVICE" "$UPDATER_TIMER"; do
+        [ -f "$f" ] && rm -f "$f" && found=1
+    done
+    [ $found -eq 1 ] && success "自动更新组件已移除" || dim "未检测到自动更新组件"
+}
+
+# ─────────────────────────────────────────────
+#  安装函数
+# ─────────────────────────────────────────────
+install_cloudflared() {
+    banner
+    echo -e "  ${WHITE}${BOLD}模式: 安装${RESET}"
+    hr
+
+    # 1. 检测架构
+    step "检测系统环境..."
     ARCH=$(uname -m)
     case $ARCH in
         x86_64)
@@ -26,313 +194,280 @@ install_cloudflared() {
             CLOUDFLARED_URL="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm"
             ;;
         *)
-            echo "错误: 不支持的架构: $ARCH" >&2
+            error "不支持的架构: $ARCH"
             exit 1
             ;;
     esac
+    success "架构: $ARCH"
+
+    if ! command_exists curl; then
+        error "'curl' 未找到，请先安装: apt install curl"
+        exit 1
+    fi
+    success "依赖检查通过"
 
     TARGET_BIN_PATH="/usr/local/bin/cloudflared"
+    SERVICE_FILE="/etc/systemd/system/cloudflared.service"
 
-    # 检查 Cloudflared 二进制文件是否已存在，提示覆盖。如果覆盖，先尝试停止现有服务。
+    # 2. 处理已有安装
     if [ -f "$TARGET_BIN_PATH" ]; then
-        echo "提示: Cloudflared 二进制文件已存在于 $TARGET_BIN_PATH。"
-        read -p "是否覆盖安装? (y/N): " OVERWRITE_CONFIRM
+        hr
+        warn "检测到已有安装: $TARGET_BIN_PATH"
+        read -rp "$(echo -e "  ${YELLOW}是否覆盖安装? (y/N): ${RESET}")" OVERWRITE_CONFIRM
         if [[ "$OVERWRITE_CONFIRM" =~ ^[Yy]$ ]]; then
-            echo "继续覆盖安装..."
-
-            # 尝试停止现有服务，以便覆盖正在执行的二进制文件
-            echo "正在尝试停止现有的 cloudflared 服务 (如果正在运行)..."
-            if systemctl is-active --quiet cloudflared.service; then
-                if sudo systemctl stop cloudflared.service; then
-                   echo "现有 cloudflared 服务已停止。"
-                else
-                   echo "错误: 停止 cloudflared.service 失败。可能导致无法覆盖二进制文件。请手动停止服务后重试。" >&2
-                   exit 1 # 如果停止失败，退出安装
+            info "停止现有服务..."
+            if systemctl is-active --quiet cloudflared.service 2>/dev/null; then
+                if ! systemctl stop cloudflared.service; then
+                    error "停止 cloudflared.service 失败，请手动停止后重试。"
+                    exit 1
                 fi
+                success "现有服务已停止"
             else
-                echo "未检测到正在运行的 cloudflared.service。"
+                dim "服务未在运行，跳过"
             fi
-
         else
-            echo "取消安装。"
+            info "已取消安装。"
             exit 0
         fi
     fi
 
-    # 检查 curl 命令是否存在
-    if ! command_exists curl; then
-        echo "错误: 'curl' 命令未找到。请先安装 curl。" >&2
+    # 3. 下载二进制（先下载到临时路径，验证后再替换，避免下载失败导致服务中断）
+    hr
+    step "下载 cloudflared 二进制..."
+    TMP_BIN=$(mktemp)
+    trap 'rm -f "$TMP_BIN"' EXIT
+
+    if ! download_with_progress "$CLOUDFLARED_URL" "$TMP_BIN"; then
+        error "下载失败，请检查网络连接。"
         exit 1
     fi
 
-    # 下载 Cloudflared 二进制文件到目标路径
-    echo "正在下载 cloudflared 二进制文件从 $CLOUDFLARED_URL 到 $TARGET_BIN_PATH..."
-    # 注意: 如果上面停止服务失败，这里可能会因为文件被占用而报错 (Text file busy)
-    if ! sudo curl -L "$CLOUDFLARED_URL" -o "$TARGET_BIN_PATH"; then
-        echo "错误: 下载 cloudflared 失败。" >&2
-        echo "可能是因为旧的服务还在运行并占用文件，或者网络问题。" >&2
+    chmod +x "$TMP_BIN"
+
+    # 验证下载的二进制可正常执行
+    if ! NEW_VER=$("$TMP_BIN" version 2>/dev/null | awk '{print $3}'); then
+        error "下载的文件无法执行，可能已损坏。"
         exit 1
     fi
+    success "下载成功，版本: ${NEW_VER}"
 
-    # 设置二进制文件执行权限
-    echo "设置执行权限..."
-    if ! sudo chmod +x "$TARGET_BIN_PATH"; then
-        echo "错误: 设置 cloudflared 执行权限失败。" >&2
-        sudo rm -f "$TARGET_BIN_PATH" # 清理文件
-        exit 1
-    fi
+    # 4. 替换二进制
+    step "安装二进制到 $TARGET_BIN_PATH..."
+    mv "$TMP_BIN" "$TARGET_BIN_PATH"
+    trap - EXIT  # 清除 trap，文件已移走
+    success "二进制安装完成"
 
-    # 验证安装 - 检查文件是否存在且可执行，并获取版本
-    echo "验证安装:"
-    if [ -x "$TARGET_BIN_PATH" ]; then # 检查文件是否存在且可执行
-        "$TARGET_BIN_PATH" version # 直接执行目标路径的文件以验证
-    else
-        echo "警告: 安装的 cloudflared 二进制文件 $TARGET_BIN_PATH 不可执行或不存在。" >&2
-        sudo rm -f "$TARGET_BIN_PATH" # 清理文件
-        exit 1
-    fi
-
-    # --- 新增: 检查并尝试卸载旧的服务配置 ---
-    # 在提示输入令牌和安装新服务之前执行此步骤
-    SERVICE_FILE="/etc/systemd/system/cloudflared.service"
+    # 5. 清理旧服务配置
+    hr
     if [ -f "$SERVICE_FILE" ]; then
-        echo "检测到现有的 systemd 服务文件: $SERVICE_FILE。正在尝试使用新的二进制文件卸载旧的服务配置..."
-        # 使用新下载的二进制尝试卸载旧服务配置
-        if "$TARGET_BIN_PATH" service uninstall --help 2>/dev/null | grep -q "uninstall"; then
-             if sudo "$TARGET_BIN_PATH" service uninstall; then
-                echo "旧的 cloudflared 服务配置已成功卸载。"
-             else
-                echo "错误: 使用新的二进制文件卸载旧的服务配置失败。" >&2
-                echo "请手动删除服务文件 $SERVICE_FILE 后重试安装。" >&2
-                exit 1 # 如果卸载旧服务失败，则退出
-             fi
-        else
-            echo "警告: 新的二进制文件 ($TARGET_BIN_PATH) 不支持 'service uninstall' 命令，或文件不可执行。请手动删除服务文件 $SERVICE_FILE 后重试安装。" >&2
-            exit 1 # 如果新二进制不支持卸载功能，也需退出
+        step "检测到旧服务配置，清理中..."
+        if ! "$TARGET_BIN_PATH" service uninstall 2>/dev/null; then
+            warn "自带卸载命令失败，手动清理服务文件..."
+            systemctl stop    cloudflared.service >/dev/null 2>&1 || true
+            systemctl disable cloudflared.service >/dev/null 2>&1 || true
+            rm -f "$SERVICE_FILE"
+            systemctl daemon-reload
         fi
+        success "旧服务配置已清理"
     else
-        echo "未检测到旧的 cloudflared systemd 服务文件，跳过卸载旧配置。"
+        dim "未检测到旧服务配置"
     fi
-    # --- 新增: 卸载旧服务配置结束 ---
 
-    # 提示用户输入 Tunnel 令牌 - 放在卸载旧服务之后，安装新服务之前
-    echo "请从 Cloudflare Zero Trust 后台复制令牌并粘贴:"
-    read -p "令牌: " TOKEN
+    # 6. 输入 Token
+    hr
+    step "配置 Tunnel Token..."
+    echo -e "  ${DIM}请前往 Cloudflare Zero Trust → Networks → Tunnels 获取令牌${RESET}"
+    echo ""
+    read -rp "$(echo -e "  ${CYAN}粘贴令牌: ${RESET}")" TOKEN
 
     if [ -z "$TOKEN" ]; then
-        echo "错误: 未输入令牌。服务无法安装。" >&2
-        # 由于服务安装必须有令牌且我们刚刚可能停止了旧服务/卸载了旧配置，这里必须退出。
+        error "令牌不能为空。"
         exit 1
     fi
+    success "令牌已接收"
 
-    # 使用新下载的二进制安装 systemd 服务
-    # 在上一步已经确保服务文件不存在或已被卸载，现在可以安全安装新服务了
-    echo "正在安装 cloudflared 服务到 $SERVICE_FILE..."
-    if sudo "$TARGET_BIN_PATH" service install "$TOKEN"; then
-        echo "cloudflared 服务已成功安装。"
-    else
-        echo "错误: cloudflared 服务安装失败。" >&2
-        echo "请尝试手动运行: sudo $TARGET_BIN_PATH service install $TOKEN" >&2
-        # 如果安装失败（不应该发生，除非令牌问题、文件权限或其他systemd问题），退出
+    # 7. 安装服务
+    hr
+    step "安装 cloudflared systemd 服务..."
+    if ! "$TARGET_BIN_PATH" service install "$TOKEN"; then
+        error "服务安装失败，请手动运行: sudo cloudflared service install <token>"
         exit 1
     fi
+    success "systemd 服务安装完成"
 
-    # 启用服务文件的自动更新选项 (修改 service 文件)
-    # service install 通常创建的主要服务文件在 /etc/systemd/system/cloudflared.service
-    if [ -f "$SERVICE_FILE" ]; then
-        echo "正在尝试修改服务文件 '$SERVICE_FILE' 启用自动更新..."
-        # 检查是否存在 --no-autoupdate 再尝试删除
-        if grep -q -- "--no-autoupdate" "$SERVICE_FILE"; then # 不需要 sudo grep，因为后面 sed 用 sudo 改
-             sudo sed -i 's/--no-autoupdate//g' "$SERVICE_FILE"
-             echo "自动更新已启用。"
-        else
-             echo "--no-autoupdate 选项未在服务文件中找到，可能自动更新已启用或服务文件结构不同。"
-        fi
+    # 8. 配置自动更新
+    hr
+    install_autoupdate
+
+    # 9. 启动服务
+    hr
+    step "启动服务..."
+    systemctl daemon-reload
+    systemctl enable cloudflared >/dev/null 2>&1 || warn "enable 失败，服务可能不会开机自启"
+    if systemctl start cloudflared; then
+        success "服务启动成功"
     else
-        echo "警告: systemd 服务文件 ($SERVICE_FILE) 未找到，无法启用自动更新。" >&2
-        echo "请手动编辑服务文件以启用自动更新（如果需要）。" >&2
+        warn "服务启动失败，请查看日志: journalctl -u cloudflared.service -n 50"
     fi
 
-    # 重新加载 systemd 配置，启用并启动新安装的服务
-    echo "重新加载 systemd 配置并启动 cloudflared 服务..."
-    sudo systemctl daemon-reload || echo "警告: systemctl daemon-reload 失败。" >&2
-    # 确保开机自启，service install_逻辑上会 enable，这里再 ensure 一下
-    sudo systemctl enable cloudflared || echo "警告: systemctl enable cloudflared 失败，服务可能不会开机自启。" >&2
-    sudo systemctl start cloudflared || echo "警告: cloudflared 服务启动失败。请检查 journalctl -u cloudflared.service 日志。" >&2
-
-    # 显示服务状态
-    echo "cloudflared 服务状态:"
-    systemctl status cloudflared || echo "警告: 获取 cloudflared 服务状态失败。" >&2
-
-    echo "--- Cloudflared 安装完成！---"
-    echo "cloudflared 二进制文件已安装到 $TARGET_BIN_PATH"
-    echo "新服务已配置并尝试启动。"
-    echo "下次系统启动时服务将尝试自动运行和更新。"
+    # 10. 完成汇总
+    hr
+    echo ""
+    echo -e "${GREEN}${BOLD}  ✔ 安装完成！${RESET}"
+    echo ""
+    echo -e "  ${WHITE}版本:${RESET}      $("$TARGET_BIN_PATH" version 2>/dev/null | head -1)"
+    echo -e "  ${WHITE}二进制:${RESET}    $TARGET_BIN_PATH"
+    echo -e "  ${WHITE}服务状态:${RESET}"
+    echo ""
+    systemctl status cloudflared --no-pager -l 2>/dev/null || true
+    echo ""
+    echo -e "  ${DIM}查看日志: journalctl -u cloudflared.service -f${RESET}"
+    echo ""
 }
 
-# --- 卸载 Cloudflared 函数 ---
+# ─────────────────────────────────────────────
+#  卸载函数
+# ─────────────────────────────────────────────
 uninstall_cloudflared() {
-    echo "--- 开始彻底清除 Cloudflared ---"
-    echo "警告: 此操作将尝试删除所有 cloudflared 二进制文件、相关的 systemd 服务和配置文件。"
-    echo "特别是配置文件目录 (/etc/cloudflared, /var/lib/cloudflared, ~/.cloudflared 等) 将被移除，"
-    echo "这些目录可能包含您与此 Tunnel 无关的其他 Cloudflare 配置。请谨慎操作，并在需要时提前备份您的配置。"
-    read -p "确定要继续彻底清除吗? (y/N): " CONFIRM_UNINSTALL
-    if [[ "$CONFIRM_UNINSTALL" =~ ^[Yy]$ ]]; then
-        echo "继续清除..."
-    else
-        echo "取消清除并退出。"
+    banner
+    echo -e "  ${WHITE}${BOLD}模式: 卸载${RESET}"
+    hr
+
+    warn "此操作将移除 cloudflared 二进制、systemd 服务、自动更新及所有配置文件。"
+    warn "配置目录 (/etc/cloudflared, /var/lib/cloudflared 等) 将被删除，请提前备份。"
+    echo ""
+    read -rp "$(echo -e "  ${RED}确认彻底清除? (y/N): ${RESET}")" CONFIRM_UNINSTALL
+    if [[ ! "$CONFIRM_UNINSTALL" =~ ^[Yy]$ ]]; then
+        info "已取消。"
         exit 0
     fi
-    echo "" # 加一个空行分隔
+    echo ""
 
-    # 尝试使用 cloudflared 自带的卸载命令 'cloudflared service uninstall'
-    # 优先使用安装时的主要路径，如果不存在再尝试 PATH 中的命令
     TARGET_BIN_PATH="/usr/local/bin/cloudflared"
+
+    # 1. 移除自动更新
+    step "移除自动更新组件..."
+    remove_autoupdate
+
+    # 2. cloudflared 自带卸载
+    hr
+    step "调用 cloudflared service uninstall..."
     CLOUDFLARED_CMD=""
     if [ -x "$TARGET_BIN_PATH" ]; then
         CLOUDFLARED_CMD="$TARGET_BIN_PATH"
     elif command_exists cloudflared; then
-        CLOUDFLARED_CMD="$(which cloudflared)"
-        echo "警告: 主要安装路径 $TARGET_BIN_PATH 未找到，将尝试使用 PATH 中的 cloudflared 命令: $CLOUDFLARED_CMD" >&2
-    else
-        echo "cloudflared 二进制文件未找到，跳过 'service uninstall' 尝试。" >&2
+        CLOUDFLARED_CMD="$(command -v cloudflared)"
+        warn "主路径未找到，使用 PATH 中的: $CLOUDFLARED_CMD"
     fi
 
     if [ -n "$CLOUDFLARED_CMD" ]; then
-        echo "尝试使用 cloudflared 自带卸载命令 '$CLOUDFLARED_CMD service uninstall'..."
-         if "$CLOUDFLARED_CMD" service uninstall --help 2>/dev/null | grep -q "uninstall"; then
-            sudo "$CLOUDFLARED_CMD" service uninstall || echo "警告: '$CLOUDFLARED_CMD service uninstall' 失败。可能服务不是由此命令安装的，或仍在运行。" >&2
+        if "$CLOUDFLARED_CMD" service uninstall 2>/dev/null; then
+            success "service uninstall 执行成功"
         else
-            echo "警告: '$CLOUDFLARED_CMD service uninstall' 命令不可用。" >&2
+            warn "service uninstall 失败，将手动清理"
         fi
+    else
+        dim "未找到 cloudflared 二进制，跳过"
     fi
 
-    # 停止并禁用已知的 systemd 服务 (作为额外的清理步骤)
-    echo "停止并禁用已知的 cloudflared systemd 服务..."
-    KNOWN_SERVICES="cloudflared.service cloudflared-update.service"
-    for service in $KNOWN_SERVICES; do
-        # 检查服务单元是否存在于系统中 (Loaded状态)
-        if systemctl list-units --full --no-pager --all | grep -q "^${service}"; then # 使用 ^锚点确保匹配服务名称开头
-             echo "正在停止和禁用 $service ..."
-            sudo systemctl stop "$service" >/dev/null 2>&1 || true # 停止失败则忽略
-            sudo systemctl disable "$service" >/dev/null 2>&1 || true # 禁用失败则忽略
-             echo "$service 已停止并禁用 (如果存在且运行)。"
+    # 3. 停止并禁用 systemd 服务
+    hr
+    step "停止并禁用 systemd 服务..."
+    for service in cloudflared.service cloudflared-update.service; do
+        if systemctl list-unit-files --no-pager 2>/dev/null | grep -q "^$service"; then
+            systemctl stop    "$service" >/dev/null 2>&1 || true
+            systemctl disable "$service" >/dev/null 2>&1 || true
+            success "已处理: $service"
         else
-            echo "未找到服务单元: $service"
+            dim "未找到: $service"
         fi
     done
 
-    # 删除已知的 cloudflared systemd 服务文件和软链接
-    echo "删除已知的 cloudflared systemd 服务文件和软链接..."
-    SERVICE_FILES_TO_DELETE=(
-        "/etc/systemd/system/cloudflared.service"
-        "/etc/systemd/system/cloudflared-update.service"
-        "/etc/systemd/system/multi-user.target.wants/cloudflared.service"
-        "/etc/systemd/system/multi-user.target.wants/cloudflared-update.service"
-        # 根据需要添加其他可能的位置
-    )
-
-    for service_file_path in "${SERVICE_FILES_TO_DELETE[@]}"; do
-        if [ -f "$service_file_path" ] || [ -L "$service_file_path" ]; then # 检查文件或软链接
-            echo "删除服务文件/链接: $service_file_path"
-            sudo rm -f "$service_file_path" || true # 删除失败则忽略
+    # 4. 删除服务文件
+    step "删除服务文件..."
+    for f in \
+        "/etc/systemd/system/cloudflared.service" \
+        "/etc/systemd/system/cloudflared-update.service" \
+        "/etc/systemd/system/multi-user.target.wants/cloudflared.service" \
+        "/etc/systemd/system/multi-user.target.wants/cloudflared-update.service"; do
+        if [ -f "$f" ] || [ -L "$f" ]; then
+            rm -f "$f" && success "已删除: $f" || warn "删除失败: $f"
         fi
     done
 
-    # 重新加载 systemd 配置
-    echo "重新加载 systemd 配置并重置失败的服务..."
-    sudo systemctl daemon-reload || echo "警告: systemctl daemon-reload 失败。" >&2
-    sudo systemctl reset-failed || echo "警告: systemctl reset-failed 失败。" >&2
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    systemctl reset-failed  >/dev/null 2>&1 || true
 
-    # 删除配置文件和证书目录 (包含用户家目录)
-    echo "删除配置文件和证书目录 (/etc/cloudflared, /var/lib/cloudflared, ~/.cloudflared 等)..."
-     echo "注意: 这些目录可能包含其他 Cloudflare 配置。请确保您已备份重要数据。" # 重申警告
-
-    CONFIG_DIRS_TO_DELETE=(
-        "/etc/cloudflared"
-        "/var/lib/cloudflared"
-        "/root/.cloudflared" # root 用户
-        "$HOME/.cloudflared" # 当前运行脚本的用户
-    )
-
-    for config_dir in "${CONFIG_DIRS_TO_DELETE[@]}"; do
-        if [ -d "$config_dir" ]; then
-             echo "删除目录: $config_dir"
-             sudo rm -rf "$config_dir" || true # 删除失败则忽略
+    # 5. 删除配置目录
+    hr
+    step "删除配置文件和证书目录..."
+    for dir in "/etc/cloudflared" "/var/lib/cloudflared" "/root/.cloudflared" "$HOME/.cloudflared"; do
+        if [ -d "$dir" ]; then
+            rm -rf "$dir" && success "已删除: $dir" || warn "删除失败: $dir"
         fi
     done
 
-    # 尝试删除其他用户家目录下的 .cloudflared 目录
-    echo "尝试删除其他用户家目录下的 .cloudflared 目录 (/home/*/.cloudflared)..."
-    find /home -maxdepth 1 -minddepth 1 -type d -print0 | while IFS= read -r -d $'\0' user_home; do
+    # 修复原版 -minddepth 拼写错误，改为 -mindepth
+    while IFS= read -r -d '' user_home; do
         if [ -d "$user_home/.cloudflared" ]; then
-            echo "删除目录: $user_home/.cloudflared"
-            sudo rm -rf "$user_home/.cloudflared" || true # 删除失败则忽略
+            rm -rf "$user_home/.cloudflared" && success "已删除: $user_home/.cloudflared" || warn "删除失败: $user_home/.cloudflared"
+        fi
+    done < <(find /home -maxdepth 1 -mindepth 1 -type d -print0 2>/dev/null)
+
+    # 6. 删除二进制
+    hr
+    step "删除 cloudflared 二进制文件..."
+    for bin in "/usr/local/bin/cloudflared" "/usr/bin/cloudflared" "/usr/sbin/cloudflared" "/bin/cloudflared"; do
+        if [ -f "$bin" ] || [ -L "$bin" ]; then
+            rm -f "$bin" && success "已删除: $bin" || warn "删除失败: $bin"
         fi
     done
 
-    # 删除 cloudflared 二进制文件
-    echo "删除 cloudflared 二进制文件..."
-    BINARIES_TO_DELETE=(
-        "/usr/local/bin/cloudflared" # 安装脚本主要位置
-        "/usr/bin/cloudflared"
-        "/usr/sbin/cloudflared"
-        "/bin/cloudflared"
-    )
-
-    for bin_path in "${BINARIES_TO_DELETE[@]}"; do
-        if [ -f "$bin_path" ] || [ -L "$bin_path" ]; then
-            echo "删除二进制文件/链接: $bin_path"
-             sudo rm -f "$bin_path" || true # 删除失败则忽略
-        fi
-    done
-
-    echo "--- Cloudflared 清除完成！---"
-
-    # 最终验证
-    echo "进行最终验证..."
-    # 检查二进制文件是否还在
+    # 7. 最终验证
+    hr
+    step "验证清除结果..."
     if [ -x "/usr/local/bin/cloudflared" ] || command_exists cloudflared; then
-        echo "警告：Cloudflared 二进制文件可能仍然存在。" >&2
-         which cloudflared 2>/dev/null # 尝试显示路径
+        warn "cloudflared 二进制仍然存在:"
+        command -v cloudflared 2>/dev/null || true
     else
-        echo "验证：Cloudflared 二进制文件已成功移除或不在 PATH 中。"
+        success "cloudflared 二进制已完全移除"
     fi
 
-    # 检查相关服务是否还在 systemd 中
-    if systemctl list-units --full --no-pager --all | grep -q cloudflared.service; then # 检查服务单元是否存在
-        echo "警告：仍有 Cloudflared 相关 systemd 服务单元存在。" >&2
-        systemctl list-units --full --no-pager --all | grep cloudflared.service >&2 # 只显示服务单元行
+    if systemctl list-unit-files --no-pager 2>/dev/null | grep -q "cloudflared"; then
+        warn "仍有残留的 systemd 单元:"
+        systemctl list-unit-files --no-pager 2>/dev/null | grep cloudflared || true
     else
-        echo "验证：所有 Cloudflared 服务单元已成功移除。"
+        success "所有 cloudflared 服务单元已移除"
     fi
+
+    echo ""
+    echo -e "${GREEN}${BOLD}  ✔ 卸载完成！${RESET}"
+    echo ""
 }
 
-# --- 显示用法函数 ---
+# ─────────────────────────────────────────────
+#  用法
+# ─────────────────────────────────────────────
 usage() {
-    echo "用法: sudo $(basename "$0") [install|uninstall]"
-    echo "  install: 下载并安装最新版本 cloudflared 二进制文件，并安装为 systemd 服务。"
-    echo "  uninstall: 尝试停止、禁用并移除 cloudflared 二进制文件、systemd 服务和配置文件。"
+    banner
+    echo -e "  ${WHITE}用法:${RESET} sudo $(basename "$0") [install|uninstall]"
+    echo ""
+    echo -e "  ${CYAN}install${RESET}    下载并安装最新版 cloudflared，配置 systemd 服务及每日自动更新"
+    echo -e "  ${CYAN}uninstall${RESET}  彻底移除 cloudflared 二进制、服务、自动更新及所有配置文件"
+    echo ""
     exit 1
 }
 
-# --- 主脚本执行逻辑 ---
-
-# 检查是否以 root 用户运行
+# ─────────────────────────────────────────────
+#  入口
+# ─────────────────────────────────────────────
 if [ "$EUID" -ne 0 ]; then
-    echo "错误: 请使用 sudo 运行此脚本。" >&2
+    echo -e "${RED}  ✘ 请使用 sudo 运行此脚本。${RESET}" >&2
     exit 1
 fi
 
-# 解析命令行参数，调用相应函数
-case "$1" in
-    install)
-        install_cloudflared
-        ;;
-    uninstall)
-        uninstall_cloudflared
-        ;;
-    *)
-        usage # 参数错误或缺失时显示用法
-        ;;
+case "${1:-}" in
+    install)   install_cloudflared ;;
+    uninstall) uninstall_cloudflared ;;
+    *)         usage ;;
 esac
