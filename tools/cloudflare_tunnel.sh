@@ -231,7 +231,7 @@ install_cloudflared() {
         fi
     fi
 
-    # 3. 下载二进制（先下载到临时路径，验证后再替换，避免下载失败导致服务中断）
+    # 3. 下载二进制（先下载到临时路径，验证后再替换）
     hr
     step "下载 cloudflared 二进制..."
     TMP_BIN=$(mktemp)
@@ -322,6 +322,102 @@ install_cloudflared() {
     systemctl status cloudflared --no-pager -l 2>/dev/null || true
     echo ""
     echo -e "  ${DIM}查看日志: journalctl -u cloudflared.service -f${RESET}"
+    echo ""
+}
+
+# ─────────────────────────────────────────────
+#  升级函数（仅更新二进制，不动 Token / 服务配置）
+# ─────────────────────────────────────────────
+upgrade_cloudflared() {
+    banner
+    echo -e "  ${WHITE}${BOLD}模式: 升级${RESET}"
+    hr
+
+    TARGET_BIN_PATH="/usr/local/bin/cloudflared"
+
+    # 检查是否已安装
+    if [ ! -f "$TARGET_BIN_PATH" ]; then
+        error "未检测到已安装的 cloudflared，请先运行 install。"
+        exit 1
+    fi
+
+    # 检查 curl
+    if ! command_exists curl; then
+        error "'curl' 未找到，请先安装: apt install curl"
+        exit 1
+    fi
+
+    # 检测架构
+    step "检测系统环境..."
+    ARCH=$(uname -m)
+    case $ARCH in
+        x86_64)        CLOUDFLARED_URL="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64" ;;
+        aarch64|arm64) CLOUDFLARED_URL="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm64" ;;
+        armv7l|armv6l) CLOUDFLARED_URL="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm" ;;
+        *)
+            error "不支持的架构: $ARCH"
+            exit 1
+            ;;
+    esac
+
+    CURRENT_VER=$("$TARGET_BIN_PATH" version 2>/dev/null | awk '{print $3}' || echo "unknown")
+    success "当前版本: $CURRENT_VER"
+
+    # 下载到临时路径
+    hr
+    step "下载最新版 cloudflared 二进制..."
+    TMP_BIN=$(mktemp)
+    trap 'rm -f "$TMP_BIN"' EXIT
+
+    if ! download_with_progress "$CLOUDFLARED_URL" "$TMP_BIN"; then
+        error "下载失败，请检查网络连接。"
+        exit 1
+    fi
+
+    chmod +x "$TMP_BIN"
+
+    # 验证并对比版本
+    if ! NEW_VER=$("$TMP_BIN" version 2>/dev/null | awk '{print $3}'); then
+        error "下载的文件无法执行，可能已损坏。"
+        exit 1
+    fi
+
+    if [ "$CURRENT_VER" = "$NEW_VER" ]; then
+        success "已是最新版本 ($CURRENT_VER)，无需升级。"
+        exit 0
+    fi
+
+    info "发现新版本: $CURRENT_VER → $NEW_VER"
+
+    # 停服务 → 替换二进制 → 启服务
+    hr
+    step "替换二进制..."
+    if systemctl is-active --quiet cloudflared.service 2>/dev/null; then
+        info "停止服务..."
+        systemctl stop cloudflared.service
+        success "服务已停止"
+    fi
+
+    mv "$TMP_BIN" "$TARGET_BIN_PATH"
+    trap - EXIT
+    success "二进制已替换"
+
+    step "重启服务..."
+    if systemctl start cloudflared.service 2>/dev/null; then
+        success "服务已重启"
+    else
+        warn "服务重启失败，请查看日志: journalctl -u cloudflared.service -n 50"
+    fi
+
+    # 完成
+    hr
+    echo ""
+    echo -e "${GREEN}${BOLD}  ✔ 升级完成！${RESET}"
+    echo ""
+    echo -e "  ${WHITE}版本:${RESET}  $CURRENT_VER  →  $NEW_VER"
+    echo -e "  ${WHITE}二进制:${RESET} $TARGET_BIN_PATH"
+    echo ""
+    echo -e "  ${DIM}Token 和服务配置未做任何改动${RESET}"
     echo ""
 }
 
@@ -450,9 +546,10 @@ uninstall_cloudflared() {
 # ─────────────────────────────────────────────
 usage() {
     banner
-    echo -e "  ${WHITE}用法:${RESET} sudo $(basename "$0") [install|uninstall]"
+    echo -e "  ${WHITE}用法:${RESET} sudo $(basename "$0") [install|upgrade|uninstall]"
     echo ""
     echo -e "  ${CYAN}install${RESET}    下载并安装最新版 cloudflared，配置 systemd 服务及每日自动更新"
+    echo -e "  ${CYAN}upgrade${RESET}    仅更新 cloudflared 二进制，不修改 Token 和服务配置"
     echo -e "  ${CYAN}uninstall${RESET}  彻底移除 cloudflared 二进制、服务、自动更新及所有配置文件"
     echo ""
     exit 1
@@ -468,6 +565,7 @@ fi
 
 case "${1:-}" in
     install)   install_cloudflared ;;
+    upgrade)   upgrade_cloudflared ;;
     uninstall) uninstall_cloudflared ;;
     *)         usage ;;
 esac
