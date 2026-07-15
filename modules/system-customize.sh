@@ -21,6 +21,7 @@ readonly XANMOD_LEGACY_SOURCE_BACKUP="/root/xanmod-release.sources.legacy"
 readonly XANMOD_OLD_BAD_BACKUP="/etc/apt/sources.list.d/xanmod-release.sources.backup"
 readonly XANMOD_KEY_URL="https://dl.xanmod.org/archive.key"
 readonly XANMOD_REPO_URL="http://deb.xanmod.org"
+readonly XANMOD_PSABI_CHECK_URL="https://dl.xanmod.org/check_x86-64_psabi.sh"
 
 # === 日志函数 ===
 log() {
@@ -182,7 +183,7 @@ sleep 0.5
 
 read -r _ user2 nice2 system2 idle2 _ < <(grep '^cpu ' /proc/stat)
 total2=$((user2 + nice2 + system2 + idle2))
-busy2=$((user2 + nice2 + system2 + idle2))
+busy2=$((user2 + nice2 + system2))
 
 total_delta=$((total2 - total1))
 busy_delta=$((busy2 - busy1))
@@ -305,16 +306,6 @@ is_amd64() {
         [[ "$(uname -m)" == "x86_64" || "$(uname -m)" == "amd64" ]]
 }
 
-cpu_has_flags() {
-    local flag
-
-    for flag in "$@"; do
-        grep -qw "$flag" /proc/cpuinfo || return 1
-    done
-
-    return 0
-}
-
 package_is_installed() {
     local package="$1"
 
@@ -339,21 +330,63 @@ get_running_xanmod_package() {
     esac
 }
 
+detect_x86_64_psabi_level() {
+    local checker
+    local result
+
+    if ! checker=$(mktemp); then
+        return 1
+    fi
+
+    if ! curl -fsSL \
+        --connect-timeout 10 \
+        --max-time 30 \
+        "$XANMOD_PSABI_CHECK_URL" \
+        -o "$checker"; then
+        rm -f "$checker"
+        return 1
+    fi
+
+    if [[ ! -s "$checker" ]]; then
+        rm -f "$checker"
+        return 1
+    fi
+
+    if ! result=$(awk -f "$checker" 2>/dev/null); then
+        rm -f "$checker"
+        return 1
+    fi
+
+    rm -f "$checker"
+
+    case "$result" in
+        *"x86-64-v3"*)
+            echo "v3"
+            ;;
+        *"x86-64-v2"*)
+            echo "v2"
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
 detect_xanmod_package() {
     local running_package
+    local psabi_level
 
     if ! is_amd64; then
         return 1
     fi
 
-    # 优先尊重当前正在运行的 XanMod 内核。
-    # 虚拟机可能不完整暴露 CPU flags，运行中的 v3/v2 是最可靠依据。
+    # 已实际运行的 XanMod 内核是最高优先级证据。
     if running_package=$(get_running_xanmod_package); then
         echo "$running_package"
         return 0
     fi
 
-    # 其次尊重已安装的 XanMod 元包，避免把已部署的 v3 错判为 v2。
+    # 已安装的元包次之，避免更新脚本误切换内核分支。
     if package_is_installed "linux-xanmod-x64v3"; then
         echo "linux-xanmod-x64v3"
         return 0
@@ -364,18 +397,20 @@ detect_xanmod_package() {
         return 0
     fi
 
-    # 未安装 XanMod 时，再按 CPU flags 选择合适版本。
-    if cpu_has_flags avx avx2 bmi1 bmi2 fma f16c movbe lzcnt; then
-        echo "linux-xanmod-x64v3"
-        return 0
+    # 首次安装时，使用 XanMod 官方 psABI 检测脚本。
+    if ! psabi_level=$(detect_x86_64_psabi_level); then
+        warn "无法确认 CPU 的 x86-64 psABI 等级，跳过 XanMod 安装"
+        return 1
     fi
 
-    if cpu_has_flags cx16 lahf_lm popcnt sse4_1 sse4_2 ssse3; then
-        echo "linux-xanmod-x64v2"
-        return 0
-    fi
-
-    return 1
+    case "$psabi_level" in
+        v3)
+            echo "linux-xanmod-x64v3"
+            ;;
+        v2)
+            echo "linux-xanmod-x64v2"
+            ;;
+    esac
 }
 
 xanmod_source_configured() {
