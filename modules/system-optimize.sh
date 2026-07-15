@@ -39,11 +39,6 @@ wait_for_apt() {
         /var/cache/apt/archives/lock
     )
 
-    if ! command -v fuser >/dev/null 2>&1; then
-        log "未找到 fuser，跳过 APT 锁占用检查" "warn"
-        return 0
-    fi
-
     while fuser "${lock_files[@]}" >/dev/null 2>&1; do
         if (( waited >= APT_LOCK_TIMEOUT )); then
             log "APT/dpkg 被占用超过 ${APT_LOCK_TIMEOUT} 秒，请等待其他软件包操作完成后重试" "error"
@@ -88,27 +83,16 @@ show_swap_status() {
 }
 
 get_zram_used_bytes() {
-    local zram_device="/dev/zram0"
-
-    if [[ ! -b "$zram_device" ]]; then
-        echo "0"
-        return 0
-    fi
-
-    local used
-    used=$(swapon --noheadings --bytes --show "$zram_device" 2>/dev/null | awk '{print $4}' | head -n 1)
-
-    if [[ "$used" =~ ^[0-9]+$ ]]; then
-        echo "$used"
-    else
-        echo "0"
-    fi
+    swapon --noheadings --bytes --show 2>/dev/null |
+        awk '$1 == "/dev/zram0" {print $4; exit}'
 }
 
 is_zram_active() {
     systemctl is-active --quiet systemd-zram-setup@zram0.service &&
         [[ -b /dev/zram0 ]] &&
-        swapon --noheadings --show 2>/dev/null | awk '{print $1}' | grep -qx "/dev/zram0"
+        swapon --noheadings --show 2>/dev/null |
+            awk '{print $1}' |
+            grep -qx "/dev/zram0"
 }
 
 # === Zram 配置 ===
@@ -117,6 +101,7 @@ get_optimal_zram_config() {
     local zram_size
     local swappiness
 
+    # 小内存优先避免 OOM；大内存则减少不必要的压缩和换页。
     if (( mem_mb <= 512 )); then
         zram_size="ram * 2"
         swappiness=60
@@ -154,16 +139,15 @@ EOF
 }
 
 apply_zram_sysctl() {
-    if ! sysctl --system >/dev/null 2>&1; then
-        log "sysctl 配置应用失败，尝试应用 Zram 配置文件" "warn"
-
-        if ! sysctl -p "$SYSCTL_CONFIG" >/dev/null 2>&1; then
-            log "无法立即应用全部 sysctl 参数，重启后会再次应用" "warn"
-        fi
+    if ! sysctl -p "$SYSCTL_CONFIG" >/dev/null 2>&1; then
+        log "无法立即应用 Zram sysctl 配置，重启后会自动生效" "warn"
+        return 1
     fi
+
+    return 0
 }
 
-get_current_config_value() {
+get_zram_config_value() {
     local key="$1"
 
     [[ -f "$ZRAM_CONFIG" ]] || return 1
@@ -177,36 +161,48 @@ get_current_config_value() {
     ' "$ZRAM_CONFIG"
 }
 
-zram_config_matches() {
-    local target_size="$1"
-    local target_swappiness="$2"
-
-    is_zram_active || return 1
-    [[ -f "$ZRAM_CONFIG" ]] || return 1
+get_zram_swappiness() {
     [[ -f "$SYSCTL_CONFIG" ]] || return 1
 
-    local current_size
-    local current_swappiness
-
-    current_size=$(get_current_config_value "zram-size" || true)
-    current_swappiness=$(awk -F= '
+    awk -F= '
         $1 ~ /^[[:space:]]*vm\.swappiness[[:space:]]*$/ {
             gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2)
             print $2
             exit
         }
-    ' "$SYSCTL_CONFIG" 2>/dev/null || true)
+    ' "$SYSCTL_CONFIG"
+}
+
+zram_config_matches() {
+    local target_size="$1"
+    local target_swappiness="$2"
+    local current_size
+    local current_swappiness
+
+    is_zram_active || return 1
+
+    current_size=$(get_zram_config_value "zram-size" || true)
+    current_swappiness=$(get_zram_swappiness || true)
 
     [[ "$current_size" == "$target_size" ]] &&
         [[ "$current_swappiness" == "$target_swappiness" ]]
 }
 
-stop_managed_zram() {
-    systemctl stop systemd-zram-setup@zram0.service >/dev/null 2>&1 || true
-    systemctl reset-failed systemd-zram-setup@zram0.service >/dev/null 2>&1 || true
+install_zram_generator() {
+    if dpkg-query -W -f='${db:Status-Status}' systemd-zram-generator 2>/dev/null |
+        grep -qx "installed"; then
+        return 0
+    fi
+
+    log "安装 systemd-zram-generator..." "info"
+
+    if ! apt-get install -y systemd-zram-generator; then
+        log "systemd-zram-generator 安装失败" "error"
+        return 1
+    fi
 }
 
-start_managed_zram() {
+start_zram() {
     systemctl daemon-reload
 
     if ! systemctl start systemd-zram-setup@zram0.service; then
@@ -246,51 +242,44 @@ setup_zram() {
 
     if zram_config_matches "$zram_size" "$swappiness"; then
         local current_size
-        current_size=$(swapon --noheadings --show /dev/zram0 2>/dev/null | awk '{print $3}')
+        current_size=$(swapon --noheadings --show 2>/dev/null |
+            awk '$1 == "/dev/zram0" {print $3; exit}')
 
         echo "Zram: ${current_size:-已启用}（配置无需变更）"
         show_swap_status
         return 0
     fi
 
-    if ! dpkg-query -W -f='${db:Status-Status}' systemd-zram-generator 2>/dev/null | grep -qx "installed"; then
-        log "安装 systemd-zram-generator..." "info"
-
-        if ! apt-get install -y systemd-zram-generator; then
-            log "systemd-zram-generator 安装失败" "error"
-            return 1
-        fi
-    fi
+    install_zram_generator || return 1
 
     local used_bytes
     used_bytes=$(get_zram_used_bytes)
+    used_bytes="${used_bytes:-0}"
 
     write_zram_config "$zram_size" "$swappiness"
-    apply_zram_sysctl
+    apply_zram_sysctl || true
     systemctl daemon-reload
 
-    # 已有 Zram 正在使用时，不强制 swapoff，以免低内存机器发生 OOM。
+    # 当前 Zram 有实际换页时，不强制 swapoff，避免低内存机器触发 OOM。
     if is_zram_active && (( used_bytes > 0 )); then
-        log "当前 Zram 正在使用 ${used_bytes} 字节 Swap，已保存新配置，将在下次重启后生效" "warn"
+        log "当前 Zram 已使用 ${used_bytes} 字节 Swap；新配置将在下次重启后生效" "warn"
         show_swap_status
         return 0
     fi
 
     if is_zram_active; then
         log "停止未使用的现有 Zram 服务以应用新配置..." "info"
-        stop_managed_zram
+        systemctl stop systemd-zram-setup@zram0.service
     fi
 
-    if start_managed_zram; then
-        local actual_size
-        actual_size=$(swapon --noheadings --show /dev/zram0 2>/dev/null | awk '{print $3}')
+    start_zram || return 1
 
-        echo "Zram: ${actual_size:-已启用}（zstd，swappiness=${swappiness}）"
-        show_swap_status
-        return 0
-    fi
+    local actual_size
+    actual_size=$(swapon --noheadings --show 2>/dev/null |
+        awk '$1 == "/dev/zram0" {print $3; exit}')
 
-    return 1
+    echo "Zram: ${actual_size:-已启用}（zstd，swappiness=${swappiness}）"
+    show_swap_status
 }
 
 # === 时区配置 ===
@@ -347,48 +336,56 @@ setup_timezone() {
 }
 
 # === Chrony 时间同步 ===
+disable_timesyncd() {
+    systemctl disable --now systemd-timesyncd >/dev/null 2>&1 || true
+}
+
 setup_chrony() {
+    # 已运行的 Chrony 优先，确保默认 NTP 客户端不与它并行工作。
     if systemctl is-active --quiet chrony; then
+        disable_timesyncd
+
         local sync_status
-        sync_status=$(chronyc tracking 2>/dev/null | awk -F': ' '/Leap status/ {print $2}')
+        sync_status=$(chronyc tracking 2>/dev/null |
+            awk -F': ' '/Leap status/ {print $2}')
 
         if [[ "$sync_status" == "Normal" ]]; then
             echo "时间同步: Chrony（已同步）"
-            return 0
+        else
+            echo "时间同步: Chrony（运行中，等待同步）"
         fi
+
+        return 0
     fi
 
     if ! command -v chronyd >/dev/null 2>&1; then
         log "安装 Chrony..." "info"
 
         if ! apt-get install -y chrony; then
-            log "Chrony 安装失败；保留 systemd-timesyncd 状态不变" "error"
+            log "Chrony 安装失败，保留 systemd-timesyncd 状态不变" "error"
             return 1
         fi
     fi
 
     if ! systemctl enable --now chrony; then
-        log "Chrony 启动失败；保留 systemd-timesyncd 状态不变" "error"
+        log "Chrony 启动失败，保留 systemd-timesyncd 状态不变" "error"
         return 1
     fi
 
-    # Chrony 已成功启动后，再关闭可能冲突的 systemd-timesyncd。
-    if systemctl is-active --quiet chrony; then
-        systemctl disable --now systemd-timesyncd >/dev/null 2>&1 || true
-    fi
-
-    sleep 2
-
+    # 仅当 Chrony 成功运行后，才停用 systemd-timesyncd。
     if ! systemctl is-active --quiet chrony; then
         log "Chrony 未处于运行状态" "error"
         return 1
     fi
 
+    disable_timesyncd
+    sleep 2
+
     local sources
-    sources=$(chronyc sources 2>/dev/null | awk '/^[\^\*+\-]/ {count++} END {print count + 0}')
+    sources=$(chronyc sources 2>/dev/null |
+        awk '/^[\^\*\+\-]/ {count++} END {print count + 0}')
 
     echo "时间同步: Chrony（${sources} 个时间源）"
-    return 0
 }
 
 # === 主流程 ===
@@ -398,7 +395,7 @@ main() {
         exit 1
     fi
 
-    for cmd in awk swapon systemctl timedatectl; do
+    for cmd in awk swapon systemctl timedatectl fuser; do
         if ! command -v "$cmd" >/dev/null 2>&1; then
             log "缺少必要命令: $cmd" "error"
             exit 1
