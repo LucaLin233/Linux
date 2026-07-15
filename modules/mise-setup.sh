@@ -13,8 +13,8 @@ readonly MISE_BASH_ACTIVATE_FILE="$MISE_CONFIG_DIR/activate.bash"
 
 readonly ZSHRC_FILE="$HOME/.zshrc"
 readonly BASHRC_FILE="$HOME/.bashrc"
-readonly ZSH_LOADER_MARKER="# Mise Shell 集成：配置文件由 mise-setup.sh 维护。"
-readonly BASH_LOADER_MARKER="# Mise Shell 集成：配置文件由 mise-setup.sh 维护。"
+readonly ZSH_LOADER_MARKER="# Mise shell 集成：配置文件由 mise-setup.sh 维护。"
+readonly BASH_LOADER_MARKER="# Mise shell 集成：配置文件由 mise-setup.sh 维护。"
 
 readonly MISE_CRON_COMMENT="# Mise Weekly Auto Update"
 readonly MISE_CRON_SCHEDULE="0 1 * * 0"
@@ -100,6 +100,36 @@ get_current_tool_version() {
     # python 3.14.6 /root/.config/mise/config.toml
     # node   24.12.0 /root/.config/mise/config.toml
     awk 'NR == 1 {print $2; exit}' <<< "$output"
+}
+
+get_global_tool_version() {
+    local tool="$1"
+    local config_file="$MISE_CONFIG_DIR/config.toml"
+
+    [[ -f "$config_file" ]] || return 1
+
+    awk -v tool="$tool" '
+        /^\[tools\][[:space:]]*$/ {
+            in_tools = 1
+            next
+        }
+
+        /^\[/ {
+            in_tools = 0
+        }
+
+        in_tools {
+            pattern = "^[[:space:]]*" tool "[[:space:]]*="
+            if ($0 ~ pattern) {
+                value = $0
+                sub(/^[^=]*=[[:space:]]*/, "", value)
+                gsub(/^[[:space:]]*"|"[[:space:]]*$/, "", value)
+                gsub(/[[:space:]]*#.*/, "", value)
+                print value
+                exit
+            }
+        }
+    ' "$config_file"
 }
 
 package_is_installed() {
@@ -630,8 +660,8 @@ show_summary() {
     if mise_cmd=$(get_mise_executable); then
         echo "  Mise: $("$mise_cmd" --version 2>/dev/null | head -n 1)"
 
-        python_version=$(get_current_tool_version "python" || true)
-        node_version=$(get_current_tool_version "node" || true)
+        python_version=$(get_global_tool_version "python" || true)
+        node_version=$(get_global_tool_version "node" || true)
 
         if [[ -n "$python_version" ]]; then
             echo "  Mise Python: $python_version"
