@@ -223,6 +223,8 @@ install_dependencies() {
         "fuser:psmisc"
         "locale-gen:locales"
         "gpg:gpg"
+        "gpg-agent:gpg-agent"
+        "dirmngr:dirmngr"
     )
 
     local missing_packages=()
