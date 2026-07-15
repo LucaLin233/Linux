@@ -1,42 +1,60 @@
-#!/bin/bash
-
-#=============================================================================
-# Debian 系统部署脚本 v3.5.1
-# 适用系统: Debian 12+, 作者: LucaLin233
-# 功能: 模块化部署，智能依赖处理
-#=============================================================================
+#!/usr/bin/env bash
+# =============================================================================
+# Debian 系统部署脚本
+# 适用系统：Debian 12+
+# 功能：模块化部署、依赖处理、模块版本固定下载
+# =============================================================================
 
 set -uo pipefail
 
-# 全局常量
-readonly SCRIPT_VERSION="3.5.1"
+# === 全局常量 ===
+readonly SCRIPT_VERSION="4.0.0"
 SCRIPT_COMMIT="${SCRIPT_COMMIT:-unknown}"
+
 readonly MODULE_BASE_URL="https://raw.githubusercontent.com/LucaLin233/Linux"
-readonly TEMP_DIR="/tmp/debian-setup-modules"
-readonly LOG_FILE="/var/log/debian-setup.log"
+readonly GITHUB_API_URL="https://api.github.com/repos/LucaLin233/Linux/commits/main"
+
+LOG_FILE="/var/log/debian-setup.log"
 readonly SUMMARY_FILE="/root/deployment_summary.txt"
+readonly CACHE_DIR="/var/cache/debian-setup"
 readonly LINE="============================================================"
 
-# 模块定义
+TEMP_DIR=""
+LATEST_COMMIT=""
+TOTAL_START_TIME=0
+
+SELECTED_MODULES=()
+FILTERED_ARGS=()
+
+declare -A MODULE_STATUS
+declare -A MODULE_EXEC_TIME
+
+# === 模块定义 ===
 declare -A MODULES=(
-    ["system-optimize"]="系统优化 (Zram, 时区, 时间同步)"
+    ["system-optimize"]="系统优化（Zram、时区、Chrony 时间同步）"
+    ["system-customize"]="系统定制（欢迎信息、中文环境、XanMod 内核）"
+    ["network-optimize"]="网络优化（BBR、fq、IPv4 转发）"
     ["zsh-setup"]="Zsh Shell 环境"
-    ["mise-setup"]="Mise 版本管理器"
-    ["tools-setup"]="系统工具 (NextTrace, SpeedTest等)"
+    ["mise-setup"]="Mise、Python、Node.js 版本管理"
+    ["tools-setup"]="系统工具（NextTrace、测速、htop 等）"
     ["docker-setup"]="Docker 容器化平台"
-    ["auto-update-setup"]="自动更新系统"
+    ["auto-update-setup"]="自动更新系统与内核"
     ["ssh-security"]="SSH 安全配置"
 )
 
-# 依赖关系
+# === 模块依赖 ===
 declare -A MODULE_DEPS=(
+    ["system-customize"]="system-optimize"
+    ["network-optimize"]="system-optimize"
     ["zsh-setup"]="system-optimize"
     ["mise-setup"]="system-optimize zsh-setup"
 )
 
-# 标准执行顺序（按依赖层级）
+# === 标准执行顺序 ===
 readonly MODULE_ORDER=(
     system-optimize
+    system-customize
+    network-optimize
     zsh-setup
     mise-setup
     tools-setup
@@ -45,119 +63,154 @@ readonly MODULE_ORDER=(
     ssh-security
 )
 
-# 执行状态
-declare -A MODULE_STATUS
-declare -A MODULE_EXEC_TIME
-SELECTED_MODULES=()
-TOTAL_START_TIME=0
-LATEST_COMMIT=""
-FILTERED_ARGS=()
-
-# 颜色定义
+# === 颜色 ===
 readonly C_RED='\033[0;31m'
 readonly C_GREEN='\033[0;32m'
 readonly C_YELLOW='\033[0;33m'
+readonly C_CYAN='\033[0;36m'
 readonly C_NC='\033[0m'
 
-#=============================================================================
-# 工具函数
-#=============================================================================
+# =============================================================================
+# 基础函数
+# =============================================================================
 
 log() {
-    local msg="$1"
+    local message="$1"
     local level="${2:-info}"
-    local timestamp=$(date '+%H:%M:%S')
-    
-    local -A icons=([info]="✅" [warn]="⚠️ " [error]="❌" [success]="🎉")
-    local -A colors=([info]=$C_GREEN [warn]=$C_YELLOW [error]=$C_RED [success]=$C_GREEN)
-    
-    echo -e "${colors[$level]}${icons[$level]} $msg${C_NC}"
-    echo "[$timestamp] [$level] $msg" >> "$LOG_FILE"
+    local timestamp
+    local color
+    local icon
+
+    timestamp=$(date '+%H:%M:%S')
+
+    case "$level" in
+        info)
+            color="$C_CYAN"
+            icon="ℹ️ "
+            ;;
+        warn)
+            color="$C_YELLOW"
+            icon="⚠️ "
+            ;;
+        error)
+            color="$C_RED"
+            icon="❌"
+            ;;
+        success)
+            color="$C_GREEN"
+            icon="✅"
+            ;;
+        *)
+            color="$C_NC"
+            icon="•"
+            ;;
+    esac
+
+    echo -e "${color}${icon} ${message}${C_NC}"
+    echo "[$timestamp] [$level] $message" >> "$LOG_FILE" 2>/dev/null || true
 }
 
-check_command() {
-    command -v "$1" &>/dev/null
-}
-
-get_info() {
-    "$@" 2>/dev/null || echo "未知"
+command_exists() {
+    command -v "$1" >/dev/null 2>&1
 }
 
 cleanup() {
     local exit_code=$?
-    
-    if (( exit_code != 0 )); then
-        log "脚本异常退出，保留临时文件用于调试: $TEMP_DIR" "error"
-        log "调试完成后手动删除: rm -rf $TEMP_DIR" "warn"
-        log "详细日志: $LOG_FILE" "error"
-    else
-        [[ -d "$TEMP_DIR" ]] && rm -rf "$TEMP_DIR" 2>/dev/null || true
+
+    if [[ -n "$TEMP_DIR" && -d "$TEMP_DIR" ]]; then
+        if (( exit_code == 0 )); then
+            rm -rf "$TEMP_DIR" 2>/dev/null || true
+        else
+            log "脚本异常退出，临时文件保留在：$TEMP_DIR" "error"
+            log "调试完成后可手动删除：rm -rf $TEMP_DIR" "warn"
+            log "详细日志：$LOG_FILE" "error"
+        fi
     fi
-    
-    exit $exit_code
+
+    exit "$exit_code"
 }
-trap cleanup EXIT INT TERM
 
 init_logging() {
     mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null || true
-    
+
     if ! touch "$LOG_FILE" 2>/dev/null; then
-        echo "⚠️  无法写入日志文件 $LOG_FILE，将只输出到终端"
+        echo "⚠️ 无法写入日志文件 $LOG_FILE，将仅输出到终端"
         LOG_FILE="/dev/null"
     else
         : > "$LOG_FILE"
     fi
 }
 
-#=============================================================================
+create_temp_dir() {
+    if ! TEMP_DIR=$(mktemp -d -p /tmp debian-setup.XXXXXX); then
+        log "无法创建安全临时目录" "error"
+        exit 1
+    fi
+
+    chmod 700 "$TEMP_DIR"
+}
+
+# =============================================================================
 # 系统检查
-#=============================================================================
+# =============================================================================
 
 pre_check() {
     log "系统预检查"
-    
+
     if (( EUID != 0 )); then
         log "需要 root 权限运行" "error"
         exit 1
     fi
-    
+
     if [[ ! -f /etc/debian_version ]]; then
         log "仅支持 Debian 系统" "error"
         exit 1
     fi
-    
+
     local free_space_kb
-    free_space_kb=$(LANG=C df / 2>/dev/null | awk 'NR==2 {print $4}' | tr -cd '0-9')
-    
-    if [[ -z "$free_space_kb" ]] || [[ "$free_space_kb" -eq 0 ]]; then
-        log "无法获取磁盘空间信息，跳过检查" "warn"
+    free_space_kb=$(LANG=C df / 2>/dev/null | awk 'NR == 2 {print $4}' | tr -cd '0-9')
+
+    if [[ -z "$free_space_kb" || "$free_space_kb" == "0" ]]; then
+        log "无法获取根分区可用空间，跳过磁盘检查" "warn"
     else
-        local free_space_gb=$((free_space_kb / 1024 / 1024))
-        log "可用磁盘空间: ${free_space_gb}GB"
-        
+        local free_space_gb
+        free_space_gb=$((free_space_kb / 1024 / 1024))
+
+        log "根分区可用空间：${free_space_gb}GB"
+
         if (( free_space_kb < 1048576 )); then
-            log "磁盘空间不足 (需要至少1GB)" "error"
+            log "根分区可用空间不足 1GB" "error"
             exit 1
         fi
     fi
-    
-    log "检查网络连接..."
-    if ! ping -c 1 -W 3 8.8.8.8 &>/dev/null; then
-        log "网络连接异常，可能影响模块下载" "warn"
-        read -p "继续执行? [y/N]: " -r choice
-        [[ "$choice" =~ ^[Yy]$ ]] || exit 0
+
+    log "检查 GitHub 下载连接..."
+
+    if ! curl -fsI \
+        --connect-timeout 5 \
+        --max-time 10 \
+        "https://raw.githubusercontent.com/" >/dev/null 2>&1; then
+        log "无法连接 raw.githubusercontent.com，模块下载可能失败" "warn"
+
+        local choice
+        read -r -p "是否继续执行？[y/N]: " choice
+
+        if [[ ! "$choice" =~ ^[Yy]$ ]]; then
+            log "用户取消执行" "info"
+            exit 0
+        fi
     fi
-    
-    log "系统检查通过"
+
+    log "系统预检查通过" "success"
 }
 
-#=============================================================================
+# =============================================================================
 # 依赖安装
-#=============================================================================
+# =============================================================================
 
 install_dependencies() {
-    log "检查系统依赖"
-    
+    log "检查基础依赖"
+
     local required_deps=(
         "curl:curl"
         "wget:wget"
@@ -167,673 +220,774 @@ install_dependencies() {
         "sudo:sudo"
         "dig:dnsutils"
         "crontab:cron"
+        "fuser:psmisc"
+        "locale-gen:locales"
+        "gpg:gpg"
     )
-    
+
     local missing_packages=()
-    
-    for dep_pair in "${required_deps[@]}"; do
-        local check_cmd="${dep_pair%:*}"
-        local package_name="${dep_pair#*:}"
-        
-        if ! check_command "$check_cmd"; then
+    local dependency
+    local command_name
+    local package_name
+
+    for dependency in "${required_deps[@]}"; do
+        command_name="${dependency%%:*}"
+        package_name="${dependency#*:}"
+
+        if ! command_exists "$command_name"; then
             missing_packages+=("$package_name")
         fi
     done
-    
-    if (( ${#missing_packages[@]} > 0 )); then
-        log "安装缺失依赖: ${missing_packages[*]}"
-        
-        if ! apt-get update -qq; then
-            log "依赖安装失败" "error"
-            exit 1
-        fi
-        
-        if ! apt-get install -y "${missing_packages[@]}"; then
-            log "依赖安装失败" "error"
-            exit 1
-        fi
-    fi
-    
-    log "依赖检查完成"
-}
 
-#=============================================================================
-# 系统更新
-#=============================================================================
-
-system_update() {
-    log "系统更新"
-    
-    log "正在更新软件包列表..."
-    if apt-get update >> "$LOG_FILE" 2>&1; then
-        log "软件包列表更新成功"
-    else
-        log "软件包列表更新失败" "warn"
-    fi
-    
-    log "正在升级系统..."
-    if apt-get upgrade -y >> "$LOG_FILE" 2>&1; then
-        log "系统升级成功"
-    else
-        log "系统升级失败" "warn"
-    fi
-    
-    fix_hosts_file
-    
-    log "系统更新完成"
-}
-
-fix_hosts_file() {
-    local hostname=$(hostname)
-    local cloud_cfg="/etc/cloud/cloud.cfg"
-
-    # 1. 禁用 cloud-init 对 hosts 的接管，防止重启被还原
-    if [[ -f "$cloud_cfg" ]]; then
-        log "检测到 cloud-init，正在禁用 manage_etc_hosts..."
-        # 无论原来是 true 还是没设置，都统一设为 false
-        if grep -q "manage_etc_hosts:" "$cloud_cfg"; then
-            sed -i 's/manage_etc_hosts: .*/manage_etc_hosts: false/' "$cloud_cfg"
-        else
-            echo "manage_etc_hosts: false" >> "$cloud_cfg"
-        fi
-    fi
-
-    # 2. 检查是否已有正确的映射
-    if grep -qE "^127\.0\.1\.1[[:space:]]+.*\b$hostname\b" /etc/hosts 2>/dev/null; then
+    if (( ${#missing_packages[@]} == 0 )); then
+        log "基础依赖已满足"
         return 0
     fi
 
-    # 3. 备份并更新 hosts 文件
-    cp /etc/hosts "/etc/hosts.backup.$(date +%s)" 2>/dev/null || true
+    log "安装缺失依赖：${missing_packages[*]}"
 
-    if grep -q "^127.0.1.1" /etc/hosts 2>/dev/null; then
-        sed -i "s/^127\.0\.1\.1[[:space:]]\+/127.0.1.1 $hostname /" /etc/hosts
+    if ! apt-get update -qq; then
+        log "无法更新 APT 软件包索引" "error"
+        exit 1
+    fi
+
+    if ! apt-get install -y "${missing_packages[@]}"; then
+        log "基础依赖安装失败" "error"
+        exit 1
+    fi
+
+    log "基础依赖安装完成" "success"
+}
+
+# =============================================================================
+# 系统更新与 hosts 修复
+# =============================================================================
+
+system_update() {
+    log "更新软件包索引"
+
+    if apt-get update; then
+        log "软件包索引更新成功" "success"
     else
-        echo "127.0.1.1 $hostname" >> /etc/hosts
+        log "软件包索引更新失败，后续模块可能无法安装软件包" "warn"
+    fi
+
+    local choice
+    read -r -p "是否现在执行完整系统更新（apt-get full-upgrade）？[y/N]: " choice
+    choice="${choice:-N}"
+
+    if [[ ! "$choice" =~ ^[Yy]$ ]]; then
+        log "已跳过完整系统更新"
+        return 0
+    fi
+
+    log "执行完整系统更新..."
+
+    if DEBIAN_FRONTEND=noninteractive apt-get full-upgrade -y \
+        -o Dpkg::Options::=--force-confdef \
+        -o Dpkg::Options::=--force-confold; then
+        log "系统更新完成" "success"
+    else
+        log "系统更新失败，继续执行模块选择流程" "warn"
     fi
 }
 
-#=============================================================================
+fix_hosts_file() {
+    local hostname_value
+    local cloud_config="/etc/cloud/cloud.cfg"
+
+    hostname_value=$(hostname)
+
+    if [[ -f "$cloud_config" ]]; then
+        if grep -qE '^[[:space:]]*manage_etc_hosts:' "$cloud_config"; then
+            sed -i \
+                's/^[[:space:]]*manage_etc_hosts:.*/manage_etc_hosts: false/' \
+                "$cloud_config"
+        else
+            echo "manage_etc_hosts: false" >> "$cloud_config"
+        fi
+
+        log "已禁用 cloud-init 对 /etc/hosts 的自动管理"
+    fi
+
+    if grep -qE "^127\.0\.1\.1[[:space:]].*\b${hostname_value}\b" \
+        /etc/hosts 2>/dev/null; then
+        log "/etc/hosts 已包含主机名映射"
+        return 0
+    fi
+
+    cp /etc/hosts "/etc/hosts.backup.$(date +%s)" 2>/dev/null || true
+
+    if grep -qE '^127\.0\.1\.1[[:space:]]' /etc/hosts 2>/dev/null; then
+        sed -i \
+            "s/^127\\.0\\.1\\.1[[:space:]]\\+.*/127.0.1.1 ${hostname_value}/" \
+            /etc/hosts
+    else
+        echo "127.0.1.1 ${hostname_value}" >> /etc/hosts
+    fi
+
+    log "已更新 /etc/hosts 主机名映射" "success"
+}
+
+ask_fix_hosts() {
+    local choice
+
+    read -r -p "是否修复 hostname 与 /etc/hosts 映射？[y/N]: " choice
+    choice="${choice:-N}"
+
+    if [[ "$choice" =~ ^[Yy]$ ]]; then
+        fix_hosts_file
+    else
+        log "已跳过 hostname 与 /etc/hosts 修复"
+    fi
+}
+
+# =============================================================================
 # 模块选择
-#=============================================================================
+# =============================================================================
 
 select_deployment_mode() {
-    log "选择部署模式"
-      
-    echo  
-    echo "$LINE"  
-    echo "部署模式选择："  
-    echo "1) 🚀 全部安装 (安装所有7个模块)"  
-    echo "2) 🎯 自定义选择 (按需选择模块)"  
+    echo
+    echo "$LINE"
+    echo "部署模式选择："
+    echo "1) 🚀 全部安装（安装全部 ${#MODULE_ORDER[@]} 个模块）"
+    echo "2) 🎯 自定义选择（按需选择模块）"
     echo "3) ❌ 退出脚本"
-    echo  
-      
-    read -p "请选择模式 [1-3]: " -r mode_choice  
-      
-    case "$mode_choice" in  
-        1)  
-            SELECTED_MODULES=("${MODULE_ORDER[@]}")  
-            log "选择: 全部安装"  
-            ;;  
-        2)  
-            custom_module_selection  
+    echo
+
+    local mode_choice
+    read -r -p "请选择模式 [1-3]: " mode_choice
+
+    case "$mode_choice" in
+        1)
+            SELECTED_MODULES=("${MODULE_ORDER[@]}")
+            log "已选择全部模块"
+            ;;
+        2)
+            custom_module_selection
             ;;
         3)
-            log "用户选择退出，正在停止..." "info"
+            log "用户选择退出" "info"
             exit 0
             ;;
-        *)  
-            log "无效选择，已取消部署" "warn"  
+        *)
+            log "无效选择，已取消部署" "error"
             exit 1
-            ;;  
-    esac  
+            ;;
+    esac
 }
 
 custom_module_selection() {
-    echo  
-    echo "可用模块："  
-      
-    local i=1  
-    for module in "${MODULE_ORDER[@]}"; do  
-        echo "$i) $module - ${MODULES[$module]}"  
-        ((i++))  
-    done  
-      
-    echo  
-    echo "请输入要安装的模块编号 (用空格分隔，如: 1 3 5)"
-    echo "输入 'q' 取消并退出脚本"
-    read -r selection  
-    
-    if [[ "$selection" == "q" ]]; then
-        log "操作取消，退出脚本" "info"
+    local index=1
+    local module
+    local selection
+    local number
+    local max_index
+    local selected=()
+
+    echo
+    echo "可用模块："
+
+    for module in "${MODULE_ORDER[@]}"; do
+        echo "  $index) $module - ${MODULES[$module]}"
+        ((index++))
+    done
+
+    echo
+    echo "请输入要安装的模块编号，多个编号用空格分隔，例如：1 3 5"
+    echo "输入 q 取消并退出。"
+
+    read -r -p "请选择: " selection
+
+    if [[ "$selection" == "q" || "$selection" == "Q" ]]; then
+        log "用户取消选择" "info"
         exit 0
     fi
-      
-    local selected=()  
-    local max_idx=${#MODULE_ORDER[@]} # 动态获取模块总数
 
-    for num in $selection; do  
-        # 使用动态范围判断
-        if [[ "$num" =~ ^[0-9]+$ ]] && (( num >= 1 && num <= max_idx )); then  
-            local index=$((num - 1))  
-            selected+=("${MODULE_ORDER[$index]}")  
-        else  
-            log "跳过无效编号: $num" "warn"  
-        fi  
-    done  
-      
-    if (( ${#selected[@]} == 0 )); then  
-        log "未选择有效模块，操作已取消" "error"  
+    max_index=${#MODULE_ORDER[@]}
+
+    for number in $selection; do
+        if [[ "$number" =~ ^[0-9]+$ ]] &&
+            (( number >= 1 && number <= max_index )); then
+            selected+=("${MODULE_ORDER[number - 1]}")
+        else
+            log "跳过无效编号：$number" "warn"
+        fi
+    done
+
+    if (( ${#selected[@]} == 0 )); then
+        log "未选择有效模块" "error"
         exit 1
-    fi  
-      
-    SELECTED_MODULES=("${selected[@]}")  
-    log "已选择: ${SELECTED_MODULES[*]}"  
+    fi
+
+    SELECTED_MODULES=("${selected[@]}")
+    log "已选择模块：${SELECTED_MODULES[*]}"
 }
 
-#=============================================================================
-# 依赖解析（递归 + 拓扑排序）
-#=============================================================================
+# =============================================================================
+# 依赖解析
+# =============================================================================
+
+module_is_selected() {
+    local target="$1"
+    local module
+
+    for module in "${SELECTED_MODULES[@]}"; do
+        [[ "$module" == "$target" ]] && return 0
+    done
+
+    return 1
+}
+
+module_in_list() {
+    local target="$1"
+    shift
+
+    local module
+    for module in "$@"; do
+        [[ "$module" == "$target" ]] && return 0
+    done
+
+    return 1
+}
 
 resolve_dependencies() {
     local all_needed=()
-    
-    collect_deps() {
-        local module="$1"
-        [[ " ${all_needed[*]} " =~ " $module " ]] && return
-        
-        for dep in ${MODULE_DEPS[$module]:-}; do
-            collect_deps "$dep"
-        done
-        
-        all_needed+=("$module")
-    }
-    
-    for module in "${SELECTED_MODULES[@]}"; do
-        collect_deps "$module"
-    done
-    
     local added_deps=()
+    local module
+    local choice
+    local continue_choice
+
+    collect_dependencies() {
+        local current_module="$1"
+        local dependency
+
+        if module_in_list "$current_module" "${all_needed[@]}"; then
+            return 0
+        fi
+
+        for dependency in ${MODULE_DEPS[$current_module]:-}; do
+            collect_dependencies "$dependency"
+        done
+
+        all_needed+=("$current_module")
+    }
+
+    for module in "${SELECTED_MODULES[@]}"; do
+        collect_dependencies "$module"
+    done
+
     for module in "${all_needed[@]}"; do
-        if [[ ! " ${SELECTED_MODULES[*]} " =~ " $module " ]]; then
+        if ! module_is_selected "$module"; then
             added_deps+=("$module")
         fi
     done
-    
-    if (( ${#added_deps[@]} > 0 )); then
-        echo
-        log "检测到依赖关系，需要添加: ${added_deps[*]}" "warn"
-        read -p "自动添加依赖模块? [Y/n]: " -r choice
-        choice="${choice:-Y}"
-        if [[ ! "$choice" =~ ^[Yy]$ ]]; then
-            log "用户取消添加依赖，可能导致执行失败" "warn"
-            return
-        fi
+
+    if (( ${#added_deps[@]} == 0 )); then
+        return 0
     fi
-    
+
+    echo
+    log "检测到模块依赖：${added_deps[*]}" "warn"
+
+    read -r -p "是否自动添加依赖模块？[Y/n]: " choice
+    choice="${choice:-Y}"
+
+    if [[ ! "$choice" =~ ^[Yy]$ ]]; then
+        log "未自动添加依赖模块，将仅执行已选择的模块" "warn"
+
+        read -r -p "确认系统已满足依赖并继续执行？[y/N]: " continue_choice
+
+        if [[ ! "$continue_choice" =~ ^[Yy]$ ]]; then
+            log "已取消部署" "info"
+            exit 0
+        fi
+
+        return 0
+    fi
+
     local sorted=()
+
     for module in "${MODULE_ORDER[@]}"; do
-        if [[ " ${all_needed[*]} " =~ " $module " ]]; then
+        if module_in_list "$module" "${all_needed[@]}"; then
             sorted+=("$module")
         fi
     done
-    
+
     SELECTED_MODULES=("${sorted[@]}")
+    log "已加入依赖，最终模块顺序：${SELECTED_MODULES[*]}" "success"
 }
 
-#=============================================================================
-# 模块下载（带重试）
-#=============================================================================
+# =============================================================================
+# GitHub Commit 与模块下载
+# =============================================================================
 
 get_latest_commit() {
     local commit_hash
-    commit_hash=$(curl -s --connect-timeout 5 --max-time 10 \
-        "https://api.github.com/repos/LucaLin233/Linux/commits/main" 2>/dev/null | \
-        grep '"sha"' | head -1 | cut -d'"' -f4 | cut -c1-7 2>/dev/null)
-    
-    if [[ -n "$commit_hash" ]] && [[ ${#commit_hash} -eq 7 ]]; then
+
+    commit_hash=$(
+        curl -fsSL \
+            --connect-timeout 5 \
+            --max-time 15 \
+            "$GITHUB_API_URL" 2>/dev/null |
+            grep -m 1 '"sha"' |
+            cut -d '"' -f 4 |
+            cut -c 1-40
+    ) || true
+
+    if [[ "$commit_hash" =~ ^[0-9a-f]{40}$ ]]; then
         echo "$commit_hash"
-    else
-        echo "main"
+        return 0
     fi
+
+    return 1
 }
 
 download_with_retry() {
     local url="$1"
     local output="$2"
     local max_attempts=3
-    
-    for i in $(seq 1 $max_attempts); do
-        if curl -fsSL --connect-timeout 10 --max-time 30 "$url" -o "$output" 2>/dev/null && \
-           [[ -s "$output" ]] && \
-           head -1 "$output" 2>/dev/null | grep -qE "^#!/(bin/(bash|sh)|usr/bin/env bash)"; then
+    local attempt
+
+    for ((attempt = 1; attempt <= max_attempts; attempt++)); do
+        if curl -fsSL \
+            --connect-timeout 10 \
+            --max-time 60 \
+            "$url" \
+            -o "$output" &&
+            [[ -s "$output" ]] &&
+            head -n 1 "$output" |
+                grep -qE '^#!/(usr/bin/env bash|bin/bash|bin/sh)$'; then
             return 0
         fi
-        
-        (( i < max_attempts )) && log "下载失败，2秒后重试 ($i/$max_attempts)..." "warn" && sleep 2
+
+        if (( attempt < max_attempts )); then
+            log "下载失败，2 秒后重试（$attempt/$max_attempts）..." "warn"
+            sleep 2
+        fi
     done
-    
+
     return 1
 }
 
 download_module() {
     local module="$1"
     local module_file="$TEMP_DIR/${module}.sh"
-    
-    log "获取模块 $module (commit: $LATEST_COMMIT)"
-    
-    local download_url="$MODULE_BASE_URL/$LATEST_COMMIT/modules/${module}.sh"
-    
-    if download_with_retry "$download_url" "$module_file"; then
-        chmod +x "$module_file" 2>/dev/null || true
-        return 0
+    local module_url
+
+    module_url="$MODULE_BASE_URL/$LATEST_COMMIT/modules/${module}.sh"
+
+    log "下载模块：$module（commit: ${LATEST_COMMIT:0:7}）"
+
+    if ! download_with_retry "$module_url" "$module_file"; then
+        log "模块下载失败：$module" "error"
+        return 1
     fi
-    
-    log "模块 $module 下载失败" "error"
-    return 1
+
+    chmod 700 "$module_file"
+    return 0
 }
 
-#=============================================================================
-# 脚本自我更新
-#=============================================================================
+# =============================================================================
+# 脚本自更新
+# =============================================================================
 
 try_cached_script() {
     local commit="$1"
-    local cached_script="/var/cache/debian-setup/debian_setup_${commit}.sh"
-    
-    if [[ -f "$cached_script" ]] && [[ -s "$cached_script" ]]; then
-        if head -1 "$cached_script" 2>/dev/null | grep -qE "^#!/bin/(bash|sh)"; then
-            log "使用缓存的脚本 (commit: $commit)"
-            chmod +x "$cached_script"
-            exec bash "$cached_script" "${FILTERED_ARGS[@]}"
-        else
-            log "缓存文件损坏，删除" "warn"
-            rm -f "$cached_script"
-            return 1
-        fi
+    local cached_script="$CACHE_DIR/debian_setup_${commit}.sh"
+
+    if [[ ! -s "$cached_script" ]]; then
+        return 1
     fi
-    return 1
+
+    if ! head -n 1 "$cached_script" |
+        grep -qE '^#!/(usr/bin/env bash|bin/bash|bin/sh)$'; then
+        log "缓存脚本格式异常，已删除：$cached_script" "warn"
+        rm -f "$cached_script"
+        return 1
+    fi
+
+    log "使用已缓存的新版本脚本（commit: ${commit:0:7}）"
+
+    SCRIPT_COMMIT="$commit" exec bash "$cached_script" "${FILTERED_ARGS[@]}"
 }
 
 self_update() {
-    log "检查脚本更新..."
-    
     local latest_commit
-    latest_commit=$(get_latest_commit)
-    
-    if [[ "$latest_commit" == "main" ]]; then
-        log "无法获取最新版本信息，跳过更新检查" "warn"
-        return 0
-    fi
-    
-    log "当前 commit: $SCRIPT_COMMIT"
-    log "最新 commit: $latest_commit"
-    
-    if [[ "$latest_commit" == "$SCRIPT_COMMIT" ]]; then
-        log "已是最新版本 (commit: $SCRIPT_COMMIT)"
-        return 0
-    fi
-    
-    try_cached_script "$latest_commit" && return 0
-    
-    local temp_script="/tmp/debian_setup_latest.sh"
-    local script_url="https://raw.githubusercontent.com/LucaLin233/Linux/$latest_commit/debian_setup.sh"
-    
-    log "下载最新版本..."
-    
-    if ! curl -fsSL --connect-timeout 10 --max-time 30 "$script_url" -o "$temp_script" 2>/dev/null; then
-        log "无法下载最新版本，继续使用当前版本" "warn"
-        return 0
-    fi
-    
-    if [[ ! -s "$temp_script" ]] || ! head -1 "$temp_script" | grep -qE "^#!/bin/(bash|sh)" 2>/dev/null; then
-        log "下载的文件格式不正确，跳过更新" "warn"
-        rm -f "$temp_script"
-        return 0
-    fi
-    
+    local temp_script
+    local script_url
     local remote_version
-    remote_version=$(grep "^readonly SCRIPT_VERSION=" "$temp_script" 2>/dev/null | cut -d'"' -f2)
-    remote_version="${remote_version:-未知}"
-    
-    echo
-    log "发现新版本!" "warn"
-    echo "  当前: v$SCRIPT_VERSION (commit: $SCRIPT_COMMIT)"
-    echo "  最新: v$remote_version (commit: $latest_commit)"
-    echo
-    
-    read -p "是否更新并重新运行? [Y/n]: " -r choice
-    choice="${choice:-Y}"
-    
-    if [[ "$choice" =~ ^[Yy]$ ]]; then
-        log "更新脚本..."
-        
-        sed -i "13a SCRIPT_COMMIT=\"$latest_commit\"" "$temp_script"
-        
-        local cache_dir="/var/cache/debian-setup"
-        mkdir -p "$cache_dir" 2>/dev/null || true
-        
-        if [[ -d "$cache_dir" ]]; then
-            chmod +x "$temp_script"
-            local cached_script="$cache_dir/debian_setup_${latest_commit}.sh"
-            cp "$temp_script" "$cached_script" 2>/dev/null || true
-            
-            ls -t "$cache_dir"/debian_setup_*.sh 2>/dev/null | tail -n +4 | xargs rm -f 2>/dev/null || true
-            
-            log "脚本已缓存到: $cached_script"
-        fi
-        
-        log "脚本已更新到 v$remote_version (commit: $latest_commit)" "success"
-        log "重新启动脚本..." "success"
-        
-        if [[ -f "$cached_script" ]]; then
-            exec bash "$cached_script" "${FILTERED_ARGS[@]}"
-        else
-            exec bash "$temp_script" "${FILTERED_ARGS[@]}"
-        fi
-    else
-        log "跳过更新，继续使用当前版本"
-        rm -f "$temp_script"
+    local choice
+    local cached_script=""
+
+    log "检查主脚本更新..."
+
+    if ! latest_commit=$(get_latest_commit); then
+        log "无法获取 GitHub 最新 Commit，跳过主脚本自更新" "warn"
+        return 0
     fi
+
+    log "当前 Commit：$SCRIPT_COMMIT"
+    log "最新 Commit：$latest_commit"
+
+    if [[ "$SCRIPT_COMMIT" != "unknown" &&
+        "$latest_commit" == "$SCRIPT_COMMIT" ]]; then
+        log "主脚本已是最新版本"
+        return 0
+    fi
+
+    if try_cached_script "$latest_commit"; then
+        return 0
+    fi
+
+    if ! temp_script=$(mktemp "$TEMP_DIR/debian_setup_latest.XXXXXX.sh"); then
+        log "无法创建主脚本更新临时文件" "warn"
+        return 0
+    fi
+
+    script_url="$MODULE_BASE_URL/$latest_commit/debian_setup.sh"
+
+    if ! download_with_retry "$script_url" "$temp_script"; then
+        rm -f "$temp_script"
+        log "主脚本更新下载失败，继续使用当前版本" "warn"
+        return 0
+    fi
+
+    remote_version=$(
+        grep -m 1 '^readonly SCRIPT_VERSION=' "$temp_script" |
+            cut -d '"' -f 2
+    )
+    remote_version="${remote_version:-未知}"
+
+    echo
+    log "发现主脚本新版本" "warn"
+    echo "  当前：v$SCRIPT_VERSION（commit: $SCRIPT_COMMIT）"
+    echo "  最新：v$remote_version（commit: ${latest_commit:0:7}）"
+
+    read -r -p "是否更新并重新运行？[Y/n]: " choice
+    choice="${choice:-Y}"
+
+    if [[ ! "$choice" =~ ^[Yy]$ ]]; then
+        rm -f "$temp_script"
+        log "已跳过主脚本更新"
+        return 0
+    fi
+
+    mkdir -p "$CACHE_DIR" 2>/dev/null || true
+
+    if [[ -d "$CACHE_DIR" ]]; then
+        cached_script="$CACHE_DIR/debian_setup_${latest_commit}.sh"
+        cp "$temp_script" "$cached_script"
+        chmod 700 "$cached_script"
+
+        find "$CACHE_DIR" \
+            -maxdepth 1 \
+            -type f \
+            -name 'debian_setup_*.sh' \
+            -printf '%T@ %p\n' |
+            sort -nr |
+            awk 'NR > 3 {print $2}' |
+            xargs -r rm -f
+
+        log "已缓存新主脚本：$cached_script"
+    fi
+
+    log "正在重新启动更新后的主脚本..." "success"
+
+    if [[ -n "$cached_script" && -f "$cached_script" ]]; then
+        SCRIPT_COMMIT="$latest_commit" exec bash "$cached_script" "${FILTERED_ARGS[@]}"
+    fi
+
+    SCRIPT_COMMIT="$latest_commit" exec bash "$temp_script" "${FILTERED_ARGS[@]}"
 }
 
-#=============================================================================
+# =============================================================================
 # 模块执行
-#=============================================================================
+# =============================================================================
 
 execute_module() {
     local module="$1"
     local module_file="$TEMP_DIR/${module}.sh"
-    
+    local start_time
+    local end_time
+    local duration
+    local result
+
     if [[ ! -f "$module_file" ]]; then
-        log "模块文件不存在: $module" "error"
-        MODULE_STATUS[$module]="failed"
+        log "模块文件不存在：$module" "error"
+        MODULE_STATUS["$module"]="failed"
         return 1
     fi
-    
-    log "执行模块: ${MODULES[$module]}"
-    
-    local start_time=$(date +%s)
-    local exec_result=0
-    
-    set +e
-    bash "$module_file"
-    exec_result=$?
-    set -e
-    
-    local end_time=$(date +%s)
-    local duration=$((end_time - start_time))
-    MODULE_EXEC_TIME[$module]=$duration
-    
-    if (( exec_result == 0 )); then
-        MODULE_STATUS[$module]="success"
-        log "模块 $module 执行成功 (${duration}s)" "success"
-        return 0
+
+    log "执行模块：${MODULES[$module]}"
+
+    start_time=$(date +%s)
+
+    if bash "$module_file"; then
+        result=0
     else
-        MODULE_STATUS[$module]="failed"
-        log "模块 $module 执行失败 (${duration}s)" "error"
-        return 1
+        result=$?
     fi
+
+    end_time=$(date +%s)
+    duration=$((end_time - start_time))
+
+    MODULE_EXEC_TIME["$module"]="$duration"
+
+    if (( result == 0 )); then
+        MODULE_STATUS["$module"]="success"
+        log "模块执行成功：$module（${duration}s）" "success"
+        return 0
+    fi
+
+    MODULE_STATUS["$module"]="failed"
+    log "模块执行失败：$module（${duration}s，退出码：$result）" "error"
+    return 1
 }
 
-#=============================================================================
-# 系统状态获取
-#=============================================================================
+# =============================================================================
+# 部署摘要
+# =============================================================================
 
 get_system_status() {
-    local cpu_cores=$(nproc 2>/dev/null || echo "未知")
-    local mem_info=$(LANG=C free -h 2>/dev/null | awk 'NR==2 {print $3"/"$2}' || echo "未知")
-    local disk_usage=$(df -h / 2>/dev/null | awk 'NR==2 {print $5}' || echo "未知")
-    local uptime_info=$(uptime -p 2>/dev/null || echo "未知")
-    local kernel=$(uname -r 2>/dev/null || echo "未知")
-    
-    echo "💻 CPU: ${cpu_cores}核心 | 内存: $mem_info | 磁盘: $disk_usage"
-    echo "⏰ 运行时间: $uptime_info"
-    echo "🔧 内核: $kernel"
-    
-    if check_command zsh; then
-        local zsh_version=$(zsh --version 2>/dev/null | awk '{print $2}' || echo "未知")
-        local root_shell=$(getent passwd root 2>/dev/null | cut -d: -f7)
-        if [[ "$root_shell" == "$(which zsh 2>/dev/null)" ]]; then
-            echo "🐚 Zsh: v$zsh_version (已设为默认)"
-        else
-            echo "🐚 Zsh: v$zsh_version (已安装但未设为默认)"
-        fi
-    else
-        echo "🐚 Zsh: 未安装"
-    fi
-    
-    if check_command docker; then
-        local docker_version=$(docker --version 2>/dev/null | awk '{print $3}' | tr -d ',' || echo "未知")
-        local containers_count=$(docker ps -q 2>/dev/null | wc -l || echo "0")
-        local images_count=$(docker images -q 2>/dev/null | wc -l || echo "0")
-        if systemctl is-active --quiet docker 2>/dev/null; then
-            echo "🐳 Docker: v$docker_version (运行中) | 容器: $containers_count | 镜像: $images_count"
-        else
-            echo "🐳 Docker: v$docker_version (已安装但未运行) | 容器: $containers_count | 镜像: $images_count"
-        fi
-    else
-        echo "🐳 Docker: 未安装"
-    fi
-    
-    if [[ -f "$HOME/.local/bin/mise" ]]; then
-        local mise_version=$("$HOME/.local/bin/mise" --version 2>/dev/null | head -1 || echo "未知")
-        echo "📦 Mise: v$mise_version"
-    else
-        echo "📦 Mise: 未安装"
-    fi
-    
-    local tools_status=()
-    check_command nexttrace && tools_status+=("NextTrace")
-    check_command speedtest && tools_status+=("SpeedTest")
-    check_command htop && tools_status+=("htop")
-    check_command tree && tools_status+=("tree")
-    check_command jq && tools_status+=("jq")
-    if (( ${#tools_status[@]} > 0 )); then
-        echo "🛠️ 工具: ${tools_status[*]}"
-    else
-        echo "🛠️ 工具: 未安装"
-    fi
-    
-    local ssh_port=$(grep "^Port " /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}' || echo "22")
-    local ssh_root_login=$(grep "^PermitRootLogin " /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}' || echo "默认")
-    echo "🔒 SSH: 端口=$ssh_port | Root登录=$ssh_root_login"
-    
-    local network_ip=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "未知")
-    local network_interface=$(ip route 2>/dev/null | grep default | awk '{print $5}' | head -1 || echo "未知")
-    echo "🌐 网络: $network_ip via $network_interface"
-}
+    local cpu_cores
+    local memory_info
+    local disk_usage
+    local uptime_info
+    local kernel
+    local shell_path
+    local root_shell
+    local docker_version
+    local running_containers
+    local image_count
+    local ssh_ports
+    local ssh_root_login
+    local network_ip
+    local network_interface
 
-#=============================================================================
-# 部署摘要
-#=============================================================================
+    cpu_cores=$(nproc 2>/dev/null || echo "未知")
+    memory_info=$(LANG=C free -h 2>/dev/null | awk 'NR == 2 {print $3 "/" $2}' || echo "未知")
+    disk_usage=$(df -h / 2>/dev/null | awk 'NR == 2 {print $5}' || echo "未知")
+    uptime_info=$(uptime -p 2>/dev/null || echo "未知")
+    kernel=$(uname -r 2>/dev/null || echo "未知")
+
+    echo "CPU: ${cpu_cores} 核 | 内存: $memory_info | 磁盘: $disk_usage"
+    echo "运行时间: $uptime_info"
+    echo "内核: $kernel"
+
+    if command_exists zsh; then
+        shell_path=$(command -v zsh)
+        root_shell=$(getent passwd root 2>/dev/null | cut -d: -f7)
+
+        if [[ "$root_shell" == "$shell_path" ]]; then
+            echo "Zsh: 已安装并设为 Root 默认 Shell"
+        else
+            echo "Zsh: 已安装，未设为 Root 默认 Shell"
+        fi
+    else
+        echo "Zsh: 未安装"
+    fi
+
+    if command_exists docker; then
+        docker_version=$(docker --version 2>/dev/null || echo "未知")
+        running_containers=$(docker ps -q 2>/dev/null | wc -l)
+        image_count=$(docker images -q 2>/dev/null | wc -l)
+
+        if systemctl is-active --quiet docker 2>/dev/null; then
+            echo "Docker: $docker_version（运行中）| 容器: $running_containers | 镜像: $image_count"
+        else
+            echo "Docker: $docker_version（未运行）| 容器: $running_containers | 镜像: $image_count"
+        fi
+    else
+        echo "Docker: 未安装"
+    fi
+
+    if [[ -x "$HOME/.local/bin/mise" ]]; then
+        echo "Mise: $("$HOME/.local/bin/mise" --version 2>/dev/null | head -n 1)"
+    else
+        echo "Mise: 未安装"
+    fi
+
+    local installed_tools=()
+
+    command_exists nexttrace && installed_tools+=("NextTrace")
+    command_exists speedtest-cli && installed_tools+=("Speedtest")
+    command_exists htop && installed_tools+=("htop")
+    command_exists tree && installed_tools+=("tree")
+    command_exists jq && installed_tools+=("jq")
+
+    if (( ${#installed_tools[@]} > 0 )); then
+        echo "工具: ${installed_tools[*]}"
+    else
+        echo "工具: 未安装"
+    fi
+
+    ssh_ports=$(sshd -T 2>/dev/null | awk '$1 == "port" {print $2}' | tr '\n' ' ')
+    ssh_root_login=$(sshd -T 2>/dev/null | awk '$1 == "permitrootlogin" {print $2; exit}')
+
+    echo "SSH: 端口=${ssh_ports:-未知} | Root 登录=${ssh_root_login:-未知}"
+
+    network_ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+    network_interface=$(ip route 2>/dev/null | awk '/^default/ {print $5; exit}')
+
+    echo "网络: ${network_ip:-未知} via ${network_interface:-未知}"
+}
 
 generate_summary() {
-    log "生成部署摘要"
-    
     local success_count=0
     local failed_count=0
-    
-    for module in "${!MODULE_STATUS[@]}"; do
-        if [[ "${MODULE_STATUS[$module]}" == "success" ]]; then
-            success_count=$((success_count + 1))
-        elif [[ "${MODULE_STATUS[$module]}" == "failed" ]]; then
-            failed_count=$((failed_count + 1))
-        fi
-    done
-    
-    local total_modules=$((success_count + failed_count))
+    local total_modules
     local success_rate=0
-    if [[ $total_modules -gt 0 ]]; then
+    local total_time
+    local module
+    local summary_content
+
+    for module in "${!MODULE_STATUS[@]}"; do
+        case "${MODULE_STATUS[$module]}" in
+            success) ((success_count++)) ;;
+            failed) ((failed_count++)) ;;
+        esac
+    done
+
+    total_modules=$((success_count + failed_count))
+
+    if (( total_modules > 0 )); then
         success_rate=$((success_count * 100 / total_modules))
     fi
-    
-    local total_time=$(( $(date +%s) - TOTAL_START_TIME ))
-    local avg_time=0
-    if [[ $success_count -gt 0 ]]; then
-        avg_time=$((total_time / success_count))
-    fi
-    
+
+    total_time=$(( $(date +%s) - TOTAL_START_TIME ))
+
+    summary_content=$(
+        {
+            echo "$LINE"
+            echo "Debian 系统部署摘要"
+            echo "$LINE"
+            echo "脚本版本: $SCRIPT_VERSION"
+            echo "模块 Commit: ${LATEST_COMMIT:-未知}"
+            echo "部署时间: $(date '+%Y-%m-%d %H:%M:%S %Z')"
+            echo "总耗时: ${total_time} 秒"
+            echo "主机名: $(hostname)"
+            echo "系统: $(. /etc/os-release && echo "${PRETTY_NAME:-Debian}")"
+            echo
+            echo "执行统计:"
+            echo "总模块: $total_modules | 成功: $success_count | 失败: $failed_count | 成功率: ${success_rate}%"
+            echo
+
+            if (( success_count > 0 )); then
+                echo "成功模块:"
+
+                for module in "${MODULE_ORDER[@]}"; do
+                    if [[ "${MODULE_STATUS[$module]:-}" == "success" ]]; then
+                        echo "  ✅ $module (${MODULE_EXEC_TIME[$module]:-0}s)"
+                    fi
+                done
+
+                echo
+            fi
+
+            if (( failed_count > 0 )); then
+                echo "失败模块:"
+
+                for module in "${MODULE_ORDER[@]}"; do
+                    if [[ "${MODULE_STATUS[$module]:-}" == "failed" ]]; then
+                        echo "  ❌ $module (${MODULE_EXEC_TIME[$module]:-0}s)"
+                    fi
+                done
+
+                echo
+            fi
+
+            echo "当前系统状态:"
+            get_system_status
+            echo
+            echo "文件位置:"
+            echo "  日志: $LOG_FILE"
+            echo "  摘要: $SUMMARY_FILE"
+        }
+    )
+
     echo
     echo "$LINE"
-    echo "Debian 系统部署完成摘要"
+    echo "$summary_content"
     echo "$LINE"
-    
-    cat << EOF
 
-📋 基本信息:
-   🔢 脚本版本: $SCRIPT_VERSION (commit: $SCRIPT_COMMIT)
-   📅 部署时间: $(date '+%Y-%m-%d %H:%M:%S %Z')
-   ⏱️  总耗时: ${total_time}秒 | 平均耗时: ${avg_time}秒/模块
-   🏠 主机名: $(hostname)
-   💻 系统: $(grep 'PRETTY_NAME' /etc/os-release 2>/dev/null | cut -d= -f2 | tr -d '"' || echo 'Debian')
-   🌐 IP地址: $(hostname -I 2>/dev/null | awk '{print $1}' || echo '未知')
+    printf '%s\n' "$summary_content" > "$SUMMARY_FILE" 2>/dev/null || true
 
-📊 执行统计:
-   📦 总模块: $total_modules | ✅ 成功: $success_count | ❌ 失败: $failed_count | 📈 成功率: ${success_rate}%
-
-EOF
-    
-    if [[ $success_count -gt 0 ]]; then
-        echo "✅ 成功模块:"
-        for module in "${MODULE_ORDER[@]}"; do
-            if [[ "${MODULE_STATUS[$module]:-}" == "success" ]]; then
-                local exec_time=${MODULE_EXEC_TIME[$module]:-0}
-                echo "   🟢 $module: ${MODULES[$module]} (${exec_time}s)"
-            fi
-        done
-        echo
-    fi
-    
-    if [[ $failed_count -gt 0 ]]; then
-        echo "❌ 失败模块:"
-        for module in "${MODULE_ORDER[@]}"; do
-            if [[ "${MODULE_STATUS[$module]:-}" == "failed" ]]; then
-                local exec_time=${MODULE_EXEC_TIME[$module]:-0}
-                echo "   🔴 $module: ${MODULES[$module]} (${exec_time}s)"
-            fi
-        done
-        echo
-    fi
-    
-    echo "🖥️ 当前系统状态:"
-    while IFS= read -r status_line; do
-        echo "   $status_line"
-    done < <(get_system_status)
-    
-    {
-        echo "$LINE"
-        echo "Debian 系统部署摘要"
-        echo "$LINE"
-        echo "脚本版本: $SCRIPT_VERSION (commit: $SCRIPT_COMMIT)"
-        echo "部署时间: $(date '+%Y-%m-%d %H:%M:%S %Z')"
-        echo "总耗时: ${total_time}秒"
-        echo "主机: $(hostname)"
-        echo "系统: $(grep 'PRETTY_NAME' /etc/os-release 2>/dev/null | cut -d= -f2 | tr -d '"' || echo 'Debian')"
-        echo "IP地址: $(hostname -I 2>/dev/null | awk '{print $1}' || echo '未知')"
-        echo ""
-        echo "执行统计:"
-        echo "总模块: $total_modules, 成功: $success_count, 失败: $failed_count, 成功率: ${success_rate}%"
-        echo ""
-        
-        if [[ $success_count -gt 0 ]]; then
-            echo "成功模块:"
-            for module in "${MODULE_ORDER[@]}"; do
-                [[ "${MODULE_STATUS[$module]:-}" == "success" ]] && echo "  $module (${MODULE_EXEC_TIME[$module]:-0}s)"
-            done
-        fi
-        
-        if [[ $failed_count -gt 0 ]]; then
-            echo ""
-            echo "失败模块:"
-            for module in "${MODULE_ORDER[@]}"; do
-                [[ "${MODULE_STATUS[$module]:-}" == "failed" ]] && echo "  $module"
-            done
-        fi
-        
-        echo ""
-        echo "系统状态:"
-        get_system_status
-        echo ""
-        echo "文件位置:"
-        echo "  日志: $LOG_FILE"
-        echo "  摘要: $SUMMARY_FILE"
-    } > "$SUMMARY_FILE" 2>/dev/null || true
-    
-    echo
-    echo "📁 详细摘要已保存至: $SUMMARY_FILE"
-    echo "$LINE"
+    echo "详细摘要已保存至：$SUMMARY_FILE"
 }
-
-#=============================================================================
-# 最终建议
-#=============================================================================
 
 show_recommendations() {
     echo
-    log "部署完成！" "success"
-    
+    log "部署流程完成" "success"
+
     if [[ "${MODULE_STATUS[ssh-security]:-}" == "success" ]]; then
-        local new_ssh_port=$(grep "^Port " /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}' || echo "22")
-        if [[ "$new_ssh_port" != "22" ]]; then
-            echo
-            echo "⚠️  重要: SSH端口已更改为 $new_ssh_port"
-            echo "   新连接: ssh -p $new_ssh_port user@$(hostname -I | awk '{print $1}')"
+        local ssh_ports
+        local ip_address
+
+        ssh_ports=$(sshd -T 2>/dev/null | awk '$1 == "port" {print $2; exit}')
+        ip_address=$(hostname -I 2>/dev/null | awk '{print $1}')
+
+        if [[ -n "$ssh_ports" && -n "$ip_address" ]]; then
+            echo "SSH 连接示例：ssh -p $ssh_ports root@$ip_address"
         fi
     fi
-    
+
     echo
-    echo "📚 常用命令:"
-    echo "   查看日志: tail -f $LOG_FILE"
-    echo "   查看摘要: cat $SUMMARY_FILE"
-    echo "   重新运行: bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/refs/heads/main/debian_setup.sh)"
+    echo "常用命令："
+    echo "  查看部署日志: tail -f $LOG_FILE"
+    echo "  查看部署摘要: cat $SUMMARY_FILE"
+    echo "  查看自动更新日志: tail -f /var/log/auto-update.log"
+    echo "  重新运行脚本: bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/debian_setup.sh)"
 }
 
-#=============================================================================
-# 帮助信息
-#=============================================================================
+# =============================================================================
+# 参数处理
+# =============================================================================
 
 show_help() {
-    cat << EOF
+    cat <<EOF
 Debian 系统部署脚本 v$SCRIPT_VERSION
 
-用法: $0 [选项]
+用法：
+  \$0 [选项]
 
-选项:
-  --check-status    查看部署状态
-  --clean-cache     清理脚本缓存
+选项：
+  --check-status    查看最近部署摘要
+  --clean-cache     清理主脚本缓存
   --help, -h        显示帮助信息
   --version, -v     显示版本信息
 
-功能模块:
-  system-optimize, zsh-setup, mise-setup, docker-setup, 
-  tools-setup, ssh-security, auto-update-setup
+模块：
+  system-optimize    系统优化（Zram、时区、Chrony）
+  system-customize   系统定制（欢迎信息、中文环境、XanMod）
+  network-optimize   网络优化（BBR、fq、IPv4 转发）
+  zsh-setup          Zsh Shell 环境
+  mise-setup         Mise、Python、Node.js
+  tools-setup        系统工具
+  docker-setup       Docker 平台
+  auto-update-setup  自动更新系统与内核
+  ssh-security       SSH 安全配置
 
-文件位置:
+文件位置：
   日志: $LOG_FILE
   摘要: $SUMMARY_FILE
-  缓存: /var/cache/debian-setup/
+  缓存: $CACHE_DIR
 EOF
 }
 
-#=============================================================================
-# 命令行参数处理
-#=============================================================================
-
 handle_arguments() {
     FILTERED_ARGS=()
-    
-    while [[ $# -gt 0 ]]; do
-        case $1 in
+
+    while (( $# > 0 )); do
+        case "$1" in
             --internal-commit=*)
                 SCRIPT_COMMIT="${1#*=}"
-                readonly SCRIPT_COMMIT
                 shift
                 ;;
             --clean-cache)
-                log "清理脚本缓存..."
-                rm -rf /var/cache/debian-setup/ 2>/dev/null || true
-                log "缓存已清理" "success"
+                log "清理主脚本缓存..."
+                rm -rf "$CACHE_DIR"
+                log "主脚本缓存已清理" "success"
                 exit 0
                 ;;
             --check-status)
@@ -849,8 +1003,12 @@ handle_arguments() {
                 exit 0
                 ;;
             --version|-v)
-                echo "Debian 部署脚本 v$SCRIPT_VERSION"
-                [[ "$SCRIPT_COMMIT" != "unknown" ]] && echo "Commit: $SCRIPT_COMMIT"
+                echo "Debian 系统部署脚本 v$SCRIPT_VERSION"
+
+                if [[ "$SCRIPT_COMMIT" != "unknown" ]]; then
+                    echo "Commit: $SCRIPT_COMMIT"
+                fi
+
                 exit 0
                 ;;
             *)
@@ -861,117 +1019,128 @@ handle_arguments() {
     done
 }
 
-#=============================================================================
-# 主程序
-#=============================================================================
+# =============================================================================
+# 主流程
+# =============================================================================
 
 main() {
     handle_arguments "$@"
-    
+
     init_logging
-    mkdir -p "$TEMP_DIR" 2>/dev/null || true
+    create_temp_dir
+
+    trap cleanup EXIT INT TERM
+
     TOTAL_START_TIME=$(date +%s)
-    
+
     clear 2>/dev/null || true
+
     echo "$LINE"
     echo "Debian 系统部署脚本 v$SCRIPT_VERSION"
-    [[ "$SCRIPT_COMMIT" != "unknown" ]] && echo "Commit: $SCRIPT_COMMIT"
+
+    if [[ "$SCRIPT_COMMIT" != "unknown" ]]; then
+        echo "Commit: ${SCRIPT_COMMIT:0:7}"
+    fi
+
     echo "$LINE"
-    
+
     self_update
+
     echo
-    
     pre_check
     install_dependencies
     system_update
-    
-    log "获取 GitHub 最新代码版本..."
-    LATEST_COMMIT=$(get_latest_commit)
-    readonly LATEST_COMMIT
-    log "当前版本: $LATEST_COMMIT"
-    
+    ask_fix_hosts
+
+    log "获取固定模块 Commit..."
+
+    if ! LATEST_COMMIT=$(get_latest_commit); then
+        log "无法获取 GitHub Commit，为避免主脚本与模块版本不一致，停止执行" "error"
+        exit 1
+    fi
+
+    log "本次模块 Commit：${LATEST_COMMIT:0:7}"
+
     select_deployment_mode
-    
+
     if (( ${#SELECTED_MODULES[@]} == 0 )); then
         log "未选择任何模块，退出" "warn"
         exit 0
     fi
-    
+
     resolve_dependencies
-    
+
     echo
-    echo "最终执行计划: ${SELECTED_MODULES[*]}"
-    read -p "确认执行? [Y/n]: " -r choice
-    choice="${choice:-Y}"
-    [[ "$choice" =~ ^[Yy]$ ]] || exit 0
-    
+    echo "最终执行计划：${SELECTED_MODULES[*]}"
+
+    local confirmation
+    read -r -p "确认执行以上模块？[Y/n]: " confirmation
+    confirmation="${confirmation:-Y}"
+
+    if [[ ! "$confirmation" =~ ^[Yy]$ ]]; then
+        log "用户取消部署" "info"
+        exit 0
+    fi
+
     echo
     echo "$LINE"
     log "开始下载 ${#SELECTED_MODULES[@]} 个模块"
     echo "$LINE"
-    
+
     local download_failed=0
     local downloaded=0
-    
+    local module
+
     for module in "${SELECTED_MODULES[@]}"; do
-        downloaded=$((downloaded + 1))
+        ((downloaded++))
         echo
-        echo "[$downloaded/${#SELECTED_MODULES[@]}] 下载模块: $module"
-        
-        set +e
-        download_module "$module"
-        local result=$?
-        set -e
-        
-        if (( result == 0 )); then
-            log "✓ $module 下载成功"
+        echo "[$downloaded/${#SELECTED_MODULES[@]}] 下载模块：$module"
+
+        if download_module "$module"; then
+            log "模块下载成功：$module" "success"
         else
-            MODULE_STATUS[$module]="failed"
-            download_failed=$((download_failed + 1))
-            log "✗ $module 下载失败" "error"
+            MODULE_STATUS["$module"]="failed"
+            ((download_failed++))
         fi
     done
-    
-    echo
+
     if (( download_failed > 0 )); then
-        log "有 $download_failed 个模块下载失败" "warn"
-        read -p "是否继续执行已下载的模块? [y/N]: " -r choice
-        [[ "$choice" =~ ^[Yy]$ ]] || exit 1
-    else
-        log "所有模块下载完成" "success"
+        log "共有 $download_failed 个模块下载失败" "warn"
+
+        local continue_choice
+        read -r -p "是否继续执行已成功下载的模块？[y/N]: " continue_choice
+
+        if [[ ! "$continue_choice" =~ ^[Yy]$ ]]; then
+            log "用户取消执行" "info"
+            generate_summary
+            exit 1
+        fi
     fi
-    
+
     echo
     echo "$LINE"
     log "开始执行模块"
     echo "$LINE"
-    
+
     local current=0
     local total=${#SELECTED_MODULES[@]}
-    
-    set +e
-    
+
     for module in "${SELECTED_MODULES[@]}"; do
-        current=$((current + 1))
-        
+        ((current++))
+
         if [[ "${MODULE_STATUS[$module]:-}" == "failed" ]]; then
-            log "跳过模块 $module (下载失败)" "warn"
+            log "跳过模块 $module（下载失败）" "warn"
             continue
         fi
-        
+
         echo
-        echo "[$current/$total] 执行模块: ${MODULES[$module]}"
-        
-        execute_module "$module"
-        local result=$?
-        
-        if (( result != 0 )); then
-            log "模块 $module 执行失败" "warn"
+        echo "[$current/$total] 执行模块：${MODULES[$module]}"
+
+        if ! execute_module "$module"; then
+            log "模块失败，但继续执行后续模块：$module" "warn"
         fi
     done
-    
-    set -e
-    
+
     generate_summary
     show_recommendations
 }
