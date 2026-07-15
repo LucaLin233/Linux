@@ -400,7 +400,7 @@ setup_python() {
         return 1
     }
 
-    current_version=$(get_current_tool_version "python" || true)
+    current_version=$(get_global_tool_version "python" || true)
 
     if [[ -n "$current_version" ]]; then
         echo "当前 Mise Python: $current_version"
@@ -542,7 +542,7 @@ setup_node() {
         return 1
     }
 
-    current_version=$(get_current_tool_version "node" || true)
+    current_version=$(get_global_tool_version "node" || true)
 
     if [[ -n "$current_version" ]]; then
         echo "当前 Mise Node.js: $current_version"
