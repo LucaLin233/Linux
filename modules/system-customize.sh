@@ -17,7 +17,8 @@ readonly MOTD_SCRIPT="/etc/update-motd.d/00-custom-welcome"
 readonly XANMOD_KEYRING="/etc/apt/keyrings/xanmod-archive-keyring.gpg"
 readonly XANMOD_SOURCE="/etc/apt/sources.list.d/xanmod-release.list"
 readonly XANMOD_LEGACY_SOURCE="/etc/apt/sources.list.d/xanmod-release.sources"
-readonly XANMOD_LEGACY_SOURCE_BACKUP="/etc/apt/sources.list.d/xanmod-release.sources.backup"
+readonly XANMOD_LEGACY_SOURCE_BACKUP="/root/xanmod-release.sources.legacy"
+readonly XANMOD_OLD_BAD_BACKUP="/etc/apt/sources.list.d/xanmod-release.sources.backup"
 readonly XANMOD_KEY_URL="https://dl.xanmod.org/archive.key"
 readonly XANMOD_REPO_URL="http://deb.xanmod.org"
 
@@ -181,7 +182,7 @@ sleep 0.5
 
 read -r _ user2 nice2 system2 idle2 _ < <(grep '^cpu ' /proc/stat)
 total2=$((user2 + nice2 + system2 + idle2))
-busy2=$((user2 + nice2 + system2))
+busy2=$((user2 + nice2 + system2 + idle2))
 
 total_delta=$((total2 - total1))
 busy_delta=$((busy2 - busy1))
@@ -220,18 +221,12 @@ disk_color=$(pick_color "$disk_percent" "disk")
 printf "\n${BLUE_BG} 已连接 %s 服务器 ${RESET}\n" "$hostname_value"
 printf "${ITALIC_DIM} 今天想要做些什么？${RESET}\n\n"
 
-printf "  ${LABEL}内核${RESET}      ${VALUE}%s${RESET}\n" \
-    "$kernel"
-
-printf "  ${LABEL}运行时间${RESET}  ${VALUE}%s${RESET}\n" \
-    "$uptime_value"
-
+printf "  ${LABEL}内核${RESET}      ${VALUE}%s${RESET}\n" "$kernel"
+printf "  ${LABEL}运行时间${RESET}  ${VALUE}%s${RESET}\n" "$uptime_value"
 printf "  ${LABEL}CPU负载${RESET}   ${VALUE}%s  (${cpu_color}%s%%${VALUE})${RESET}\n" \
     "$load_average" "$cpu_percent"
-
 printf "  ${LABEL}内存${RESET}      ${VALUE}%s / %s  (${memory_color}%s%%${VALUE})${RESET}\n" \
     "$memory_used" "$memory_total" "$memory_percent"
-
 printf "  ${LABEL}磁盘${RESET}      ${VALUE}%s  (${disk_color}%s%%${VALUE})${RESET}\n" \
     "$disk_usage" "$disk_percent"
 SCRIPT
@@ -320,18 +315,61 @@ cpu_has_flags() {
     return 0
 }
 
+package_is_installed() {
+    local package="$1"
+
+    dpkg-query -W -f='${db:Status-Status}' "$package" 2>/dev/null |
+        grep -qx "installed"
+}
+
+get_running_xanmod_package() {
+    local kernel
+    kernel=$(uname -r)
+
+    case "$kernel" in
+        *-x64v3-xanmod*)
+            echo "linux-xanmod-x64v3"
+            ;;
+        *-x64v2-xanmod*)
+            echo "linux-xanmod-x64v2"
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
 detect_xanmod_package() {
+    local running_package
+
     if ! is_amd64; then
         return 1
     fi
 
-    # x86-64-v3：AVX2、FMA、BMI1/BMI2、MOVBE、F16C、LZCNT 等。
+    # 优先尊重当前正在运行的 XanMod 内核。
+    # 虚拟机可能不完整暴露 CPU flags，运行中的 v3/v2 是最可靠依据。
+    if running_package=$(get_running_xanmod_package); then
+        echo "$running_package"
+        return 0
+    fi
+
+    # 其次尊重已安装的 XanMod 元包，避免把已部署的 v3 错判为 v2。
+    if package_is_installed "linux-xanmod-x64v3"; then
+        echo "linux-xanmod-x64v3"
+        return 0
+    fi
+
+    if package_is_installed "linux-xanmod-x64v2"; then
+        echo "linux-xanmod-x64v2"
+        return 0
+    fi
+
+    # 未安装 XanMod 时，再按 CPU flags 选择合适版本。
     if cpu_has_flags avx avx2 bmi1 bmi2 fma f16c movbe lzcnt; then
         echo "linux-xanmod-x64v3"
         return 0
     fi
 
-    # x86-64-v2：较现代的 x86-64 CPU 基线。
     if cpu_has_flags cx16 lahf_lm popcnt sse4_1 sse4_2 ssse3; then
         echo "linux-xanmod-x64v2"
         return 0
@@ -347,13 +385,34 @@ xanmod_source_configured() {
         grep -Fq "signed-by=$XANMOD_KEYRING" "$XANMOD_SOURCE"
 }
 
+archive_old_bad_xanmod_backup() {
+    if [[ ! -f "$XANMOD_OLD_BAD_BACKUP" ]]; then
+        return 0
+    fi
+
+    if [[ -e "$XANMOD_LEGACY_SOURCE_BACKUP" ]]; then
+        warn "检测到旧 XanMod APT 备份，但目标归档已存在: $XANMOD_LEGACY_SOURCE_BACKUP"
+        warn "请手动处理: $XANMOD_OLD_BAD_BACKUP"
+        return 0
+    fi
+
+    if mv "$XANMOD_OLD_BAD_BACKUP" "$XANMOD_LEGACY_SOURCE_BACKUP"; then
+        info "已移出 APT 目录的旧 XanMod 备份: $XANMOD_LEGACY_SOURCE_BACKUP"
+        return 0
+    fi
+
+    error "无法迁移旧 XanMod APT 备份: $XANMOD_OLD_BAD_BACKUP"
+    return 1
+}
+
 migrate_legacy_xanmod_source() {
     if [[ ! -f "$XANMOD_LEGACY_SOURCE" ]]; then
         return 0
     fi
 
     if [[ -e "$XANMOD_LEGACY_SOURCE_BACKUP" ]]; then
-        warn "检测到旧 XanMod source 文件，但历史备份已存在: $XANMOD_LEGACY_SOURCE_BACKUP"
+        warn "检测到旧 XanMod source 文件，但历史归档已存在: $XANMOD_LEGACY_SOURCE_BACKUP"
+        warn "请手动处理: $XANMOD_LEGACY_SOURCE"
         return 0
     fi
 
@@ -369,6 +428,8 @@ migrate_legacy_xanmod_source() {
 configure_xanmod_repository() {
     local codename
     local key_temp
+
+    archive_old_bad_xanmod_backup || return 1
 
     if xanmod_source_configured; then
         echo "XanMod 软件源: 已配置"
@@ -466,11 +527,11 @@ install_xanmod() {
         return 0
     fi
 
-    echo "检测到适合当前 CPU 的 XanMod 包: $target_package"
+    echo "检测到适合当前环境的 XanMod 包: $target_package"
 
     installed_packages=$(get_installed_xanmod_packages || true)
 
-    if grep -Fxq "$target_package" <<< "$installed_packages"; then
+    if package_is_installed "$target_package"; then
         echo "XanMod 目标包: 已安装（$target_package）"
 
         if is_xanmod_kernel_running; then
@@ -510,10 +571,7 @@ install_xanmod() {
         return 1
     fi
 
-    if ! dpkg-query -W \
-        -f='${db:Status-Status}' \
-        "$target_package" 2>/dev/null |
-        grep -qx "installed"; then
+    if ! package_is_installed "$target_package"; then
         error "XanMod 内核安装后验证失败"
         return 1
     fi
@@ -539,9 +597,9 @@ show_xanmod_status() {
     fi
 
     if package=$(detect_xanmod_package); then
-        echo "  CPU 推荐包: $package"
+        echo "  推荐/当前包: $package"
     else
-        echo "  CPU 推荐包: 无（不支持 v2/v3 或非 amd64）"
+        echo "  推荐/当前包: 无（不支持 v2/v3 或非 amd64）"
     fi
 
     if xanmod_source_configured; then
