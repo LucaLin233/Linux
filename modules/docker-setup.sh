@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Docker 容器化平台配置模块
-# 功能：通过 Docker 官方 APT 仓库安装 Docker、Compose、Buildx，并配置容器日志轮转
+# 功能：通过 Docker 官方 APT 仓库安装 Docker、Compose、Buildx，
+#       并可选配置容器日志轮转。
 
 set -euo pipefail
 
@@ -22,9 +23,11 @@ readonly DOCKER_PACKAGES=(
     docker-compose-plugin
 )
 
+APT_UPDATED=false
+
 # === 日志函数 ===
 log() {
-    local msg="$1"
+    local message="$1"
     local level="${2:-info}"
     local -A colors=(
         [info]="\033[0;36m"
@@ -38,21 +41,46 @@ log() {
         return 0
     fi
 
-    echo -e "${colors[$level]:-\033[0;32m}${msg}\033[0m"
+    echo -e "${colors[$level]:-\033[0;32m}${message}\033[0m"
 }
 
-debug_log() {
-    log "DEBUG: $1" "debug"
+info() {
+    log "$1" "info"
+}
+
+warn() {
+    log "$1" "warn"
+}
+
+error() {
+    log "$1" "error"
+}
+
+success() {
+    log "$1" "success"
 }
 
 require_root() {
     if (( EUID != 0 )); then
-        log "需要 root 权限运行" "error"
+        error "需要 root 权限运行"
         exit 1
     fi
 }
 
-# === Docker 官方软件源 ===
+apt_update_once() {
+    if [[ "$APT_UPDATED" == "true" ]]; then
+        return 0
+    fi
+
+    if ! apt-get update -qq; then
+        error "APT 软件包索引更新失败"
+        return 1
+    fi
+
+    APT_UPDATED=true
+}
+
+# === Docker 官方仓库 ===
 get_debian_codename() {
     if [[ -r /etc/os-release ]]; then
         . /etc/os-release
@@ -66,31 +94,37 @@ get_debian_codename() {
     return 1
 }
 
+docker_repository_configured() {
+    [[ -s "$DOCKER_KEYRING" ]] &&
+        [[ -f "$DOCKER_SOURCE" ]] &&
+        grep -Fq "$DOCKER_REPO_URL" "$DOCKER_SOURCE" &&
+        grep -Fq "Signed-By: $DOCKER_KEYRING" "$DOCKER_SOURCE"
+}
+
 configure_docker_repository() {
     local codename
     local architecture
     local key_temp
 
-    if [[ -s "$DOCKER_KEYRING" && -f "$DOCKER_SOURCE" ]]; then
-        debug_log "Docker 官方软件源已配置"
+    if docker_repository_configured; then
         return 0
     fi
 
-    if ! codename=$(get_debian_codename); then
-        log "无法识别 Debian 版本代号，无法配置 Docker 官方软件源" "error"
+    codename=$(get_debian_codename) || {
+        error "无法识别 Debian 发行版代号"
         return 1
-    fi
+    }
 
     architecture=$(dpkg --print-architecture)
 
     install -d -m 0755 /etc/apt/keyrings
 
     if ! key_temp=$(mktemp); then
-        log "无法创建 Docker GPG 密钥临时文件" "error"
+        error "无法创建 Docker GPG 密钥临时文件"
         return 1
     fi
 
-    log "配置 Docker 官方 APT 软件源..." "info"
+    info "配置 Docker 官方 APT 软件源..."
 
     if ! curl -fsSL \
         --connect-timeout 10 \
@@ -98,19 +132,19 @@ configure_docker_repository() {
         "$DOCKER_GPG_URL" \
         -o "$key_temp"; then
         rm -f "$key_temp"
-        log "Docker GPG 密钥下载失败" "error"
+        error "Docker GPG 密钥下载失败"
         return 1
     fi
 
     if [[ ! -s "$key_temp" ]]; then
         rm -f "$key_temp"
-        log "Docker GPG 密钥为空" "error"
+        error "Docker GPG 密钥为空"
         return 1
     fi
 
     if ! install -m 0644 "$key_temp" "$DOCKER_KEYRING"; then
         rm -f "$key_temp"
-        log "Docker GPG 密钥安装失败" "error"
+        error "Docker GPG 密钥安装失败"
         return 1
     fi
 
@@ -125,36 +159,33 @@ Architectures: $architecture
 Signed-By: $DOCKER_KEYRING
 EOF
 
+    APT_UPDATED=false
     echo "Docker 官方软件源: 已配置（$codename / $architecture）"
 }
 
 # === Docker 安装与服务 ===
-is_docker_installed() {
+docker_installed() {
     command -v docker >/dev/null 2>&1
 }
 
 install_docker() {
-    if is_docker_installed; then
+    if docker_installed; then
         echo "Docker 状态: 已安装（$(docker --version 2>/dev/null || echo "版本未知"）"
         return 0
     fi
 
     configure_docker_repository || return 1
+    apt_update_once || return 1
 
-    if ! apt-get update -qq; then
-        log "Docker 软件源索引更新失败" "error"
-        return 1
-    fi
-
-    log "安装 Docker、Compose 和 Buildx..." "info"
+    info "安装 Docker、Compose 和 Buildx..."
 
     if ! apt-get install -y "${DOCKER_PACKAGES[@]}"; then
-        log "Docker 安装失败" "error"
+        error "Docker 安装失败"
         return 1
     fi
 
-    if ! is_docker_installed; then
-        log "Docker 安装后验证失败" "error"
+    if ! docker_installed; then
+        error "Docker 安装后验证失败"
         return 1
     fi
 
@@ -177,87 +208,46 @@ ensure_docker_plugins() {
         return 0
     fi
 
-    log "补充 Docker 插件: ${missing_packages[*]}" "info"
+    info "补充 Docker 插件: ${missing_packages[*]}"
 
-    if ! configure_docker_repository; then
-        log "无法配置 Docker 官方软件源，跳过缺失插件安装" "warn"
+    configure_docker_repository || {
+        warn "无法配置 Docker 官方软件源，跳过缺失插件安装"
         return 1
-    fi
+    }
 
-    if ! apt-get update -qq; then
-        log "APT 软件包索引更新失败，跳过缺失插件安装" "warn"
+    apt_update_once || {
+        warn "APT 软件包索引更新失败，跳过缺失插件安装"
         return 1
-    fi
+    }
 
     if ! apt-get install -y "${missing_packages[@]}"; then
-        log "Docker 插件安装失败" "warn"
+        warn "Docker 插件安装失败"
         return 1
     fi
-
-    return 0
 }
 
 start_docker_service() {
-    log "启动 Docker 服务..." "info"
+    info "启动 Docker 服务..."
 
     if ! systemctl enable --now docker; then
-        log "Docker 服务启动失败" "error"
+        error "Docker 服务启动失败"
         return 1
     fi
 
     if ! systemctl is-active --quiet docker; then
-        log "Docker 服务未处于运行状态" "error"
+        error "Docker 服务未处于运行状态"
         return 1
     fi
 
     if ! docker info >/dev/null 2>&1; then
-        log "Docker daemon 无法正常响应" "error"
+        error "Docker daemon 无法正常响应"
         return 1
     fi
 
     echo "Docker 服务: 运行中，已设置开机自启"
 }
 
-# === Docker 日志轮转配置 ===
-backup_daemon_config() {
-    [[ -f "$DOCKER_DAEMON_CONFIG" ]] || return 0
-
-    if cp "$DOCKER_DAEMON_CONFIG" "$DOCKER_DAEMON_BACKUP"; then
-        chmod 600 "$DOCKER_DAEMON_BACKUP" 2>/dev/null || true
-        debug_log "已更新 Docker 配置备份：$DOCKER_DAEMON_BACKUP"
-        return 0
-    fi
-
-    log "Docker 配置备份失败" "error"
-    return 1
-}
-
-restore_daemon_config() {
-    if [[ -f "$DOCKER_DAEMON_BACKUP" ]]; then
-        cp "$DOCKER_DAEMON_BACKUP" "$DOCKER_DAEMON_CONFIG"
-        log "已恢复 Docker 配置备份" "warn"
-    else
-        rm -f "$DOCKER_DAEMON_CONFIG"
-        log "已删除新建的 Docker 配置文件" "warn"
-    fi
-}
-
-validate_docker_config() {
-    local config_file="$1"
-
-    if ! jq empty "$config_file" >/dev/null 2>&1; then
-        log "Docker 配置 JSON 格式无效" "error"
-        return 1
-    fi
-
-    if ! dockerd --validate --config-file "$config_file" >/dev/null 2>&1; then
-        log "Docker 配置内容无效" "error"
-        return 1
-    fi
-
-    return 0
-}
-
+# === Docker 日志轮转 ===
 is_log_rotation_configured() {
     [[ -f "$DOCKER_DAEMON_CONFIG" ]] || return 1
 
@@ -266,6 +256,47 @@ is_log_rotation_configured() {
         .["log-opts"]["max-size"] == "10m" and
         .["log-opts"]["max-file"] == "3"
     ' "$DOCKER_DAEMON_CONFIG" >/dev/null 2>&1
+}
+
+backup_daemon_config() {
+    if [[ ! -f "$DOCKER_DAEMON_CONFIG" ]]; then
+        # 当前没有配置文件时，“原始状态”就是不存在；
+        # 清理旧备份，确保失败回滚时不会误恢复过时配置。
+        rm -f "$DOCKER_DAEMON_BACKUP"
+        return 0
+    fi
+
+    if ! cp -a "$DOCKER_DAEMON_CONFIG" "$DOCKER_DAEMON_BACKUP"; then
+        error "Docker 配置备份失败"
+        return 1
+    fi
+
+    chmod 600 "$DOCKER_DAEMON_BACKUP" 2>/dev/null || true
+    return 0
+}
+
+restore_daemon_config() {
+    if [[ -f "$DOCKER_DAEMON_BACKUP" ]]; then
+        cp -a "$DOCKER_DAEMON_BACKUP" "$DOCKER_DAEMON_CONFIG"
+        warn "已恢复 Docker 配置备份"
+    else
+        rm -f "$DOCKER_DAEMON_CONFIG"
+        warn "已删除新建的 Docker 配置文件"
+    fi
+}
+
+validate_docker_config() {
+    local config_file="$1"
+
+    if ! jq empty "$config_file" >/dev/null 2>&1; then
+        error "Docker 配置 JSON 格式无效"
+        return 1
+    fi
+
+    if ! dockerd --validate --config-file "$config_file" >/dev/null 2>&1; then
+        error "Docker 配置内容无效"
+        return 1
+    fi
 }
 
 configure_log_rotation() {
@@ -282,7 +313,9 @@ configure_log_rotation() {
     echo "Docker 日志轮转可避免容器 json-file 日志无限增长并占满磁盘。"
     echo "应用配置需要重启 Docker，运行中的容器可能短暂中断。"
 
-    read -r -p "是否配置 Docker 容器日志轮转（单文件 10MB，保留 3 份）？[Y/n]: " choice
+    read -r -p \
+        "是否配置 Docker 容器日志轮转（单文件 10MB，保留 3 份）？[Y/n]: " \
+        choice
     choice="${choice:-Y}"
 
     if [[ "$choice" =~ ^[Nn]$ ]]; then
@@ -292,14 +325,15 @@ configure_log_rotation() {
 
     mkdir -p "$DOCKER_DAEMON_DIR"
 
-    if [[ -f "$DOCKER_DAEMON_CONFIG" ]] &&
-        ! jq empty "$DOCKER_DAEMON_CONFIG" >/dev/null 2>&1; then
-        log "现有 $DOCKER_DAEMON_CONFIG 不是有效 JSON，拒绝覆盖" "error"
-        return 1
+    if [[ -f "$DOCKER_DAEMON_CONFIG" ]]; then
+        if ! jq empty "$DOCKER_DAEMON_CONFIG" >/dev/null 2>&1; then
+            error "现有 $DOCKER_DAEMON_CONFIG 不是有效 JSON，拒绝覆盖"
+            return 1
+        fi
     fi
 
-    if ! temp_config=$(mktemp "$DOCKER_DAEMON_DIR/daemon.json.XXXXXX"); then
-        log "无法创建 Docker 配置临时文件" "error"
+    if ! temp_config=$(mktemp "$DOCKER_DAEMON_DIR/daemon.json.new.XXXXXX"); then
+        error "无法创建 Docker 配置临时文件"
         return 1
     fi
 
@@ -312,7 +346,7 @@ configure_log_rotation() {
             })
         ' "$DOCKER_DAEMON_CONFIG" > "$temp_config"; then
             rm -f "$temp_config"
-            log "合并 Docker 日志配置失败" "error"
+            error "合并 Docker 日志配置失败"
             return 1
         fi
     else
@@ -337,18 +371,21 @@ EOF
         return 1
     }
 
-    systemctl is-active --quiet docker && docker_was_active=true
+    if systemctl is-active --quiet docker; then
+        docker_was_active=true
+    fi
 
-    if ! mv "$temp_config" "$DOCKER_DAEMON_CONFIG"; then
+    if ! install -m 0644 "$temp_config" "$DOCKER_DAEMON_CONFIG"; then
         rm -f "$temp_config"
-        log "替换 Docker 配置失败" "error"
+        error "替换 Docker 配置失败"
         return 1
     fi
 
-    chmod 644 "$DOCKER_DAEMON_CONFIG"
+    rm -f "$temp_config"
 
     if ! systemctl restart docker || ! systemctl is-active --quiet docker; then
-        log "Docker 重启失败，开始恢复原配置" "error"
+        error "Docker 重启失败，开始恢复原配置"
+
         restore_daemon_config
 
         if [[ "$docker_was_active" == "true" ]]; then
@@ -359,7 +396,6 @@ EOF
     fi
 
     echo "Docker 日志轮转: 已启用（单文件 10MB，保留 3 份）"
-    return 0
 }
 
 # === 摘要 ===
@@ -371,7 +407,7 @@ show_docker_summary() {
     echo
     log "🎯 Docker 配置摘要：" "info"
 
-    if ! is_docker_installed; then
+    if ! docker_installed; then
         echo "  Docker: 未安装"
         return 0
     fi
@@ -414,15 +450,15 @@ show_docker_summary() {
 main() {
     require_root
 
-    local command
-    for command in apt-get curl dpkg install jq mktemp systemctl dockerd; do
-        if ! command -v "$command" >/dev/null 2>&1; then
-            log "缺少必要命令: $command" "error"
+    local command_name
+    for command_name in apt-get curl dpkg install jq mktemp systemctl dockerd; do
+        if ! command -v "$command_name" >/dev/null 2>&1; then
+            error "缺少必要命令: $command_name"
             exit 1
         fi
     done
 
-    log "🐳 配置 Docker 容器化平台..." "info"
+    info "🐳 配置 Docker 容器化平台..."
 
     echo
     install_docker || exit 1
@@ -434,18 +470,19 @@ main() {
     ensure_docker_plugins || true
 
     echo
-    configure_log_rotation || log "Docker 日志轮转配置失败，保留现有 Docker 配置" "warn"
+    configure_log_rotation ||
+        warn "Docker 日志轮转配置失败，已保留或恢复原有 Docker 配置"
 
     show_docker_summary
 
     echo
-    log "✅ Docker 配置完成" "success"
+    success "Docker 配置完成"
     echo "常用命令："
     echo "  查看容器: docker ps"
     echo "  查看镜像: docker images"
     echo "  使用 Compose: docker compose up -d"
 }
 
-trap 'log "Docker 配置脚本在第 $LINENO 行执行失败" "error"' ERR
+trap 'error "Docker 配置脚本在第 $LINENO 行执行失败"' ERR
 
 main "$@"
