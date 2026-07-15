@@ -95,7 +95,7 @@ is_zram_active() {
     systemctl is-active --quiet systemd-zram-setup@zram0.service &&
         [[ -b /dev/zram0 ]] &&
         swapon --noheadings --output=NAME 2>/dev/null |
-            grep -qx "/dev/zram0"
+            awk '$1 == "/dev/zram0" {found=1} END {exit !found}'
 }
 
 # === Zram 配置 ===
