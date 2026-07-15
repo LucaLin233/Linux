@@ -30,13 +30,25 @@ log() {
     echo -e "${colors[$level]:-\033[0;32m}${msg}\033[0m"
 }
 
-debug_log() {
-    log "DEBUG: $1" "debug"
+info() {
+    log "$1" "info"
+}
+
+warn() {
+    log "$1" "warn"
+}
+
+error() {
+    log "$1" "error"
+}
+
+success() {
+    log "$1" "success"
 }
 
 require_root() {
     if (( EUID != 0 )); then
-        log "需要 root 权限运行" "error"
+        error "需要 root 权限运行"
         exit 1
     fi
 }
@@ -58,11 +70,31 @@ get_ssh_service_name() {
     return 1
 }
 
+normalize_root_login_policy() {
+    case "$1" in
+        without-password)
+            echo "prohibit-password"
+            ;;
+        *)
+            echo "$1"
+            ;;
+    esac
+}
+
 get_effective_value() {
     local key="$1"
+    local value
 
-    sshd -T 2>/dev/null |
-        awk -v key="$key" '$1 == key {print $2; exit}'
+    value=$(
+        sshd -T 2>/dev/null |
+            awk -v key="$key" '$1 == key {print $2; exit}'
+    )
+
+    if [[ "$key" == "permitrootlogin" ]]; then
+        normalize_root_login_policy "$value"
+    else
+        echo "$value"
+    fi
 }
 
 get_effective_ports() {
@@ -112,19 +144,23 @@ get_root_key_count() {
     ' "$ROOT_AUTHORIZED_KEYS" 2>/dev/null
 }
 
-has_root_ssh_key() {
-    local key_count
-    key_count=$(get_root_key_count)
-    (( key_count > 0 ))
-}
-
 format_root_login_display() {
     case "$1" in
-        no) echo "禁止 Root 登录" ;;
-        prohibit-password) echo "Root 仅允许密钥登录" ;;
-        yes) echo "允许 Root 密码登录" ;;
-        forced-commands-only) echo "仅允许强制命令密钥登录" ;;
-        *) echo "未知（$1）" ;;
+        no)
+            echo "禁止 Root 登录"
+            ;;
+        prohibit-password|without-password)
+            echo "Root 仅允许密钥登录"
+            ;;
+        yes)
+            echo "允许 Root 密码登录"
+            ;;
+        forced-commands-only)
+            echo "仅允许强制命令密钥登录"
+            ;;
+        *)
+            echo "未知（${1:-未设置}）"
+            ;;
     esac
 }
 
@@ -153,14 +189,13 @@ choose_ssh_port() {
 
     case "$choice" in
         1)
-            # 主配置仅写入第一个当前端口；额外端口由 drop-in 配置继续提供。
             head -n 1 <<< "$current_ports"
             ;;
         2)
             if validate_port "2222" "$current_ports"; then
                 echo "2222"
             else
-                log "端口 2222 不可用，保持当前端口" "warn" >&2
+                warn "端口 2222 不可用，保持当前端口" >&2
                 head -n 1 <<< "$current_ports"
             fi
             ;;
@@ -168,7 +203,7 @@ choose_ssh_port() {
             if validate_port "2022" "$current_ports"; then
                 echo "2022"
             else
-                log "端口 2022 不可用，保持当前端口" "warn" >&2
+                warn "端口 2022 不可用，保持当前端口" >&2
                 head -n 1 <<< "$current_ports"
             fi
             ;;
@@ -177,7 +212,7 @@ choose_ssh_port() {
                 read -r -p "输入端口号（1024-65535）: " custom_port >&2
 
                 if [[ -z "$custom_port" ]]; then
-                    log "端口为空，保持当前端口" "warn" >&2
+                    warn "端口为空，保持当前端口" >&2
                     head -n 1 <<< "$current_ports"
                     return 0
                 fi
@@ -187,11 +222,11 @@ choose_ssh_port() {
                     return 0
                 fi
 
-                log "端口无效或已被其他服务占用，请重新输入" "warn" >&2
+                warn "端口无效或已被其他服务占用，请重新输入" >&2
             done
             ;;
         *)
-            log "无效选择，保持当前端口" "warn" >&2
+            warn "无效选择，保持当前端口" >&2
             head -n 1 <<< "$current_ports"
             ;;
     esac
@@ -213,6 +248,7 @@ choose_password_authentication() {
         else
             echo "no"
         fi
+
         return 0
     fi
 
@@ -240,12 +276,20 @@ choose_root_login_policy() {
     choice="${choice:-1}"
 
     case "$choice" in
-        1) echo "$current_policy" ;;
-        2) echo "no" ;;
-        3) echo "prohibit-password" ;;
-        4) echo "yes" ;;
+        1)
+            echo "$current_policy"
+            ;;
+        2)
+            echo "no"
+            ;;
+        3)
+            echo "prohibit-password"
+            ;;
+        4)
+            echo "yes"
+            ;;
         *)
-            log "无效选择，保持当前策略" "warn" >&2
+            warn "无效选择，保持当前策略" >&2
             echo "$current_policy"
             ;;
     esac
@@ -259,7 +303,7 @@ create_temp_ssh_config() {
     local temp_config
 
     if ! temp_config=$(mktemp /etc/ssh/sshd_config.new.XXXXXX); then
-        log "无法创建 SSH 配置临时文件" "error"
+        error "无法创建 SSH 配置临时文件"
         return 1
     fi
 
@@ -314,8 +358,8 @@ EOF
 check_syntax() {
     local config_file="$1"
 
-    if ! sshd -t -f "$config_file" 2>&1; then
-        log "SSH 配置语法验证失败" "error"
+    if ! sshd -t -f "$config_file"; then
+        error "SSH 配置语法验证失败"
         return 1
     fi
 }
@@ -323,9 +367,18 @@ check_syntax() {
 get_effective_value_from_config() {
     local config_file="$1"
     local key="$2"
+    local value
 
-    sshd -T -f "$config_file" 2>/dev/null |
-        awk -v key="$key" '$1 == key {print $2; exit}'
+    value=$(
+        sshd -T -f "$config_file" 2>/dev/null |
+            awk -v key="$key" '$1 == key {print $2; exit}'
+    )
+
+    if [[ "$key" == "permitrootlogin" ]]; then
+        normalize_root_login_policy "$value"
+    else
+        echo "$value"
+    fi
 }
 
 get_effective_ports_from_config() {
@@ -341,12 +394,12 @@ verify_effective_settings() {
     local expected_port="$2"
     local expected_password_auth="$3"
     local expected_root_login="$4"
-
     local actual_value
     local ports
-    local extra_ports=()
     local port
     local choice
+    local extra_ports=()
+    local key
 
     declare -A expected_values=(
         [permitrootlogin]="$expected_root_login"
@@ -356,13 +409,12 @@ verify_effective_settings() {
         [allowtcpforwarding]="yes"
     )
 
-    local key
     for key in "${!expected_values[@]}"; do
         actual_value=$(get_effective_value_from_config "$config_file" "$key")
 
         if [[ "$actual_value" != "${expected_values[$key]}" ]]; then
-            log "最终生效配置不符合预期：$key=${actual_value:-未读取}，预期=${expected_values[$key]}" "error"
-            log "请检查 $SSH_DROPIN_DIR 中是否存在冲突配置" "error"
+            error "最终生效配置不符合预期：$key=${actual_value:-未读取}，预期=${expected_values[$key]}"
+            error "请检查 $SSH_DROPIN_DIR 中是否存在冲突配置"
             return 1
         fi
     done
@@ -370,7 +422,7 @@ verify_effective_settings() {
     ports=$(get_effective_ports_from_config "$config_file")
 
     if ! port_is_in_list "$expected_port" "$ports"; then
-        log "最终 SSH 配置未监听所选端口：$expected_port" "error"
+        error "最终 SSH 配置未监听所选端口：$expected_port"
         return 1
     fi
 
@@ -383,67 +435,67 @@ verify_effective_settings() {
         return 0
     fi
 
-    echo
-    log "检测到 SSH 还会监听额外端口：${extra_ports[*]}" "warn"
-    echo "当前选择的主端口: $expected_port"
-    echo "额外端口可能来自: $SSH_DROPIN_DIR/*.conf"
-    read -r -p "是否保留全部监听端口并继续应用？[y/N]: " choice
+    echo >&2
+    warn "检测到 SSH 还会监听额外端口：${extra_ports[*]}" >&2
+    echo "当前选择的主端口: $expected_port" >&2
+    echo "额外端口可能来自: $SSH_DROPIN_DIR/*.conf" >&2
+
+    read -r -p "是否保留全部监听端口并继续应用？[y/N]: " choice >&2
     choice="${choice:-N}"
 
     if [[ "$choice" =~ ^[Yy]$ ]]; then
         return 0
     fi
 
-    log "已取消应用 SSH 配置，当前配置未改变" "warn"
+    warn "已取消应用 SSH 配置，当前配置未改变" >&2
     return 1
 }
 
 backup_ssh_config() {
     if [[ ! -f "$SSH_CONFIG" ]]; then
-        log "未找到 SSH 主配置：$SSH_CONFIG" "error"
+        error "未找到 SSH 主配置：$SSH_CONFIG"
         return 1
     fi
 
     if ! cp -a "$SSH_CONFIG" "$SSH_BACKUP"; then
-        log "SSH 配置备份失败" "error"
+        error "SSH 配置备份失败"
         return 1
     fi
 
     chmod 600 "$SSH_BACKUP" 2>/dev/null || true
-    debug_log "SSH 配置备份已更新: $SSH_BACKUP"
 }
 
 restore_ssh_config() {
     local service_name="$1"
 
     if [[ ! -f "$SSH_BACKUP" ]]; then
-        log "未找到 SSH 配置备份，无法自动恢复" "error"
+        error "未找到 SSH 配置备份，无法自动恢复"
         return 1
     fi
 
-    log "恢复 SSH 配置备份..." "warn"
+    warn "恢复 SSH 配置备份..."
 
     if ! cp -a "$SSH_BACKUP" "$SSH_CONFIG"; then
-        log "恢复 SSH 配置备份失败" "error"
+        error "恢复 SSH 配置备份失败"
         return 1
     fi
 
     if ! sshd -t -f "$SSH_CONFIG" >/dev/null 2>&1; then
-        log "备份 SSH 配置语法验证失败，需要人工处理" "error"
+        error "备份 SSH 配置语法验证失败，需要人工处理"
         return 1
     fi
 
     if systemctl reload "$service_name" >/dev/null 2>&1; then
-        log "已恢复 SSH 配置并重新加载服务" "warn"
+        warn "已恢复 SSH 配置并重新加载服务"
         return 0
     fi
 
     if systemctl restart "$service_name" >/dev/null 2>&1; then
-        log "已恢复 SSH 配置并重启服务" "warn"
+        warn "已恢复 SSH 配置并重启服务"
         return 0
     fi
 
-    log "SSH 配置已恢复，但服务无法启动，需要人工处理" "error"
+    error "SSH 配置已恢复，但服务无法启动，需要人工处理"
     return 1
 }
 
@@ -458,25 +510,23 @@ apply_ssh_config() {
 
     if ! install -m 600 "$temp_config" "$SSH_CONFIG"; then
         rm -f "$temp_config"
-        log "替换 SSH 主配置失败" "error"
+        error "替换 SSH 主配置失败"
         return 1
     fi
 
     rm -f "$temp_config"
 
     if ! systemctl reload "$service_name"; then
-        log "SSH 服务重载失败，尝试恢复原配置" "error"
+        error "SSH 服务重载失败，尝试恢复原配置"
         restore_ssh_config "$service_name"
         return 1
     fi
 
     if ! systemctl is-active --quiet "$service_name"; then
-        log "SSH 服务未处于运行状态，尝试恢复原配置" "error"
+        error "SSH 服务未处于运行状态，尝试恢复原配置"
         restore_ssh_config "$service_name"
         return 1
     fi
-
-    return 0
 }
 
 # === 摘要与提示 ===
@@ -493,7 +543,7 @@ show_summary() {
     keyboard_auth=$(get_effective_value "kbdinteractiveauthentication")
 
     echo
-    log "🎯 SSH 安全配置摘要：" "info"
+    info "🎯 SSH 安全配置摘要："
     echo "  SSH 服务: $service_name（运行中）"
     echo "  监听端口: $(tr '\n' ' ' <<< "$ports")"
     echo "  Root 登录: $(format_root_login_display "$root_login")"
@@ -512,7 +562,7 @@ show_connection_warning() {
     ip_address="${ip_address:-服务器IP}"
 
     echo
-    log "⚠️ 重要提醒：" "warn"
+    warn "⚠️ 重要提醒："
     echo "  新 SSH 连接示例:"
     echo "  ssh -p $primary_port root@$ip_address"
     echo
@@ -524,28 +574,28 @@ show_connection_warning() {
 main() {
     require_root
 
-    local command
-    for command in sshd systemctl ss awk sort grep mktemp install cp; do
-        if ! command -v "$command" >/dev/null 2>&1; then
-            log "缺少必要命令: $command" "error"
+    local command_name
+    for command_name in sshd systemctl ss awk sort grep mktemp install cp; do
+        if ! command -v "$command_name" >/dev/null 2>&1; then
+            error "缺少必要命令: $command_name"
             exit 1
         fi
     done
 
     local ssh_service
     if ! ssh_service=$(get_ssh_service_name); then
-        log "未找到 SSH systemd 服务（ssh.service 或 sshd.service）" "error"
+        error "未找到 SSH systemd 服务（ssh.service 或 sshd.service）"
         exit 1
     fi
 
     if ! systemctl is-active --quiet "$ssh_service"; then
-        log "SSH 服务未运行，拒绝修改配置" "error"
+        error "SSH 服务未运行，拒绝修改配置"
         exit 1
     fi
 
     mkdir -p "$SSH_DROPIN_DIR"
 
-    log "🔐 配置 SSH 安全策略..." "info"
+    info "🔐 配置 SSH 安全策略..."
 
     echo
     local selected_port
@@ -560,7 +610,7 @@ main() {
     root_login=$(choose_root_login_policy)
 
     echo
-    log "生成并验证 SSH 配置..." "info"
+    info "生成并验证 SSH 配置..."
 
     local temp_config
     if ! temp_config=$(create_temp_ssh_config \
@@ -592,9 +642,9 @@ main() {
     show_connection_warning "$selected_port"
 
     echo
-    log "✅ SSH 安全配置完成" "success"
+    success "SSH 安全配置完成"
 }
 
-trap 'log "SSH 配置脚本在第 $LINENO 行执行失败" "error"' ERR
+trap 'error "SSH 配置脚本在第 $LINENO 行执行失败"' ERR
 
 main "$@"
