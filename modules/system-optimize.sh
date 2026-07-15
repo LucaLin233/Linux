@@ -52,18 +52,16 @@ wait_for_apt() {
         sleep "$APT_LOCK_INTERVAL"
         ((waited += APT_LOCK_INTERVAL))
     done
-
-    return 0
 }
 
 # === Swap / Zram 状态 ===
 show_swap_status() {
     local swappiness
-    swappiness=$(cat /proc/sys/vm/swappiness 2>/dev/null || echo "unknown")
+    local swap_info
 
+    swappiness=$(cat /proc/sys/vm/swappiness 2>/dev/null || echo "unknown")
     echo "Swap 配置: swappiness=$swappiness"
 
-    local swap_info
     swap_info=$(swapon --noheadings --show 2>/dev/null || true)
 
     if [[ -z "$swap_info" ]]; then
@@ -72,6 +70,7 @@ show_swap_status() {
     fi
 
     echo "Swap 状态:"
+
     while read -r device type size used priority; do
         [[ -z "$device" ]] && continue
 
@@ -134,8 +133,13 @@ EOF
 # Zram 相关内核参数：由 system-optimize.sh 自动生成
 vm.swappiness = ${swappiness}
 vm.page-cluster = 0
-kernel.zswap.enabled = 0
 EOF
+
+    # 部分内核不存在 kernel.zswap.enabled。
+    # 仅在参数存在时禁用 zswap，避免整份 sysctl 配置应用失败。
+    if [[ -e /proc/sys/kernel/zswap/enabled ]]; then
+        echo "kernel.zswap.enabled = 0" >> "$SYSCTL_CONFIG"
+    fi
 }
 
 apply_zram_sysctl() {
@@ -143,8 +147,6 @@ apply_zram_sysctl() {
         log "无法立即应用 Zram sysctl 配置，重启后会自动生效" "warn"
         return 1
     fi
-
-    return 0
 }
 
 get_zram_config_value() {
@@ -216,22 +218,23 @@ start_zram() {
         log "Zram 服务未正常激活" "error"
         return 1
     fi
-
-    return 0
 }
 
 setup_zram() {
     local mem_mb
+    local config
+    local zram_size
+    local swappiness
+    local used_bytes
+    local current_size
+    local actual_size
+
     mem_mb=$(awk '/^MemTotal:/ {print int($2 / 1024)}' /proc/meminfo)
 
     if [[ ! "$mem_mb" =~ ^[0-9]+$ ]] || (( mem_mb <= 0 )); then
         log "无法获取系统内存大小，跳过 Zram 配置" "error"
         return 1
     fi
-
-    local config
-    local zram_size
-    local swappiness
 
     config=$(get_optimal_zram_config "$mem_mb")
     zram_size="${config%,*}"
@@ -241,7 +244,6 @@ setup_zram() {
     echo "目标 Zram: ${zram_size}，swappiness=${swappiness}"
 
     if zram_config_matches "$zram_size" "$swappiness"; then
-        local current_size
         current_size=$(swapon --noheadings --show 2>/dev/null |
             awk '$1 == "/dev/zram0" {print $3; exit}')
 
@@ -252,7 +254,6 @@ setup_zram() {
 
     install_zram_generator || return 1
 
-    local used_bytes
     used_bytes=$(get_zram_used_bytes)
     used_bytes="${used_bytes:-0}"
 
@@ -260,7 +261,7 @@ setup_zram() {
     apply_zram_sysctl || true
     systemctl daemon-reload
 
-    # 当前 Zram 有实际换页时，不强制 swapoff，避免低内存机器触发 OOM。
+    # Zram 已有交换页时不强制 swapoff，避免低内存机器触发 OOM。
     if is_zram_active && (( used_bytes > 0 )); then
         log "当前 Zram 已使用 ${used_bytes} 字节 Swap；新配置将在下次重启后生效" "warn"
         show_swap_status
@@ -274,7 +275,6 @@ setup_zram() {
 
     start_zram || return 1
 
-    local actual_size
     actual_size=$(swapon --noheadings --show 2>/dev/null |
         awk '$1 == "/dev/zram0" {print $3; exit}')
 
@@ -285,9 +285,8 @@ setup_zram() {
 # === 时区配置 ===
 setup_timezone() {
     local current_tz
-    current_tz=$(timedatectl show --property=Timezone --value 2>/dev/null || true)
-    current_tz="${current_tz:-未知}"
-
+    local choice
+    local target_tz
     local -A tz_map=(
         [1]="$DEFAULT_TIMEZONE"
         [2]="UTC"
@@ -296,18 +295,22 @@ setup_timezone() {
         [5]="America/New_York"
     )
 
-    local choice
-    read -r -p "时区设置 [1=上海 2=UTC 3=东京 4=伦敦 5=纽约 6=自定义 7=保持当前]（默认 1）: " choice </dev/tty
-    choice="${choice:-1}"
+    current_tz=$(timedatectl show --property=Timezone --value 2>/dev/null || true)
+    current_tz="${current_tz:-未知}"
 
-    local target_tz
+    read -r -p \
+        "时区设置 [1=上海 2=UTC 3=东京 4=伦敦 5=纽约 6=自定义 7=保持当前]（默认 1）: " \
+        choice </dev/tty
+    choice="${choice:-1}"
 
     case "$choice" in
         [1-5])
             target_tz="${tz_map[$choice]}"
             ;;
         6)
-            read -r -p "输入时区（如 Asia/Shanghai，默认 ${DEFAULT_TIMEZONE}）: " target_tz </dev/tty
+            read -r -p \
+                "输入时区（如 Asia/Shanghai，默认 ${DEFAULT_TIMEZONE}）: " \
+                target_tz </dev/tty
             target_tz="${target_tz:-$DEFAULT_TIMEZONE}"
 
             if ! timedatectl list-timezones | grep -Fxq "$target_tz"; then
@@ -341,11 +344,12 @@ disable_timesyncd() {
 }
 
 setup_chrony() {
-    # 已运行的 Chrony 优先，确保默认 NTP 客户端不与它并行工作。
+    local sync_status
+    local sources
+
     if systemctl is-active --quiet chrony; then
         disable_timesyncd
 
-        local sync_status
         sync_status=$(chronyc tracking 2>/dev/null |
             awk -F': ' '/Leap status/ {print $2}')
 
@@ -372,7 +376,6 @@ setup_chrony() {
         return 1
     fi
 
-    # 仅当 Chrony 成功运行后，才停用 systemd-timesyncd。
     if ! systemctl is-active --quiet chrony; then
         log "Chrony 未处于运行状态" "error"
         return 1
@@ -381,7 +384,6 @@ setup_chrony() {
     disable_timesyncd
     sleep 2
 
-    local sources
     sources=$(chronyc sources 2>/dev/null |
         awk '/^[\^\*\+\-]/ {count++} END {print count + 0}')
 
@@ -395,9 +397,10 @@ main() {
         exit 1
     fi
 
-    for cmd in awk swapon systemctl timedatectl fuser; do
-        if ! command -v "$cmd" >/dev/null 2>&1; then
-            log "缺少必要命令: $cmd" "error"
+    local command_name
+    for command_name in awk swapon systemctl timedatectl fuser; do
+        if ! command -v "$command_name" >/dev/null 2>&1; then
+            log "缺少必要命令: $command_name" "error"
             exit 1
         fi
     done
@@ -432,6 +435,6 @@ main() {
     fi
 }
 
-trap 'log "脚本执行出错，行号: $LINENO" "error"' ERR
+trap 'log "系统优化脚本在第 $LINENO 行执行失败" "error"' ERR
 
 main "$@"
