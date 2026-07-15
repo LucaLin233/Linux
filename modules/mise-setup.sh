@@ -96,9 +96,6 @@ get_current_tool_version() {
 
     [[ -n "$output" ]] || return 1
 
-    # 常见输出格式：
-    # python 3.14.6 /root/.config/mise/config.toml
-    # node   24.12.0 /root/.config/mise/config.toml
     awk 'NR == 1 {print $2; exit}' <<< "$output"
 }
 
@@ -130,20 +127,6 @@ get_global_tool_version() {
             }
         }
     ' "$config_file"
-}
-
-package_is_installed() {
-    local tool="$1"
-    local version="$2"
-    local mise_cmd
-
-    mise_cmd=$(get_mise_executable) || return 1
-
-    "$mise_cmd" ls "$tool" 2>/dev/null |
-        awk -v expected="$version" '
-            $1 == tool && $2 == expected {found=1}
-            END {exit !found}
-        ' tool="$tool"
 }
 
 # === Mise 安装与更新 ===
@@ -319,8 +302,6 @@ choose_python_version() {
     latest_version=$("$mise_cmd" latest python 2>/dev/null || true)
     latest_version="${latest_version:-3.13}"
 
-    # 注意：此函数由命令替换调用。
-    # 菜单与提示必须输出到 stderr，stdout 只能输出最终选择结果。
     echo >&2
     echo "Python 版本选择：" >&2
     echo "  1) 安装最新版本（Python $latest_version）" >&2
@@ -429,7 +410,7 @@ setup_python() {
         return 1
     fi
 
-    resolved_version=$(get_current_tool_version "python" || true)
+    resolved_version=$(get_global_tool_version "python" || true)
     resolved_version="${resolved_version:-$selected_version}"
 
     echo "Python 配置: $resolved_version 已安装并设为 Mise 全局版本"
@@ -437,6 +418,24 @@ setup_python() {
 }
 
 # === Node.js 管理 ===
+ensure_node_runtime_dependencies() {
+    if ldconfig -p 2>/dev/null | grep -Fq "libatomic.so.1"; then
+        return 0
+    fi
+
+    log "安装 Node.js 运行依赖: libatomic1" "info"
+
+    if ! apt-get install -y libatomic1; then
+        log "libatomic1 安装失败，无法继续安装 Node.js" "error"
+        return 1
+    fi
+
+    if ! ldconfig -p 2>/dev/null | grep -Fq "libatomic.so.1"; then
+        log "libatomic.so.1 仍不可用，无法继续安装 Node.js" "error"
+        return 1
+    fi
+}
+
 get_installed_node_versions() {
     local mise_cmd
 
@@ -457,8 +456,6 @@ choose_node_version() {
     latest_version=$("$mise_cmd" latest node 2>/dev/null || true)
     latest_version="${latest_version:-lts}"
 
-    # 注意：此函数由命令替换调用。
-    # 菜单与提示必须输出到 stderr，stdout 只能输出最终选择结果。
     echo >&2
     echo "Node.js 版本选择：" >&2
     echo "  1) 安装最新版本（Node.js $latest_version）" >&2
@@ -557,6 +554,8 @@ setup_node() {
         return 0
     fi
 
+    ensure_node_runtime_dependencies || return 1
+
     log "安装 Node.js $selected_version..." "info"
 
     if ! "$mise_cmd" install "node@$selected_version"; then
@@ -571,7 +570,7 @@ setup_node() {
         return 1
     fi
 
-    resolved_version=$(get_current_tool_version "node" || true)
+    resolved_version=$(get_global_tool_version "node" || true)
     resolved_version="${resolved_version:-$selected_version}"
 
     echo "Node.js 配置: $resolved_version 已安装并设为 Mise 全局版本"
@@ -699,7 +698,7 @@ main() {
     require_root
 
     local command_name
-    for command_name in curl mktemp flock awk grep sort; do
+    for command_name in curl mktemp flock awk grep sort ldconfig; do
         if ! command -v "$command_name" >/dev/null 2>&1; then
             log "缺少必要命令: $command_name" "error"
             exit 1
