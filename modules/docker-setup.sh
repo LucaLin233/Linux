@@ -1,178 +1,323 @@
-#!/bin/bash
-# Docker 容器化平台配置模块 v5.1 - 稳定版
-# 功能: 安装Docker、优化配置
+#!/usr/bin/env bash
+# Docker 容器化平台配置模块
+# 功能：通过 Docker 官方 APT 仓库安装 Docker、Compose、Buildx，并配置容器日志轮转
 
 set -euo pipefail
 
 # === 常量定义 ===
-readonly DOCKER_CONFIG_DIR="/etc/docker"
-readonly DOCKER_DAEMON_CONFIG="$DOCKER_CONFIG_DIR/daemon.json"
+readonly DOCKER_KEYRING="/etc/apt/keyrings/docker.asc"
+readonly DOCKER_SOURCE="/etc/apt/sources.list.d/docker.sources"
+readonly DOCKER_DAEMON_DIR="/etc/docker"
+readonly DOCKER_DAEMON_CONFIG="$DOCKER_DAEMON_DIR/daemon.json"
+readonly DOCKER_DAEMON_BACKUP="$DOCKER_DAEMON_DIR/daemon.json.backup"
+
+readonly DOCKER_GPG_URL="https://download.docker.com/linux/debian/gpg"
+readonly DOCKER_REPO_URL="https://download.docker.com/linux/debian"
+
+readonly DOCKER_PACKAGES=(
+    docker-ce
+    docker-ce-cli
+    containerd.io
+    docker-buildx-plugin
+    docker-compose-plugin
+)
 
 # === 日志函数 ===
 log() {
-    local msg="$1" level="${2:-info}"
-    local -A colors=([info]="\033[0;36m" [warn]="\033[0;33m" [error]="\033[0;31m" [debug]="\033[0;35m")
-    echo -e "${colors[$level]:-\033[0;32m}$msg\033[0m"
+    local msg="$1"
+    local level="${2:-info}"
+    local -A colors=(
+        [info]="\033[0;36m"
+        [warn]="\033[0;33m"
+        [error]="\033[0;31m"
+        [success]="\033[0;32m"
+        [debug]="\033[0;35m"
+    )
+
+    if [[ "$level" == "debug" && "${DEBUG:-}" != "1" ]]; then
+        return 0
+    fi
+
+    echo -e "${colors[$level]:-\033[0;32m}${msg}\033[0m"
 }
 
 debug_log() {
-    if [[ "${DEBUG:-}" == "1" ]]; then
-        log "DEBUG: $1" "debug" >&2
-    fi
-    return 0
+    log "DEBUG: $1" "debug"
 }
 
-# === 辅助函数 ===
-# 获取内存大小
-get_memory_mb() {
-    debug_log "获取系统内存大小"
-    local mem_mb=""
-    
-    # 方法1：使用 /proc/meminfo（最可靠）
-    if [[ -f /proc/meminfo ]]; then
-        mem_mb=$(awk '/^MemTotal:/ {print int($2/1024)}' /proc/meminfo 2>/dev/null || echo "")
-        debug_log "从/proc/meminfo获取内存: ${mem_mb}MB"
-    fi
-    
-    # 方法2：使用 free 命令作为备选
-    if [[ -z "$mem_mb" ]] && command -v free >/dev/null; then
-        debug_log "尝试使用free命令获取内存"
-        # 尝试不同的 free 命令格式
-        mem_mb=$(free -m 2>/dev/null | awk 'NR==2{print $2}' || echo "")
-        
-        # 如果上面失败，尝试其他格式
-        if [[ -z "$mem_mb" ]]; then
-            mem_mb=$(free -m 2>/dev/null | awk '/^Mem:/{print $2}' || echo "")
-        fi
-        debug_log "从free命令获取内存: ${mem_mb}MB"
-    fi
-    
-    # 验证结果是否为有效数字
-    if [[ "$mem_mb" =~ ^[0-9]+$ ]] && [[ "$mem_mb" -gt 0 ]]; then
-        debug_log "内存大小验证成功: ${mem_mb}MB"
-        echo "$mem_mb"
-    else
-        debug_log "内存大小获取失败，返回0"
-        echo "0"
-    fi
-}
-
-# 获取Docker版本
-get_docker_version() {
-    debug_log "获取Docker版本"
-    local version
-    version=$(docker --version 2>/dev/null | awk '{print $3}' | tr -d ',' || echo "未知")
-    debug_log "Docker版本: $version"
-    echo "$version"
-}
-
-# === 核心功能函数 ===
-# 安装Docker
-install_docker() {
-    debug_log "开始安装Docker"
-    if command -v docker &>/dev/null; then
-        local docker_version=$(get_docker_version)
-        echo "Docker状态: 已安装 v$docker_version"
-        debug_log "Docker已安装，版本: $docker_version"
-        return 0
-    fi
-    
-    echo "安装Docker中..."
-    debug_log "开始下载并安装Docker"
-    if curl -fsSL https://get.docker.com | sh >/dev/null 2>&1; then
-        echo "Docker安装: 成功"
-        debug_log "Docker安装成功"
-    else
-        log "✗ Docker安装失败" "error"
-        debug_log "Docker安装失败"
+require_root() {
+    if (( EUID != 0 )); then
+        log "需要 root 权限运行" "error"
         exit 1
     fi
-    
-    if ! command -v docker &>/dev/null; then
-        log "✗ Docker安装验证失败" "error"
-        debug_log "Docker安装后验证失败"
-        exit 1
-    fi
-    debug_log "Docker安装验证成功"
 }
 
-# 启动Docker服务
-start_docker_service() {
-    debug_log "启动Docker服务"
-    if systemctl is-active docker &>/dev/null; then
-        echo "Docker服务: 已运行"
-        debug_log "Docker服务已运行"
-    elif systemctl list-unit-files docker.service &>/dev/null; then
-        debug_log "启用并启动Docker服务"
-        if systemctl enable --now docker.service >/dev/null 2>&1; then
-            echo "Docker服务: 已启动并设置开机自启"
-            debug_log "Docker服务启动并自启设置成功"
-        else
-            debug_log "Docker服务启动失败"
-        fi
-    else
-        debug_log "尝试直接启动Docker服务"
-        if systemctl start docker >/dev/null 2>&1; then
-            systemctl enable docker >/dev/null 2>&1 || {
-                debug_log "设置Docker开机自启失败"
-                true
-            }
-            echo "Docker服务: 已启动"
-            debug_log "Docker服务启动成功"
-        else
-            echo "Docker服务: 状态未知，但可能已运行"
-            debug_log "Docker服务状态未知"
+# === Docker 官方软件源 ===
+get_debian_codename() {
+    if [[ -r /etc/os-release ]]; then
+        . /etc/os-release
+
+        if [[ -n "${VERSION_CODENAME:-}" ]]; then
+            echo "$VERSION_CODENAME"
+            return 0
         fi
     fi
-    return 0
+
+    return 1
 }
 
-# 优化Docker配置
-optimize_docker_config() {
-    debug_log "开始Docker配置优化"
-    local mem_mb=$(get_memory_mb)
-    
-    if [[ "$mem_mb" -eq 0 ]]; then
-        echo "内存检测: 失败，跳过优化配置"
-        debug_log "内存检测失败，跳过优化"
+configure_docker_repository() {
+    local codename
+    local architecture
+    local key_temp
+
+    if [[ -s "$DOCKER_KEYRING" && -f "$DOCKER_SOURCE" ]]; then
+        debug_log "Docker 官方软件源已配置"
         return 0
     fi
-    
-    # 1GB以下才需要优化
-    if (( mem_mb >= 1024 )); then
-        echo "内存状态: ${mem_mb}MB (充足，无需优化)"
-        debug_log "内存充足 (${mem_mb}MB)，无需优化"
-        return 0
-    fi
-    
-    echo "内存状态: ${mem_mb}MB (偏低)"
-    debug_log "内存偏低 (${mem_mb}MB)，询问是否优化"
-    read -p "是否优化Docker配置以降低内存使用? [Y/n] (默认: Y): " -r optimize_choice || optimize_choice="Y"
-    optimize_choice=${optimize_choice:-Y}
-    
-    if [[ "$optimize_choice" =~ ^[Nn]$ ]]; then
-        echo "Docker优化: 跳过"
-        debug_log "用户选择跳过Docker优化"
-        return 0
-    fi
-    
-    debug_log "创建Docker配置目录: $DOCKER_CONFIG_DIR"
-    if ! mkdir -p "$DOCKER_CONFIG_DIR" 2>/dev/null; then
-        log "创建Docker配置目录失败" "error"
-        debug_log "创建Docker配置目录失败"
+
+    if ! codename=$(get_debian_codename); then
+        log "无法识别 Debian 版本代号，无法配置 Docker 官方软件源" "error"
         return 1
     fi
-    
-    if [[ -f "$DOCKER_DAEMON_CONFIG" ]] && grep -q "max-size" "$DOCKER_DAEMON_CONFIG"; then
-        echo "Docker优化: 已存在"
-        debug_log "Docker优化配置已存在"
+
+    architecture=$(dpkg --print-architecture)
+
+    install -d -m 0755 /etc/apt/keyrings
+
+    if ! key_temp=$(mktemp); then
+        log "无法创建 Docker GPG 密钥临时文件" "error"
+        return 1
+    fi
+
+    log "配置 Docker 官方 APT 软件源..." "info"
+
+    if ! curl -fsSL \
+        --connect-timeout 10 \
+        --max-time 30 \
+        "$DOCKER_GPG_URL" \
+        -o "$key_temp"; then
+        rm -f "$key_temp"
+        log "Docker GPG 密钥下载失败" "error"
+        return 1
+    fi
+
+    if [[ ! -s "$key_temp" ]]; then
+        rm -f "$key_temp"
+        log "Docker GPG 密钥为空" "error"
+        return 1
+    fi
+
+    if ! install -m 0644 "$key_temp" "$DOCKER_KEYRING"; then
+        rm -f "$key_temp"
+        log "Docker GPG 密钥安装失败" "error"
+        return 1
+    fi
+
+    rm -f "$key_temp"
+
+    cat > "$DOCKER_SOURCE" <<EOF
+Types: deb
+URIs: $DOCKER_REPO_URL
+Suites: $codename
+Components: stable
+Architectures: $architecture
+Signed-By: $DOCKER_KEYRING
+EOF
+
+    echo "Docker 官方软件源: 已配置（$codename / $architecture）"
+}
+
+# === Docker 安装与服务 ===
+is_docker_installed() {
+    command -v docker >/dev/null 2>&1
+}
+
+install_docker() {
+    if is_docker_installed; then
+        echo "Docker 状态: 已安装（$(docker --version 2>/dev/null || echo "版本未知"）"
         return 0
     fi
-    
-    debug_log "写入Docker优化配置"
-    if ! cat > "$DOCKER_DAEMON_CONFIG" << 'EOF'; then
+
+    configure_docker_repository || return 1
+
+    if ! apt-get update -qq; then
+        log "Docker 软件源索引更新失败" "error"
+        return 1
+    fi
+
+    log "安装 Docker、Compose 和 Buildx..." "info"
+
+    if ! apt-get install -y "${DOCKER_PACKAGES[@]}"; then
+        log "Docker 安装失败" "error"
+        return 1
+    fi
+
+    if ! is_docker_installed; then
+        log "Docker 安装后验证失败" "error"
+        return 1
+    fi
+
+    echo "Docker 安装: 成功（$(docker --version 2>/dev/null)）"
+}
+
+ensure_docker_plugins() {
+    local missing_packages=()
+
+    if ! docker compose version >/dev/null 2>&1; then
+        missing_packages+=("docker-compose-plugin")
+    fi
+
+    if ! docker buildx version >/dev/null 2>&1; then
+        missing_packages+=("docker-buildx-plugin")
+    fi
+
+    if (( ${#missing_packages[@]} == 0 )); then
+        echo "Docker 插件: Compose 和 Buildx 均可用"
+        return 0
+    fi
+
+    log "补充 Docker 插件: ${missing_packages[*]}" "info"
+
+    if ! configure_docker_repository; then
+        log "无法配置 Docker 官方软件源，跳过缺失插件安装" "warn"
+        return 1
+    fi
+
+    if ! apt-get update -qq; then
+        log "APT 软件包索引更新失败，跳过缺失插件安装" "warn"
+        return 1
+    fi
+
+    if ! apt-get install -y "${missing_packages[@]}"; then
+        log "Docker 插件安装失败" "warn"
+        return 1
+    fi
+
+    return 0
+}
+
+start_docker_service() {
+    log "启动 Docker 服务..." "info"
+
+    if ! systemctl enable --now docker; then
+        log "Docker 服务启动失败" "error"
+        return 1
+    fi
+
+    if ! systemctl is-active --quiet docker; then
+        log "Docker 服务未处于运行状态" "error"
+        return 1
+    fi
+
+    if ! docker info >/dev/null 2>&1; then
+        log "Docker daemon 无法正常响应" "error"
+        return 1
+    fi
+
+    echo "Docker 服务: 运行中，已设置开机自启"
+}
+
+# === Docker 日志轮转配置 ===
+backup_daemon_config() {
+    [[ -f "$DOCKER_DAEMON_CONFIG" ]] || return 0
+
+    if cp "$DOCKER_DAEMON_CONFIG" "$DOCKER_DAEMON_BACKUP"; then
+        chmod 600 "$DOCKER_DAEMON_BACKUP" 2>/dev/null || true
+        debug_log "已更新 Docker 配置备份：$DOCKER_DAEMON_BACKUP"
+        return 0
+    fi
+
+    log "Docker 配置备份失败" "error"
+    return 1
+}
+
+restore_daemon_config() {
+    if [[ -f "$DOCKER_DAEMON_BACKUP" ]]; then
+        cp "$DOCKER_DAEMON_BACKUP" "$DOCKER_DAEMON_CONFIG"
+        log "已恢复 Docker 配置备份" "warn"
+    else
+        rm -f "$DOCKER_DAEMON_CONFIG"
+        log "已删除新建的 Docker 配置文件" "warn"
+    fi
+}
+
+validate_docker_config() {
+    local config_file="$1"
+
+    if ! jq empty "$config_file" >/dev/null 2>&1; then
+        log "Docker 配置 JSON 格式无效" "error"
+        return 1
+    fi
+
+    if ! dockerd --validate --config-file "$config_file" >/dev/null 2>&1; then
+        log "Docker 配置内容无效" "error"
+        return 1
+    fi
+
+    return 0
+}
+
+is_log_rotation_configured() {
+    [[ -f "$DOCKER_DAEMON_CONFIG" ]] || return 1
+
+    jq -e '
+        .["log-driver"] == "json-file" and
+        .["log-opts"]["max-size"] == "10m" and
+        .["log-opts"]["max-file"] == "3"
+    ' "$DOCKER_DAEMON_CONFIG" >/dev/null 2>&1
+}
+
+configure_log_rotation() {
+    local choice
+    local temp_config
+    local docker_was_active=false
+
+    if is_log_rotation_configured; then
+        echo "Docker 日志轮转: 已配置（单文件 10MB，保留 3 份）"
+        return 0
+    fi
+
+    echo
+    echo "Docker 日志轮转可避免容器 json-file 日志无限增长并占满磁盘。"
+    echo "应用配置需要重启 Docker，运行中的容器可能短暂中断。"
+
+    read -r -p "是否配置 Docker 容器日志轮转（单文件 10MB，保留 3 份）？[Y/n]: " choice
+    choice="${choice:-Y}"
+
+    if [[ "$choice" =~ ^[Nn]$ ]]; then
+        echo "Docker 日志轮转: 已跳过"
+        return 0
+    fi
+
+    mkdir -p "$DOCKER_DAEMON_DIR"
+
+    if [[ -f "$DOCKER_DAEMON_CONFIG" ]] &&
+        ! jq empty "$DOCKER_DAEMON_CONFIG" >/dev/null 2>&1; then
+        log "现有 $DOCKER_DAEMON_CONFIG 不是有效 JSON，拒绝覆盖" "error"
+        return 1
+    fi
+
+    if ! temp_config=$(mktemp "$DOCKER_DAEMON_DIR/daemon.json.XXXXXX"); then
+        log "无法创建 Docker 配置临时文件" "error"
+        return 1
+    fi
+
+    if [[ -f "$DOCKER_DAEMON_CONFIG" ]]; then
+        if ! jq '
+            .["log-driver"] = "json-file" |
+            .["log-opts"] = ((.["log-opts"] // {}) + {
+                "max-size": "10m",
+                "max-file": "3"
+            })
+        ' "$DOCKER_DAEMON_CONFIG" > "$temp_config"; then
+            rm -f "$temp_config"
+            log "合并 Docker 日志配置失败" "error"
+            return 1
+        fi
+    else
+        cat > "$temp_config" <<'EOF'
 {
-  "storage-driver": "overlay2",
   "log-driver": "json-file",
   "log-opts": {
     "max-size": "10m",
@@ -180,94 +325,127 @@ optimize_docker_config() {
   }
 }
 EOF
-        log "写入Docker配置失败" "error"
-        debug_log "写入Docker配置文件失败"
+    fi
+
+    if ! validate_docker_config "$temp_config"; then
+        rm -f "$temp_config"
         return 1
     fi
-    
-    debug_log "重启Docker服务以应用配置"
-    if systemctl is-active docker &>/dev/null; then
-        if systemctl restart docker >/dev/null 2>&1; then
-            debug_log "Docker服务重启成功"
-        else
-            debug_log "Docker服务重启失败"
-        fi
+
+    backup_daemon_config || {
+        rm -f "$temp_config"
+        return 1
+    }
+
+    systemctl is-active --quiet docker && docker_was_active=true
+
+    if ! mv "$temp_config" "$DOCKER_DAEMON_CONFIG"; then
+        rm -f "$temp_config"
+        log "替换 Docker 配置失败" "error"
+        return 1
     fi
-    
-    echo "Docker优化: 已配置并重启"
-    debug_log "Docker优化配置完成"
+
+    chmod 644 "$DOCKER_DAEMON_CONFIG"
+
+    if ! systemctl restart docker || ! systemctl is-active --quiet docker; then
+        log "Docker 重启失败，开始恢复原配置" "error"
+        restore_daemon_config
+
+        if [[ "$docker_was_active" == "true" ]]; then
+            systemctl restart docker >/dev/null 2>&1 || true
+        fi
+
+        return 1
+    fi
+
+    echo "Docker 日志轮转: 已启用（单文件 10MB，保留 3 份）"
     return 0
 }
 
-# 显示配置摘要
+# === 摘要 ===
 show_docker_summary() {
-    debug_log "显示Docker配置摘要"
+    local docker_version
+    local containers
+    local images
+
     echo
-    log "🎯 Docker配置摘要:" "info"
-    
-    if command -v docker &>/dev/null; then
-        local docker_version=$(get_docker_version)
-        echo "  Docker: v$docker_version"
-        
-        if systemctl is-active docker &>/dev/null; then
-            echo "  服务状态: 运行中"
-            debug_log "Docker服务运行中"
-        else
-            echo "  服务状态: 未知"
-            debug_log "Docker服务状态未知"
-        fi
-        
-        local running_containers=$(docker ps -q 2>/dev/null | wc -l || echo "0")
-        echo "  运行容器: ${running_containers}个"
-        debug_log "当前运行 $running_containers 个容器"
-        
-        if [[ -f "$DOCKER_DAEMON_CONFIG" ]] && grep -q "max-size" "$DOCKER_DAEMON_CONFIG"; then
-            echo "  配置优化: 已启用"
-            debug_log "Docker优化配置已启用"
-        fi
-    else
+    log "🎯 Docker 配置摘要：" "info"
+
+    if ! is_docker_installed; then
         echo "  Docker: 未安装"
-        debug_log "Docker未安装"
+        return 0
     fi
-    return 0
+
+    docker_version=$(docker --version 2>/dev/null || echo "未知")
+    containers=$(docker ps -aq 2>/dev/null | wc -l)
+    images=$(docker images -q 2>/dev/null | wc -l)
+
+    echo "  Docker: $docker_version"
+
+    if systemctl is-active --quiet docker; then
+        echo "  服务状态: 运行中"
+    else
+        echo "  服务状态: 未运行"
+    fi
+
+    if docker compose version >/dev/null 2>&1; then
+        echo "  Compose: $(docker compose version 2>/dev/null)"
+    else
+        echo "  Compose: 未安装"
+    fi
+
+    if docker buildx version >/dev/null 2>&1; then
+        echo "  Buildx: 已安装"
+    else
+        echo "  Buildx: 未安装"
+    fi
+
+    echo "  容器数量: $containers"
+    echo "  镜像数量: $images"
+
+    if is_log_rotation_configured; then
+        echo "  日志轮转: 已启用（10MB × 3）"
+    else
+        echo "  日志轮转: 未配置"
+    fi
 }
 
 # === 主流程 ===
 main() {
-    log "🐳 配置Docker容器化平台..." "info"
-    
+    require_root
+
+    local command
+    for command in apt-get curl dpkg install jq mktemp systemctl dockerd; do
+        if ! command -v "$command" >/dev/null 2>&1; then
+            log "缺少必要命令: $command" "error"
+            exit 1
+        fi
+    done
+
+    log "🐳 配置 Docker 容器化平台..." "info"
+
     echo
-    if ! install_docker; then
-        log "Docker安装失败" "error"
-        exit 1
-    fi
-    
+    install_docker || exit 1
+
     echo
-    if ! start_docker_service; then
-        debug_log "Docker服务启动可能失败，但继续执行"
-    fi
-    
+    start_docker_service || exit 1
+
     echo
-    if ! optimize_docker_config; then
-        debug_log "Docker优化配置失败，但继续执行"
-    fi
-    
+    ensure_docker_plugins || true
+
+    echo
+    configure_log_rotation || log "Docker 日志轮转配置失败，保留现有 Docker 配置" "warn"
+
     show_docker_summary
-    
+
     echo
-    log "✅ Docker配置完成!" "info"
-    
-    if command -v docker &>/dev/null; then
-        echo
-        log "常用命令:" "info"
-        echo "  查看容器: docker ps"
-        echo "  查看镜像: docker images"
-        echo "  系统清理: docker system prune -f"
-    fi
-    return 0
+    log "✅ Docker 配置完成" "success"
+    echo "常用命令："
+    echo "  查看容器: docker ps"
+    echo "  查看镜像: docker images"
+    echo "  使用 Compose: docker compose up -d"
 }
 
-# 错误处理
-trap 'log "脚本执行出错，行号: $LINENO" "error"; exit 1' ERR
+trap 'log "Docker 配置脚本在第 $LINENO 行执行失败" "error"' ERR
 
 main "$@"
