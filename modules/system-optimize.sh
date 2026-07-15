@@ -82,20 +82,27 @@ show_swap_status() {
 }
 
 get_zram_used_bytes() {
-    swapon --noheadings -o NAME,USED 2>/dev/null |
-        awk '$1 == "/dev/zram0" {print $2; exit}'
+    awk '
+        $1 == "/dev/zram0" {
+            print $4 * 1024
+            exit
+        }
+    ' /proc/swaps
 }
 
 get_zram_size() {
-    swapon --noheadings -o NAME,SIZE 2>/dev/null |
-        awk '$1 == "/dev/zram0" {print $2; exit}'
+    awk '
+        $1 == "/dev/zram0" {
+            printf "%.1fG\n", $3 / 1024 / 1024
+            exit
+        }
+    ' /proc/swaps
 }
 
 is_zram_active() {
     systemctl is-active --quiet systemd-zram-setup@zram0.service &&
         [[ -b /dev/zram0 ]] &&
-        swapon --noheadings -o NAME 2>/dev/null |
-            awk '$1 == "/dev/zram0" {found=1} END {exit !found}'
+        awk '$1 == "/dev/zram0" {found=1} END {exit !found}' /proc/swaps
 }
 
 # === Zram 配置 ===
