@@ -11,14 +11,8 @@ readonly NEXTTRACE_KEY_URL="https://github.com/nxtrace/nexttrace-debs/releases/l
 readonly NEXTTRACE_REPO_URL="https://github.com/nxtrace/nexttrace-debs/releases/latest/download/"
 readonly NEXTTRACE_INSTALLER_URL="https://nxtrace.org/nt"
 
-readonly APT_TOOLS=(
-    speedtest-cli
-    htop
-    jq
-    tree
-    curl
-    wget
-)
+APT_UPDATED=false
+NEXTTRACE_BACKUP_PATH=""
 
 # === 日志函数 ===
 log() {
@@ -39,10 +33,6 @@ log() {
     echo -e "${colors[$level]:-\033[0;32m}${msg}\033[0m"
 }
 
-debug_log() {
-    log "DEBUG: $1" "debug"
-}
-
 require_root() {
     if (( EUID != 0 )); then
         log "需要 root 权限运行" "error"
@@ -50,7 +40,20 @@ require_root() {
     fi
 }
 
-# === 工具定义 ===
+apt_update_once() {
+    if [[ "$APT_UPDATED" == "true" ]]; then
+        return 0
+    fi
+
+    if ! apt-get update -qq; then
+        log "APT 软件包索引更新失败" "error"
+        return 1
+    fi
+
+    APT_UPDATED=true
+}
+
+# === 工具映射 ===
 get_tool_command() {
     case "$1" in
         nexttrace) echo "nexttrace" ;;
@@ -68,7 +71,7 @@ get_tool_package() {
     esac
 }
 
-is_tool_installed() {
+command_is_available() {
     local tool="$1"
     local command_name
 
@@ -76,48 +79,31 @@ is_tool_installed() {
     command -v "$command_name" >/dev/null 2>&1
 }
 
-get_tool_version() {
-    local tool="$1"
-    local command_name
-    local version_output
+package_is_installed() {
+    local package="$1"
 
-    command_name=$(get_tool_command "$tool") || return 1
-
-    if ! command -v "$command_name" >/dev/null 2>&1; then
-        echo "未安装"
-        return 1
-    fi
-
-    case "$tool" in
-        speedtest)
-            version_output=$("$command_name" --version 2>/dev/null | head -n 1 || true)
-            ;;
-        *)
-            version_output=$("$command_name" --version 2>/dev/null | head -n 1 || true)
-            ;;
-    esac
-
-    [[ -n "$version_output" ]] && echo "$version_output" || echo "已安装"
+    dpkg-query -W -f='${db:Status-Status}' "$package" 2>/dev/null |
+        grep -qx "installed"
 }
 
 # === 菜单 ===
 show_tool_menu() {
-    echo "可安装的工具："
-    echo "  1) 全部安装 - NextTrace、测速和常用系统工具"
-    echo "  2) 网络工具 - NextTrace + Speedtest CLI"
-    echo "  3) 系统工具 - htop + jq + tree"
-    echo "  4) 基础工具 - curl + wget"
-    echo "  5) 自定义选择"
-    echo "  6) 跳过安装"
-    echo "  7) 更新已安装工具"
-    echo
+    echo "可安装的工具：" >&2
+    echo "  1) 全部安装 - NextTrace、测速和常用系统工具" >&2
+    echo "  2) 网络工具 - NextTrace + Speedtest CLI" >&2
+    echo "  3) 系统工具 - htop + jq + tree" >&2
+    echo "  4) 基础工具 - curl + wget" >&2
+    echo "  5) 自定义选择" >&2
+    echo "  6) 跳过安装" >&2
+    echo "  7) 更新已安装工具" >&2
+    echo >&2
 }
 
 get_user_choice() {
     local choice
 
     show_tool_menu
-    read -r -p "请选择 [1-7]（默认 1）: " choice
+    read -r -p "请选择 [1-7]（默认 1）: " choice >&2
     choice="${choice:-1}"
 
     case "$choice" in
@@ -129,7 +115,7 @@ get_user_choice() {
         6) echo "skip" ;;
         7) echo "update" ;;
         *)
-            log "无效选择，使用全部安装" "warn"
+            log "无效选择，使用全部安装" "warn" >&2
             echo "all"
             ;;
     esac
@@ -147,20 +133,21 @@ get_tools_by_category() {
 }
 
 custom_tool_selection() {
+    local choices
     local choice
     local selected=()
 
-    echo "选择要安装的工具（多选用空格分隔，例如：1 3 5）："
-    echo "  1) nexttrace - 网络路由追踪"
-    echo "  2) speedtest - 网络测速（speedtest-cli）"
-    echo "  3) htop - 进程与资源监控"
-    echo "  4) jq - JSON 处理"
-    echo "  5) tree - 目录树显示"
-    echo "  6) curl - 网络请求工具"
-    echo "  7) wget - 文件下载工具"
-    echo
+    echo "选择要安装的工具（多选用空格分隔，例如：1 3 5）：" >&2
+    echo "  1) nexttrace - 网络路由追踪" >&2
+    echo "  2) speedtest - 网络测速（speedtest-cli）" >&2
+    echo "  3) htop - 进程与资源监控" >&2
+    echo "  4) jq - JSON 处理" >&2
+    echo "  5) tree - 目录树显示" >&2
+    echo "  6) curl - 网络请求工具" >&2
+    echo "  7) wget - 文件下载工具" >&2
+    echo >&2
 
-    read -r -p "请输入编号（默认：全部）: " choices
+    read -r -p "请输入编号（默认：全部）: " choices >&2
 
     if [[ -z "${choices:-}" ]]; then
         echo "nexttrace speedtest htop jq tree curl wget"
@@ -176,7 +163,7 @@ custom_tool_selection() {
             5) selected+=("tree") ;;
             6) selected+=("curl") ;;
             7) selected+=("wget") ;;
-            *) log "跳过无效编号：$choice" "warn" ;;
+            *) log "跳过无效编号：$choice" "warn" >&2 ;;
         esac
     done
 
@@ -185,58 +172,25 @@ custom_tool_selection() {
 
 # === NextTrace 安装 ===
 is_nexttrace_apt_installed() {
-    dpkg-query -W -f='${db:Status-Status}' nexttrace 2>/dev/null |
-        grep -qx "installed"
+    package_is_installed "nexttrace"
 }
 
-backup_external_nexttrace() {
-    local nexttrace_path
-    local backup_path
-
-    nexttrace_path=$(command -v nexttrace 2>/dev/null || true)
-
-    [[ -n "$nexttrace_path" ]] || return 0
-    is_nexttrace_apt_installed && return 0
-
-    if [[ ! -f "$nexttrace_path" ]]; then
-        return 0
-    fi
-
-    backup_path="${nexttrace_path}.backup.$(date +%Y%m%d-%H%M%S)"
-
-    if mv "$nexttrace_path" "$backup_path"; then
-        echo "旧 NextTrace 已备份至：$backup_path"
-        return 0
-    fi
-
-    log "无法备份旧 NextTrace：$nexttrace_path" "error"
-    return 1
-}
-
-restore_external_nexttrace() {
-    local backup_path="$1"
-    local original_path="${backup_path%.backup.*}"
-
-    [[ -f "$backup_path" ]] || return 0
-
-    if [[ ! -e "$original_path" ]]; then
-        mv "$backup_path" "$original_path" || true
-        log "已恢复原有 NextTrace：$original_path" "warn"
-    fi
+nexttrace_source_configured() {
+    [[ -s "$NEXTTRACE_KEYRING" ]] &&
+        [[ -f "$NEXTTRACE_SOURCE" ]] &&
+        grep -Fq "$NEXTTRACE_REPO_URL" "$NEXTTRACE_SOURCE" &&
+        grep -Fq "Signed-By: $NEXTTRACE_KEYRING" "$NEXTTRACE_SOURCE"
 }
 
 configure_nexttrace_repository() {
-    local key_temp
+    local key_temp=""
     local attempt
-    local downloaded=false
 
-    if [[ -f "$NEXTTRACE_KEYRING" && -s "$NEXTTRACE_KEYRING" &&
-        -f "$NEXTTRACE_SOURCE" ]]; then
+    if nexttrace_source_configured; then
         return 0
     fi
 
-    mkdir -p /etc/apt/keyrings
-    chmod 755 /etc/apt/keyrings
+    install -d -m 0755 /etc/apt/keyrings
 
     if ! key_temp=$(mktemp); then
         log "无法创建 NextTrace 密钥临时文件" "error"
@@ -250,21 +204,18 @@ configure_nexttrace_repository() {
             "$NEXTTRACE_KEY_URL" \
             -o "$key_temp" &&
             [[ -s "$key_temp" ]]; then
-            downloaded=true
             break
         fi
 
-        (( attempt < 3 )) && {
-            log "NextTrace 密钥下载失败，2 秒后重试（$attempt/3）..." "warn"
-            sleep 2
-        }
-    done
+        if (( attempt == 3 )); then
+            rm -f "$key_temp"
+            log "NextTrace 签名密钥下载失败" "error"
+            return 1
+        fi
 
-    if [[ "$downloaded" != "true" ]]; then
-        rm -f "$key_temp"
-        log "NextTrace 签名密钥下载失败" "error"
-        return 1
-    fi
+        log "NextTrace 密钥下载失败，2 秒后重试（$attempt/3）..." "warn"
+        sleep 2
+    done
 
     if ! install -m 0644 "$key_temp" "$NEXTTRACE_KEYRING"; then
         rm -f "$key_temp"
@@ -281,21 +232,53 @@ Suites: ./
 Signed-By: $NEXTTRACE_KEYRING
 EOF
 
+    APT_UPDATED=false
     echo "NextTrace 官方软件源: 已配置"
+}
+
+backup_external_nexttrace() {
+    local nexttrace_path
+    local backup_path
+
+    NEXTTRACE_BACKUP_PATH=""
+
+    if is_nexttrace_apt_installed; then
+        return 0
+    fi
+
+    nexttrace_path=$(command -v nexttrace 2>/dev/null || true)
+
+    [[ -n "$nexttrace_path" && -f "$nexttrace_path" ]] || return 0
+
+    backup_path="${nexttrace_path}.backup.$(date +%Y%m%d-%H%M%S)"
+
+    if ! mv "$nexttrace_path" "$backup_path"; then
+        log "无法备份旧 NextTrace：$nexttrace_path" "error"
+        return 1
+    fi
+
+    NEXTTRACE_BACKUP_PATH="$backup_path"
+    echo "旧 NextTrace 已备份至：$backup_path"
+}
+
+restore_external_nexttrace() {
+    local original_path
+
+    [[ -n "$NEXTTRACE_BACKUP_PATH" && -f "$NEXTTRACE_BACKUP_PATH" ]] || return 0
+
+    original_path="${NEXTTRACE_BACKUP_PATH%.backup.*}"
+
+    if [[ ! -e "$original_path" ]]; then
+        mv "$NEXTTRACE_BACKUP_PATH" "$original_path"
+        log "已恢复原有 NextTrace：$original_path" "warn"
+    fi
 }
 
 install_nexttrace_from_apt() {
     local mode="$1"
-    local backup_path=""
 
-    if ! configure_nexttrace_repository; then
-        return 1
-    fi
-
-    if ! apt-get update -qq; then
-        log "NextTrace 软件源索引更新失败" "error"
-        return 1
-    fi
+    configure_nexttrace_repository || return 1
+    apt_update_once || return 1
 
     if [[ "$mode" == "update" ]]; then
         if ! is_nexttrace_apt_installed; then
@@ -306,36 +289,24 @@ install_nexttrace_from_apt() {
         return $?
     fi
 
-    if command -v nexttrace >/dev/null 2>&1 && ! is_nexttrace_apt_installed; then
-        local old_path
-        old_path=$(command -v nexttrace)
-
-        if ! backup_external_nexttrace; then
-            return 1
-        fi
-
-        backup_path=$(find "$(dirname "$old_path")" -maxdepth 1 \
-            -type f -name "$(basename "$old_path").backup.*" \
-            -printf '%T@ %p\n' 2>/dev/null |
-            sort -nr |
-            awk 'NR == 1 {print $2}')
-    fi
+    backup_external_nexttrace || return 1
 
     if apt-get install -y nexttrace; then
-        command -v nexttrace >/dev/null 2>&1
-        return $?
+        if command -v nexttrace >/dev/null 2>&1; then
+            return 0
+        fi
     fi
 
-    [[ -n "$backup_path" ]] && restore_external_nexttrace "$backup_path"
+    restore_external_nexttrace
     return 1
 }
 
 install_nexttrace_fallback() {
-    local installer
+    local installer=""
     local result=0
 
     if command -v nexttrace >/dev/null 2>&1; then
-        log "官方 APT 安装失败，但当前 NextTrace 可用，保留现有版本" "warn"
+        log "官方 APT 安装失败，但当前 NextTrace 仍可用，保留现有版本" "warn"
         return 0
     fi
 
@@ -382,7 +353,11 @@ install_nexttrace() {
     local mode="$1"
 
     if install_nexttrace_from_apt "$mode"; then
-        echo "NextTrace: 已通过官方 APT 源安装"
+        if [[ "$mode" == "update" ]]; then
+            echo "NextTrace: 已通过官方 APT 源更新"
+        else
+            echo "NextTrace: 已通过官方 APT 源安装"
+        fi
         return 0
     fi
 
@@ -404,21 +379,17 @@ install_apt_tools() {
     local mode="$1"
     shift
 
-    local requested_tools=("$@")
-    local packages=()
     local tool
     local package
+    local packages=()
 
-    for tool in "${requested_tools[@]}"; do
+    for tool in "$@"; do
         [[ "$tool" == "nexttrace" ]] && continue
 
         package=$(get_tool_package "$tool") || continue
 
         if [[ "$mode" == "update" ]]; then
-            if dpkg-query -W -f='${db:Status-Status}' "$package" 2>/dev/null |
-                grep -qx "installed"; then
-                packages+=("$package")
-            fi
+            package_is_installed "$package" && packages+=("$package")
         else
             packages+=("$package")
         fi
@@ -426,10 +397,7 @@ install_apt_tools() {
 
     (( ${#packages[@]} > 0 )) || return 0
 
-    if ! apt-get update -qq; then
-        log "APT 软件包索引更新失败" "error"
-        return 1
-    fi
+    apt_update_once || return 1
 
     if [[ "$mode" == "update" ]]; then
         apt-get install -y --only-upgrade "${packages[@]}"
@@ -438,16 +406,15 @@ install_apt_tools() {
     fi
 }
 
-# === 工具安装流程 ===
+# === 执行工具安装 ===
 install_selected_tools() {
     local mode="$1"
     shift
 
-    local tools=("$@")
-    local tool
     local failed=()
+    local tool
 
-    for tool in "${tools[@]}"; do
+    for tool in "$@"; do
         if [[ "$tool" == "nexttrace" ]]; then
             if ! install_nexttrace "$mode"; then
                 failed+=("nexttrace")
@@ -455,8 +422,8 @@ install_selected_tools() {
         fi
     done
 
-    if ! install_apt_tools "$mode" "${tools[@]}"; then
-        for tool in "${tools[@]}"; do
+    if ! install_apt_tools "$mode" "$@"; then
+        for tool in "$@"; do
             [[ "$tool" != "nexttrace" ]] && failed+=("$tool")
         done
     fi
@@ -465,8 +432,6 @@ install_selected_tools() {
         log "部分工具操作失败：${failed[*]}" "warn"
         return 1
     fi
-
-    return 0
 }
 
 # === 摘要 ===
@@ -483,28 +448,23 @@ show_tools_summary() {
     local installed=()
     local missing=()
     local tool
-    local command_name
 
     echo
     log "🎯 系统工具摘要：" "info"
 
     for tool in "${tools[@]}"; do
-        command_name=$(get_tool_command "$tool")
-
-        if command -v "$command_name" >/dev/null 2>&1; then
+        if command_is_available "$tool"; then
             installed+=("$tool")
         else
             missing+=("$tool")
         fi
     done
 
-    if (( ${#installed[@]} > 0 )); then
+    (( ${#installed[@]} > 0 )) &&
         echo "  已安装: ${installed[*]}"
-    fi
 
-    if (( ${#missing[@]} > 0 )); then
+    (( ${#missing[@]} > 0 )) &&
         echo "  未安装: ${missing[*]}"
-    fi
 
     echo
     echo "常用命令："
@@ -529,10 +489,10 @@ show_tools_summary() {
 main() {
     require_root
 
-    local command
-    for command in apt-get curl git mktemp install grep awk sort find; do
-        if ! command -v "$command" >/dev/null 2>&1; then
-            log "缺少必要命令: $command" "error"
+    local command_name
+    for command_name in apt-get curl dpkg grep install mktemp mv; do
+        if ! command -v "$command_name" >/dev/null 2>&1; then
+            log "缺少必要命令: $command_name" "error"
             exit 1
         fi
     done
@@ -541,6 +501,7 @@ main() {
 
     local mode
     local selected_tools
+    local -a tools=()
 
     mode=$(get_user_choice)
 
@@ -552,10 +513,12 @@ main() {
 
     if [[ "$mode" == "custom" ]]; then
         selected_tools=$(custom_tool_selection)
-        [[ -n "$selected_tools" ]] || {
+
+        if [[ -z "$selected_tools" ]]; then
             log "未选择任何有效工具" "warn"
             return 0
-        }
+        fi
+
         read -r -a tools <<< "$selected_tools"
         mode="install"
     else
@@ -563,10 +526,11 @@ main() {
         read -r -a tools <<< "$selected_tools"
     fi
 
-    case "$mode" in
-        update) echo "操作模式: 更新已安装工具" ;;
-        *) echo "操作模式: 安装 ${tools[*]}" ;;
-    esac
+    if [[ "$mode" == "update" ]]; then
+        echo "操作模式: 更新已安装工具"
+    else
+        echo "操作模式: 安装 ${tools[*]}"
+    fi
 
     echo
     install_selected_tools "$mode" "${tools[@]}" ||
