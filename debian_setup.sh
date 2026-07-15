@@ -225,6 +225,7 @@ install_dependencies() {
         "gpg:gpg"
         "gpg-agent:gpg-agent"
         "dirmngr:dirmngr"
+        "libatomic.so.1:libatomic1"
     )
 
     local missing_packages=()
