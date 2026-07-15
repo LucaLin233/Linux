@@ -13,6 +13,8 @@ readonly MISE_BASH_ACTIVATE_FILE="$MISE_CONFIG_DIR/activate.bash"
 
 readonly ZSHRC_FILE="$HOME/.zshrc"
 readonly BASHRC_FILE="$HOME/.bashrc"
+readonly ZSH_LOADER_MARKER="# Mise Shell 集成：配置文件由 mise-setup.sh 维护。"
+readonly BASH_LOADER_MARKER="# Mise Shell 集成：配置文件由 mise-setup.sh 维护。"
 
 readonly MISE_CRON_COMMENT="# Mise Weekly Auto Update"
 readonly MISE_CRON_SCHEDULE="0 1 * * 0"
@@ -51,12 +53,12 @@ require_root() {
 
 # === Mise 基础函数 ===
 get_mise_executable() {
+    local candidate
     local candidates=(
         "$MISE_PATH"
         "$HOME/.local/share/mise/bin/mise"
         "/usr/local/bin/mise"
     )
-    local candidate
 
     for candidate in "${candidates[@]}"; do
         if [[ -x "$candidate" ]]; then
@@ -94,8 +96,24 @@ get_current_tool_version() {
 
     [[ -n "$output" ]] || return 1
 
-    # 常见输出如：node 22.14.0 /root/.config/mise/config.toml
-    awk 'NR == 1 {print $2}' <<< "$output"
+    # 常见输出格式：
+    # python 3.14.6 /root/.config/mise/config.toml
+    # node   24.12.0 /root/.config/mise/config.toml
+    awk 'NR == 1 {print $2; exit}' <<< "$output"
+}
+
+package_is_installed() {
+    local tool="$1"
+    local version="$2"
+    local mise_cmd
+
+    mise_cmd=$(get_mise_executable) || return 1
+
+    "$mise_cmd" ls "$tool" 2>/dev/null |
+        awk -v expected="$version" '
+            $1 == tool && $2 == expected {found=1}
+            END {exit !found}
+        ' tool="$tool"
 }
 
 # === Mise 安装与更新 ===
@@ -137,8 +155,8 @@ run_mise_installer() {
 install_or_update_mise() {
     local mise_cmd
     local old_version
-    local update_choice
     local new_version
+    local update_choice
 
     if mise_cmd=$(get_mise_executable); then
         old_version=$("$mise_cmd" --version 2>/dev/null | head -n 1 || echo "未知")
@@ -239,12 +257,12 @@ configure_shell_integration() {
 
     ensure_loader_entry \
         "$ZSHRC_FILE" \
-        "# Mise shell 集成：配置文件由 mise-setup.sh 维护。" \
+        "$ZSH_LOADER_MARKER" \
         '[[ -r "$HOME/.config/mise/activate.zsh" ]] && source "$HOME/.config/mise/activate.zsh"'
 
     ensure_loader_entry \
         "$BASHRC_FILE" \
-        "# Mise shell 集成：配置文件由 mise-setup.sh 维护。" \
+        "$BASH_LOADER_MARKER" \
         '[[ -r "$HOME/.config/mise/activate.bash" ]] && source "$HOME/.config/mise/activate.bash"'
 
     echo "Shell 集成: 已配置"
@@ -271,14 +289,16 @@ choose_python_version() {
     latest_version=$("$mise_cmd" latest python 2>/dev/null || true)
     latest_version="${latest_version:-3.13}"
 
-    echo
-    echo "Python 版本选择："
-    echo "  1) 安装最新版本（Python $latest_version）"
-    echo "  2) 手动输入版本号"
-    echo "  3) 保持当前配置（默认）"
-    echo
+    # 注意：此函数由命令替换调用。
+    # 菜单与提示必须输出到 stderr，stdout 只能输出最终选择结果。
+    echo >&2
+    echo "Python 版本选择：" >&2
+    echo "  1) 安装最新版本（Python $latest_version）" >&2
+    echo "  2) 手动输入版本号" >&2
+    echo "  3) 保持当前配置（默认）" >&2
+    echo >&2
 
-    read -r -p "请选择 [1-3]（默认 3）: " choice
+    read -r -p "请选择 [1-3]（默认 3）: " choice >&2
     choice="${choice:-3}"
 
     case "$choice" in
@@ -286,12 +306,12 @@ choose_python_version() {
             echo "$latest_version"
             ;;
         2)
-            read -r -p "输入 Python 版本号（如 3.13.1）: " custom_version
+            read -r -p "输入 Python 版本号（如 3.13.1）: " custom_version >&2
 
             if [[ "$custom_version" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]]; then
                 echo "$custom_version"
             else
-                log "版本号格式错误，保持当前配置" "warn"
+                log "版本号格式错误，保持当前配置" "warn" >&2
                 echo "current"
             fi
             ;;
@@ -315,6 +335,7 @@ cleanup_old_python_versions() {
 
     echo
     echo "检测到其他已安装的 Python 版本："
+
     while IFS= read -r version; do
         [[ -n "$version" ]] && echo "  - Python $version"
     done <<< "$versions"
@@ -406,15 +427,17 @@ choose_node_version() {
     latest_version=$("$mise_cmd" latest node 2>/dev/null || true)
     latest_version="${latest_version:-lts}"
 
-    echo
-    echo "Node.js 版本选择："
-    echo "  1) 安装最新版本（Node.js $latest_version）"
-    echo "  2) 安装最新 LTS 版本"
-    echo "  3) 手动输入版本号"
-    echo "  4) 保持当前配置（默认）"
-    echo
+    # 注意：此函数由命令替换调用。
+    # 菜单与提示必须输出到 stderr，stdout 只能输出最终选择结果。
+    echo >&2
+    echo "Node.js 版本选择：" >&2
+    echo "  1) 安装最新版本（Node.js $latest_version）" >&2
+    echo "  2) 安装最新 LTS 版本" >&2
+    echo "  3) 手动输入版本号" >&2
+    echo "  4) 保持当前配置（默认）" >&2
+    echo >&2
 
-    read -r -p "请选择 [1-4]（默认 4）: " choice
+    read -r -p "请选择 [1-4]（默认 4）: " choice >&2
     choice="${choice:-4}"
 
     case "$choice" in
@@ -425,12 +448,12 @@ choose_node_version() {
             echo "lts"
             ;;
         3)
-            read -r -p "输入 Node.js 版本号（如 22.14.0）: " custom_version
+            read -r -p "输入 Node.js 版本号（如 22.14.0）: " custom_version >&2
 
             if [[ "$custom_version" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]]; then
                 echo "$custom_version"
             else
-                log "版本号格式错误，保持当前配置" "warn"
+                log "版本号格式错误，保持当前配置" "warn" >&2
                 echo "current"
             fi
             ;;
@@ -454,6 +477,7 @@ cleanup_old_node_versions() {
 
     echo
     echo "检测到其他已安装的 Node.js 版本："
+
     while IFS= read -r version; do
         [[ -n "$version" ]] && echo "  - Node.js $version"
     done <<< "$versions"
@@ -537,20 +561,23 @@ ensure_cron_installed() {
         return 1
     fi
 
-    systemctl enable --now cron >/dev/null 2>&1 || true
-
-    if ! command -v crontab >/dev/null 2>&1; then
-        log "Cron 命令不可用" "error"
+    if ! systemctl enable --now cron >/dev/null 2>&1; then
+        log "Cron 服务启动失败" "error"
         return 1
     fi
+
+    command -v crontab >/dev/null 2>&1
 }
 
 configure_mise_cron() {
     local temp_cron
+    local current_cron
     local cron_command
-    local existing_cron
 
-    ensure_cron_installed || return 1
+    ensure_cron_installed || {
+        log "Cron 不可用，无法配置 Mise 自动更新" "error"
+        return 1
+    }
 
     if [[ ! -x "$MISE_PATH" ]]; then
         log "找不到 Mise：$MISE_PATH" "error"
@@ -567,10 +594,10 @@ configure_mise_cron() {
         return 1
     fi
 
-    existing_cron=$(crontab -l 2>/dev/null || true)
+    current_cron=$(crontab -l 2>/dev/null || true)
 
     {
-        printf '%s\n' "$existing_cron" |
+        printf '%s\n' "$current_cron" |
             grep -Fv "$MISE_CRON_COMMENT" |
             grep -Fv "$MISE_UPDATE_LOCK" || true
 
@@ -621,17 +648,13 @@ show_summary() {
         echo "  Mise: 未安装"
     fi
 
-    if [[ -r "$MISE_ZSH_ACTIVATE_FILE" ]]; then
-        echo "  Zsh 集成: 已配置"
-    else
+    [[ -r "$MISE_ZSH_ACTIVATE_FILE" ]] &&
+        echo "  Zsh 集成: 已配置" ||
         echo "  Zsh 集成: 未配置"
-    fi
 
-    if [[ -r "$MISE_BASH_ACTIVATE_FILE" ]]; then
-        echo "  Bash 集成: 已配置"
-    else
+    [[ -r "$MISE_BASH_ACTIVATE_FILE" ]] &&
+        echo "  Bash 集成: 已配置" ||
         echo "  Bash 集成: 未配置"
-    fi
 
     if crontab -l 2>/dev/null | grep -Fq "$MISE_UPDATE_LOCK"; then
         cron_status="每周日 01:00 自动更新"
@@ -645,10 +668,10 @@ show_summary() {
 main() {
     require_root
 
-    local command
-    for command in curl mktemp flock awk grep sort; do
-        if ! command -v "$command" >/dev/null 2>&1; then
-            log "缺少必要命令: $command" "error"
+    local command_name
+    for command_name in curl mktemp flock awk grep sort; do
+        if ! command -v "$command_name" >/dev/null 2>&1; then
+            log "缺少必要命令: $command_name" "error"
             exit 1
         fi
     done
