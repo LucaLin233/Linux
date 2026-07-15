@@ -155,8 +155,6 @@ create_temp_dir() {
 # =============================================================================
 
 pre_check() {
-    log "系统预检查"
-
     if (( EUID != 0 )); then
         log "需要 root 权限运行" "error"
         exit 1
@@ -168,23 +166,16 @@ pre_check() {
     fi
 
     local free_space_kb
-    free_space_kb=$(LANG=C df / 2>/dev/null | awk 'NR == 2 {print $4}' | tr -cd '0-9')
+    free_space_kb=$(LANG=C df / 2>/dev/null |
+        awk 'NR == 2 {print $4}' |
+        tr -cd '0-9')
 
-    if [[ -z "$free_space_kb" || "$free_space_kb" == "0" ]]; then
-        log "无法获取根分区可用空间，跳过磁盘检查" "warn"
-    else
-        local free_space_gb
-        free_space_gb=$((free_space_kb / 1024 / 1024))
-
-        log "根分区可用空间：${free_space_gb}GB"
-
+    if [[ -n "$free_space_kb" && "$free_space_kb" != "0" ]]; then
         if (( free_space_kb < 1048576 )); then
             log "根分区可用空间不足 1GB" "error"
             exit 1
         fi
     fi
-
-    log "检查 GitHub 下载连接..."
 
     if ! curl -fsI \
         --connect-timeout 5 \
@@ -266,82 +257,51 @@ install_dependencies() {
 # =============================================================================
 
 system_update() {
-    log "更新软件包索引"
-
-    if apt-get update; then
-        log "软件包索引更新成功" "success"
+    if apt-get update -qq; then
+        log "软件包索引已更新" "success"
     else
         log "软件包索引更新失败，后续模块可能无法安装软件包" "warn"
-    fi
-
-    local choice
-    read -r -p "是否现在执行完整系统更新（apt-get full-upgrade）？[y/N]: " choice
-    choice="${choice:-N}"
-
-    if [[ ! "$choice" =~ ^[Yy]$ ]]; then
-        log "已跳过完整系统更新"
-        return 0
-    fi
-
-    log "执行完整系统更新..."
-
-    if DEBIAN_FRONTEND=noninteractive apt-get full-upgrade -y \
-        -o Dpkg::Options::=--force-confdef \
-        -o Dpkg::Options::=--force-confold; then
-        log "系统更新完成" "success"
-    else
-        log "系统更新失败，继续执行模块选择流程" "warn"
     fi
 }
 
 fix_hosts_file() {
     local hostname_value
     local cloud_config="/etc/cloud/cloud.cfg"
+    local changed=false
 
     hostname_value=$(hostname)
 
     if [[ -f "$cloud_config" ]]; then
         if grep -qE '^[[:space:]]*manage_etc_hosts:' "$cloud_config"; then
-            sed -i \
-                's/^[[:space:]]*manage_etc_hosts:.*/manage_etc_hosts: false/' \
-                "$cloud_config"
+            if ! grep -qE '^[[:space:]]*manage_etc_hosts:[[:space:]]*false[[:space:]]*$' "$cloud_config"; then
+                sed -i \
+                    's/^[[:space:]]*manage_etc_hosts:.*/manage_etc_hosts: false/' \
+                    "$cloud_config"
+                changed=true
+            fi
         else
             echo "manage_etc_hosts: false" >> "$cloud_config"
+            changed=true
+        fi
+    fi
+
+    if ! grep -qE "^127\\.0\\.1\\.1[[:space:]].*\\b${hostname_value}\\b" \
+        /etc/hosts 2>/dev/null; then
+        cp /etc/hosts "/etc/hosts.backup.$(date +%s)" 2>/dev/null || true
+
+        if grep -qE '^127\.0\.1\.1[[:space:]]' /etc/hosts 2>/dev/null; then
+            sed -i \
+                "s/^127\\.0\\.1\\.1[[:space:]]\\+.*/127.0.1.1 ${hostname_value}/" \
+                /etc/hosts
+        else
+            echo "127.0.1.1 ${hostname_value}" >> /etc/hosts
         fi
 
-        log "已禁用 cloud-init 对 /etc/hosts 的自动管理"
+        changed=true
     fi
 
-    if grep -qE "^127\.0\.1\.1[[:space:]].*\b${hostname_value}\b" \
-        /etc/hosts 2>/dev/null; then
-        log "/etc/hosts 已包含主机名映射"
-        return 0
-    fi
-
-    cp /etc/hosts "/etc/hosts.backup.$(date +%s)" 2>/dev/null || true
-
-    if grep -qE '^127\.0\.1\.1[[:space:]]' /etc/hosts 2>/dev/null; then
-        sed -i \
-            "s/^127\\.0\\.1\\.1[[:space:]]\\+.*/127.0.1.1 ${hostname_value}/" \
-            /etc/hosts
-    else
-        echo "127.0.1.1 ${hostname_value}" >> /etc/hosts
-    fi
-
-    log "已更新 /etc/hosts 主机名映射" "success"
-}
-
-ask_fix_hosts() {
-    local choice
-
-    read -r -p "是否修复 hostname 与 /etc/hosts 映射？[y/N]: " choice
-    choice="${choice:-N}"
-
-    if [[ "$choice" =~ ^[Yy]$ ]]; then
-        fix_hosts_file
-    else
-        log "已跳过 hostname 与 /etc/hosts 修复"
-    fi
+    [[ "$changed" == "true" ]] &&
+        log "已修复 hostname 与 /etc/hosts 映射" "success"
 }
 
 # =============================================================================
@@ -579,15 +539,11 @@ download_module() {
 
     module_url="$MODULE_BASE_URL/$LATEST_COMMIT/modules/${module}.sh"
 
-    log "下载模块：$module（commit: ${LATEST_COMMIT:0:7}）"
-
     if ! download_with_retry "$module_url" "$module_file"; then
-        log "模块下载失败：$module" "error"
         return 1
     fi
 
     chmod 700 "$module_file"
-    return 0
 }
 
 # =============================================================================
@@ -622,19 +578,14 @@ self_update() {
     local choice
     local cached_script=""
 
-    log "检查主脚本更新..."
-
     if ! latest_commit=$(get_latest_commit); then
-        log "无法获取 GitHub 最新 Commit，跳过主脚本自更新" "warn"
+        log "无法检查主脚本更新，继续使用当前版本" "warn"
         return 0
     fi
 
-    log "当前 Commit：$SCRIPT_COMMIT"
-    log "最新 Commit：$latest_commit"
-
     if [[ "$SCRIPT_COMMIT" != "unknown" &&
         "$latest_commit" == "$SCRIPT_COMMIT" ]]; then
-        log "主脚本已是最新版本"
+        log "主脚本已是最新版本" "success"
         return 0
     fi
 
@@ -643,7 +594,7 @@ self_update() {
     fi
 
     if ! temp_script=$(mktemp "$TEMP_DIR/debian_setup_latest.XXXXXX.sh"); then
-        log "无法创建主脚本更新临时文件" "warn"
+        log "无法创建主脚本更新临时文件，继续使用当前版本" "warn"
         return 0
     fi
 
@@ -663,7 +614,7 @@ self_update() {
 
     echo
     log "发现主脚本新版本" "warn"
-    echo "  当前：v$SCRIPT_VERSION（commit: $SCRIPT_COMMIT）"
+    echo "  当前：v$SCRIPT_VERSION（commit: ${SCRIPT_COMMIT:0:7}）"
     echo "  最新：v$remote_version（commit: ${latest_commit:0:7}）"
 
     read -r -p "是否更新并重新运行？[Y/n]: " choice
@@ -679,28 +630,35 @@ self_update() {
 
     if [[ -d "$CACHE_DIR" ]]; then
         cached_script="$CACHE_DIR/debian_setup_${latest_commit}.sh"
-        cp "$temp_script" "$cached_script"
-        chmod 700 "$cached_script"
 
-        find "$CACHE_DIR" \
-            -maxdepth 1 \
-            -type f \
-            -name 'debian_setup_*.sh' \
-            -printf '%T@ %p\n' |
-            sort -nr |
-            awk 'NR > 3 {print $2}' |
-            xargs -r rm -f
+        if cp "$temp_script" "$cached_script"; then
+            chmod 700 "$cached_script"
 
-        log "已缓存新主脚本：$cached_script"
+            find "$CACHE_DIR" \
+                -maxdepth 1 \
+                -type f \
+                -name 'debian_setup_*.sh' \
+                -printf '%T@ %p\n' |
+                sort -nr |
+                awk 'NR > 3 {print $2}' |
+                xargs -r rm -f
+
+            log "主脚本已更新至 v$remote_version" "success"
+        else
+            cached_script=""
+            log "无法缓存新主脚本，将直接使用临时文件重新运行" "warn"
+        fi
     fi
 
     log "正在重新启动更新后的主脚本..." "success"
 
     if [[ -n "$cached_script" && -f "$cached_script" ]]; then
-        SCRIPT_COMMIT="$latest_commit" exec bash "$cached_script" "${FILTERED_ARGS[@]}"
+        SCRIPT_COMMIT="$latest_commit" exec bash \
+            "$cached_script" "${FILTERED_ARGS[@]}"
     fi
 
-    SCRIPT_COMMIT="$latest_commit" exec bash "$temp_script" "${FILTERED_ARGS[@]}"
+    SCRIPT_COMMIT="$latest_commit" exec bash \
+        "$temp_script" "${FILTERED_ARGS[@]}"
 }
 
 # =============================================================================
@@ -1045,23 +1003,19 @@ main() {
     fi
 
     echo "$LINE"
+    echo
 
     self_update
 
-    echo
     pre_check
     install_dependencies
     system_update
-    ask_fix_hosts
-
-    log "获取固定模块 Commit..."
+    fix_hosts_file
 
     if ! LATEST_COMMIT=$(get_latest_commit); then
         log "无法获取 GitHub Commit，为避免主脚本与模块版本不一致，停止执行" "error"
         exit 1
     fi
-
-    log "本次模块 Commit：${LATEST_COMMIT:0:7}"
 
     select_deployment_mode
 
@@ -1085,26 +1039,22 @@ main() {
     fi
 
     echo
-    echo "$LINE"
-    log "开始下载 ${#SELECTED_MODULES[@]} 个模块"
-    echo "$LINE"
+    log "正在准备 ${#SELECTED_MODULES[@]} 个模块..."
 
     local download_failed=0
-    local downloaded=0
     local module
 
     for module in "${SELECTED_MODULES[@]}"; do
-        ((downloaded++))
-        echo
-        echo "[$downloaded/${#SELECTED_MODULES[@]}] 下载模块：$module"
-
-        if download_module "$module"; then
-            log "模块下载成功：$module" "success"
-        else
+        if ! download_module "$module"; then
             MODULE_STATUS["$module"]="failed"
             ((download_failed++))
+            log "模块下载失败：$module" "error"
         fi
     done
+
+    if (( download_failed == 0 )); then
+        log "模块准备完成" "success"
+    fi
 
     if (( download_failed > 0 )); then
         log "共有 $download_failed 个模块下载失败" "warn"
