@@ -7,12 +7,13 @@
 #   bash system-customize.sh motd      # 仅配置欢迎信息
 #   bash system-customize.sh locale    # 仅配置中文环境
 #   bash system-customize.sh xanmod    # 仅配置 XanMod 内核
-#   bash system-customize.sh all       # 交互执行全部功能
+#   bash system-customize.sh status    # 查看 XanMod 状态
 
 set -euo pipefail
 
 # === 常量定义 ===
 readonly MOTD_SCRIPT="/etc/update-motd.d/00-custom-welcome"
+
 readonly XANMOD_KEYRING="/etc/apt/keyrings/xanmod-archive-keyring.gpg"
 readonly XANMOD_SOURCE="/etc/apt/sources.list.d/xanmod-release.list"
 readonly XANMOD_LEGACY_SOURCE="/etc/apt/sources.list.d/xanmod-release.sources"
@@ -73,10 +74,34 @@ ask_yes_no() {
     [[ "$choice" =~ ^[Yy]$ ]]
 }
 
+ensure_package() {
+    local command_name="$1"
+    local package_name="$2"
+
+    if command -v "$command_name" >/dev/null 2>&1; then
+        return 0
+    fi
+
+    info "安装依赖包: $package_name"
+
+    if ! apt-get update -qq; then
+        error "无法更新软件包索引，无法安装 $package_name"
+        return 1
+    fi
+
+    if ! apt-get install -y "$package_name"; then
+        error "安装依赖包失败: $package_name"
+        return 1
+    fi
+
+    if ! command -v "$command_name" >/dev/null 2>&1; then
+        error "依赖命令仍不可用: $command_name"
+        return 1
+    fi
+}
+
 # === 动态欢迎信息 ===
 configure_motd() {
-    local choice
-
     if ! ask_yes_no "是否配置自定义动态欢迎信息？[Y/n]: " "Y"; then
         echo "欢迎信息: 已跳过"
         return 0
@@ -228,10 +253,14 @@ configure_chinese_locale() {
         return 0
     fi
 
-    info "配置中文 Locale..."
+    ensure_package "locale-gen" "locales" || return 1
 
-    apt-get update -qq
-    apt-get install -y locales
+    if ! command -v update-locale >/dev/null 2>&1; then
+        error "未找到 update-locale，locales 安装可能不完整"
+        return 1
+    fi
+
+    info "配置中文 Locale..."
 
     sed -i \
         's/^[[:space:]]*#[[:space:]]*zh_CN.UTF-8[[:space:]]\+UTF-8/zh_CN.UTF-8 UTF-8/' \
@@ -243,8 +272,7 @@ configure_chinese_locale() {
 
     locale-gen
 
-    # 移除旧脚本设置的全局 LC_ALL。
-    # LANG/LANGUAGE 可实现中文界面，同时避免强制覆盖脚本所需的 Locale 分类。
+    # 移除旧设置中的 LC_ALL，避免强制覆盖所有 Locale 分类。
     sed -i '/^LC_ALL=/d' /etc/default/locale
 
     update-locale \
@@ -297,13 +325,13 @@ detect_xanmod_package() {
         return 1
     fi
 
-    # x86-64-v3 需要 AVX2、FMA、BMI1/BMI2、MOVBE、F16C、LZCNT 等。
+    # x86-64-v3：AVX2、FMA、BMI1/BMI2、MOVBE、F16C、LZCNT 等。
     if cpu_has_flags avx avx2 bmi1 bmi2 fma f16c movbe lzcnt; then
         echo "linux-xanmod-x64v3"
         return 0
     fi
 
-    # x86-64-v2 对应较现代的 x86-64 CPU 基线。
+    # x86-64-v2：较现代的 x86-64 CPU 基线。
     if cpu_has_flags cx16 lahf_lm popcnt sse4_1 sse4_2 ssse3; then
         echo "linux-xanmod-x64v2"
         return 0
@@ -313,11 +341,10 @@ detect_xanmod_package() {
 }
 
 xanmod_source_configured() {
-    grep -Rqs \
-        "deb.xanmod.org" \
-        /etc/apt/sources.list.d/xanmod-release.list \
-        /etc/apt/sources.list.d/xanmod-release.sources 2>/dev/null &&
-        [[ -s "$XANMOD_KEYRING" ]]
+    [[ -s "$XANMOD_KEYRING" ]] &&
+        [[ -f "$XANMOD_SOURCE" ]] &&
+        grep -Fq "deb.xanmod.org" "$XANMOD_SOURCE" &&
+        grep -Fq "signed-by=$XANMOD_KEYRING" "$XANMOD_SOURCE"
 }
 
 migrate_legacy_xanmod_source() {
@@ -347,6 +374,8 @@ configure_xanmod_repository() {
         echo "XanMod 软件源: 已配置"
         return 0
     fi
+
+    ensure_package "gpg" "gpg" || return 1
 
     codename=$(get_debian_codename) || {
         error "无法识别 Debian 发行版代号"
@@ -402,7 +431,12 @@ get_installed_xanmod_packages() {
     dpkg-query -W \
         -f='${binary:Package} ${db:Status-Status}\n' \
         "linux-xanmod-*" 2>/dev/null |
-        awk '$2 == "installed" {print $1}' |
+        awk '
+            $2 == "installed" {
+                sub(/:amd64$/, "", $1)
+                print $1
+            }
+        ' |
         sort -u
 }
 
@@ -411,7 +445,6 @@ is_xanmod_kernel_running() {
 }
 
 install_xanmod() {
-    local choice
     local target_package
     local installed_packages
     local install_choice
@@ -451,6 +484,7 @@ install_xanmod() {
 
     if [[ -n "$installed_packages" ]]; then
         warn "检测到已安装的其他 XanMod 包: $(tr '\n' ' ' <<< "$installed_packages")"
+
         read -r -p "是否额外安装当前检测到的 $target_package？[y/N]: " install_choice
         install_choice="${install_choice:-N}"
 
@@ -463,6 +497,7 @@ install_xanmod() {
     configure_xanmod_repository || return 1
 
     info "更新软件包索引..."
+
     if ! apt-get update; then
         error "XanMod 软件源索引更新失败"
         return 1
@@ -544,8 +579,8 @@ main() {
     require_root
 
     local required_command
-    for required_command in apt-get awk cat chmod curl dpkg gpg grep hostname \
-        locale-gen mktemp sed sort systemctl uname update-locale; do
+    for required_command in apt-get awk cat chmod curl dpkg grep hostname \
+        mktemp sed sort uname; do
         if ! command -v "$required_command" >/dev/null 2>&1; then
             error "缺少必要命令: $required_command"
             exit 1
