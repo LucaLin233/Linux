@@ -545,7 +545,9 @@ install_xanmod() {
     local installed_packages
     local install_choice
 
-    if ! ask_yes_no "是否安装 XanMod 内核？[y/N]: " "N"; then
+    echo "XanMod 将在兼容时自动安装；Debian 原内核会保留，重启后才生效。"
+
+    if ! ask_yes_no "是否安装 XanMod 内核？[Y/n]: " "Y"; then
         echo "XanMod 内核: 已跳过"
         return 0
     fi
