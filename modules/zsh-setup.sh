@@ -326,20 +326,22 @@ EOF
 }
 
 setup_theme() {
+    debug_log "开始主题选择"
+
     echo "主题选择:" >&2
     echo "  1) LucaLin（推荐）" >&2
     echo "  2) Rainbow（彩虹风格）" >&2
     echo "  3) Lean（简洁风格）" >&2
     echo "  4) Classic（经典风格）" >&2
-    echo "  5) Pure（极简风格）" >&2
+    echo "  5) Pure（极简风格，默认）" >&2
     echo "  6) 配置向导" >&2
     echo >&2
 
     local choice
-    read -r -t 30 -p "请选择 [1-6]（默认 1）: " choice >&2 || choice="1"
-    choice="${choice:-1}"
-
     local config_url=""
+
+    read -r -t 30 -p "请选择 [1-6]（默认 5）: " choice >&2 || choice="5"
+    choice="${choice:-5}"
 
     case "$choice" in
         1)
@@ -368,8 +370,8 @@ setup_theme() {
             return 0
             ;;
         *)
-            log "无效选择，使用 LucaLin 主题" "warn"
-            config_url="https://raw.githubusercontent.com/LucaLin233/Linux/main/p10k-config.zsh"
+            warn "无效选择，使用 Pure 主题"
+            config_url="https://raw.githubusercontent.com/romkatv/powerlevel10k/master/config/p10k-pure.zsh"
             ;;
     esac
 
@@ -382,7 +384,7 @@ setup_theme() {
         return 0
     fi
 
-    log "主题配置下载失败，首次进入 Zsh 时可运行 p10k configure 配置" "warn"
+    warn "主题配置下载失败，首次进入 Zsh 时可运行 p10k configure 配置"
     return 1
 }
 
