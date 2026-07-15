@@ -82,15 +82,19 @@ show_swap_status() {
 }
 
 get_zram_used_bytes() {
-    swapon --noheadings --bytes --show 2>/dev/null |
-        awk '$1 == "/dev/zram0" {print $4; exit}'
+    swapon --noheadings --bytes --output=NAME,USED 2>/dev/null |
+        awk '$1 == "/dev/zram0" {print $2; exit}'
+}
+
+get_zram_size() {
+    swapon --noheadings --output=NAME,SIZE 2>/dev/null |
+        awk '$1 == "/dev/zram0" {print $2; exit}'
 }
 
 is_zram_active() {
     systemctl is-active --quiet systemd-zram-setup@zram0.service &&
         [[ -b /dev/zram0 ]] &&
-        swapon --noheadings --show 2>/dev/null |
-            awk '{print $1}' |
+        swapon --noheadings --output=NAME 2>/dev/null |
             grep -qx "/dev/zram0"
 }
 
@@ -244,9 +248,7 @@ setup_zram() {
     echo "目标 Zram: ${zram_size}，swappiness=${swappiness}"
 
     if zram_config_matches "$zram_size" "$swappiness"; then
-        current_size=$(swapon --noheadings --show 2>/dev/null |
-            awk '$1 == "/dev/zram0" {print $3; exit}')
-
+        current_size=$(get_zram_size)
         echo "Zram: ${current_size:-已启用}（配置无需变更）"
         show_swap_status
         return 0
@@ -275,9 +277,7 @@ setup_zram() {
 
     start_zram || return 1
 
-    actual_size=$(swapon --noheadings --show 2>/dev/null |
-        awk '$1 == "/dev/zram0" {print $3; exit}')
-
+    actual_size=$(get_zram_size)
     echo "Zram: ${actual_size:-已启用}（zstd，swappiness=${swappiness}）"
     show_swap_status
 }
