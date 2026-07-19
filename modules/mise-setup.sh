@@ -1,13 +1,16 @@
 #!/usr/bin/env bash
 # Mise 版本管理器配置模块
-# 功能：安装最新版 Mise、配置 Shell 集成、管理 Python/Node.js、每周自动更新
+# 功能：安装或更新 Mise、配置 Shell 集成、管理 Python/Node.js、
+#       升级运行时后迁移依赖，并配置每周自动更新。
 
 set -euo pipefail
 
-# === 常量定义 ===
+# === 路径与常量 ===
 readonly MISE_BIN_DIR="$HOME/.local/bin"
 readonly MISE_PATH="$MISE_BIN_DIR/mise"
 readonly MISE_CONFIG_DIR="$HOME/.config/mise"
+readonly MISE_DEPENDENCY_BACKUP_DIR="$MISE_CONFIG_DIR/dependency-backups"
+
 readonly MISE_ZSH_ACTIVATE_FILE="$MISE_CONFIG_DIR/activate.zsh"
 readonly MISE_BASH_ACTIVATE_FILE="$MISE_CONFIG_DIR/activate.bash"
 
@@ -21,27 +24,18 @@ readonly MISE_CRON_SCHEDULE="0 1 * * 0"
 readonly MISE_UPDATE_LOG="/var/log/mise-update.log"
 readonly MISE_UPDATE_LOCK="/var/lock/mise-self-update.lock"
 
-# === 日志函数 ===
+# === 日志 ===
 log() {
-    local msg="$1"
+    local message="$1"
     local level="${2:-info}"
     local -A colors=(
         [info]="\033[0;36m"
         [warn]="\033[0;33m"
         [error]="\033[0;31m"
-        [debug]="\033[0;35m"
         [success]="\033[0;32m"
     )
 
-    if [[ "$level" == "debug" && "${DEBUG:-}" != "1" ]]; then
-        return 0
-    fi
-
-    echo -e "${colors[$level]:-\033[0;32m}${msg}\033[0m"
-}
-
-debug_log() {
-    log "DEBUG: $1" "debug"
+    echo -e "${colors[$level]:-\033[0m]}${message}\033[0m"
 }
 
 require_root() {
@@ -62,44 +56,26 @@ get_mise_executable() {
 
     for candidate in "${candidates[@]}"; do
         if [[ -x "$candidate" ]]; then
-            echo "$candidate"
+            printf '%s\n' "$candidate"
             return 0
         fi
     done
 
-    if command -v mise >/dev/null 2>&1; then
-        command -v mise
-        return 0
-    fi
-
-    return 1
+    command -v mise 2>/dev/null || return 1
 }
 
 get_mise_version() {
     local mise_cmd
 
     if ! mise_cmd=$(get_mise_executable); then
-        echo "未安装"
+        printf '%s\n' "未安装"
         return 1
     fi
 
-    "$mise_cmd" --version 2>/dev/null | head -n 1 || echo "未知"
+    "$mise_cmd" --version 2>/dev/null | head -n 1
 }
 
-get_current_tool_version() {
-    local tool="$1"
-    local mise_cmd
-    local output
-
-    mise_cmd=$(get_mise_executable) || return 1
-    output=$("$mise_cmd" current "$tool" 2>/dev/null || true)
-
-    [[ -n "$output" ]] || return 1
-
-    awk 'NR == 1 {print $2; exit}' <<< "$output"
-}
-
-get_global_tool_version() {
+get_active_tool_version() {
     local tool="$1"
     local config_file="$MISE_CONFIG_DIR/config.toml"
 
@@ -129,17 +105,14 @@ get_global_tool_version() {
     ' "$config_file"
 }
 
-# === Mise 安装与更新 ===
 run_mise_installer() {
     local installer
     local result=0
 
-    if ! installer=$(mktemp); then
+    installer=$(mktemp) || {
         log "无法创建 Mise 安装临时文件" "error"
         return 1
-    fi
-
-    debug_log "下载最新版 Mise 安装脚本"
+    }
 
     if ! curl -fsSL \
         --connect-timeout 10 \
@@ -157,8 +130,6 @@ run_mise_installer() {
         return 1
     fi
 
-    debug_log "执行 Mise 安装脚本"
-
     MISE_INSTALL_PATH="$MISE_PATH" sh "$installer" || result=$?
     rm -f "$installer"
 
@@ -169,16 +140,16 @@ install_or_update_mise() {
     local mise_cmd
     local old_version
     local new_version
-    local update_choice
+    local choice
 
     if mise_cmd=$(get_mise_executable); then
-        old_version=$("$mise_cmd" --version 2>/dev/null | head -n 1 || echo "未知")
+        old_version=$("$mise_cmd" --version 2>/dev/null | head -n 1)
         echo "Mise 状态: 已安装（$old_version）"
 
-        read -r -p "是否更新 Mise 到最新版？[y/N]: " update_choice
-        update_choice="${update_choice:-N}"
+        read -r -p "是否更新 Mise 到最新版？[y/N]: " choice
+        choice="${choice:-N}"
 
-        if [[ ! "$update_choice" =~ ^[Yy]$ ]]; then
+        if [[ ! "$choice" =~ ^[Yy]$ ]]; then
             echo "Mise 更新: 跳过"
             return 0
         fi
@@ -191,7 +162,7 @@ install_or_update_mise() {
         fi
 
         new_version=$(get_mise_version)
-        echo "Mise 更新: ${old_version} → ${new_version}"
+        echo "Mise 更新: ${old_version} -> ${new_version}"
         return 0
     fi
 
@@ -199,11 +170,6 @@ install_or_update_mise() {
 
     if ! run_mise_installer; then
         log "Mise 安装失败" "error"
-        return 1
-    fi
-
-    if ! get_mise_executable >/dev/null; then
-        log "Mise 安装后验证失败" "error"
         return 1
     fi
 
@@ -220,16 +186,16 @@ write_activation_files() {
 # 缓存 activation 输出以减少新开 Zsh 的启动开销。
 
 if [[ -x "$HOME/.local/bin/mise" ]]; then
-  _mise_bin="$HOME/.local/bin/mise"
-  _mise_cache="${XDG_CACHE_HOME:-$HOME/.cache}/mise_activate.zsh"
+    _mise_bin="$HOME/.local/bin/mise"
+    _mise_cache="${XDG_CACHE_HOME:-$HOME/.cache}/mise_activate.zsh"
 
-  if [[ ! -r "$_mise_cache" || "$_mise_bin" -nt "$_mise_cache" ]]; then
-    mkdir -p "${XDG_CACHE_HOME:-$HOME/.cache}"
-    "$_mise_bin" activate zsh > "$_mise_cache"
-  fi
+    if [[ ! -r "$_mise_cache" || "$_mise_bin" -nt "$_mise_cache" ]]; then
+        mkdir -p "${XDG_CACHE_HOME:-$HOME/.cache}"
+        "$_mise_bin" activate zsh > "$_mise_cache"
+    fi
 
-  source "$_mise_cache"
-  unset _mise_bin _mise_cache
+    source "$_mise_cache"
+    unset _mise_bin _mise_cache
 fi
 EOF
 
@@ -252,7 +218,6 @@ ensure_loader_entry() {
     [[ -f "$shell_file" ]] || touch "$shell_file"
 
     if grep -Fqx "$marker" "$shell_file" 2>/dev/null; then
-        debug_log "Shell 加载入口已存在：$shell_file"
         return 0
     fi
 
@@ -281,80 +246,87 @@ configure_shell_integration() {
     echo "Shell 集成: 已配置"
 }
 
-# === Python 管理 ===
+# === 通用备份目录 ===
+prepare_backup_dir() {
+    mkdir -p "$MISE_DEPENDENCY_BACKUP_DIR"
+    chmod 700 "$MISE_DEPENDENCY_BACKUP_DIR" 2>/dev/null || true
+}
+
+# === Python 依赖迁移 ===
 get_installed_python_versions() {
     local mise_cmd
 
     mise_cmd=$(get_mise_executable) || return 0
 
     "$mise_cmd" ls python 2>/dev/null |
-        awk '$1 == "python" && $2 ~ /^[0-9]+\.[0-9]+\.[0-9]+$/ {print $2}' |
+        awk '$1 == "python" && $2 ~ /^[0-9]+\.[0-9]+\.[0-9]+$/ { print $2 }' |
         sort -V -u
 }
 
-choose_python_version() {
-    local mise_cmd
-    local latest_version
-    local choice
-    local custom_version
+backup_python_packages() {
+    local mise_cmd="$1"
+    local version="$2"
+    local backup_file="$MISE_DEPENDENCY_BACKUP_DIR/python-$version.txt"
+    local temp_file
 
-    mise_cmd=$(get_mise_executable) || return 1
-    latest_version=$("$mise_cmd" latest python 2>/dev/null || true)
-    latest_version="${latest_version:-3.13}"
+    prepare_backup_dir
+    temp_file=$(mktemp "$MISE_DEPENDENCY_BACKUP_DIR/.python-$version.XXXXXX") || return 1
 
-    echo >&2
-    echo "Python 版本选择：" >&2
-    echo "  1) 安装最新版本（Python $latest_version）" >&2
-    echo "  2) 手动输入版本号" >&2
-    echo "  3) 保持当前配置（默认）" >&2
-    echo >&2
+    if ! "$mise_cmd" exec "python@$version" -- \
+        python -m pip freeze > "$temp_file"; then
+        rm -f "$temp_file"
+        log "无法导出 Python $version 的依赖，已取消升级" "error"
+        return 1
+    fi
 
-    read -r -p "请选择 [1-3]（默认 3）: " choice >&2
-    choice="${choice:-3}"
+    mv -f "$temp_file" "$backup_file"
+    chmod 600 "$backup_file" 2>/dev/null || true
 
-    case "$choice" in
-        1)
-            echo "$latest_version"
-            ;;
-        2)
-            read -r -p "输入 Python 版本号（如 3.13.1）: " custom_version >&2
+    PYTHON_PACKAGE_BACKUP="$backup_file"
+    echo "Python 依赖: 已备份到 $backup_file"
+}
 
-            if [[ "$custom_version" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]]; then
-                echo "$custom_version"
-            else
-                log "版本号格式错误，保持当前配置" "warn" >&2
-                echo "current"
-            fi
-            ;;
-        *)
-            echo "current"
-            ;;
-    esac
+restore_python_packages() {
+    local mise_cmd="$1"
+    local version="$2"
+    local backup_file="$3"
+
+    [[ -f "$backup_file" ]] || return 0
+
+    if [[ -s "$backup_file" ]]; then
+        log "恢复 Python 依赖到 $version..." "info"
+
+        "$mise_cmd" exec "python@$version" -- \
+            python -m pip install -r "$backup_file" || return 1
+    else
+        echo "Python 依赖: 旧版本没有额外第三方包，无需恢复"
+    fi
+
+    "$mise_cmd" exec "python@$version" -- python -m pip check
 }
 
 cleanup_old_python_versions() {
-    local current_version="$1"
+    local active_version="$1"
     local mise_cmd
     local versions
-    local cleanup_choice
+    local choice
     local version
 
     mise_cmd=$(get_mise_executable) || return 0
-    versions=$(get_installed_python_versions | grep -Fxv "$current_version" || true)
+    versions=$(get_installed_python_versions | grep -Fxv "$active_version" || true)
 
     [[ -n "$versions" ]] || return 0
 
     echo
     echo "检测到其他已安装的 Python 版本："
-
     while IFS= read -r version; do
         [[ -n "$version" ]] && echo "  - Python $version"
     done <<< "$versions"
 
-    read -r -p "是否删除这些其他 Python 版本？[y/N]: " cleanup_choice
-    cleanup_choice="${cleanup_choice:-N}"
+    read -r -p "依赖已恢复，是否删除这些旧 Python 版本？[y/N]: " choice
+    choice="${choice:-N}"
 
-    if [[ ! "$cleanup_choice" =~ ^[Yy]$ ]]; then
+    if [[ ! "$choice" =~ ^[Yy]$ ]]; then
         echo "Python 清理: 保留其他版本"
         return 0
     fi
@@ -374,14 +346,15 @@ setup_python() {
     local mise_cmd
     local current_version
     local selected_version
-    local resolved_version
+    local active_version
+    local PYTHON_PACKAGE_BACKUP=""
 
     mise_cmd=$(get_mise_executable) || {
         log "找不到 Mise 可执行文件" "error"
         return 1
     }
 
-    current_version=$(get_global_tool_version "python" || true)
+    current_version=$(get_active_tool_version "python" || true)
 
     if [[ -n "$current_version" ]]; then
         echo "当前 Mise Python: $current_version"
@@ -389,11 +362,37 @@ setup_python() {
         echo "当前 Mise Python: 未配置"
     fi
 
-    selected_version=$(choose_python_version)
+    echo
+    echo "Python 版本选择："
+    echo "  1) 安装最新版本"
+    echo "  2) 手动输入版本号"
+    echo "  3) 保持当前配置（默认）"
 
-    if [[ "$selected_version" == "current" ]]; then
-        echo "Python 配置: 保持当前"
-        return 0
+    local choice
+    local selected_input
+    read -r -p "请选择 [1-3]（默认 3）: " choice
+    choice="${choice:-3}"
+
+    case "$choice" in
+        1)
+            selected_version=$("$mise_cmd" latest python)
+            ;;
+        2)
+            read -r -p "输入 Python 版本号（如 3.14.6）: " selected_input
+            if [[ ! "$selected_input" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]]; then
+                log "版本号格式错误，保持当前配置" "warn"
+                return 0
+            fi
+            selected_version="$selected_input"
+            ;;
+        *)
+            echo "Python 配置: 保持当前"
+            return 0
+            ;;
+    esac
+
+    if [[ -n "$current_version" ]]; then
+        backup_python_packages "$mise_cmd" "$current_version" || return 1
     fi
 
     log "安装 Python $selected_version..." "info"
@@ -403,21 +402,33 @@ setup_python() {
         return 1
     fi
 
-    log "设置 Mise 全局 Python 为 $selected_version..." "info"
-
     if ! "$mise_cmd" use -g "python@$selected_version"; then
         log "Python 已安装，但设置全局版本失败" "error"
         return 1
     fi
 
-    resolved_version=$(get_global_tool_version "python" || true)
-    resolved_version="${resolved_version:-$selected_version}"
+    active_version=$(get_active_tool_version "python" || true)
+    active_version="${active_version:-$selected_version}"
 
-    echo "Python 配置: $resolved_version 已安装并设为 Mise 全局版本"
-    cleanup_old_python_versions "$resolved_version"
+    if [[ -n "$current_version" && "$active_version" != "$current_version" ]]; then
+        if ! restore_python_packages \
+            "$mise_cmd" \
+            "$active_version" \
+            "$PYTHON_PACKAGE_BACKUP"; then
+            log "Python 依赖恢复失败，正在切回 $current_version" "error"
+            "$mise_cmd" use -g "python@$current_version" || true
+            log "新旧 Python 均已保留，未删除任何版本" "warn"
+            return 1
+        fi
+
+        echo "Python 依赖: 已恢复并通过 pip check 检查"
+    fi
+
+    echo "Python 配置: $active_version 已设为全局版本"
+    cleanup_old_python_versions "$active_version"
 }
 
-# === Node.js 管理 ===
+# === Node.js 全局 npm 包迁移 ===
 ensure_node_runtime_dependencies() {
     if ldconfig -p 2>/dev/null | grep -Fq "libatomic.so.1"; then
         return 0
@@ -429,11 +440,6 @@ ensure_node_runtime_dependencies() {
         log "libatomic1 安装失败，无法继续安装 Node.js" "error"
         return 1
     fi
-
-    if ! ldconfig -p 2>/dev/null | grep -Fq "libatomic.so.1"; then
-        log "libatomic.so.1 仍不可用，无法继续安装 Node.js" "error"
-        return 1
-    fi
 }
 
 get_installed_node_versions() {
@@ -442,77 +448,101 @@ get_installed_node_versions() {
     mise_cmd=$(get_mise_executable) || return 0
 
     "$mise_cmd" ls node 2>/dev/null |
-        awk '$1 == "node" && $2 ~ /^[0-9]+\.[0-9]+\.[0-9]+$/ {print $2}' |
+        awk '$1 == "node" && $2 ~ /^[0-9]+\.[0-9]+\.[0-9]+$/ { print $2 }' |
         sort -V -u
 }
 
-choose_node_version() {
-    local mise_cmd
-    local latest_version
-    local choice
-    local custom_version
+backup_node_packages() {
+    local mise_cmd="$1"
+    local version="$2"
+    local backup_file="$MISE_DEPENDENCY_BACKUP_DIR/node-$version.txt"
+    local temp_json
+    local temp_file
 
-    mise_cmd=$(get_mise_executable) || return 1
-    latest_version=$("$mise_cmd" latest node 2>/dev/null || true)
-    latest_version="${latest_version:-lts}"
+    prepare_backup_dir
+    temp_json=$(mktemp "$MISE_DEPENDENCY_BACKUP_DIR/.node-$version.XXXXXX.json") || return 1
+    temp_file=$(mktemp "$MISE_DEPENDENCY_BACKUP_DIR/.node-$version.XXXXXX.txt") || {
+        rm -f "$temp_json"
+        return 1
+    }
 
-    echo >&2
-    echo "Node.js 版本选择：" >&2
-    echo "  1) 安装最新版本（Node.js $latest_version）" >&2
-    echo "  2) 安装最新 LTS 版本" >&2
-    echo "  3) 手动输入版本号" >&2
-    echo "  4) 保持当前配置（默认）" >&2
-    echo >&2
+    if ! "$mise_cmd" exec "node@$version" -- \
+        npm ls -g --depth=0 --json > "$temp_json"; then
+        rm -f "$temp_json" "$temp_file"
+        log "无法读取 Node.js $version 的全局 npm 包，已取消升级" "error"
+        return 1
+    fi
 
-    read -r -p "请选择 [1-4]（默认 4）: " choice >&2
-    choice="${choice:-4}"
+    if ! "$mise_cmd" exec "node@$version" -- \
+        node -e '
+            const fs = require("fs");
+            const data = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+            const dependencies = data.dependencies || {};
 
-    case "$choice" in
-        1)
-            echo "$latest_version"
-            ;;
-        2)
-            echo "lts"
-            ;;
-        3)
-            read -r -p "输入 Node.js 版本号（如 22.14.0）: " custom_version >&2
+            for (const [name, meta] of Object.entries(dependencies)) {
+                if (name !== "npm" && name !== "corepack" && meta.version) {
+                    console.log(`${name}@${meta.version}`);
+                }
+            }
+        ' "$temp_json" > "$temp_file"; then
+        rm -f "$temp_json" "$temp_file"
+        log "无法解析 Node.js $version 的全局 npm 包，已取消升级" "error"
+        return 1
+    fi
 
-            if [[ "$custom_version" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]]; then
-                echo "$custom_version"
-            else
-                log "版本号格式错误，保持当前配置" "warn" >&2
-                echo "current"
-            fi
-            ;;
-        *)
-            echo "current"
-            ;;
-    esac
+    rm -f "$temp_json"
+    mv -f "$temp_file" "$backup_file"
+    chmod 600 "$backup_file" 2>/dev/null || true
+
+    NODE_PACKAGE_BACKUP="$backup_file"
+    echo "npm 全局包: 已备份到 $backup_file"
+}
+
+restore_node_packages() {
+    local mise_cmd="$1"
+    local version="$2"
+    local backup_file="$3"
+    local packages=()
+
+    [[ -f "$backup_file" ]] || return 0
+    mapfile -t packages < "$backup_file"
+
+    if (( ${#packages[@]} == 0 )); then
+        echo "npm 全局包: 旧版本没有额外全局包，无需恢复"
+        return 0
+    fi
+
+    log "恢复 npm 全局包到 Node.js $version..." "info"
+
+    "$mise_cmd" exec "node@$version" -- \
+        npm install -g -- "${packages[@]}" || return 1
+
+    "$mise_cmd" exec "node@$version" -- \
+        npm ls -g --depth=0 >/dev/null
 }
 
 cleanup_old_node_versions() {
-    local current_version="$1"
+    local active_version="$1"
     local mise_cmd
     local versions
-    local cleanup_choice
+    local choice
     local version
 
     mise_cmd=$(get_mise_executable) || return 0
-    versions=$(get_installed_node_versions | grep -Fxv "$current_version" || true)
+    versions=$(get_installed_node_versions | grep -Fxv "$active_version" || true)
 
     [[ -n "$versions" ]] || return 0
 
     echo
     echo "检测到其他已安装的 Node.js 版本："
-
     while IFS= read -r version; do
         [[ -n "$version" ]] && echo "  - Node.js $version"
     done <<< "$versions"
 
-    read -r -p "是否删除这些其他 Node.js 版本？[y/N]: " cleanup_choice
-    cleanup_choice="${cleanup_choice:-N}"
+    read -r -p "全局 npm 包已恢复，是否删除这些旧 Node.js 版本？[y/N]: " choice
+    choice="${choice:-N}"
 
-    if [[ ! "$cleanup_choice" =~ ^[Yy]$ ]]; then
+    if [[ ! "$choice" =~ ^[Yy]$ ]]; then
         echo "Node.js 清理: 保留其他版本"
         return 0
     fi
@@ -532,14 +562,15 @@ setup_node() {
     local mise_cmd
     local current_version
     local selected_version
-    local resolved_version
+    local active_version
+    local NODE_PACKAGE_BACKUP=""
 
     mise_cmd=$(get_mise_executable) || {
         log "找不到 Mise 可执行文件" "error"
         return 1
     }
 
-    current_version=$(get_global_tool_version "node" || true)
+    current_version=$(get_active_tool_version "node" || true)
 
     if [[ -n "$current_version" ]]; then
         echo "当前 Mise Node.js: $current_version"
@@ -547,11 +578,41 @@ setup_node() {
         echo "当前 Mise Node.js: 未配置"
     fi
 
-    selected_version=$(choose_node_version)
+    echo
+    echo "Node.js 版本选择："
+    echo "  1) 安装最新版本"
+    echo "  2) 安装最新 LTS 版本"
+    echo "  3) 手动输入版本号"
+    echo "  4) 保持当前配置（默认）"
 
-    if [[ "$selected_version" == "current" ]]; then
-        echo "Node.js 配置: 保持当前"
-        return 0
+    local choice
+    local selected_input
+    read -r -p "请选择 [1-4]（默认 4）: " choice
+    choice="${choice:-4}"
+
+    case "$choice" in
+        1)
+            selected_version=$("$mise_cmd" latest node)
+            ;;
+        2)
+            selected_version="lts"
+            ;;
+        3)
+            read -r -p "输入 Node.js 版本号（如 24.4.0）: " selected_input
+            if [[ ! "$selected_input" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]]; then
+                log "版本号格式错误，保持当前配置" "warn"
+                return 0
+            fi
+            selected_version="$selected_input"
+            ;;
+        *)
+            echo "Node.js 配置: 保持当前"
+            return 0
+            ;;
+    esac
+
+    if [[ -n "$current_version" ]]; then
+        backup_node_packages "$mise_cmd" "$current_version" || return 1
     fi
 
     ensure_node_runtime_dependencies || return 1
@@ -563,18 +624,30 @@ setup_node() {
         return 1
     fi
 
-    log "设置 Mise 全局 Node.js 为 $selected_version..." "info"
-
     if ! "$mise_cmd" use -g "node@$selected_version"; then
         log "Node.js 已安装，但设置全局版本失败" "error"
         return 1
     fi
 
-    resolved_version=$(get_global_tool_version "node" || true)
-    resolved_version="${resolved_version:-$selected_version}"
+    active_version=$(get_active_tool_version "node" || true)
+    active_version="${active_version:-$selected_version}"
 
-    echo "Node.js 配置: $resolved_version 已安装并设为 Mise 全局版本"
-    cleanup_old_node_versions "$resolved_version"
+    if [[ -n "$current_version" && "$active_version" != "$current_version" ]]; then
+        if ! restore_node_packages \
+            "$mise_cmd" \
+            "$active_version" \
+            "$NODE_PACKAGE_BACKUP"; then
+            log "npm 全局包恢复失败，正在切回 Node.js $current_version" "error"
+            "$mise_cmd" use -g "node@$current_version" || true
+            log "新旧 Node.js 均已保留，未删除任何版本" "warn"
+            return 1
+        fi
+
+        echo "npm 全局包: 已恢复并通过检查"
+    fi
+
+    echo "Node.js 配置: $active_version 已设为全局版本"
+    cleanup_old_node_versions "$active_version"
 }
 
 # === Mise 自动更新 ===
@@ -594,8 +667,6 @@ ensure_cron_installed() {
         log "Cron 服务启动失败" "error"
         return 1
     fi
-
-    command -v crontab >/dev/null 2>&1
 }
 
 configure_mise_cron() {
@@ -603,25 +674,13 @@ configure_mise_cron() {
     local current_cron
     local cron_command
 
-    ensure_cron_installed || {
-        log "Cron 不可用，无法配置 Mise 自动更新" "error"
-        return 1
-    }
-
-    if [[ ! -x "$MISE_PATH" ]]; then
-        log "找不到 Mise：$MISE_PATH" "error"
-        return 1
-    fi
+    ensure_cron_installed || return 1
 
     touch "$MISE_UPDATE_LOG"
     chmod 600 "$MISE_UPDATE_LOG" 2>/dev/null || true
 
     cron_command="/usr/bin/flock -n $MISE_UPDATE_LOCK $MISE_PATH self-update >> $MISE_UPDATE_LOG 2>&1"
-
-    if ! temp_cron=$(mktemp); then
-        log "无法创建 Cron 临时文件" "error"
-        return 1
-    fi
+    temp_cron=$(mktemp) || return 1
 
     current_cron=$(crontab -l 2>/dev/null || true)
 
@@ -641,56 +700,7 @@ configure_mise_cron() {
     fi
 
     rm -f "$temp_cron"
-
     echo "Mise 自动更新: 已配置（每周日 01:00）"
-    echo "更新日志: $MISE_UPDATE_LOG"
-}
-
-# === 摘要 ===
-show_summary() {
-    local mise_cmd
-    local python_version
-    local node_version
-    local cron_status="未配置"
-
-    echo
-    log "🎯 Mise 配置摘要：" "info"
-
-    if mise_cmd=$(get_mise_executable); then
-        echo "  Mise: $("$mise_cmd" --version 2>/dev/null | head -n 1)"
-
-        python_version=$(get_global_tool_version "python" || true)
-        node_version=$(get_global_tool_version "node" || true)
-
-        if [[ -n "$python_version" ]]; then
-            echo "  Mise Python: $python_version"
-        else
-            echo "  Mise Python: 未配置"
-        fi
-
-        if [[ -n "$node_version" ]]; then
-            echo "  Mise Node.js: $node_version"
-        else
-            echo "  Mise Node.js: 未配置"
-        fi
-    else
-        echo "  Mise: 未安装"
-    fi
-
-    [[ -r "$MISE_ZSH_ACTIVATE_FILE" ]] &&
-        echo "  Zsh 集成: 已配置" ||
-        echo "  Zsh 集成: 未配置"
-
-    [[ -r "$MISE_BASH_ACTIVATE_FILE" ]] &&
-        echo "  Bash 集成: 已配置" ||
-        echo "  Bash 集成: 未配置"
-
-    if crontab -l 2>/dev/null | grep -Fq "$MISE_UPDATE_LOCK"; then
-        cron_status="每周日 01:00 自动更新"
-    fi
-
-    echo "  自动更新: $cron_status"
-    echo "  更新日志: $MISE_UPDATE_LOG"
 }
 
 # === 主流程 ===
@@ -705,7 +715,7 @@ main() {
         fi
     done
 
-    log "📦 配置 Mise 版本管理器..." "info"
+    log "配置 Mise 版本管理器..." "info"
 
     echo
     install_or_update_mise || exit 1
@@ -714,22 +724,19 @@ main() {
     configure_shell_integration
 
     echo
-    setup_python || log "Python 配置失败，可稍后单独重新运行 Mise 模块" "warn"
+    setup_python || log "Python 配置失败，可稍后重新运行此模块" "warn"
 
     echo
-    setup_node || log "Node.js 配置失败，可稍后单独重新运行 Mise 模块" "warn"
+    setup_node || log "Node.js 配置失败，可稍后重新运行此模块" "warn"
 
     echo
     configure_mise_cron || log "Mise 自动更新任务配置失败" "warn"
 
-    show_summary
-
     echo
-    log "✅ Mise 配置完成" "success"
-    echo "重新打开 Shell 或执行以下命令后生效："
-    echo "  exec zsh"
+    log "Mise 配置完成" "success"
+    echo "重新打开 Shell 或执行：exec zsh"
 }
 
-trap 'log "Mise 配置脚本在第 $LINENO 行执行失败" "error"' ERR
+trap 'log "脚本在第 $LINENO 行执行失败" "error"' ERR
 
 main "$@"
