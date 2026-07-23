@@ -11,7 +11,6 @@ readonly THEME_DIR="$CUSTOM_DIR/themes/powerlevel10k"
 readonly PLUGINS_DIR="$CUSTOM_DIR/plugins"
 readonly ZSHRC_FILE="$HOME/.zshrc"
 readonly ZSHRC_BACKUP="$HOME/.zshrc.backup"
-readonly MISE_ACTIVATE_FILE="$HOME/.config/mise/activate.zsh"
 
 # === 日志函数 ===
 log() {
@@ -298,7 +297,9 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$HOME/
 # 7. Mise Shell 集成
 # activation 文件由 mise-setup.sh 维护。
 # ============================================================
-[[ -r "$HOME/.config/mise/activate.zsh" ]] && source "$HOME/.config/mise/activate.zsh"
+# Mise shell 集成：配置文件由 mise-setup.sh 维护。
+[[ -r "$HOME/.config/mise/activate.zsh" ]] &&
+  source "$HOME/.config/mise/activate.zsh"
 
 # ============================================================
 # 8. Powerlevel10k 配置
@@ -370,7 +371,7 @@ setup_theme() {
             return 0
             ;;
         *)
-            warn "无效选择，使用 Pure 主题"
+            log "无效选择，使用 Pure 主题" "warn"
             config_url="https://raw.githubusercontent.com/romkatv/powerlevel10k/master/config/p10k-pure.zsh"
             ;;
     esac
@@ -384,7 +385,7 @@ setup_theme() {
         return 0
     fi
 
-    warn "主题配置下载失败，首次进入 Zsh 时可运行 p10k configure 配置"
+    log "主题配置下载失败，首次进入 Zsh 时可运行 p10k configure 配置" "warn"
     return 1
 }
 
