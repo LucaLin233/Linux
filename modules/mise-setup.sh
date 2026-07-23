@@ -183,28 +183,54 @@ write_activation_files() {
 
     cat > "$MISE_ZSH_ACTIVATE_FILE" <<'EOF'
 # 由 mise-setup.sh 自动生成，请勿手动编辑。
-# 缓存 activation 输出以减少新开 Zsh 的启动开销。
 
-if [[ -x "$HOME/.local/bin/mise" ]]; then
-    _mise_bin="$HOME/.local/bin/mise"
-    _mise_cache="${XDG_CACHE_HOME:-$HOME/.cache}/mise_activate.zsh"
+_mise_bin=""
 
-    if [[ ! -r "$_mise_cache" || "$_mise_bin" -nt "$_mise_cache" ]]; then
-        mkdir -p "${XDG_CACHE_HOME:-$HOME/.cache}"
-        "$_mise_bin" activate zsh > "$_mise_cache"
+for _mise_candidate in \
+    "$HOME/.local/bin/mise" \
+    "$HOME/.local/share/mise/bin/mise" \
+    "/usr/local/bin/mise"; do
+    if [[ -x "$_mise_candidate" ]]; then
+        _mise_bin="$_mise_candidate"
+        break
     fi
+done
 
-    source "$_mise_cache"
-    unset _mise_bin _mise_cache
+if [[ -z "$_mise_bin" ]]; then
+    _mise_bin="$(command -v mise 2>/dev/null || true)"
 fi
+
+if [[ -n "$_mise_bin" && -x "$_mise_bin" ]]; then
+    eval "$("$_mise_bin" activate zsh)"
+fi
+
+unset _mise_bin _mise_candidate
 EOF
 
     cat > "$MISE_BASH_ACTIVATE_FILE" <<'EOF'
 # 由 mise-setup.sh 自动生成，请勿手动编辑。
 
-if [[ -x "$HOME/.local/bin/mise" ]]; then
-    eval "$("$HOME/.local/bin/mise" activate bash)"
+_mise_bin=""
+
+for _mise_candidate in \
+    "$HOME/.local/bin/mise" \
+    "$HOME/.local/share/mise/bin/mise" \
+    "/usr/local/bin/mise"; do
+    if [[ -x "$_mise_candidate" ]]; then
+        _mise_bin="$_mise_candidate"
+        break
+    fi
+done
+
+if [[ -z "$_mise_bin" ]]; then
+    _mise_bin="$(command -v mise 2>/dev/null || true)"
 fi
+
+if [[ -n "$_mise_bin" && -x "$_mise_bin" ]]; then
+    eval "$("$_mise_bin" activate bash)"
+fi
+
+unset _mise_bin _mise_candidate
 EOF
 
     chmod 644 "$MISE_ZSH_ACTIVATE_FILE" "$MISE_BASH_ACTIVATE_FILE"
@@ -214,24 +240,59 @@ ensure_loader_entry() {
     local shell_file="$1"
     local marker="$2"
     local loader_line="$3"
+    local temp_file
 
     [[ -f "$shell_file" ]] || touch "$shell_file"
 
-    if grep -Fqx "$marker" "$shell_file" 2>/dev/null; then
+    temp_file=$(mktemp) || {
+        log "无法创建 Shell 配置临时文件" "error"
+        return 1
+    }
+
+    # 只对脚本管理的两行做精确去重，不影响其他用户配置。
+    awk -v marker="$marker" -v loader="$loader_line" '
+        $0 == marker {
+            if (marker_seen++) {
+                next
+            }
+        }
+
+        $0 == loader {
+            if (loader_seen++) {
+                next
+            }
+        }
+
+        {
+            print
+        }
+    ' "$shell_file" > "$temp_file"
+
+    if ! cat "$temp_file" > "$shell_file"; then
+        rm -f "$temp_file"
+        log "无法更新 Shell 配置：$shell_file" "error"
+        return 1
+    fi
+
+    rm -f "$temp_file"
+
+    # 已经有实际加载命令，不需要再次追加。
+    if grep -Fqx "$loader_line" "$shell_file" 2>/dev/null; then
         return 0
     fi
 
-    cat >> "$shell_file" <<EOF
+    # marker 可能存在但加载命令缺失。
+    if ! grep -Fqx "$marker" "$shell_file" 2>/dev/null; then
+        printf '\n%s\n' "$marker" >> "$shell_file"
+    fi
 
-$marker
-$loader_line
-EOF
+    printf '%s\n' "$loader_line" >> "$shell_file"
 
     echo "Shell 集成: 已添加到 $shell_file"
 }
 
 configure_shell_integration() {
-    write_activation_files
+    write_activation_files || return 1
 
     ensure_loader_entry \
         "$ZSHRC_FILE" \
@@ -734,7 +795,10 @@ main() {
 
     echo
     log "Mise 配置完成" "success"
-    echo "重新打开 Shell 或执行：exec zsh"
+    echo
+    log "Mise 配置完成" "success"
+    echo "当前 Shell 尚未重新加载 Mise 环境。"
+    echo "请执行：exec zsh"
 }
 
 trap 'log "脚本在第 $LINENO 行执行失败" "error"' ERR
