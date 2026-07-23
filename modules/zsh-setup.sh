@@ -298,8 +298,7 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$HOME/
 # activation 文件由 mise-setup.sh 维护。
 # ============================================================
 # Mise shell 集成：配置文件由 mise-setup.sh 维护。
-[[ -r "$HOME/.config/mise/activate.zsh" ]] &&
-  source "$HOME/.config/mise/activate.zsh"
+[[ -r "$HOME/.config/mise/activate.zsh" ]] && source "$HOME/.config/mise/activate.zsh"
 
 # ============================================================
 # 8. Powerlevel10k 配置
