@@ -297,12 +297,14 @@ configure_shell_integration() {
     ensure_loader_entry \
         "$ZSHRC_FILE" \
         "$ZSH_LOADER_MARKER" \
-        '[[ -r "$HOME/.config/mise/activate.zsh" ]] && source "$HOME/.config/mise/activate.zsh"'
+        '[[ -r "$HOME/.config/mise/activate.zsh" ]] && source "$HOME/.config/mise/activate.zsh"' ||
+        return 1
 
     ensure_loader_entry \
         "$BASHRC_FILE" \
         "$BASH_LOADER_MARKER" \
-        '[[ -r "$HOME/.config/mise/activate.bash" ]] && source "$HOME/.config/mise/activate.bash"'
+        '[[ -r "$HOME/.config/mise/activate.bash" ]] && source "$HOME/.config/mise/activate.bash"' ||
+        return 1
 
     echo "Shell 集成: 已配置"
 }
@@ -734,14 +736,23 @@ configure_mise_cron() {
     local temp_cron
     local current_cron
     local cron_command
+    local mise_cmd
 
     ensure_cron_installed || return 1
+
+    mise_cmd=$(get_mise_executable) || {
+        log "找不到 Mise 可执行文件，无法配置自动更新" "error"
+        return 1
+    }
 
     touch "$MISE_UPDATE_LOG"
     chmod 600 "$MISE_UPDATE_LOG" 2>/dev/null || true
 
-    cron_command="/usr/bin/flock -n $MISE_UPDATE_LOCK $MISE_PATH self-update >> $MISE_UPDATE_LOG 2>&1"
-    temp_cron=$(mktemp) || return 1
+    cron_command="/usr/bin/flock -n $MISE_UPDATE_LOCK $mise_cmd self-update >> $MISE_UPDATE_LOG 2>&1"
+    temp_cron=$(mktemp) || {
+        log "无法创建 Cron 临时文件" "error"
+        return 1
+    }
 
     current_cron=$(crontab -l 2>/dev/null || true)
 
@@ -761,7 +772,7 @@ configure_mise_cron() {
     fi
 
     rm -f "$temp_cron"
-    echo "Mise 自动更新: 已配置（每周日 01:00）"
+    echo "Mise 自动更新: 已配置（每周日 01:00，使用 $mise_cmd）"
 }
 
 # === 主流程 ===
@@ -782,21 +793,24 @@ main() {
     install_or_update_mise || exit 1
 
     echo
-    configure_shell_integration
+    configure_shell_integration || exit 1
 
     echo
-    setup_python || log "Python 配置失败，可稍后重新运行此模块" "warn"
+    setup_python ||
+        log "Python 配置失败，可稍后重新运行此模块" "warn"
 
     echo
-    setup_node || log "Node.js 配置失败，可稍后重新运行此模块" "warn"
+    setup_node ||
+        log "Node.js 配置失败，可稍后重新运行此模块" "warn"
 
     echo
-    configure_mise_cron || log "Mise 自动更新任务配置失败" "warn"
+    configure_mise_cron ||
+        log "Mise 自动更新任务配置失败" "warn"
 
     echo
     log "Mise 配置完成" "success"
     echo "当前 Shell 尚未重新加载 Mise 环境。"
-    echo "请重新登录或执行：exec zsh"
+    echo "请重新登录，或根据当前 Shell 执行：exec zsh / exec bash"
 }
 
 trap 'log "脚本在第 $LINENO 行执行失败" "error"' ERR
