@@ -289,9 +289,22 @@ function kubectl() {
 
 # ============================================================
 # 6. PATH
-# 系统路径优先，保留既有 PATH 以兼容镜像和其他工具的路径设置。
+# 系统路径优先，并使用 Zsh 的唯一数组属性自动去除重复目录。
 # ============================================================
-export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$HOME/.local/bin:$PATH"
+typeset -U path PATH
+
+path=(
+  /usr/local/sbin
+  /usr/local/bin
+  /usr/sbin
+  /usr/bin
+  /sbin
+  /bin
+  "$HOME/.local/bin"
+  $path
+)
+
+export PATH
 
 # ============================================================
 # 7. Mise Shell 集成
