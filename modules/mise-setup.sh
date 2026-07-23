@@ -795,10 +795,8 @@ main() {
 
     echo
     log "Mise 配置完成" "success"
-    echo
-    log "Mise 配置完成" "success"
     echo "当前 Shell 尚未重新加载 Mise 环境。"
-    echo "请执行：exec zsh"
+    echo "请重新登录或执行：exec zsh"
 }
 
 trap 'log "脚本在第 $LINENO 行执行失败" "error"' ERR
