@@ -214,7 +214,7 @@ configure_zshrc() {
 # 必须位于文件顶部，以减少终端启动时的视觉等待。
 # ============================================================
 if [[ -r "${XDG_CACHE_HOME:-$HOME/.cache}/p10k-instant-prompt-${(%):-%n}.zsh" ]]; then
-  source "${XDG_CACHE_HOME:-$HOME/.cache}/p10k-instant-prompt-${(%):-%n}.zsh"
+    source "${XDG_CACHE_HOME:-$HOME/.cache}/p10k-instant-prompt-${(%):-%n}.zsh"
 fi
 
 # ============================================================
@@ -231,18 +231,18 @@ export ZSH_DISABLE_COMPFIX="true"
 # 2. compinit 缓存
 # ============================================================
 function compinit() {
-  unfunction compinit
-  autoload -Uz compinit
+    unfunction compinit
+    autoload -Uz compinit
 
-  local dump="${ZDOTDIR:-$HOME}/.zcompdump"
-  local -a expired_dump
-  expired_dump=($dump(Nmh+24))
+    local dump="${ZDOTDIR:-$HOME}/.zcompdump"
+    local -a expired_dump
+    expired_dump=($dump(Nmh+24))
 
-  if [[ ! -f "$dump" ]] || (( ${#expired_dump} )); then
-    compinit "$@"
-  else
-    compinit -C "$@"
-  fi
+    if [[ ! -f "$dump" ]] || (( ${#expired_dump} )); then
+        compinit "$@"
+    else
+        compinit -C "$@"
+    fi
 }
 
 # ============================================================
@@ -254,19 +254,20 @@ zstyle ':omz:update' frequency 7
 
 # ============================================================
 # 4. 插件
+# docker 插件已提供 drs、dps、dpsa、dxc 等常用别名。
 # zsh-syntax-highlighting 必须处于最后。
 # ============================================================
 plugins=(
-  git
-  sudo
-  docker
-  kubectl
-  web-search
-  history
-  colored-man-pages
-  zsh-completions
-  zsh-autosuggestions
-  zsh-syntax-highlighting
+    git
+    sudo
+    docker
+    kubectl
+    web-search
+    history
+    colored-man-pages
+    zsh-completions
+    zsh-autosuggestions
+    zsh-syntax-highlighting
 )
 
 source "$ZSH/oh-my-zsh.sh"
@@ -276,15 +277,15 @@ source "$ZSH/oh-my-zsh.sh"
 # 首次执行 kubectl 时才加载补全，减少 Zsh 启动开销。
 # ============================================================
 function kubectl() {
-  unfunction kubectl
+    unfunction kubectl
 
-  if ! command -v kubectl >/dev/null 2>&1; then
-    print -u2 "kubectl 未安装"
-    return 127
-  fi
+    if ! command -v kubectl >/dev/null 2>&1; then
+        print -u2 "kubectl 未安装"
+        return 127
+    fi
 
-  source <(command kubectl completion zsh)
-  command kubectl "$@"
+    source <(command kubectl completion zsh)
+    command kubectl "$@"
 }
 
 # ============================================================
@@ -292,26 +293,24 @@ function kubectl() {
 # 系统路径优先，并使用 Zsh 的唯一数组属性自动去除重复目录。
 # ============================================================
 typeset -U path PATH
-
 path=(
-  /usr/local/sbin
-  /usr/local/bin
-  /usr/sbin
-  /usr/bin
-  /sbin
-  /bin
-  "$HOME/.local/bin"
-  $path
+    /usr/local/sbin
+    /usr/local/bin
+    /usr/sbin
+    /usr/bin
+    /sbin
+    /bin
+    "$HOME/.local/bin"
+    $path
 )
-
 export PATH
 
 # ============================================================
 # 7. Mise Shell 集成
 # activation 文件由 mise-setup.sh 维护。
 # ============================================================
-# Mise shell 集成：配置文件由 mise-setup.sh 维护。
-[[ -r "$HOME/.config/mise/activate.zsh" ]] && source "$HOME/.config/mise/activate.zsh"
+[[ -r "$HOME/.config/mise/activate.zsh" ]] &&
+    source "$HOME/.config/mise/activate.zsh"
 
 # ============================================================
 # 8. Powerlevel10k 配置
@@ -319,22 +318,50 @@ export PATH
 [[ -r "$HOME/.p10k.zsh" ]] && source "$HOME/.p10k.zsh"
 
 # ============================================================
-# 9. 常用别名
+# 9. APT 别名
 # ============================================================
-alias upgrade='apt update && apt full-upgrade -y'
-alias update='apt update'
-alias reproxy='cd /root/proxy && docker compose down && docker compose pull && docker compose up -d --remove-orphans'
-alias dlog='docker logs -f'
+alias aptu='apt update'
+alias aptuf='apt update && apt full-upgrade -y'
 alias autodel='docker system prune -a -f && apt autoremove -y && apt clean'
-alias sstop='systemctl stop'
-alias sre='systemctl restart'
-alias sst='systemctl status'
-alias sdre='systemctl daemon-reload'
+
+# ============================================================
+# 10. Docker 别名
+# ============================================================
+
+# 普通容器日志。
+alias dlog='docker logs -f'
+
+# Compose 项目操作。
+alias dcd='docker compose down'
+alias dcr='docker compose restart'
+alias dcre='docker compose down && docker compose pull && docker compose up -d --remove-orphans'
+
+# docker 插件已经提供普通容器重启命令：
+# drs <容器名>  -> docker container restart <容器名>
+
+# ============================================================
+# 11. Proxy Compose 项目
+# 在子 Shell 中切换目录，执行后不会改变当前工作目录。
+# ============================================================
+dcreproxy() {
+    (
+        cd /root/proxy || return 1
+
+        docker compose down &&
+            docker compose pull &&
+            docker compose up -d --remove-orphans
+    )
+}
+
+# ============================================================
+# 12. systemd 与日志
+# ============================================================
+alias sc='systemctl'
+alias jc='journalctl'
 EOF
 
     sed -i 's/\r$//' "$ZSHRC_FILE"
     chmod 644 "$ZSHRC_FILE"
-
     debug_log ".zshrc 已更新"
 }
 
