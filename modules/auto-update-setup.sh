@@ -254,7 +254,7 @@ get_installed_kernel_candidates() {
     fi
 
     dpkg-query -W -f='\${binary:Package} \${db:Status-Status}\n' 'linux-image-*' 2>/dev/null |
-        awk '$2 == "installed" {sub(/^linux-image-/, "", $1); print $1}' |
+        awk '\$2 == "installed" {sub(/^linux-image-/, "", \$1); print \$1}' |
         while IFS= read -r kernel; do
             [[ -f "/boot/vmlinuz-\$kernel" ]] || continue
             [[ -f "/boot/initrd.img-\$kernel" ]] || continue
@@ -356,12 +356,12 @@ EOF
 
     chmod 700 "$UPDATE_SCRIPT"
 
-    if [[ ! -x "$UPDATE_SCRIPT" ]]; then
-        log "更新脚本创建失败" "error"
+    if [[ ! -x "$UPDATE_SCRIPT" ]] || ! bash -n "$UPDATE_SCRIPT"; then
+        log "更新脚本创建或语法验证失败" "error"
         return 1
     fi
 
-    echo "更新脚本: 已创建（$UPDATE_SCRIPT）"
+    echo "更新脚本: 已创建并通过语法检查（$UPDATE_SCRIPT）"
 }
 
 # === 摘要 ===
