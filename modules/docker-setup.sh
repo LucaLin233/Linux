@@ -172,6 +172,11 @@ install_docker() {
         return 1
     fi
 
+    if ! command -v dockerd >/dev/null 2>&1; then
+        error "Docker 安装后未找到 dockerd"
+        return 1
+    fi
+
     printf 'Docker 安装: 成功（%s）\n' "$(get_docker_version)"
 }
 
@@ -426,7 +431,7 @@ main() {
     require_root
 
     local command_name
-    for command_name in apt-get curl dpkg install jq mktemp systemctl dockerd; do
+    for command_name in apt-get curl dpkg install jq mktemp systemctl; do
         if ! command -v "$command_name" >/dev/null 2>&1; then
             error "缺少必要命令: $command_name"
             exit 1

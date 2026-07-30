@@ -243,7 +243,23 @@ SCRIPT
 }
 
 # === 中文 Locale ===
+get_locale_config_file() {
+    local version_id=""
+
+    if [[ -r /etc/os-release ]]; then
+        . /etc/os-release
+        version_id="${VERSION_ID%%.*}"
+    fi
+
+    if [[ "$version_id" =~ ^[0-9]+$ ]] && (( version_id >= 13 )); then
+        echo "/etc/locale.conf"
+    else
+        echo "/etc/default/locale"
+    fi
+}
+
 configure_chinese_locale() {
+    local locale_config
     if ! ask_yes_no "是否设置系统中文环境（zh_CN.UTF-8）？[Y/n]: " "Y"; then
         echo "中文环境: 已跳过"
         return 0
@@ -268,18 +284,23 @@ configure_chinese_locale() {
 
     locale-gen
 
-    # 移除旧设置中的 LC_ALL，避免强制覆盖所有 Locale 分类。
-    sed -i '/^LC_ALL=/d' /etc/default/locale
+    locale_config=$(get_locale_config_file)
+
+    # LC_ALL 不应写入系统 Locale 配置，否则会覆盖所有分类设置。
+    if [[ -f "$locale_config" ]]; then
+        sed -i '/^LC_ALL=/d' "$locale_config"
+    fi
 
     update-locale \
+        --locale-file "$locale_config" \
         LANG=zh_CN.UTF-8 \
         LANGUAGE=zh_CN:zh
 
     success "中文环境已配置"
     echo "说明: 当前 SSH 会话需重新登录后完全生效。"
     echo "当前会话可执行: unset LC_ALL && exec zsh"
-    echo "系统 Locale 配置:"
-    cat /etc/default/locale
+    echo "系统 Locale 配置（$locale_config）:"
+    cat "$locale_config"
 }
 
 # === XanMod 内核 ===
@@ -333,6 +354,7 @@ get_running_xanmod_package() {
 detect_x86_64_psabi_level() {
     local checker
     local result
+    local checker_status
 
     if ! checker=$(mktemp); then
         return 1
@@ -352,9 +374,11 @@ detect_x86_64_psabi_level() {
         return 1
     fi
 
-    if ! result=$(awk -f "$checker" 2>/dev/null); then
-        rm -f "$checker"
-        return 1
+    # 官方检测器输出结果后会以 psABI 等级加 1 作为退出码。
+    if result=$(awk -f "$checker" 2>/dev/null); then
+        checker_status=0
+    else
+        checker_status=$?
     fi
 
     rm -f "$checker"
@@ -366,8 +390,12 @@ detect_x86_64_psabi_level() {
         *"x86-64-v2"*)
             echo "v2"
             ;;
+        *"x86-64-v1"*)
+            return 2
+            ;;
         *)
-            return 1
+            [[ "$checker_status" -eq 0 ]] && return 2
+            return 3
             ;;
     esac
 }
@@ -398,9 +426,10 @@ detect_xanmod_package() {
     fi
 
     # 首次安装时，使用 XanMod 官方 psABI 检测脚本。
-    if ! psabi_level=$(detect_x86_64_psabi_level); then
-        warn "无法确认 CPU 的 x86-64 psABI 等级，跳过 XanMod 安装"
-        return 1
+    if psabi_level=$(detect_x86_64_psabi_level); then
+        :
+    else
+        return $?
     fi
 
     case "$psabi_level" in
@@ -558,8 +587,20 @@ install_xanmod() {
         return 0
     fi
 
-    if ! target_package=$(detect_xanmod_package); then
-        warn "当前 CPU 不支持 XanMod MAIN 所需的 x86-64-v2 指令集"
+    if target_package=$(detect_xanmod_package); then
+        :
+    else
+        case $? in
+            2)
+                warn "当前 CPU 不支持 XanMod MAIN 所需的 x86-64-v2 指令集"
+                ;;
+            3)
+                warn "无法下载或执行 XanMod CPU 兼容性检测器"
+                ;;
+            *)
+                warn "无法确认适用的 XanMod 内核包"
+                ;;
+        esac
         warn "为避免安装不兼容内核，已保留 Debian 原内核"
         return 0
     fi
