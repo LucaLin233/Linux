@@ -15,13 +15,10 @@ set -euo pipefail
 readonly MOTD_SCRIPT="/etc/update-motd.d/00-custom-welcome"
 
 readonly XANMOD_KEYRING="/etc/apt/keyrings/xanmod-archive-keyring.gpg"
-readonly XANMOD_SOURCE="/etc/apt/sources.list.d/xanmod-release.list"
-readonly XANMOD_LEGACY_SOURCE="/etc/apt/sources.list.d/xanmod-release.sources"
-readonly XANMOD_LEGACY_SOURCE_BACKUP="/root/xanmod-release.sources.legacy"
-readonly XANMOD_OLD_BAD_BACKUP="/etc/apt/sources.list.d/xanmod-release.sources.backup"
+readonly XANMOD_SOURCE_LIST="/etc/apt/sources.list.d/xanmod-release.list"
+readonly XANMOD_SOURCE_DEB822="/etc/apt/sources.list.d/xanmod-release.sources"
 readonly XANMOD_KEY_URL="https://dl.xanmod.org/archive.key"
 readonly XANMOD_REPO_URL="http://deb.xanmod.org"
-readonly XANMOD_PSABI_CHECK_URL="https://dl.xanmod.org/check_x86-64_psabi.sh"
 
 # === 日志函数 ===
 log() {
@@ -364,57 +361,56 @@ get_running_xanmod_package() {
 }
 
 detect_x86_64_psabi_level() {
-    local checker
-    local result
-    local checker_status
+    local cpuinfo_file="${1:-/proc/cpuinfo}"
 
-    if ! checker=$(mktemp); then
-        return 3
-    fi
+    [[ -r "$cpuinfo_file" ]] || return 3
 
-    if ! curl -fsSL \
-        --connect-timeout 10 \
-        --max-time 30 \
-        "$XANMOD_PSABI_CHECK_URL" \
-        -o "$checker"; then
-        rm -f "$checker"
-        return 3
-    fi
+    awk '
+        function has(name) {
+            return index(flags, " " name " ") > 0
+        }
 
-    if [[ ! -s "$checker" ]]; then
-        rm -f "$checker"
-        return 3
-    fi
+        BEGIN { found = 0 }
 
-    # 官方检测器输出结果后会以 psABI 等级加 1 作为退出码。
-    if result=$(awk -f "$checker" 2>/dev/null); then
-        checker_status=0
-    else
-        checker_status=$?
-    fi
+        /^flags[[:space:]]*:/ {
+            found = 1
+            flags = " " $0 " "
+            level = 0
 
-    rm -f "$checker"
+            if (has("lm") && has("cmov") && has("cx8") && has("fpu") &&
+                has("fxsr") && has("mmx") && has("syscall") && has("sse2")) {
+                level = 1
+            }
 
-    case "$result" in
-        *"x86-64-v4"*)
-            echo "v4"
-            ;;
-        *"x86-64-v3"*)
-            echo "v3"
-            ;;
-        *"x86-64-v2"*)
-            echo "v2"
-            ;;
-        *"x86-64-v1"*)
-            return 2
-            ;;
-        *)
-            [[ "$checker_status" -eq 0 ]] && return 2
-            return 3
-            ;;
-    esac
+            if (level == 1 && has("cx16") && has("lahf_lm") &&
+                has("popcnt") && has("sse4_1") && has("sse4_2") &&
+                has("ssse3")) {
+                level = 2
+            }
+
+            if (level == 2 && has("avx") && has("avx2") && has("bmi1") &&
+                has("bmi2") && has("f16c") && has("fma") &&
+                (has("abm") || has("lzcnt")) && has("movbe") && has("xsave")) {
+                level = 3
+            }
+
+            if (level == 3 && has("avx512f") && has("avx512bw") &&
+                has("avx512cd") && has("avx512dq") && has("avx512vl")) {
+                level = 4
+            }
+
+            if (level > 0) {
+                print "v" level
+                exit 0
+            }
+            exit 2
+        }
+
+        END {
+            if (!found) exit 3
+        }
+    ' "$cpuinfo_file"
 }
-
 get_xanmod_package_for_psabi_level() {
     local psabi_level="$1"
 
@@ -446,116 +442,83 @@ detect_xanmod_package() {
     fi
 }
 
-xanmod_source_configured() {
+xanmod_list_source_configured() {
     [[ -s "$XANMOD_KEYRING" ]] &&
-        [[ -f "$XANMOD_SOURCE" ]] &&
-        grep -Fq "deb.xanmod.org" "$XANMOD_SOURCE" &&
-        grep -Fq "signed-by=$XANMOD_KEYRING" "$XANMOD_SOURCE"
+        [[ -f "$XANMOD_SOURCE_LIST" ]] &&
+        grep -Fq "deb.xanmod.org" "$XANMOD_SOURCE_LIST" &&
+        grep -Fiq "signed-by=$XANMOD_KEYRING" "$XANMOD_SOURCE_LIST"
 }
 
-archive_old_bad_xanmod_backup() {
-    if [[ ! -f "$XANMOD_OLD_BAD_BACKUP" ]]; then
-        return 0
-    fi
-
-    if [[ -e "$XANMOD_LEGACY_SOURCE_BACKUP" ]]; then
-        warn "检测到旧 XanMod APT 备份，但目标归档已存在: $XANMOD_LEGACY_SOURCE_BACKUP"
-        warn "请手动处理: $XANMOD_OLD_BAD_BACKUP"
-        return 0
-    fi
-
-    if mv "$XANMOD_OLD_BAD_BACKUP" "$XANMOD_LEGACY_SOURCE_BACKUP"; then
-        info "已移出 APT 目录的旧 XanMod 备份: $XANMOD_LEGACY_SOURCE_BACKUP"
-        return 0
-    fi
-
-    error "无法迁移旧 XanMod APT 备份: $XANMOD_OLD_BAD_BACKUP"
-    return 1
+xanmod_deb822_source_configured() {
+    [[ -s "$XANMOD_KEYRING" ]] &&
+        [[ -f "$XANMOD_SOURCE_DEB822" ]] &&
+        grep -Eiq '^[[:space:]]*URIs:[[:space:]]*https?://deb\.xanmod\.org/?[[:space:]]*$' "$XANMOD_SOURCE_DEB822" &&
+        grep -Fiq "Signed-By: $XANMOD_KEYRING" "$XANMOD_SOURCE_DEB822"
 }
 
-migrate_legacy_xanmod_source() {
-    if [[ ! -f "$XANMOD_LEGACY_SOURCE" ]]; then
-        return 0
+get_xanmod_source_file() {
+    if xanmod_deb822_source_configured; then
+        echo "$XANMOD_SOURCE_DEB822"
+    elif xanmod_list_source_configured; then
+        echo "$XANMOD_SOURCE_LIST"
+    else
+        return 1
     fi
+}
 
-    if [[ -e "$XANMOD_LEGACY_SOURCE_BACKUP" ]]; then
-        warn "检测到旧 XanMod source 文件，但历史归档已存在: $XANMOD_LEGACY_SOURCE_BACKUP"
-        warn "请手动处理: $XANMOD_LEGACY_SOURCE"
-        return 0
-    fi
-
-    if mv "$XANMOD_LEGACY_SOURCE" "$XANMOD_LEGACY_SOURCE_BACKUP"; then
-        info "已归档旧 XanMod source 文件: $XANMOD_LEGACY_SOURCE_BACKUP"
-        return 0
-    fi
-
-    error "无法归档旧 XanMod source 文件"
-    return 1
+xanmod_source_configured() {
+    get_xanmod_source_file >/dev/null
 }
 
 configure_xanmod_repository() {
     local codename
     local key_temp
+    local source_file
 
-    archive_old_bad_xanmod_backup || return 1
-
-    if xanmod_source_configured; then
-        echo "XanMod 软件源: 已配置"
+    if source_file=$(get_xanmod_source_file); then
+        echo "XanMod 软件源: 已配置（$source_file）"
         return 0
     fi
 
     ensure_package "gpg" "gpg" || return 1
-
     codename=$(get_debian_codename) || {
         error "无法识别 Debian 发行版代号"
         return 1
     }
 
-    migrate_legacy_xanmod_source || return 1
-
     install -d -m 0755 /etc/apt/keyrings
 
-    if ! key_temp=$(mktemp); then
-        error "无法创建 XanMod 密钥临时文件"
-        return 1
-    fi
+    if [[ ! -s "$XANMOD_KEYRING" ]]; then
+        key_temp=$(mktemp) || return 1
+        info "下载 XanMod 软件源签名密钥..."
 
-    info "下载 XanMod 软件源签名密钥..."
+        if ! curl -fsSL --connect-timeout 10 --max-time 30 \
+            "$XANMOD_KEY_URL" -o "$key_temp"; then
+            rm -f "$key_temp"
+            error "XanMod 签名密钥下载失败"
+            return 1
+        fi
 
-    if ! curl -fsSL \
-        --connect-timeout 10 \
-        --max-time 30 \
-        "$XANMOD_KEY_URL" \
-        -o "$key_temp"; then
+        if ! gpg --dearmor --yes --output "$XANMOD_KEYRING" "$key_temp"; then
+            rm -f "$key_temp"
+            error "XanMod 签名密钥转换失败"
+            return 1
+        fi
+
         rm -f "$key_temp"
-        error "XanMod 签名密钥下载失败"
-        return 1
+        chmod 644 "$XANMOD_KEYRING"
     fi
 
-    if [[ ! -s "$key_temp" ]]; then
-        rm -f "$key_temp"
-        error "XanMod 签名密钥为空"
-        return 1
-    fi
-
-    if ! gpg --dearmor --yes \
-        --output "$XANMOD_KEYRING" \
-        "$key_temp"; then
-        rm -f "$key_temp"
-        error "XanMod 签名密钥转换失败"
-        return 1
-    fi
-
-    rm -f "$key_temp"
-    chmod 644 "$XANMOD_KEYRING"
-
-    cat > "$XANMOD_SOURCE" <<EOF
-deb [signed-by=$XANMOD_KEYRING] $XANMOD_REPO_URL $codename main
+    cat > "$XANMOD_SOURCE_DEB822" <<EOF
+Types: deb
+URIs: $XANMOD_REPO_URL
+Suites: $codename
+Components: main
+Signed-By: $XANMOD_KEYRING
 EOF
 
-    echo "XanMod 软件源: 已配置（$codename）"
+    echo "XanMod 软件源: 已配置（Deb822 / $codename）"
 }
-
 get_installed_xanmod_packages() {
     dpkg-query -W \
         -f='${binary:Package} ${db:Status-Status}\n' \
@@ -596,17 +559,25 @@ install_xanmod() {
     else
         case $? in
             2)
-                warn "当前 CPU 不支持 XanMod MAIN 所需的 x86-64-v2 指令集"
+                warn "当前 CPU 仅达到 x86-64-v1，不支持 XanMod MAIN 所需的 x86-64-v2"
                 ;;
             3)
-                warn "无法下载或执行 XanMod CPU 兼容性检测器"
+                target_package=$(get_running_xanmod_package || true)
+                if [[ -n "$target_package" ]]; then
+                    warn "无法读取本机 CPU 指令集，沿用当前已运行的 XanMod 分支: $target_package"
+                else
+                    warn "无法读取本机 CPU 指令集，跳过 XanMod 安装"
+                fi
                 ;;
             *)
                 warn "无法确认适用的 XanMod 内核包"
                 ;;
         esac
-        warn "为避免安装不兼容内核，已保留 Debian 原内核"
-        return 0
+
+        if [[ -z "${target_package:-}" ]]; then
+            warn "为避免安装不兼容内核，已保留 Debian 原内核"
+            return 0
+        fi
     fi
 
     echo "检测到适合当前环境的 XanMod 包: $target_package"
@@ -667,7 +638,10 @@ install_xanmod() {
 }
 
 show_xanmod_status() {
-    local package
+    local psabi_level=""
+    local recommended_package=""
+    local running_package=""
+    local source_file=""
     local installed_packages
 
     echo
@@ -675,33 +649,48 @@ show_xanmod_status() {
     echo "  当前架构: $(dpkg --print-architecture) / $(uname -m)"
     echo "  当前内核: $(uname -r)"
 
-    if is_xanmod_kernel_running; then
-        echo "  当前内核类型: XanMod（已生效）"
+    if psabi_level=$(detect_x86_64_psabi_level); then
+        echo "  CPU psABI: x86-64-$psabi_level"
+        recommended_package=$(get_xanmod_package_for_psabi_level "$psabi_level" || true)
     else
-        echo "  当前内核类型: 非 XanMod"
+        case $? in
+            2) echo "  CPU psABI: x86-64-v1（MAIN 不支持）" ;;
+            *) echo "  CPU psABI: 无法确认" ;;
+        esac
     fi
 
-    if package=$(detect_xanmod_package); then
-        echo "  推荐/当前包: $package"
+    running_package=$(get_running_xanmod_package || true)
+    if [[ -n "$running_package" ]]; then
+        echo "  当前运行包: $running_package"
     else
-        echo "  推荐/当前包: 无（不支持 v2/v3 或非 amd64）"
+        echo "  当前运行包: 无（当前为非 XanMod 内核）"
     fi
 
-    if xanmod_source_configured; then
-        echo "  软件源状态: 已配置"
+    if [[ -n "$recommended_package" ]]; then
+        echo "  推荐包: $recommended_package"
+    elif [[ -n "$running_package" ]]; then
+        echo "  推荐包: 无法检测；当前运行包可作为兼容性证据"
     else
-        echo "  软件源状态: 未配置"
+        echo "  推荐包: 无"
+    fi
+
+    if source_file=$(get_xanmod_source_file); then
+        case "$source_file" in
+            *.sources) echo "  软件源: 已配置（Deb822）" ;;
+            *) echo "  软件源: 已配置（传统 list）" ;;
+        esac
+        echo "  软件源文件: $source_file"
+    else
+        echo "  软件源: 未配置或配置未通过校验"
     fi
 
     installed_packages=$(get_installed_xanmod_packages || true)
-
     if [[ -n "$installed_packages" ]]; then
-        echo "  已安装 XanMod 包: $(tr '\n' ' ' <<< "$installed_packages")"
+        echo "  已安装包: $(tr '\n' ' ' <<< "$installed_packages")"
     else
-        echo "  已安装 XanMod 包: 无"
+        echo "  已安装包: 无"
     fi
 }
-
 # === 主流程 ===
 show_help() {
     cat <<'EOF'
