@@ -1,27 +1,70 @@
-#!/bin/bash
-# Debian MOTD 一键定制脚本 — 彩色版 (v4: 负载颜色分级)
-set -e
+#!/usr/bin/env bash
+# Debian 动态 MOTD 配置脚本
+# 内容与 modules/system-customize.sh 的 MOTD 功能保持一致。
 
-echo ">>> 清空静态文件..."
-echo "" | sudo tee /etc/motd /etc/issue /etc/issue.net > /dev/null
+set -euo pipefail
 
-echo ">>> 禁用原生脚本..."
-for f in /etc/update-motd.d/10-uname /etc/update-motd.d/50-motd-news; do
-    [ -x "$f" ] && sudo chmod -x "$f" && echo "    已禁用 $(basename "$f")"
-done
+readonly MOTD_SCRIPT="/etc/update-motd.d/00-custom-welcome"
 
-echo ">>> 部署欢迎脚本..."
-sudo tee /etc/update-motd.d/00-custom-welcome > /dev/null << 'SCRIPT'
-#!/bin/bash
-# 欢迎横幅 + 系统面板（彩色版 + 负载颜色分级）
+log() {
+    local msg="$1"
+    local level="${2:-info}"
+    local -A colors=(
+        [info]="\033[0;36m"
+        [error]="\033[0;31m"
+        [success]="\033[0;32m"
+    )
+    echo -e "${colors[$level]:-\033[0;32m}${msg}\033[0m"
+}
 
-hn=$(hostname)
+info() { log "$1" "info"; }
+error() { log "$1" "error"; }
+success() { log "$1" "success"; }
+
+require_root() {
+    if (( EUID != 0 )); then
+        error "需要 root 权限运行"
+        exit 1
+    fi
+}
+
+backup_initial_file() {
+    local file="$1"
+    [[ -e "$file" ]] || return 0
+    [[ -e "${file}.initial-backup" ]] || cp -a "$file" "${file}.initial-backup"
+}
+
+configure_motd() {
+    info "配置动态欢迎信息..."
+
+    backup_initial_file /etc/motd || return 1
+    backup_initial_file /etc/issue || return 1
+    backup_initial_file /etc/issue.net || return 1
+    : > /etc/motd
+    : > /etc/issue
+    : > /etc/issue.net
+
+    local file
+    for file in /etc/update-motd.d/10-uname /etc/update-motd.d/50-motd-news; do
+        if [[ -x "$file" ]]; then
+            chmod -x "$file"
+            info "已禁用原生 MOTD 脚本: $(basename "$file")"
+        fi
+    done
+
+    cat > "$MOTD_SCRIPT" <<'SCRIPT'
+#!/usr/bin/env bash
+# 由 setup-motd.sh 自动生成。
+# 欢迎横幅与系统状态面板。
+
+hostname_value=$(hostname)
 kernel=$(uname -r)
 
-uptime_str=$(uptime -p 2>/dev/null | sed 's/^up //')
-[ -z "$uptime_str" ] && uptime_str=$(uptime | sed -E 's/.*up\s+//; s/,\s+[0-9]+ user.*//')
+uptime_value=$(uptime -p 2>/dev/null | sed 's/^up //')
+if [[ -z "$uptime_value" ]]; then
+    uptime_value=$(uptime | sed -E 's/.*up[[:space:]]+//; s/,[[:space:]]+[0-9]+ user.*//')
+fi
 
-# ---- ANSI ----
 ESC=$'\033'
 RESET="${ESC}[0m"
 BLUE_BG="${ESC}[44;37m"
@@ -32,76 +75,116 @@ GREEN="${ESC}[32m"
 ORANGE="${ESC}[33m"
 RED="${ESC}[31m"
 
-# ---- 颜色选择函数 ----
-# 用 bash 整数比较，避免 awk -v 传 ANSI 码时的转义问题
-# $1: 浮点百分比  $2: 类型 cpu|mem|disk
 pick_color() {
-    local lo hi pct_int
-    case "${2:-}" in
-        disk) lo=70; hi=90 ;;
-        *)    lo=50; hi=80 ;;
+    local percent="$1"
+    local type="$2"
+    local low
+    local high
+    local percent_int
+
+    case "$type" in
+        disk)
+            low=70
+            high=90
+            ;;
+        *)
+            low=50
+            high=80
+            ;;
     esac
-    pct_int=$(awk -v p="$1" 'BEGIN { printf "%d", int(p + 0.5) }')
-    if   [ "$pct_int" -ge "$hi" ]; then printf '%s' "$RED"
-    elif [ "$pct_int" -ge "$lo" ]; then printf '%s' "$ORANGE"
-    else printf '%s' "$GREEN"
+
+    percent_int=$(awk -v value="$percent" 'BEGIN {printf "%d", int(value + 0.5)}')
+
+    if (( percent_int >= high )); then
+        printf '%s' "$RED"
+    elif (( percent_int >= low )); then
+        printf '%s' "$ORANGE"
+    else
+        printf '%s' "$GREEN"
     fi
 }
 
-# ---- CPU: /proc/stat 两次采样 ----
-read -r _ u1 n1 s1 i1 _ <<< "$(grep '^cpu ' /proc/stat)"
-t1=$((u1 + n1 + s1 + i1)); d1=$((u1 + n1 + s1))
+read -r _ user1 nice1 system1 idle1 _ < <(grep '^cpu ' /proc/stat)
+total1=$((user1 + nice1 + system1 + idle1))
+busy1=$((user1 + nice1 + system1))
+
 sleep 0.5
-read -r _ u2 n2 s2 i2 _ <<< "$(grep '^cpu ' /proc/stat)"
-t2=$((u2 + n2 + s2 + i2)); d2=$((u2 + n2 + s2))
-td=$((t2 - t1)); dd=$((d2 - d1))
-if [ "$td" -gt 0 ]; then
-    cpu_pct=$(awk -v u="$dd" -v t="$td" 'BEGIN { printf "%.1f", u/t*100 }')
-    cpu_color=$(pick_color "$cpu_pct" cpu)
+
+read -r _ user2 nice2 system2 idle2 _ < <(grep '^cpu ' /proc/stat)
+total2=$((user2 + nice2 + system2 + idle2))
+busy2=$((user2 + nice2 + system2))
+
+total_delta=$((total2 - total1))
+busy_delta=$((busy2 - busy1))
+
+if (( total_delta > 0 )); then
+    cpu_percent=$(awk -v busy="$busy_delta" -v total="$total_delta" \
+        'BEGIN {printf "%.1f", busy / total * 100}')
+    cpu_color=$(pick_color "$cpu_percent" "cpu")
 else
-    cpu_pct="N/A"; cpu_color="$VALUE"
+    cpu_percent="N/A"
+    cpu_color="$VALUE"
 fi
 
-load=$(awk '{printf "%.2f %.2f %.2f", $1, $2, $3}' /proc/loadavg)
+load_average=$(awk '{printf "%.2f %.2f %.2f", $1, $2, $3}' /proc/loadavg)
 
-# ---- 内存: /proc/meminfo，用 | 分隔避免空格歧义 ----
-mem_raw=$(awk '
-    /^MemTotal:/     { t=$2 }
-    /^MemAvailable:/ { a=$2 }
-    END { u=t-a; p=(t>0)?u/t*100:0
-          printf "%.1f|%.1f|%.1f", u/1048576, t/1048576, p }
+memory_raw=$(awk '
+    /^MemTotal:/     { total=$2 }
+    /^MemAvailable:/ { available=$2 }
+    END {
+        used=total-available
+        percent=(total > 0) ? used/total*100 : 0
+        printf "%.1f|%.1f|%.1f", used/1048576, total/1048576, percent
+    }
 ' /proc/meminfo)
-mem_used="${mem_raw%%|*}G"
-mem_rest="${mem_raw#*|}"; mem_total="${mem_rest%%|*}G"; mem_pct="${mem_raw##*|}"
-mem_color=$(pick_color "$mem_pct" mem)
 
-# ---- 磁盘 ----
-disk_pct=$(df / | awk 'NR==2 { gsub(/%/,""); print $5 }')
-disk_sizes=$(df -h / | awk 'NR==2 { printf "%s / %s", $3, $2 }')
-disk_color=$(pick_color "$disk_pct" disk)
+memory_used="${memory_raw%%|*}G"
+memory_rest="${memory_raw#*|}"
+memory_total="${memory_rest%%|*}G"
+memory_percent="${memory_raw##*|}"
+memory_color=$(pick_color "$memory_percent" "memory")
 
-# ---- 输出 ----
-# 关键: ) 前加 ${VALUE} 显式回到白色，防止继承颜色状态导致括号变色
-printf "\n${BLUE_BG} 已连接 %s 服务器 ${RESET}\n" "$hn"
-printf "${ITALIC_DIM} 今天想要做些什么？${RESET}\n"
-echo ""
-printf "  ${LABEL}内核${RESET}      ${VALUE}%s${RESET}\n"                                                     "$kernel"
-printf "  ${LABEL}运行时间${RESET}  ${VALUE}%s${RESET}\n"                                                     "$uptime_str"
-printf "  ${LABEL}CPU负载${RESET}   ${VALUE}%s  (${cpu_color}%s%%${VALUE})${RESET}\n"                        "$load"     "$cpu_pct"
-printf "  ${LABEL}内存${RESET}      ${VALUE}%s / %s  (${mem_color}%s%%${VALUE})${RESET}\n"                   "$mem_used" "$mem_total" "$mem_pct"
-printf "  ${LABEL}磁盘${RESET}      ${VALUE}%s  (${disk_color}%s%%${VALUE})${RESET}\n"                       "$disk_sizes" "$disk_pct"
+disk_percent=$(df / | awk 'NR == 2 {gsub(/%/, "", $5); print $5}')
+disk_usage=$(df -h / | awk 'NR == 2 {printf "%s / %s", $3, $2}')
+disk_color=$(pick_color "$disk_percent" "disk")
+
+printf "\n${BLUE_BG} 已连接 %s 服务器 ${RESET}\n" "$hostname_value"
+printf "${ITALIC_DIM} 今天想要做些什么？${RESET}\n\n"
+
+printf "  ${LABEL}内核${RESET}      ${VALUE}%s${RESET}\n" "$kernel"
+printf "  ${LABEL}运行时间${RESET}  ${VALUE}%s${RESET}\n" "$uptime_value"
+printf "  ${LABEL}CPU负载${RESET}   ${VALUE}%s  (${cpu_color}%s%%${VALUE})${RESET}\n" \
+    "$load_average" "$cpu_percent"
+printf "  ${LABEL}内存${RESET}      ${VALUE}%s / %s  (${memory_color}%s%%${VALUE})${RESET}\n" \
+    "$memory_used" "$memory_total" "$memory_percent"
+printf "  ${LABEL}磁盘${RESET}      ${VALUE}%s  (${disk_color}%s%%${VALUE})${RESET}\n" \
+    "$disk_usage" "$disk_percent"
 SCRIPT
 
-sudo chmod +x /etc/update-motd.d/00-custom-welcome
-echo "    部署完成"
+    chmod 755 "$MOTD_SCRIPT"
 
-echo ">>> 重启 sshd..."
-sudo systemctl restart sshd
+    echo "欢迎信息: 已配置"
+    echo
+    echo "预览："
+    echo "----------------------------------------"
+    "$MOTD_SCRIPT"
+    echo "----------------------------------------"
+}
 
-echo ""
-echo ">>> 预览："
-echo "----------------------------------------"
-run-parts /etc/update-motd.d/
-echo "----------------------------------------"
-echo ""
-echo "✅ 完成。"
+main() {
+    require_root
+
+    local required_command
+    for required_command in awk basename cat chmod cp df grep hostname sed sleep uname uptime; do
+        if ! command -v "$required_command" >/dev/null 2>&1; then
+            error "缺少必要命令: $required_command"
+            exit 1
+        fi
+    done
+
+    configure_motd
+}
+
+trap 'error "MOTD 配置脚本在第 $LINENO 行执行失败"' ERR
+
+main "$@"
