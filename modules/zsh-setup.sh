@@ -48,9 +48,20 @@ backup_zshrc() {
 install_oh_my_zsh() {
     local installer
 
-    if [[ -d "$ZSH_DIR" ]]; then
-        debug_log "Oh My Zsh 已安装，跳过"
+    if [[ -d "$ZSH_DIR/.git" ]]; then
+        if git -C "$ZSH_DIR" pull --ff-only >/dev/null 2>&1; then
+            echo "Oh My Zsh: 已更新（commit: $(git -C "$ZSH_DIR" rev-parse --short HEAD)）"
+            return 0
+        fi
+
+        log "Oh My Zsh 更新失败，保留当前可用版本" "warn"
+        echo "Oh My Zsh: 保留版本（commit: $(git -C "$ZSH_DIR" rev-parse --short HEAD 2>/dev/null || echo 未知)）"
         return 0
+    fi
+
+    if [[ -e "$ZSH_DIR" ]]; then
+        log "Oh My Zsh 目录存在但不是 Git 仓库，拒绝覆盖" "warn"
+        return 1
     fi
 
     if ! installer=$(mktemp); then

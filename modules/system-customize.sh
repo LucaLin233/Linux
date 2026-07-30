@@ -117,6 +117,9 @@ configure_motd() {
 
     info "配置动态欢迎信息..."
 
+    backup_initial_file /etc/motd || return 1
+    backup_initial_file /etc/issue || return 1
+    backup_initial_file /etc/issue.net || return 1
     : > /etc/motd
     : > /etc/issue
     : > /etc/issue.net
@@ -277,6 +280,9 @@ configure_chinese_locale() {
         error "未找到 update-locale，locales 安装可能不完整"
         return 1
     fi
+    backup_initial_file /etc/locale.gen || return 1
+    backup_initial_file /etc/locale.conf || return 1
+    backup_initial_file /etc/default/locale || return 1
 
     info "配置中文 Locale..."
 
