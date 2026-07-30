@@ -912,11 +912,14 @@ show_recommendations() {
         local ssh_ports
         local ip_address
 
-        ssh_ports=$(sshd -T 2>/dev/null | awk '$1 == "port" {print $2; exit}')
+        ssh_ports=$(sshd -T 2>/dev/null | awk '$1 == "port" {print $2}' | sort -n -u)
         ip_address=$(hostname -I 2>/dev/null | awk '{print $1}')
 
         if [[ -n "$ssh_ports" && -n "$ip_address" ]]; then
-            echo "SSH 连接示例：ssh -p $ssh_ports root@$ip_address"
+            echo "SSH 连接示例："
+            while IFS= read -r ssh_port; do
+                [[ -n "$ssh_port" ]] && echo "  ssh -p $ssh_port root@$ip_address"
+            done <<< "$ssh_ports"
         fi
     fi
 
