@@ -9,7 +9,8 @@ readonly DOCKER_KEYRING="/etc/apt/keyrings/docker.asc"
 readonly DOCKER_SOURCE="/etc/apt/sources.list.d/docker.sources"
 readonly DOCKER_DAEMON_DIR="/etc/docker"
 readonly DOCKER_DAEMON_CONFIG="$DOCKER_DAEMON_DIR/daemon.json"
-readonly DOCKER_DAEMON_BACKUP="$DOCKER_DAEMON_DIR/daemon.json.backup"
+readonly DOCKER_DAEMON_INITIAL_BACKUP="$DOCKER_DAEMON_DIR/daemon.json.initial-backup"
+readonly DOCKER_DAEMON_PREVIOUS_BACKUP="$DOCKER_DAEMON_DIR/daemon.json.previous-backup"
 
 readonly DOCKER_GPG_URL="https://download.docker.com/linux/debian/gpg"
 readonly DOCKER_REPO_URL="https://download.docker.com/linux/debian"
@@ -143,8 +144,40 @@ EOF
     echo "Docker 官方软件源: 已配置（$codename / $architecture）"
 }
 
+package_is_installed() {
+    dpkg-query -W -f='${db:Status-Status}' "$1" 2>/dev/null | grep -qx installed
+}
+
+docker_ce_installed() {
+    package_is_installed docker-ce &&
+        package_is_installed docker-ce-cli &&
+        package_is_installed containerd.io &&
+        command -v docker >/dev/null 2>&1 &&
+        command -v dockerd >/dev/null 2>&1
+}
+
 docker_installed() {
     command -v docker >/dev/null 2>&1
+}
+
+handle_conflicting_packages() {
+    local package
+    local choice
+    local conflicts=()
+    local candidates=(docker.io docker-compose docker-doc docker-buildx podman-docker containerd runc)
+
+    for package in "${candidates[@]}"; do
+        package_is_installed "$package" && conflicts+=("$package")
+    done
+
+    (( ${#conflicts[@]} == 0 )) && return 0
+
+    warn "检测到与 Docker CE 冲突的软件包: ${conflicts[*]}"
+    echo "现有 /var/lib/docker 数据不会被删除。"
+    read -r -p "是否卸载冲突包并继续安装 Docker CE？[y/N]: " choice
+    [[ "$choice" =~ ^[Yy]$ ]] || return 1
+
+    apt-get remove -y "${conflicts[@]}"
 }
 
 get_docker_version() {
@@ -152,10 +185,15 @@ get_docker_version() {
 }
 
 install_docker() {
-    if docker_installed; then
-        printf 'Docker 状态: 已安装（%s）\n' "$(get_docker_version)"
+    if docker_ce_installed; then
+        printf 'Docker CE 状态: 已完整安装（%s）\n' "$(get_docker_version)"
         return 0
     fi
+
+    handle_conflicting_packages || {
+        error "未处理冲突软件包，已取消 Docker CE 安装"
+        return 1
+    }
 
     configure_docker_repository || return 1
     apt_update_once || return 1
@@ -246,26 +284,23 @@ is_log_rotation_configured() {
 }
 
 backup_daemon_config() {
-    if [[ ! -f "$DOCKER_DAEMON_CONFIG" ]]; then
-        rm -f "$DOCKER_DAEMON_BACKUP"
-        return 0
+    [[ -f "$DOCKER_DAEMON_CONFIG" ]] || return 0
+
+    if [[ ! -f "$DOCKER_DAEMON_INITIAL_BACKUP" ]]; then
+        cp -a "$DOCKER_DAEMON_CONFIG" "$DOCKER_DAEMON_INITIAL_BACKUP" || return 1
     fi
 
-    if ! cp -a "$DOCKER_DAEMON_CONFIG" "$DOCKER_DAEMON_BACKUP"; then
-        error "Docker 配置备份失败"
-        return 1
-    fi
-
-    chmod 600 "$DOCKER_DAEMON_BACKUP" 2>/dev/null || true
+    cp -a "$DOCKER_DAEMON_CONFIG" "$DOCKER_DAEMON_PREVIOUS_BACKUP" || return 1
+    chmod 600 "$DOCKER_DAEMON_INITIAL_BACKUP" "$DOCKER_DAEMON_PREVIOUS_BACKUP" 2>/dev/null || true
 }
 
 restore_daemon_config() {
-    if [[ -f "$DOCKER_DAEMON_BACKUP" ]]; then
-        cp -a "$DOCKER_DAEMON_BACKUP" "$DOCKER_DAEMON_CONFIG"
-        warn "已恢复 Docker 配置备份"
+    if [[ -f "$DOCKER_DAEMON_PREVIOUS_BACKUP" ]]; then
+        cp -a "$DOCKER_DAEMON_PREVIOUS_BACKUP" "$DOCKER_DAEMON_CONFIG"
+        warn "已恢复 Docker 上一次配置"
     else
         rm -f "$DOCKER_DAEMON_CONFIG"
-        warn "已删除新建的 Docker 配置文件"
+        warn "已删除本次新建的 Docker 配置文件"
     fi
 }
 
@@ -431,7 +466,7 @@ main() {
     require_root
 
     local command_name
-    for command_name in apt-get curl dpkg install jq mktemp systemctl; do
+    for command_name in apt-get curl dpkg dpkg-query grep install jq mktemp systemctl; do
         if ! command -v "$command_name" >/dev/null 2>&1; then
             error "缺少必要命令: $command_name"
             exit 1

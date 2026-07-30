@@ -8,7 +8,7 @@
 set -uo pipefail
 
 # === 全局常量 ===
-readonly SCRIPT_VERSION="4.0.0"
+readonly SCRIPT_VERSION="4.1.0"
 SCRIPT_COMMIT="${SCRIPT_COMMIT:-unknown}"
 
 readonly MODULE_BASE_URL="https://raw.githubusercontent.com/LucaLin233/Linux"
@@ -112,6 +112,16 @@ log() {
 
 command_exists() {
     command -v "$1" >/dev/null 2>&1
+}
+
+backup_initial_and_previous() {
+    local file="$1"
+    local initial="${file}.initial-backup"
+    local previous="${file}.previous-backup"
+
+    [[ -e "$file" ]] || return 0
+    [[ -e "$initial" ]] || cp -a "$file" "$initial" || return 1
+    cp -a "$file" "$previous"
 }
 
 cleanup() {
@@ -272,6 +282,8 @@ fix_hosts_file() {
     hostname_value=$(hostname)
 
     if [[ -f "$cloud_config" ]]; then
+        backup_initial_and_previous "$cloud_config" || return 1
+
         if grep -qE '^[[:space:]]*manage_etc_hosts:' "$cloud_config"; then
             if ! grep -qE '^[[:space:]]*manage_etc_hosts:[[:space:]]*false[[:space:]]*$' "$cloud_config"; then
                 sed -i \
@@ -287,7 +299,7 @@ fix_hosts_file() {
 
     if ! grep -qE "^127\\.0\\.1\\.1[[:space:]].*\\b${hostname_value}\\b" \
         /etc/hosts 2>/dev/null; then
-        cp /etc/hosts "/etc/hosts.backup.$(date +%s)" 2>/dev/null || true
+        backup_initial_and_previous /etc/hosts || return 1
 
         if grep -qE '^127\.0\.1\.1[[:space:]]' /etc/hosts 2>/dev/null; then
             sed -i \
@@ -700,6 +712,12 @@ execute_module() {
         return 0
     fi
 
+    if (( result == 2 )); then
+        MODULE_STATUS["$module"]="degraded"
+        log "模块部分完成：$module（${duration}s）" "warn"
+        return 0
+    fi
+
     MODULE_STATUS["$module"]="failed"
     log "模块执行失败：$module（${duration}s，退出码：$result）" "error"
     return 1
@@ -795,6 +813,7 @@ get_system_status() {
 
 generate_summary() {
     local success_count=0
+    local degraded_count=0
     local failed_count=0
     local total_modules
     local success_rate=0
@@ -805,14 +824,15 @@ generate_summary() {
     for module in "${!MODULE_STATUS[@]}"; do
         case "${MODULE_STATUS[$module]}" in
             success) ((success_count++)) ;;
+            degraded) ((degraded_count++)) ;;
             failed) ((failed_count++)) ;;
         esac
     done
 
-    total_modules=$((success_count + failed_count))
+    total_modules=$((success_count + degraded_count + failed_count))
 
     if (( total_modules > 0 )); then
-        success_rate=$((success_count * 100 / total_modules))
+        success_rate=$(((success_count + degraded_count) * 100 / total_modules))
     fi
 
     total_time=$(( $(date +%s) - TOTAL_START_TIME ))
@@ -830,7 +850,7 @@ generate_summary() {
             echo "系统: $(. /etc/os-release && echo "${PRETTY_NAME:-Debian}")"
             echo
             echo "执行统计:"
-            echo "总模块: $total_modules | 成功: $success_count | 失败: $failed_count | 成功率: ${success_rate}%"
+            echo "总模块: $total_modules | 成功: $success_count | 部分完成: $degraded_count | 失败: $failed_count | 完成率: ${success_rate}%"
             echo
 
             if (( success_count > 0 )); then
@@ -842,6 +862,14 @@ generate_summary() {
                     fi
                 done
 
+                echo
+            fi
+
+            if (( degraded_count > 0 )); then
+                echo "部分完成模块:"
+                for module in "${MODULE_ORDER[@]}"; do
+                    [[ "${MODULE_STATUS[$module]:-}" == "degraded" ]] && echo "  ⚠️  $module (${MODULE_EXEC_TIME[$module]:-0}s)"
+                done
                 echo
             fi
 

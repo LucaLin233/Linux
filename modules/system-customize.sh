@@ -102,6 +102,12 @@ ensure_package() {
     fi
 }
 
+backup_initial_file() {
+    local file="$1"
+    [[ -e "$file" ]] || return 0
+    [[ -e "${file}.initial-backup" ]] || cp -a "$file" "${file}.initial-backup"
+}
+
 # === 动态欢迎信息 ===
 configure_motd() {
     if ! ask_yes_no "是否配置自定义动态欢迎信息？[Y/n]: " "Y"; then

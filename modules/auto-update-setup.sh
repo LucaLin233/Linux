@@ -242,53 +242,68 @@ cleanup_packages() {
         log warn "清理 APT 缓存失败"
 }
 
-get_latest_boot_kernel() {
-    find /boot -maxdepth 1 -type f -name 'vmlinuz-*' -printf '%f\\n' 2>/dev/null |
-        sed 's/^vmlinuz-//' |
-        sort -V |
-        tail -n 1
-}
-
-has_new_complete_kernel() {
+get_installed_kernel_candidates() {
     local current_kernel
-    local latest_kernel
+    local current_family
 
     current_kernel=\$(uname -r)
-    latest_kernel=\$(get_latest_boot_kernel)
-
-    [[ -n "\$latest_kernel" ]] || return 1
-    [[ "\$latest_kernel" != "\$current_kernel" ]] || return 1
-
-    [[ -f "/boot/vmlinuz-\$latest_kernel" ]] || return 1
-    [[ -f "/boot/initrd.img-\$latest_kernel" ]] || return 1
-    [[ -d "/lib/modules/\$latest_kernel" ]] || return 1
-
-    if dpkg --compare-versions "\$latest_kernel" gt "\$current_kernel" 2>/dev/null; then
-        return 0
+    if [[ "\$current_kernel" == *xanmod* ]]; then
+        current_family="xanmod"
+    else
+        current_family="debian"
     fi
 
-    # 部分云内核版本格式不完全符合 Debian 版本比较规则；
-    # 内核文件完整且版本不同的情况下仍建议重启以应用更新。
-    return 0
+    dpkg-query -W -f='\${binary:Package} \${db:Status-Status}\n' 'linux-image-*' 2>/dev/null |
+        awk '$2 == "installed" {sub(/^linux-image-/, "", $1); print $1}' |
+        while IFS= read -r kernel; do
+            [[ -f "/boot/vmlinuz-\$kernel" ]] || continue
+            [[ -f "/boot/initrd.img-\$kernel" ]] || continue
+            [[ -d "/lib/modules/\$kernel" ]] || continue
+
+            if [[ "\$current_family" == "xanmod" && "\$kernel" != *xanmod* ]]; then
+                continue
+            fi
+            if [[ "\$current_family" == "debian" && "\$kernel" == *xanmod* ]]; then
+                continue
+            fi
+
+            printf '%s\n' "\$kernel"
+        done
+}
+
+get_newer_installed_kernel() {
+    local current_kernel
+    local kernel
+    local newer=""
+
+    current_kernel=\$(uname -r)
+
+    while IFS= read -r kernel; do
+        dpkg --compare-versions "\$kernel" gt "\$current_kernel" 2>/dev/null || continue
+        if [[ -z "\$newer" ]] || dpkg --compare-versions "\$kernel" gt "\$newer"; then
+            newer="\$kernel"
+        fi
+    done < <(get_installed_kernel_candidates)
+
+    [[ -n "\$newer" ]] || return 1
+    printf '%s\n' "\$newer"
 }
 
 reboot_if_required() {
     local current_kernel
-    local latest_kernel
+    local newer_kernel=""
     local reason=""
 
     current_kernel=\$(uname -r)
-    latest_kernel=\$(get_latest_boot_kernel)
 
     if [[ -f /var/run/reboot-required ]]; then
         reason="系统标记需要重启"
     fi
 
-    if has_new_complete_kernel; then
-        if [[ -n "\$reason" ]]; then
-            reason+="；"
-        fi
-        reason+="检测到新内核：\${latest_kernel}（当前：\${current_kernel}）"
+    newer_kernel=\$(get_newer_installed_kernel || true)
+    if [[ -n "\$newer_kernel" ]]; then
+        [[ -n "\$reason" ]] && reason+="；"
+        reason+="同分支已安装更高版本内核：\${newer_kernel}（当前：\${current_kernel}）"
     fi
 
     if [[ -z "\$reason" ]]; then
@@ -298,15 +313,10 @@ reboot_if_required() {
 
     log warn "\$reason"
     log warn "系统将在 \${REBOOT_DELAY} 秒后自动重启以应用更新"
-
     sync
     sleep "\$REBOOT_DELAY"
-
     log warn "正在自动重启系统"
-
-    if ! systemctl reboot --message="Auto-update applied system updates"; then
-        reboot
-    fi
+    systemctl reboot --message="Auto-update applied system updates" || reboot
 }
 
 main() {

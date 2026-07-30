@@ -532,13 +532,22 @@ main() {
         echo "操作模式: 安装 ${tools[*]}"
     fi
 
+    local degraded=false
+
     echo
-    install_selected_tools "$mode" "${tools[@]}" ||
+    install_selected_tools "$mode" "${tools[@]}" || {
         log "工具安装过程中存在失败项目" "warn"
+        degraded=true
+    }
 
     show_tools_summary
 
     echo
+    if [[ "$degraded" == "true" ]]; then
+        log "系统工具配置部分完成" "warn"
+        return 2
+    fi
+
     log "✅ 系统工具配置完成" "success"
 }
 

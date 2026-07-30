@@ -11,7 +11,8 @@ set -euo pipefail
 
 # === 常量定义 ===
 readonly NETWORK_CONF="/etc/sysctl.d/99-network-optimize.conf"
-readonly NETWORK_BACKUP="/etc/sysctl.d/99-network-optimize.conf.backup"
+readonly NETWORK_INITIAL_BACKUP="/etc/sysctl.d/99-network-optimize.conf.initial-backup"
+readonly NETWORK_PREVIOUS_BACKUP="/etc/sysctl.d/99-network-optimize.conf.previous-backup"
 
 # 旧版 kernel2.sh 使用的配置文件。
 readonly LEGACY_KERNEL_CONF="/etc/sysctl.d/99-kernel.conf"
@@ -238,32 +239,53 @@ EOF
 }
 
 backup_network_config() {
-    if [[ ! -f "$NETWORK_CONF" ]]; then
-        return 0
+    [[ -f "$NETWORK_CONF" ]] || return 0
+
+    if [[ ! -f "$NETWORK_INITIAL_BACKUP" ]]; then
+        cp -a "$NETWORK_CONF" "$NETWORK_INITIAL_BACKUP" || return 1
     fi
 
-    if cp -a "$NETWORK_CONF" "$NETWORK_BACKUP"; then
-        info "已更新网络配置备份：$NETWORK_BACKUP"
-        return 0
-    fi
+    cp -a "$NETWORK_CONF" "$NETWORK_PREVIOUS_BACKUP"
+}
 
-    error "网络配置备份失败"
-    return 1
+capture_runtime_values() {
+    local config_file="$1"
+    local output_file="$2"
+    local key
+
+    : > "$output_file"
+    while IFS='=' read -r key _; do
+        key="${key//[[:space:]]/}"
+        [[ -z "$key" || "$key" == \#* ]] && continue
+        if sysctl -n "$key" >/dev/null 2>&1; then
+            printf '%s=%s\n' "$key" "$(sysctl -n "$key")" >> "$output_file"
+        else
+            error "当前内核不存在 sysctl 参数: $key"
+            return 1
+        fi
+    done < "$config_file"
+}
+
+restore_runtime_values() {
+    local values_file="$1"
+    local key
+    local value
+
+    while IFS='=' read -r key value; do
+        [[ -n "$key" ]] || continue
+        sysctl -w "$key=$value" >/dev/null 2>&1 ||
+            warn "运行时参数恢复失败: $key"
+    done < "$values_file"
 }
 
 apply_network_config() {
     local config_file="$1"
-
-    if ! sysctl -p "$config_file"; then
-        error "网络 sysctl 参数应用失败"
-        return 1
-    fi
-
-    return 0
+    sysctl -p "$config_file"
 }
 
 install_optimization() {
     local temp_config
+    local runtime_backup
     local bbr_enabled="false"
 
     info "开始配置网络优化..."
@@ -288,31 +310,36 @@ install_optimization() {
 
     create_network_config "$temp_config" "$bbr_enabled"
 
-    backup_network_config || {
+    runtime_backup=$(mktemp) || {
         rm -f "$temp_config"
         return 1
     }
 
-    # 先验证临时配置。sysctl -p 会实际应用配置，
-    # 因此仅在配置本身生成完成后执行。
+    if ! capture_runtime_values "$temp_config" "$runtime_backup"; then
+        rm -f "$temp_config" "$runtime_backup"
+        return 1
+    fi
+
+    backup_network_config || {
+        rm -f "$temp_config" "$runtime_backup"
+        return 1
+    }
+
+    # 应用前已保存全部涉及参数的运行值，失败时逐项回滚。
     if ! apply_network_config "$temp_config"; then
-        rm -f "$temp_config"
-
-        if [[ -f "$NETWORK_BACKUP" ]]; then
-            warn "尝试恢复旧网络配置..."
-            cp -a "$NETWORK_BACKUP" "$NETWORK_CONF"
-            sysctl -p "$NETWORK_CONF" >/dev/null 2>&1 || true
-        fi
-
+        restore_runtime_values "$runtime_backup"
+        rm -f "$temp_config" "$runtime_backup"
         return 1
     fi
 
     if ! mv "$temp_config" "$NETWORK_CONF"; then
         error "写入网络配置文件失败"
-        rm -f "$temp_config"
+        restore_runtime_values "$runtime_backup"
+        rm -f "$temp_config" "$runtime_backup"
         return 1
     fi
 
+    rm -f "$runtime_backup"
     success "网络优化配置已写入：$NETWORK_CONF"
 
     if [[ "$bbr_enabled" != "true" ]]; then
@@ -331,11 +358,11 @@ install_optimization() {
 restore_optimization() {
     info "开始恢复新版网络优化配置..."
 
-    if [[ -f "$NETWORK_BACKUP" ]]; then
-        cp -a "$NETWORK_BACKUP" "$NETWORK_CONF"
+    if [[ -f "$NETWORK_PREVIOUS_BACKUP" ]]; then
+        cp -a "$NETWORK_PREVIOUS_BACKUP" "$NETWORK_CONF"
 
         if apply_network_config "$NETWORK_CONF"; then
-            success "已恢复网络配置备份：$NETWORK_BACKUP"
+            success "已恢复网络上一次配置：$NETWORK_PREVIOUS_BACKUP"
         else
             error "恢复网络配置后应用失败"
             return 1
@@ -381,7 +408,8 @@ show_status() {
     echo "========== 网络优化状态 =========="
     echo "配置文件: $NETWORK_CONF"
     [[ -f "$NETWORK_CONF" ]] && echo "配置状态: 已存在" || echo "配置状态: 未创建"
-    [[ -f "$NETWORK_BACKUP" ]] && echo "配置备份: $NETWORK_BACKUP"
+    [[ -f "$NETWORK_INITIAL_BACKUP" ]] && echo "初始备份: $NETWORK_INITIAL_BACKUP"
+    [[ -f "$NETWORK_PREVIOUS_BACKUP" ]] && echo "上次备份: $NETWORK_PREVIOUS_BACKUP"
 
     echo
     echo "拥塞控制:"

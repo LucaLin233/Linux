@@ -10,7 +10,8 @@ readonly CUSTOM_DIR="${ZSH_CUSTOM:-$ZSH_DIR/custom}"
 readonly THEME_DIR="$CUSTOM_DIR/themes/powerlevel10k"
 readonly PLUGINS_DIR="$CUSTOM_DIR/plugins"
 readonly ZSHRC_FILE="$HOME/.zshrc"
-readonly ZSHRC_BACKUP="$HOME/.zshrc.backup"
+readonly ZSHRC_INITIAL_BACKUP="$HOME/.zshrc.initial-backup"
+readonly ZSHRC_PREVIOUS_BACKUP="$HOME/.zshrc.previous-backup"
 
 # === 日志函数 ===
 log() {
@@ -34,18 +35,14 @@ debug_log() {
 
 # === 辅助函数 ===
 backup_zshrc() {
-    if [[ ! -f "$ZSHRC_FILE" ]]; then
-        return 0
+    [[ -f "$ZSHRC_FILE" ]] || return 0
+
+    if [[ ! -f "$ZSHRC_INITIAL_BACKUP" ]]; then
+        cp -a "$ZSHRC_FILE" "$ZSHRC_INITIAL_BACKUP" || return 1
     fi
 
-    if cp "$ZSHRC_FILE" "$ZSHRC_BACKUP"; then
-        chmod 600 "$ZSHRC_BACKUP" 2>/dev/null || true
-        debug_log "已更新 Zsh 配置备份：$ZSHRC_BACKUP"
-        return 0
-    fi
-
-    log "备份 .zshrc 失败" "error"
-    return 1
+    cp -a "$ZSHRC_FILE" "$ZSHRC_PREVIOUS_BACKUP" || return 1
+    chmod 600 "$ZSHRC_INITIAL_BACKUP" "$ZSHRC_PREVIOUS_BACKUP" 2>/dev/null || true
 }
 
 install_oh_my_zsh() {
@@ -92,14 +89,21 @@ install_oh_my_zsh() {
     return 0
 }
 
-clone_repository() {
+clone_or_update_repository() {
     local repository="$1"
     local destination="$2"
     local description="$3"
+    local commit
 
     if [[ -d "$destination/.git" ]]; then
-        debug_log "$description 已安装，跳过"
-        return 0
+        if git -C "$destination" pull --ff-only >/dev/null 2>&1; then
+            commit=$(git -C "$destination" rev-parse --short HEAD)
+            echo "$description: 已更新（commit: $commit）"
+            return 0
+        fi
+
+        log "$description 更新失败，保留当前版本" "warn"
+        return 1
     fi
 
     if [[ -e "$destination" ]]; then
@@ -108,7 +112,8 @@ clone_repository() {
     fi
 
     if git clone --depth=1 "$repository" "$destination" >/dev/null 2>&1; then
-        debug_log "$description 安装成功"
+        commit=$(git -C "$destination" rev-parse --short HEAD)
+        echo "$description: 已安装（commit: $commit）"
         return 0
     fi
 
@@ -153,7 +158,7 @@ install_components() {
     if mkdir -p "$THEME_DIR" "$PLUGINS_DIR" 2>/dev/null; then
         rmdir "$THEME_DIR" 2>/dev/null || true
 
-        if clone_repository \
+        if clone_or_update_repository \
             "https://github.com/romkatv/powerlevel10k.git" \
             "$THEME_DIR" \
             "Powerlevel10k"; then
@@ -178,7 +183,7 @@ install_components() {
         plugin_name="${plugin_info%%|*}"
         plugin_url="${plugin_info#*|}"
 
-        if ! clone_repository \
+        if ! clone_or_update_repository \
             "$plugin_url" \
             "$PLUGINS_DIR/$plugin_name" \
             "$plugin_name"; then
@@ -206,7 +211,8 @@ configure_zshrc() {
 # ============================================================
 # 此文件由 zsh-setup.sh 自动生成。
 # 手动修改会在下次运行脚本时被覆盖。
-# 上一次版本备份于：~/.zshrc.backup
+# 初始备份：~/.zshrc.initial-backup
+# 上次备份：~/.zshrc.previous-backup
 # ============================================================
 
 # ============================================================
@@ -475,7 +481,8 @@ main() {
     echo
     configure_zshrc
     echo "配置文件: $ZSHRC_FILE 已更新"
-    echo "备份文件: $ZSHRC_BACKUP"
+    echo "初始备份: $ZSHRC_INITIAL_BACKUP"
+    echo "上次备份: $ZSHRC_PREVIOUS_BACKUP"
 
     echo
     setup_theme || true

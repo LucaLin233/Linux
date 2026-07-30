@@ -795,19 +795,23 @@ main() {
     echo
     configure_shell_integration || exit 1
 
-    echo
-    setup_python ||
-        log "Python 配置失败，可稍后重新运行此模块" "warn"
+    local degraded=false
 
     echo
-    setup_node ||
-        log "Node.js 配置失败，可稍后重新运行此模块" "warn"
+    setup_python || { log "Python 配置失败，可稍后重新运行此模块" "warn"; degraded=true; }
 
     echo
-    configure_mise_cron ||
-        log "Mise 自动更新任务配置失败" "warn"
+    setup_node || { log "Node.js 配置失败，可稍后重新运行此模块" "warn"; degraded=true; }
 
     echo
+    configure_mise_cron || { log "Mise 自动更新任务配置失败" "warn"; degraded=true; }
+
+    echo
+    if [[ "$degraded" == "true" ]]; then
+        log "Mise 配置部分完成" "warn"
+        return 2
+    fi
+
     log "Mise 配置完成" "success"
     echo "当前 Shell 尚未重新加载 Mise 环境。"
     echo "请重新登录，或根据当前 Shell 执行：exec zsh / exec bash"

@@ -419,16 +419,23 @@ main() {
 
     log "🔧 智能系统优化配置..." "info"
 
-    echo
-    setup_zram || log "Zram 配置失败，继续执行后续项目" "warn"
+    local degraded=false
 
     echo
-    setup_timezone || log "时区配置失败，继续执行后续项目" "warn"
+    setup_zram || { log "Zram 配置失败，继续执行后续项目" "warn"; degraded=true; }
 
     echo
-    setup_chrony || log "Chrony 时间同步配置失败" "warn"
+    setup_timezone || { log "时区配置失败，继续执行后续项目" "warn"; degraded=true; }
 
     echo
+    setup_chrony || { log "Chrony 时间同步配置失败" "warn"; degraded=true; }
+
+    echo
+    if [[ "$degraded" == "true" ]]; then
+        log "系统优化部分完成" "warn"
+        return 2
+    fi
+
     log "✅ 系统优化完成" "info"
 
     if [[ "${DEBUG:-}" == "1" ]]; then
