@@ -1,124 +1,134 @@
-# 🐧 Linux Scripts Collection
+# Linux Scripts Collection
 
-一个收集Linux实用脚本的个人仓库，主要包含AI辅助生成的各种Linux系统管理和运维脚本。
+一个面向 Debian 系列系统的个人 Linux 运维脚本仓库，包含系统初始化、环境配置、网络优化、服务部署和日常管理工具。
 
-## 📖 项目介绍
+部分脚本使用 AI 工具辅助编写，经过人工检查、修改，并已在个人 VPS 环境中进行功能测试。由于发行版版本、内核、虚拟化环境和软件源配置可能存在差异，使用前仍应阅读脚本并做好备份。
 
-本仓库专注于收集和整理Linux环境下的实用脚本，涵盖系统管理、自动化运维、性能监控等多个方面。这些脚本主要通过AI工具辅助生成，经过测试和优化后供个人使用和学习。
+## 项目内容
 
-### 🎯 项目特点
-- 🤖 **AI辅助生成**：大部分脚本由AI工具（ChatGPT、Claude等）协助编写
-- 🔧 **实用导向**：专注于解决Linux日常使用中的实际问题
-- 📚 **个人收藏**：根据个人需求收集和整理的脚本集合
-- 🧪 **经过测试**：脚本在常见Linux发行版上进行过基本测试
+### Debian 一键部署
 
-## ⚠️ 重要声明
+[`debian_setup.sh`](debian_setup.sh) 是仓库的主要入口，仅支持 Debian 12 及以上版本。脚本支持全部安装或自定义选择，并会解析模块依赖、按固定 commit 下载模块、记录执行日志以及生成部署摘要。
 
-### AI生成内容声明
-- 本仓库脚本**主要由AI工具辅助生成**
-- 代码经过人工审核和基本测试，但仍可能存在问题
-- **强烈建议在测试环境中验证后再用于生产环境**
+其功能由 `modules/` 下的模块组成：
 
-### 免责声明
-1. **无担保使用**：所有脚本按"原样"提供，不提供任何形式的担保
-2. **风险自负**：使用者需自行承担使用脚本可能产生的风险和后果
-3. **安全提醒**：执行任何脚本前请确保了解其功能并备份重要数据
-4. **环境差异**：不同Linux发行版和版本可能存在兼容性问题
-5. **持续更新**：脚本可能会根据反馈和测试结果进行优化更新
+| 模块 | 功能 |
+| --- | --- |
+| `system-optimize.sh` | 根据内存配置 Zram、设置时区并配置 Chrony 时间同步 |
+| `system-customize.sh` | 配置动态 MOTD、中文 Locale，并可选安装 XanMod 内核 |
+| `network-optimize.sh` | 配置 BBR、fq、IPv4 转发及代理和端口转发相关参数 |
+| `zsh-setup.sh` | 安装 Zsh、Oh My Zsh、Powerlevel10k 和常用插件 |
+| `mise-setup.sh` | 安装 Mise，管理 Python、Node.js 及运行时更新 |
+| `tools-setup.sh` | 安装 NextTrace、Speedtest CLI 和常用系统工具 |
+| `docker-setup.sh` | 通过 Docker 官方仓库安装 Docker Engine、Compose 和 Buildx |
+| `auto-update-setup.sh` | 配置定期系统与内核更新，并在需要时自动重启 |
+| `ssh-security.sh` | 配置 SSH 端口、Root 登录策略和认证方式 |
 
-## 📁 脚本列表
+### 独立工具
 
-### 🌐 网络代理工具
-- **SingBox安装脚本** - 简化SingBox代理工具的安装和配置过程
+`tools/` 中的脚本可按需单独使用：
 
-### 🔧 系统优化
-- **Linux内核优化脚本** - 优化Linux内核参数，提升系统性能
+| 脚本 | 功能 |
+| --- | --- |
+| `cloudflare_tunnel.sh` | 安装、配置、更新或卸载 Cloudflare Tunnel |
+| `sbinstall.sh` | 在 Debian 系列系统上安装或卸载 sing-box，并创建 systemd 服务 |
+| `kernel.sh` / `kernel2.sh` | 两套独立的网络与内核参数优化方案，请按需选择，不要与新版网络模块重复使用 |
+| `xanmod-install.sh` | 在 Debian 上检测 CPU 指令集并安装对应 XanMod 内核 |
+| `setup-motd.sh` | 单独部署动态系统欢迎信息 |
+| `push.sh` | 通过 SSH/rsync 向多台服务器并发推送文件 |
 
-### 🚀 系统部署
-- **Debian一键部署脚本** - 快速部署和配置Debian系统环境
+### 配置文件
 
-### ☁️ 云服务工具
-- **Cloudflare Tunnel安装脚本** - 自动安装和配置Cloudflare隧道服务
+- `p10k-config.zsh`：Powerlevel10k 配置，由 Zsh 模块使用。
 
-## 🚀 使用指南
+## 环境要求
 
-### 环境要求
-- Linux系统（主要针对Debian系系统）
-- Bash Shell
-- Root权限或sudo权限
-- 稳定的网络连接
+- 一键部署脚本：Debian 12 或更高版本
+- `sbinstall.sh`：Debian、Ubuntu 等 Debian 系列系统
+- Bash 和 systemd
+- Root 权限或可用的 `sudo`
+- 可访问 GitHub 等脚本所需的上游服务
 
-### 使用步骤
-1. **克隆仓库**
+独立工具的具体支持范围可能不同，请在执行前阅读对应脚本顶部说明。
+
+## 使用方法
+
+### 克隆仓库
+
 ```bash
 git clone https://github.com/LucaLin233/Linux.git
 cd Linux
 ```
 
-2. **添加执行权限**
+### 运行一键部署脚本
+
 ```bash
-chmod +x script_name.sh
+chmod +x debian_setup.sh
+sudo ./debian_setup.sh
 ```
 
-3. **执行脚本**
+`debian_setup.sh` 会引导选择全部模块或自定义模块。通常无需手动执行 `modules/` 下的脚本。
+
+### 运行独立工具
+
 ```bash
-# 大部分脚本需要root权限
-sudo ./script_name.sh
+chmod +x tools/cloudflare_tunnel.sh
+sudo ./tools/cloudflare_tunnel.sh
 ```
 
-### 使用建议
-- 📖 **仔细阅读**：了解脚本功能和用途
-- 🧪 **测试优先**：先在虚拟机或测试环境中运行
-- 💾 **数据备份**：执行系统级操作前务必备份重要数据
-- 🔍 **理解原理**：尽量理解脚本的工作原理再使用
-- ⚙️ **网络环境**：确保网络环境稳定，某些脚本需要访问外部资源
+将文件名替换为需要使用的实际脚本。例如：
 
-### 特别注意
-- **内核优化脚本**：可能会修改系统关键参数，建议在测试环境先验证
-- **部署脚本**：会对系统进行大量配置更改，请确保理解所有操作
-- **网络工具**：请遵守当地法律法规，合理使用网络代理工具
+```bash
+chmod +x tools/sbinstall.sh
+sudo ./tools/sbinstall.sh install
+```
 
-## 🔧 常见问题
+### 单独运行模块
 
-**Q: 这些脚本安全吗？**
-A: 脚本经过基本审核，但建议在使用前自行检查代码逻辑。
+仅在明确了解模块依赖及影响时单独执行模块：
 
-**Q: 支持哪些Linux发行版？**
-A: 主要针对Debian系发行版（Ubuntu、Debian等），其他发行版可能需要调整。
+```bash
+chmod +x modules/network-optimize.sh
+sudo ./modules/network-optimize.sh status
+```
 
-**Q: 脚本执行失败怎么办？**
-A: 检查网络连接、权限设置和系统兼容性，可通过Issues反馈具体问题。
+## 使用前须知
 
-**Q: 可以在生产环境直接使用吗？**
-A: 强烈建议先在测试环境验证，确认无误后再在生产环境使用。
+- 脚本会安装软件包，并可能修改 SSH、sysctl、内核、Shell、定时任务及 systemd 服务配置。
+- 执行系统级操作前，请备份重要数据和相关配置文件。
+- 修改 SSH 配置时应保留一个已连接会话，并先验证新连接，避免失去服务器访问权限。
+- `kernel.sh`、`kernel2.sh` 与 `modules/network-optimize.sh` 存在功能重叠，请选择其中一种方案。
+- 生产环境使用前，建议先在相同系统版本的测试环境中验证。
+- 网络代理相关工具应在当地法律法规及服务条款允许的范围内使用。
 
-## 📋 更新日志
+## 问题排查
 
-### 最近更新
-- 完善README文档
-- 添加详细的脚本分类和说明
-- 增加使用注意事项
+脚本执行失败时，请优先检查：
 
-## ⭐ 关于项目
+1. 是否使用了受支持的系统版本和 Root 权限。
+2. 网络是否可以访问脚本引用的软件源和 GitHub。
+3. APT/dpkg 是否被其他进程占用。
+4. 终端输出、systemd 日志及脚本生成的日志文件。
 
-这是一个个人学习和使用的脚本收集仓库。如果你觉得某些脚本有用，欢迎：
-- 点个⭐支持一下
-- Fork到自己仓库使用
-- 反馈使用体验和建议
+一键部署脚本的主要输出文件：
 
-## 📄 许可证
+- 日志：`/var/log/debian-setup.log`
+- 部署摘要：`/root/deployment_summary.txt`
+
+如仍无法解决，可提交 Issue，并附上系统版本、执行命令和已脱敏的完整错误日志。
+
+## 免责声明
+
+本仓库中的脚本按“原样”提供，不提供任何形式的担保。使用者应自行检查代码、评估风险，并承担执行脚本产生的后果。
+
+## 许可证
 
 本项目采用 [MIT License](LICENSE) 开源许可证。
 
-## 🔗 相关资源
+## 相关文档
 
-- [SingBox官方文档](https://sing-box.sagernet.org/)
-- [Cloudflare Tunnel文档](https://developers.cloudflare.com/cloudflare-one/connections/connect-apps/)
-- [Linux内核参数调优指南](https://www.kernel.org/doc/Documentation/sysctl/)
-- [Debian系统管理手册](https://www.debian.org/doc/manuals/debian-reference/)
-
----
-
-⚡ **提醒**：Linux系统操作具有风险，使用脚本前请确保理解其功能并做好备份！
-
-**最后更新**: 2025-07-26
+- [Debian Reference](https://www.debian.org/doc/manuals/debian-reference/)
+- [sing-box Documentation](https://sing-box.sagernet.org/)
+- [Cloudflare Tunnel Documentation](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/)
+- [Docker Engine on Debian](https://docs.docker.com/engine/install/debian/)
+- [Mise Documentation](https://mise.jdx.dev/)

@@ -1,4 +1,6 @@
-#!/bin/bash
+#!/usr/bin/env bash
+
+set -euo pipefail
 
 # 定义变量
 INSTALL_DIR="/root/proxy"
@@ -33,12 +35,6 @@ uninstall_singbox() {
         rm -rf "${SRC_DIR}"
     fi
     
-    # 如果系统启用了 SELinux，清理相关设置
-    if command -v selinuxenabled >/dev/null 2>&1 && selinuxenabled; then
-        echo "清理 SELinux 设置..."
-        setsebool -P nis_enabled 0 || true
-    fi
-    
     echo "sing-box 卸载完成"
     echo "注意: /root/proxy 目录及其配置文件已保留"
 }
@@ -51,48 +47,20 @@ error_exit() {
 
 # 检测系统类型
 detect_os() {
-    if [ -f /etc/os-release ]; then
-        . /etc/os-release
-        OS_NAME="${ID}"
-        OS_VERSION_ID="${VERSION_ID%%.*}"  # 只取主版本号
-        echo "检测到操作系统: ${OS_NAME} ${VERSION_ID}"
-        
-        case "${OS_NAME}" in
-            debian)
-                if [ "${OS_VERSION_ID}" != "12" ]; then
-                    echo "警告: 推荐使用 Debian 12，当前版本: ${VERSION_ID}"
-                    read -p "是否继续？(y/n) " -n 1 -r
-                    echo
-                    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-                        error_exit "安装已取消"
-                    fi
-                fi
-                PKG_MANAGER="apt"
-                PKG_UPDATE="apt update"
-                PKG_INSTALL="apt install -y"
-                CHRONY_SERVICE="chrony"
-                ;;
-            almalinux)
-                if [ "${OS_VERSION_ID}" != "9" ]; then
-                    echo "警告: 推荐使用 AlmaLinux 9，当前版本: ${VERSION_ID}"
-                    read -p "是否继续？(y/n) " -n 1 -r
-                    echo
-                    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-                        error_exit "安装已取消"
-                    fi
-                fi
-                PKG_MANAGER="dnf"
-                PKG_UPDATE="dnf check-update"
-                PKG_INSTALL="dnf install -y"
-                CHRONY_SERVICE="chronyd"
-                ;;
-            *)
-                error_exit "不支持的操作系统: ${OS_NAME}"
-                ;;
-        esac
-    else
-        error_exit "无法检测操作系统类型"
+    [ -r /etc/os-release ] || error_exit "无法检测操作系统类型"
+
+    . /etc/os-release
+    OS_NAME="${ID:-unknown}"
+    OS_ID_LIKE="${ID_LIKE:-}"
+
+    if [ "$OS_NAME" != "debian" ] && [[ " $OS_ID_LIKE " != *" debian "* ]]; then
+        error_exit "仅支持 Debian 系列系统，当前系统: ${PRETTY_NAME:-$OS_NAME}"
     fi
+
+    command -v apt-get >/dev/null 2>&1 || error_exit "未找到 apt-get"
+    command -v dpkg-query >/dev/null 2>&1 || error_exit "未找到 dpkg-query"
+
+    echo "检测到 Debian 系列系统: ${PRETTY_NAME:-$OS_NAME}"
 }
 
 # 安装必要的软件包
@@ -101,51 +69,29 @@ install_dependencies() {
     
     # 更新软件包列表
     echo "更新软件包列表..."
-    ${PKG_UPDATE} >/dev/null 2>&1 || true
+    apt-get update >/dev/null 2>&1 || true
     
     # 要安装的软件包列表
-    local debian_packages=("curl" "tar" "gzip" "jq" "chrony")
-    local almalinux_packages=("curl" "tar" "gzip" "jq" "chrony" "policycoreutils-python-utils")
-    
-    # 根据系统选择包列表
-    local packages=()
-    case "${OS_NAME}" in
-        debian)
-            packages=("${debian_packages[@]}")
-            ;;
-        almalinux)
-            packages=("${almalinux_packages[@]}")
-            ;;
-    esac
+    local packages=("curl" "tar" "gzip" "jq" "chrony")
     
     # 检查并安装缺失的软件包
     local missing_packages=()
     for pkg in "${packages[@]}"; do
-        if ! command -v "${pkg}" >/dev/null 2>&1; then
-            case "${OS_NAME}" in
-                debian)
-                    if ! dpkg -l | grep -q "^ii  $pkg "; then
-                        missing_packages+=("$pkg")
-                    fi
-                    ;;
-                almalinux)
-                    if ! rpm -q "$pkg" >/dev/null 2>&1; then
-                        missing_packages+=("$pkg")
-                    fi
-                    ;;
-            esac
+        if ! dpkg-query -W -f='${db:Status-Status}' "$pkg" 2>/dev/null |
+            grep -qx installed; then
+            missing_packages+=("$pkg")
         fi
     done
     
     if [ ${#missing_packages[@]} -gt 0 ]; then
         echo "安装缺失的软件包: ${missing_packages[*]}"
-        ${PKG_INSTALL} "${missing_packages[@]}" || error_exit "软件包安装失败"
+        apt-get install -y "${missing_packages[@]}" || error_exit "软件包安装失败"
         
         # 特别处理 chrony
         if [[ " ${missing_packages[*]} " =~ " chrony " ]]; then
             echo "配置并启动 chrony 服务..."
-            systemctl enable "${CHRONY_SERVICE}" || error_exit "chrony 服务启用失败"
-            systemctl start "${CHRONY_SERVICE}" || error_exit "chrony 服务启动失败"
+            systemctl enable chrony || error_exit "chrony 服务启用失败"
+            systemctl start chrony || error_exit "chrony 服务启动失败"
             # 等待 chrony 同步时间
             echo "等待时间同步..."
             sleep 5
@@ -156,26 +102,6 @@ install_dependencies() {
     fi
     
     echo "软件包安装完成"
-}
-
-# 配置 SELinux
-configure_selinux() {
-    if command -v selinuxenabled >/dev/null 2>&1 && selinuxenabled; then
-        echo "检测到 SELinux 已启用，配置相关权限..."
-        
-        # 设置二进制文件的 SELinux 上下文
-        chcon -t bin_t "${SRC_DIR}/sing-box" || error_exit "设置 SELinux 上下文失败"
-        
-        # 允许服务访问网络
-        setsebool -P nis_enabled 1 || error_exit "设置 SELinux boolean 失败"
-        
-        # 如果需要，可以添加自定义 SELinux 策略
-        # semanage port -a -t http_port_t -p tcp 443 || true
-        
-        echo "SELinux 配置完成"
-    else
-        echo "SELinux 未启用或不存在，跳过配置"
-    fi
 }
 
 # 创建必要的目录
@@ -364,7 +290,6 @@ LimitNOFILE=1000000
 Type=simple
 User=root
 Group=root
-SELinuxContext=system_u:system_r:unconfined_service_t:s0
 
 [Install]
 WantedBy=multi-user.target
@@ -413,7 +338,7 @@ main() {
     fi
     
     # 处理命令行参数
-    case "$1" in
+    case "${1:-}" in
         uninstall)
             uninstall_singbox
             exit 0
@@ -438,7 +363,6 @@ main() {
     create_directories
     backup_existing
     download_singbox
-    configure_selinux
     create_service
     enable_service
     echo "安装完成!"
