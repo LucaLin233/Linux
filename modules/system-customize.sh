@@ -357,7 +357,7 @@ detect_x86_64_psabi_level() {
     local checker_status
 
     if ! checker=$(mktemp); then
-        return 1
+        return 3
     fi
 
     if ! curl -fsSL \
@@ -366,12 +366,12 @@ detect_x86_64_psabi_level() {
         "$XANMOD_PSABI_CHECK_URL" \
         -o "$checker"; then
         rm -f "$checker"
-        return 1
+        return 3
     fi
 
     if [[ ! -s "$checker" ]]; then
         rm -f "$checker"
-        return 1
+        return 3
     fi
 
     # 官方检测器输出结果后会以 psABI 等级加 1 作为退出码。
@@ -384,6 +384,9 @@ detect_x86_64_psabi_level() {
     rm -f "$checker"
 
     case "$result" in
+        *"x86-64-v4"*)
+            echo "v4"
+            ;;
         *"x86-64-v3"*)
             echo "v3"
             ;;
@@ -400,46 +403,35 @@ detect_x86_64_psabi_level() {
     esac
 }
 
+get_xanmod_package_for_psabi_level() {
+    local psabi_level="$1"
+
+    case "$psabi_level" in
+        v4|v3)
+            # XanMod 不提供 MAIN v4 包，且官方说明 v4 对内核无收益。
+            echo "linux-xanmod-x64v3"
+            ;;
+        v2)
+            echo "linux-xanmod-x64v2"
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
 detect_xanmod_package() {
-    local running_package
     local psabi_level
 
     if ! is_amd64; then
         return 1
     fi
 
-    # 已实际运行的 XanMod 内核是最高优先级证据。
-    if running_package=$(get_running_xanmod_package); then
-        echo "$running_package"
-        return 0
-    fi
-
-    # 已安装的元包次之，避免更新脚本误切换内核分支。
-    if package_is_installed "linux-xanmod-x64v3"; then
-        echo "linux-xanmod-x64v3"
-        return 0
-    fi
-
-    if package_is_installed "linux-xanmod-x64v2"; then
-        echo "linux-xanmod-x64v2"
-        return 0
-    fi
-
-    # 首次安装时，使用 XanMod 官方 psABI 检测脚本。
     if psabi_level=$(detect_x86_64_psabi_level); then
-        :
+        get_xanmod_package_for_psabi_level "$psabi_level"
     else
         return $?
     fi
-
-    case "$psabi_level" in
-        v3)
-            echo "linux-xanmod-x64v3"
-            ;;
-        v2)
-            echo "linux-xanmod-x64v2"
-            ;;
-    esac
 }
 
 xanmod_source_configured() {
@@ -612,25 +604,28 @@ install_xanmod() {
     if package_is_installed "$target_package"; then
         echo "XanMod 目标包: 已安装（$target_package）"
 
-        if is_xanmod_kernel_running; then
-            echo "当前内核: $(uname -r)（XanMod 已生效）"
+        if [[ "$(get_running_xanmod_package || true)" == "$target_package" ]]; then
+            echo "当前内核: $(uname -r)（匹配 CPU 检测结果）"
         else
-            echo "当前内核: $(uname -r)（XanMod 将在下次重启后生效）"
+            echo "当前内核: $(uname -r)（目标内核将在下次重启后生效）"
         fi
 
         return 0
     fi
 
     if [[ -n "$installed_packages" ]]; then
-        warn "检测到已安装的其他 XanMod 包: $(tr '\n' ' ' <<< "$installed_packages")"
+        warn "已安装的 XanMod 包与 CPU 检测结果不匹配: $(tr '\n' ' ' <<< "$installed_packages")"
+        warn "建议安装: $target_package"
 
-        read -r -p "是否额外安装当前检测到的 $target_package？[y/N]: " install_choice
-        install_choice="${install_choice:-N}"
+        read -r -p "是否安装检测到的正确版本 $target_package？[Y/n]: " install_choice
+        install_choice="${install_choice:-Y}"
 
         if [[ ! "$install_choice" =~ ^[Yy]$ ]]; then
             echo "XanMod 内核: 保留现有安装"
             return 0
         fi
+
+        echo "说明: 旧 XanMod 包将保留，确认新内核可正常启动后再手动清理。"
     fi
 
     configure_xanmod_repository || return 1
