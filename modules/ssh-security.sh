@@ -7,7 +7,8 @@ set -euo pipefail
 
 # === 常量定义 ===
 readonly SSH_CONFIG="/etc/ssh/sshd_config"
-readonly SSH_BACKUP="/etc/ssh/sshd_config.backup"
+readonly SSH_PREVIOUS_BACKUP="/etc/ssh/sshd_config.previous-backup"
+readonly SSH_INITIAL_BACKUP="/etc/ssh/sshd_config.initial-backup"
 readonly SSH_DROPIN_DIR="/etc/ssh/sshd_config.d"
 readonly ROOT_AUTHORIZED_KEYS="/root/.ssh/authorized_keys"
 
@@ -165,71 +166,49 @@ format_root_login_display() {
 }
 
 # === 交互选择 ===
-choose_ssh_port() {
+choose_ssh_ports() {
     local current_ports
     local choice
-    local custom_port
+    local input
+    local selected_ports
+    local port
 
     current_ports=$(get_effective_ports)
-
-    if [[ -z "$current_ports" ]]; then
-        current_ports="22"
-    fi
+    current_ports="${current_ports:-22}"
 
     echo "当前 SSH 监听端口: $(tr '\n' ' ' <<< "$current_ports")" >&2
     echo "端口配置：" >&2
-    echo "  1) 保持当前端口" >&2
+    echo "  1) 保持当前全部端口" >&2
     echo "  2) 使用 2222" >&2
     echo "  3) 使用 2022" >&2
-    echo "  4) 自定义端口" >&2
-    echo >&2
-
+    echo "  4) 自定义一个或多个端口" >&2
     read -r -p "请选择 [1-4]（默认 1）: " choice >&2
     choice="${choice:-1}"
 
     case "$choice" in
-        1)
-            head -n 1 <<< "$current_ports"
-            ;;
-        2)
-            if validate_port "2222" "$current_ports"; then
-                echo "2222"
-            else
-                warn "端口 2222 不可用，保持当前端口" >&2
-                head -n 1 <<< "$current_ports"
-            fi
-            ;;
-        3)
-            if validate_port "2022" "$current_ports"; then
-                echo "2022"
-            else
-                warn "端口 2022 不可用，保持当前端口" >&2
-                head -n 1 <<< "$current_ports"
-            fi
-            ;;
+        1) selected_ports="$current_ports" ;;
+        2) selected_ports="2222" ;;
+        3) selected_ports="2022" ;;
         4)
-            while true; do
-                read -r -p "输入端口号（1024-65535）: " custom_port >&2
-
-                if [[ -z "$custom_port" ]]; then
-                    warn "端口为空，保持当前端口" >&2
-                    head -n 1 <<< "$current_ports"
-                    return 0
-                fi
-
-                if validate_port "$custom_port" "$current_ports"; then
-                    echo "$custom_port"
-                    return 0
-                fi
-
-                warn "端口无效或已被其他服务占用，请重新输入" >&2
-            done
+            read -r -p "输入端口，使用空格或逗号分隔（如 22,2222,443）: " input >&2
+            selected_ports=$(tr ', ' '\n\n' <<< "$input" | awk '/^[0-9]+$/ {print}' | sort -n -u)
             ;;
-        *)
-            warn "无效选择，保持当前端口" >&2
-            head -n 1 <<< "$current_ports"
-            ;;
+        *) selected_ports="$current_ports" ;;
     esac
+
+    if [[ -z "$selected_ports" ]]; then
+        warn "未输入有效端口，保持当前端口" >&2
+        selected_ports="$current_ports"
+    fi
+
+    while IFS= read -r port; do
+        if ! validate_port "$port" "$current_ports"; then
+            error "端口无效或已被其他服务占用: $port" >&2
+            return 1
+        fi
+    done <<< "$selected_ports"
+
+    printf '%s\n' "$selected_ports"
 }
 
 choose_password_authentication() {
@@ -297,7 +276,7 @@ choose_root_login_policy() {
 
 # === 配置生成与验证 ===
 create_temp_ssh_config() {
-    local port="$1"
+    local ports="$1"
     local password_auth="$2"
     local root_login="$3"
     local temp_config
@@ -313,7 +292,7 @@ create_temp_ssh_config() {
 # 主配置由本脚本完整管理；扩展配置在文件末尾加载。
 
 # 网络
-Port $port
+$(while IFS= read -r port; do [[ -n "$port" ]] && echo "Port $port"; done <<< "$ports")
 AddressFamily any
 ListenAddress 0.0.0.0
 ListenAddress ::
@@ -391,14 +370,11 @@ get_effective_ports_from_config() {
 
 verify_effective_settings() {
     local config_file="$1"
-    local expected_port="$2"
+    local expected_ports="$2"
     local expected_password_auth="$3"
     local expected_root_login="$4"
     local actual_value
     local ports
-    local port
-    local choice
-    local extra_ports=()
     local key
 
     declare -A expected_values=(
@@ -421,61 +397,34 @@ verify_effective_settings() {
 
     ports=$(get_effective_ports_from_config "$config_file")
 
-    if ! port_is_in_list "$expected_port" "$ports"; then
-        error "最终 SSH 配置未监听所选端口：$expected_port"
+    if [[ "$ports" != "$expected_ports" ]]; then
+        error "最终 SSH 端口不符合预期：$(tr '\n' ' ' <<< "$ports")"
         return 1
     fi
-
-    while IFS= read -r port; do
-        [[ -z "$port" || "$port" == "$expected_port" ]] && continue
-        extra_ports+=("$port")
-    done <<< "$ports"
-
-    if (( ${#extra_ports[@]} == 0 )); then
-        return 0
-    fi
-
-    echo >&2
-    warn "检测到 SSH 还会监听额外端口：${extra_ports[*]}" >&2
-    echo "当前选择的主端口: $expected_port" >&2
-    echo "额外端口可能来自: $SSH_DROPIN_DIR/*.conf" >&2
-
-    read -r -p "是否保留全部监听端口并继续应用？[y/N]: " choice >&2
-    choice="${choice:-N}"
-
-    if [[ "$choice" =~ ^[Yy]$ ]]; then
-        return 0
-    fi
-
-    warn "已取消应用 SSH 配置，当前配置未改变" >&2
-    return 1
 }
 
 backup_ssh_config() {
-    if [[ ! -f "$SSH_CONFIG" ]]; then
-        error "未找到 SSH 主配置：$SSH_CONFIG"
-        return 1
+    [[ -f "$SSH_CONFIG" ]] || return 1
+
+    if [[ ! -f "$SSH_INITIAL_BACKUP" ]]; then
+        cp -a "$SSH_CONFIG" "$SSH_INITIAL_BACKUP" || return 1
     fi
 
-    if ! cp -a "$SSH_CONFIG" "$SSH_BACKUP"; then
-        error "SSH 配置备份失败"
-        return 1
-    fi
-
-    chmod 600 "$SSH_BACKUP" 2>/dev/null || true
+    cp -a "$SSH_CONFIG" "$SSH_PREVIOUS_BACKUP" || return 1
+    chmod 600 "$SSH_INITIAL_BACKUP" "$SSH_PREVIOUS_BACKUP" 2>/dev/null || true
 }
 
 restore_ssh_config() {
     local service_name="$1"
 
-    if [[ ! -f "$SSH_BACKUP" ]]; then
+    if [[ ! -f "$SSH_PREVIOUS_BACKUP" ]]; then
         error "未找到 SSH 配置备份，无法自动恢复"
         return 1
     fi
 
     warn "恢复 SSH 配置备份..."
 
-    if ! cp -a "$SSH_BACKUP" "$SSH_CONFIG"; then
+    if ! cp -a "$SSH_PREVIOUS_BACKUP" "$SSH_CONFIG"; then
         error "恢复 SSH 配置备份失败"
         return 1
     fi
@@ -499,9 +448,24 @@ restore_ssh_config() {
     return 1
 }
 
+verify_listening_ports() {
+    local ports="$1"
+    local port
+
+    sleep 1
+    while IFS= read -r port; do
+        [[ -n "$port" ]] || continue
+        if ! ss -ltnH | awk '{print $4}' | grep -Eq "(^|[:.])${port}$"; then
+            error "SSH 未实际监听端口: $port"
+            return 1
+        fi
+    done <<< "$ports"
+}
+
 apply_ssh_config() {
     local temp_config="$1"
     local service_name="$2"
+    local ports="$3"
 
     if ! backup_ssh_config; then
         rm -f "$temp_config"
@@ -522,8 +486,8 @@ apply_ssh_config() {
         return 1
     fi
 
-    if ! systemctl is-active --quiet "$service_name"; then
-        error "SSH 服务未处于运行状态，尝试恢复原配置"
+    if ! systemctl is-active --quiet "$service_name" || ! verify_listening_ports "$ports"; then
+        error "SSH 服务状态或端口监听验证失败，尝试恢复原配置"
         restore_ssh_config "$service_name"
         return 1
     fi
@@ -551,23 +515,24 @@ show_summary() {
     echo "  交互式认证: $keyboard_auth"
     echo "  Root SSH 密钥数量: $(get_root_key_count)"
     echo "  TCP 转发: $(get_effective_value "allowtcpforwarding")"
-    echo "  配置备份: $SSH_BACKUP"
+    echo "  配置备份: $SSH_PREVIOUS_BACKUP"
 }
 
 show_connection_warning() {
-    local primary_port="$1"
+    local ports="$1"
     local ip_address
+    local port
 
     ip_address=$(hostname -I 2>/dev/null | awk '{print $1}')
     ip_address="${ip_address:-服务器IP}"
 
     echo
-    warn "⚠️ 重要提醒："
-    echo "  新 SSH 连接示例:"
-    echo "  ssh -p $primary_port root@$ip_address"
-    echo
-    echo "  请确认防火墙与云服务商安全组已放行端口 $primary_port。"
-    echo "  请保持当前 SSH 会话不要关闭，并在新终端测试连接成功后再退出。"
+    warn "重要提醒："
+    echo "新 SSH 连接示例:"
+    while IFS= read -r port; do
+        [[ -n "$port" ]] && echo "  ssh -p $port root@$ip_address"
+    done <<< "$ports"
+    echo "请在防火墙与云安全组放行以上全部端口，并保持当前会话直到新连接验证成功。"
 }
 
 # === 主流程 ===
@@ -598,8 +563,8 @@ main() {
     info "🔐 配置 SSH 安全策略..."
 
     echo
-    local selected_port
-    selected_port=$(choose_ssh_port)
+    local selected_ports
+    selected_ports=$(choose_ssh_ports) || exit 1
 
     echo
     local password_auth
@@ -614,7 +579,7 @@ main() {
 
     local temp_config
     if ! temp_config=$(create_temp_ssh_config \
-        "$selected_port" \
+        "$selected_ports" \
         "$password_auth" \
         "$root_login"); then
         exit 1
@@ -627,19 +592,19 @@ main() {
 
     if ! verify_effective_settings \
         "$temp_config" \
-        "$selected_port" \
+        "$selected_ports" \
         "$password_auth" \
         "$root_login"; then
         rm -f "$temp_config"
         exit 1
     fi
 
-    if ! apply_ssh_config "$temp_config" "$ssh_service"; then
+    if ! apply_ssh_config "$temp_config" "$ssh_service" "$selected_ports"; then
         exit 1
     fi
 
     show_summary "$ssh_service"
-    show_connection_warning "$selected_port"
+    show_connection_warning "$selected_ports"
 
     echo
     success "SSH 安全配置完成"
