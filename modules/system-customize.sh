@@ -19,7 +19,6 @@ readonly XANMOD_SOURCE_LIST="/etc/apt/sources.list.d/xanmod-release.list"
 readonly XANMOD_SOURCE_DEB822="/etc/apt/sources.list.d/xanmod-release.sources"
 readonly XANMOD_KEY_FINGERPRINT="D38D7D1DA1349567ADED882D86F7D09EE734E623"
 readonly XANMOD_KEY_URL="https://dl.xanmod.org/archive.key"
-readonly XANMOD_KEY_FALLBACK_OPENPGP="https://keys.openpgp.org/vks/v1/by-fingerprint/${XANMOD_KEY_FINGERPRINT}"
 readonly XANMOD_KEY_FALLBACK_UBUNTU="https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x${XANMOD_KEY_FINGERPRINT}"
 readonly XANMOD_REPOSITORIES=(
     "https://deb.xanmod.org"
@@ -473,7 +472,9 @@ xanmod_keyring_valid() {
 
     [[ -s "$key_file" ]] || return 1
     fingerprint=$(get_primary_key_fingerprint "$key_file") || return 1
-    [[ "$fingerprint" == "$XANMOD_KEY_FINGERPRINT" ]]
+    [[ "$fingerprint" == "$XANMOD_KEY_FINGERPRINT" ]] || return 1
+    gpg --batch --show-keys --with-colons "$key_file" 2>/dev/null |
+        awk -F: '$1 == "uid" { found = 1 } END { exit !found }'
 }
 
 install_xanmod_key() {
@@ -495,7 +496,6 @@ install_xanmod_key() {
 
     for key_url in \
         "$XANMOD_KEY_URL" \
-        "$XANMOD_KEY_FALLBACK_OPENPGP" \
         "$XANMOD_KEY_FALLBACK_UBUNTU"; do
         info "下载 XanMod 软件源签名密钥: $key_url"
 
@@ -593,6 +593,7 @@ xanmod_source_is_usable() {
     local apt_status
 
     lists_temp=$(mktemp -d) || return 1
+    chmod 0755 "$lists_temp"
     install -d -m 0755 "$lists_temp/partial"
 
     if apt-get update -qq \
