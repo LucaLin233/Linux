@@ -349,9 +349,12 @@ alias autodel='docker system prune -a -f && apt autoremove -y && apt clean'
 alias dlog='docker logs -f'
 
 # Compose 项目操作。
+alias dc='docker compose'
 alias dcd='docker compose down'
+alias dcu='docker compose downup -d'
 alias dcr='docker compose restart'
-alias dcre='docker compose down && docker compose pull && docker compose up -d --remove-orphans'
+alias dcre='docker compose pull && docker compose up -d --force-recreate'
+alias dcreup='docker compose down && docker compose pull && docker compose up -d --remove-orphans'
 
 # docker 插件已经提供普通容器重启命令：
 # drs <容器名>  -> docker container restart <容器名>
