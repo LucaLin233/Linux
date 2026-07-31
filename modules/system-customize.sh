@@ -17,8 +17,16 @@ readonly MOTD_SCRIPT="/etc/update-motd.d/00-custom-welcome"
 readonly XANMOD_KEYRING="/etc/apt/keyrings/xanmod-archive-keyring.gpg"
 readonly XANMOD_SOURCE_LIST="/etc/apt/sources.list.d/xanmod-release.list"
 readonly XANMOD_SOURCE_DEB822="/etc/apt/sources.list.d/xanmod-release.sources"
+readonly XANMOD_KEY_FINGERPRINT="D38D7D1DA1349567ADED882D86F7D09EE734E623"
 readonly XANMOD_KEY_URL="https://dl.xanmod.org/archive.key"
-readonly XANMOD_REPO_URL="http://deb.xanmod.org"
+readonly XANMOD_KEY_FALLBACK_OPENPGP="https://keys.openpgp.org/vks/v1/by-fingerprint/${XANMOD_KEY_FINGERPRINT}"
+readonly XANMOD_KEY_FALLBACK_UBUNTU="https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x${XANMOD_KEY_FINGERPRINT}"
+readonly XANMOD_REPOSITORIES=(
+    "https://deb.xanmod.org"
+    "https://mirror.nju.edu.cn/xanmod"
+    "https://mirrors.bfsu.edu.cn/xanmod"
+    "https://mirrors.tuna.tsinghua.edu.cn/xanmod"
+)
 
 # === 日志函数 ===
 log() {
@@ -411,6 +419,7 @@ detect_x86_64_psabi_level() {
         }
     ' "$cpuinfo_file"
 }
+
 get_xanmod_package_for_psabi_level() {
     local psabi_level="$1"
 
@@ -442,25 +451,86 @@ detect_xanmod_package() {
     fi
 }
 
-xanmod_list_source_configured() {
-    [[ -s "$XANMOD_KEYRING" ]] &&
-        [[ -f "$XANMOD_SOURCE_LIST" ]] &&
-        grep -Fq "deb.xanmod.org" "$XANMOD_SOURCE_LIST" &&
-        grep -Fiq "signed-by=$XANMOD_KEYRING" "$XANMOD_SOURCE_LIST"
+key_has_expected_fingerprint() {
+    local key_file="$1"
+    local fingerprint
+
+    fingerprint=$(gpg --batch --show-keys --with-colons "$key_file" 2>/dev/null |
+        awk -F: '$1 == "fpr" { print $10; exit }')
+    [[ "$fingerprint" == "$XANMOD_KEY_FINGERPRINT" ]]
+}
+
+install_xanmod_key() {
+    local key_temp
+    local url
+
+    if [[ -s "$XANMOD_KEYRING" ]] && key_has_expected_fingerprint "$XANMOD_KEYRING"; then
+        return 0
+    fi
+
+    [[ -e "$XANMOD_KEYRING" ]] && warn "现有 XanMod 密钥指纹无效，将重新获取"
+    key_temp=$(mktemp) || return 1
+    trap 'rm -f "$key_temp"' RETURN
+
+    for url in "$XANMOD_KEY_URL" "$XANMOD_KEY_FALLBACK_OPENPGP" "$XANMOD_KEY_FALLBACK_UBUNTU"; do
+        info "获取 XanMod 签名密钥: $url"
+        if curl -fsSL --connect-timeout 10 --max-time 30 "$url" -o "$key_temp" &&
+            key_has_expected_fingerprint "$key_temp"; then
+            if gpg --batch --yes --dearmor --output "${XANMOD_KEYRING}.new" "$key_temp" &&
+                key_has_expected_fingerprint "${XANMOD_KEYRING}.new"; then
+                chmod 644 "${XANMOD_KEYRING}.new"
+                mv -f "${XANMOD_KEYRING}.new" "$XANMOD_KEYRING"
+                success "XanMod 签名密钥已验证并安装"
+                trap - RETURN
+                rm -f "$key_temp"
+                return 0
+            fi
+            rm -f "${XANMOD_KEYRING}.new"
+        fi
+        warn "该密钥来源不可用或指纹不匹配，尝试下一个来源"
+        : > "$key_temp"
+    done
+
+    trap - RETURN
+    rm -f "$key_temp"
+    error "无法获得指纹为 $XANMOD_KEY_FINGERPRINT 的 XanMod 签名密钥"
+    return 1
+}
+
+write_deb822_source() {
+    local file="$1"
+    local repository="$2"
+    local codename="$3"
+
+    cat > "$file" <<EOF
+Types: deb
+URIs: $repository
+Suites: $codename
+Components: main
+Signed-By: $XANMOD_KEYRING
+EOF
+}
+
+xanmod_source_is_usable() {
+    local source_file="$1"
+
+    apt-get update -qq \
+        -o "Dir::Etc::sourcelist=$source_file" \
+        -o 'Dir::Etc::sourceparts=-' \
+        -o 'APT::Get::List-Cleanup=0'
 }
 
 xanmod_deb822_source_configured() {
     [[ -s "$XANMOD_KEYRING" ]] &&
+        key_has_expected_fingerprint "$XANMOD_KEYRING" &&
         [[ -f "$XANMOD_SOURCE_DEB822" ]] &&
-        grep -Eiq '^[[:space:]]*URIs:[[:space:]]*https?://deb\.xanmod\.org/?[[:space:]]*$' "$XANMOD_SOURCE_DEB822" &&
+        grep -Eiq '^[[:space:]]*URIs:[[:space:]]*https://[^[:space:]]*xanmod[^[:space:]]*[[:space:]]*$' "$XANMOD_SOURCE_DEB822" &&
         grep -Fiq "Signed-By: $XANMOD_KEYRING" "$XANMOD_SOURCE_DEB822"
 }
 
 get_xanmod_source_file() {
     if xanmod_deb822_source_configured; then
         echo "$XANMOD_SOURCE_DEB822"
-    elif xanmod_list_source_configured; then
-        echo "$XANMOD_SOURCE_LIST"
     else
         return 1
     fi
@@ -472,53 +542,58 @@ xanmod_source_configured() {
 
 configure_xanmod_repository() {
     local codename
-    local key_temp
     local source_file
+    local candidate
+    local selected=""
+    local probe_file
 
-    if source_file=$(get_xanmod_source_file); then
-        echo "XanMod 软件源: 已配置（$source_file）"
-        return 0
-    fi
-
-    ensure_package "gpg" "gpg" || return 1
+    ensure_package "gpg" "gpg" || {
+        error "无法安装 GnuPG"
+        return 1
+    }
     codename=$(get_debian_codename) || {
         error "无法识别 Debian 发行版代号"
         return 1
     }
 
     install -d -m 0755 /etc/apt/keyrings
+    install_xanmod_key || return 1
 
-    if [[ ! -s "$XANMOD_KEYRING" ]]; then
-        key_temp=$(mktemp) || return 1
-        info "下载 XanMod 软件源签名密钥..."
-
-        if ! curl -fsSL --connect-timeout 10 --max-time 30 \
-            "$XANMOD_KEY_URL" -o "$key_temp"; then
-            rm -f "$key_temp"
-            error "XanMod 签名密钥下载失败"
-            return 1
-        fi
-
-        if ! gpg --dearmor --yes --output "$XANMOD_KEYRING" "$key_temp"; then
-            rm -f "$key_temp"
-            error "XanMod 签名密钥转换失败"
-            return 1
-        fi
-
-        rm -f "$key_temp"
-        chmod 644 "$XANMOD_KEYRING"
+    if source_file=$(get_xanmod_source_file) && xanmod_source_is_usable "$source_file"; then
+        echo "XanMod 软件源: 已配置并可用（$source_file）"
+        return 0
     fi
 
-    cat > "$XANMOD_SOURCE_DEB822" <<EOF
-Types: deb
-URIs: $XANMOD_REPO_URL
-Suites: $codename
-Components: main
-Signed-By: $XANMOD_KEYRING
-EOF
+    [[ -n "${source_file:-}" ]] && warn "现有 XanMod 软件源不可用，重新选择镜像"
 
-    echo "XanMod 软件源: 已配置（Deb822 / $codename）"
+    probe_file=$(mktemp --suffix=.sources) || return 1
+    trap 'rm -f "$probe_file"' RETURN
+
+    for candidate in "${XANMOD_REPOSITORIES[@]}"; do
+        info "探测 XanMod 软件源: $candidate"
+        write_deb822_source "$probe_file" "$candidate" "$codename"
+        if xanmod_source_is_usable "$probe_file"; then
+            selected="$candidate"
+            break
+        fi
+        warn "软件源不可用: $candidate"
+    done
+
+    if [[ -z "$selected" ]]; then
+        trap - RETURN
+        rm -f "$probe_file"
+        error "所有 XanMod 软件源均不可用，未修改正式 APT 配置"
+        return 1
+    fi
+
+    install -m 644 "$probe_file" "${XANMOD_SOURCE_DEB822}.new"
+    mv -f "${XANMOD_SOURCE_DEB822}.new" "$XANMOD_SOURCE_DEB822"
+    rm -f "$XANMOD_SOURCE_LIST"
+    trap - RETURN
+    rm -f "$probe_file"
+    echo "XanMod 软件源: 已配置（Deb822 / $codename / $selected）"
 }
+
 get_installed_xanmod_packages() {
     dpkg-query -W \
         -f='${binary:Package} ${db:Status-Status}\n' \
@@ -674,11 +749,14 @@ show_xanmod_status() {
         echo "  推荐包: 无"
     fi
 
+    if [[ -s "$XANMOD_KEYRING" ]] && key_has_expected_fingerprint "$XANMOD_KEYRING"; then
+        echo "  签名密钥: 已验证"
+    else
+        echo "  签名密钥: 未配置或校验失败"
+    fi
+
     if source_file=$(get_xanmod_source_file); then
-        case "$source_file" in
-            *.sources) echo "  软件源: 已配置（Deb822）" ;;
-            *) echo "  软件源: 已配置（传统 list）" ;;
-        esac
+        echo "  软件源: 已配置（Deb822）"
         echo "  软件源文件: $source_file"
     else
         echo "  软件源: 未配置或配置未通过校验"
@@ -691,6 +769,7 @@ show_xanmod_status() {
         echo "  已安装包: 无"
     fi
 }
+
 # === 主流程 ===
 show_help() {
     cat <<'EOF'
@@ -711,8 +790,8 @@ main() {
     require_root
 
     local required_command
-    for required_command in apt-get awk cat chmod curl dpkg grep hostname \
-        mktemp sed sort uname; do
+    for required_command in apt-get awk cat chmod curl dpkg grep hostname install \
+        mktemp mv rm sed sort tr uname; do
         if ! command -v "$required_command" >/dev/null 2>&1; then
             error "缺少必要命令: $required_command"
             exit 1
