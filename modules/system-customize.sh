@@ -356,94 +356,56 @@ get_running_xanmod_package() {
     kernel=$(uname -r)
 
     case "$kernel" in
-        *-x64v3-xanmod*)
-            echo "linux-xanmod-x64v3"
-            ;;
-        *-x64v2-xanmod*)
-            echo "linux-xanmod-x64v2"
-            ;;
-        *)
-            return 1
-            ;;
+        *-x64v3-xanmod*) echo "linux-xanmod-x64v3" ;;
+        *-x64v2-xanmod*) echo "linux-xanmod-x64v2" ;;
+        *) return 1 ;;
     esac
 }
 
 detect_x86_64_psabi_level() {
     local cpuinfo_file="${1:-/proc/cpuinfo}"
-
     [[ -r "$cpuinfo_file" ]] || return 3
 
     awk '
-        function has(name) {
-            return index(flags, " " name " ") > 0
-        }
-
+        function has(name) { return index(flags, " " name " ") > 0 }
         BEGIN { found = 0 }
-
         /^flags[[:space:]]*:/ {
             found = 1
             flags = " " $0 " "
             level = 0
-
             if (has("lm") && has("cmov") && has("cx8") && has("fpu") &&
-                has("fxsr") && has("mmx") && has("syscall") && has("sse2")) {
-                level = 1
-            }
-
-            if (level == 1 && has("cx16") && has("lahf_lm") &&
-                has("popcnt") && has("sse4_1") && has("sse4_2") &&
-                has("ssse3")) {
-                level = 2
-            }
-
+                has("fxsr") && has("mmx") && has("syscall") && has("sse2")) level = 1
+            if (level == 1 && has("cx16") && has("lahf_lm") && has("popcnt") &&
+                has("sse4_1") && has("sse4_2") && has("ssse3")) level = 2
             if (level == 2 && has("avx") && has("avx2") && has("bmi1") &&
                 has("bmi2") && has("f16c") && has("fma") &&
-                (has("abm") || has("lzcnt")) && has("movbe") && has("xsave")) {
-                level = 3
-            }
-
-            if (level == 3 && has("avx512f") && has("avx512bw") &&
-                has("avx512cd") && has("avx512dq") && has("avx512vl")) {
-                level = 4
-            }
-
-            if (level > 0) {
-                print "v" level
-                exit 0
-            }
+                (has("abm") || has("lzcnt")) && has("movbe") && has("xsave")) level = 3
+            if (level == 3 && has("avx512f") && has("avx512bw") && has("avx512cd") &&
+                has("avx512dq") && has("avx512vl")) level = 4
+            if (level > 0) { print "v" level; exit 0 }
             exit 2
         }
-
-        END {
-            if (!found) exit 3
-        }
+        END { if (!found) exit 3 }
     ' "$cpuinfo_file"
 }
 
 get_xanmod_package_for_psabi_level() {
     local psabi_level="$1"
-
     case "$psabi_level" in
         v4|v3)
             # XanMod 不提供 MAIN v4 包，且官方说明 v4 对内核无收益。
             echo "linux-xanmod-x64v3"
             ;;
-        v2)
-            echo "linux-xanmod-x64v2"
-            ;;
-        *)
-            return 1
-            ;;
+        v2) echo "linux-xanmod-x64v2" ;;
+        *) return 1 ;;
     esac
 }
 
 detect_xanmod_package() {
     local psabi_level
-
     if ! is_amd64; then
         return 1
     fi
-
     if psabi_level=$(detect_x86_64_psabi_level); then
         get_xanmod_package_for_psabi_level "$psabi_level"
     else
@@ -451,58 +413,117 @@ detect_xanmod_package() {
     fi
 }
 
-key_has_expected_fingerprint() {
+get_primary_key_fingerprint() {
     local key_file="$1"
-    local fingerprint
+    gpg --batch --show-keys --with-colons "$key_file" 2>/dev/null |
+        awk -F: '
+            $1 == "pub" && !seen_pub { seen_pub = 1; next }
+            seen_pub && $1 == "fpr" { print $10; exit }
+        '
+}
 
-    fingerprint=$(gpg --batch --show-keys --with-colons "$key_file" 2>/dev/null |
-        awk -F: '$1 == "fpr" { print $10; exit }')
+xanmod_keyring_valid() {
+    local key_file="${1:-$XANMOD_KEYRING}"
+    local fingerprint
+    [[ -s "$key_file" ]] || return 1
+    fingerprint=$(get_primary_key_fingerprint "$key_file") || return 1
     [[ "$fingerprint" == "$XANMOD_KEY_FINGERPRINT" ]]
 }
 
 install_xanmod_key() {
     local key_temp
-    local url
+    local key_new="${XANMOD_KEYRING}.new"
+    local key_url
 
-    if [[ -s "$XANMOD_KEYRING" ]] && key_has_expected_fingerprint "$XANMOD_KEYRING"; then
+    if xanmod_keyring_valid; then
         return 0
     fi
+    if [[ -e "$XANMOD_KEYRING" ]]; then
+        warn "现有 XanMod 密钥指纹无效，将重新获取"
+    fi
 
-    [[ -e "$XANMOD_KEYRING" ]] && warn "现有 XanMod 密钥指纹无效，将重新获取"
     key_temp=$(mktemp) || return 1
-    trap 'rm -f "$key_temp"' RETURN
+    trap 'rm -f "$key_temp" "$key_new"' RETURN
+    rm -f "$key_new"
 
-    for url in "$XANMOD_KEY_URL" "$XANMOD_KEY_FALLBACK_OPENPGP" "$XANMOD_KEY_FALLBACK_UBUNTU"; do
-        info "获取 XanMod 签名密钥: $url"
-        if curl -fsSL --connect-timeout 10 --max-time 30 "$url" -o "$key_temp" &&
-            key_has_expected_fingerprint "$key_temp"; then
-            if gpg --batch --yes --dearmor --output "${XANMOD_KEYRING}.new" "$key_temp" &&
-                key_has_expected_fingerprint "${XANMOD_KEYRING}.new"; then
-                chmod 644 "${XANMOD_KEYRING}.new"
-                mv -f "${XANMOD_KEYRING}.new" "$XANMOD_KEYRING"
-                success "XanMod 签名密钥已验证并安装"
-                trap - RETURN
-                rm -f "$key_temp"
-                return 0
-            fi
-            rm -f "${XANMOD_KEYRING}.new"
+    for key_url in \
+        "$XANMOD_KEY_URL" \
+        "$XANMOD_KEY_FALLBACK_OPENPGP" \
+        "$XANMOD_KEY_FALLBACK_UBUNTU"; do
+        info "下载 XanMod 软件源签名密钥: $key_url"
+        if ! curl -fsSL --connect-timeout 10 --max-time 30 "$key_url" -o "$key_temp"; then
+            warn "该密钥来源下载失败，尝试下一个来源"
+            continue
         fi
-        warn "该密钥来源不可用或指纹不匹配，尝试下一个来源"
-        : > "$key_temp"
+        if ! xanmod_keyring_valid "$key_temp"; then
+            warn "该密钥来源的第一主密钥指纹不匹配，尝试下一个来源"
+            continue
+        fi
+
+        rm -f "$key_new"
+        if ! gpg --batch --yes --dearmor --output "$key_new" "$key_temp"; then
+            warn "XanMod 签名密钥转换失败，尝试下一个来源"
+            continue
+        fi
+        if ! xanmod_keyring_valid "$key_new"; then
+            warn "转换后的 XanMod 密钥指纹不匹配，尝试下一个来源"
+            continue
+        fi
+
+        chmod 644 "$key_new"
+        mv -f "$key_new" "$XANMOD_KEYRING"
+        rm -f "$key_temp"
+        trap - RETURN
+        success "XanMod 签名密钥已验证并安装"
+        return 0
     done
 
+    rm -f "$key_temp" "$key_new"
     trap - RETURN
-    rm -f "$key_temp"
     error "无法获得指纹为 $XANMOD_KEY_FINGERPRINT 的 XanMod 签名密钥"
     return 1
 }
 
-write_deb822_source() {
-    local file="$1"
+xanmod_source_has_supported_uri() {
+    local source_file="$1"
+    grep -Eiq \
+        '^[[:space:]]*URIs:[[:space:]]*https://(deb\.xanmod\.org|mirror\.nju\.edu\.cn/xanmod|mirrors\.bfsu\.edu\.cn/xanmod|mirrors\.tuna\.tsinghua\.edu\.cn/xanmod)/?[[:space:]]*$' \
+        "$source_file"
+}
+
+xanmod_list_source_configured() {
+    [[ -s "$XANMOD_KEYRING" ]] && xanmod_keyring_valid &&
+        [[ -f "$XANMOD_SOURCE_LIST" ]] &&
+        grep -Eiq 'https://(deb\.xanmod\.org|mirror\.nju\.edu\.cn/xanmod|mirrors\.bfsu\.edu\.cn/xanmod|mirrors\.tuna\.tsinghua\.edu\.cn/xanmod)/?' "$XANMOD_SOURCE_LIST" &&
+        grep -Fiq "signed-by=$XANMOD_KEYRING" "$XANMOD_SOURCE_LIST"
+}
+
+xanmod_deb822_source_configured() {
+    [[ -s "$XANMOD_KEYRING" ]] && xanmod_keyring_valid &&
+        [[ -f "$XANMOD_SOURCE_DEB822" ]] &&
+        xanmod_source_has_supported_uri "$XANMOD_SOURCE_DEB822" &&
+        grep -Fiq "Signed-By: $XANMOD_KEYRING" "$XANMOD_SOURCE_DEB822"
+}
+
+get_xanmod_source_file() {
+    if xanmod_deb822_source_configured; then
+        echo "$XANMOD_SOURCE_DEB822"
+    elif xanmod_list_source_configured; then
+        echo "$XANMOD_SOURCE_LIST"
+    else
+        return 1
+    fi
+}
+
+xanmod_source_configured() {
+    get_xanmod_source_file >/dev/null
+}
+
+write_xanmod_deb822_source() {
+    local source_file="$1"
     local repository="$2"
     local codename="$3"
-
-    cat > "$file" <<EOF
+    cat > "$source_file" <<EOF
 Types: deb
 URIs: $repository
 Suites: $codename
@@ -513,44 +534,33 @@ EOF
 
 xanmod_source_is_usable() {
     local source_file="$1"
+    local lists_temp
+    local apt_status
 
-    apt-get update -qq \
+    lists_temp=$(mktemp -d) || return 1
+    install -d -m 0755 "$lists_temp/partial"
+    if apt-get update -qq \
         -o "Dir::Etc::sourcelist=$source_file" \
         -o 'Dir::Etc::sourceparts=-' \
-        -o 'APT::Get::List-Cleanup=0'
-}
-
-xanmod_deb822_source_configured() {
-    [[ -s "$XANMOD_KEYRING" ]] &&
-        key_has_expected_fingerprint "$XANMOD_KEYRING" &&
-        [[ -f "$XANMOD_SOURCE_DEB822" ]] &&
-        grep -Eiq '^[[:space:]]*URIs:[[:space:]]*https://[^[:space:]]*xanmod[^[:space:]]*[[:space:]]*$' "$XANMOD_SOURCE_DEB822" &&
-        grep -Fiq "Signed-By: $XANMOD_KEYRING" "$XANMOD_SOURCE_DEB822"
-}
-
-get_xanmod_source_file() {
-    if xanmod_deb822_source_configured; then
-        echo "$XANMOD_SOURCE_DEB822"
+        -o "Dir::State::lists=$lists_temp" \
+        -o 'APT::Get::List-Cleanup=0'; then
+        apt_status=0
     else
-        return 1
+        apt_status=$?
     fi
-}
-
-xanmod_source_configured() {
-    get_xanmod_source_file >/dev/null
+    rm -rf -- "$lists_temp"
+    return "$apt_status"
 }
 
 configure_xanmod_repository() {
     local codename
     local source_file
-    local candidate
-    local selected=""
-    local probe_file
+    local source_temp
+    local source_new="${XANMOD_SOURCE_DEB822}.new"
+    local repository
+    local selected_repository=""
 
-    ensure_package "gpg" "gpg" || {
-        error "无法安装 GnuPG"
-        return 1
-    }
+    ensure_package "gpg" "gpg" || return 1
     codename=$(get_debian_codename) || {
         error "无法识别 Debian 发行版代号"
         return 1
@@ -559,39 +569,41 @@ configure_xanmod_repository() {
     install -d -m 0755 /etc/apt/keyrings
     install_xanmod_key || return 1
 
-    if source_file=$(get_xanmod_source_file) && xanmod_source_is_usable "$source_file"; then
-        echo "XanMod 软件源: 已配置并可用（$source_file）"
-        return 0
+    if source_file=$(get_xanmod_source_file); then
+        if xanmod_source_is_usable "$source_file"; then
+            echo "XanMod 软件源: 已配置并可用（$source_file）"
+            return 0
+        fi
+        warn "现有 XanMod 软件源不可用，将重新选择镜像"
     fi
 
-    [[ -n "${source_file:-}" ]] && warn "现有 XanMod 软件源不可用，重新选择镜像"
+    source_temp=$(mktemp --suffix=.sources) || return 1
+    trap 'rm -f "$source_temp" "$source_new"' RETURN
+    rm -f "$source_new"
 
-    probe_file=$(mktemp --suffix=.sources) || return 1
-    trap 'rm -f "$probe_file"' RETURN
-
-    for candidate in "${XANMOD_REPOSITORIES[@]}"; do
-        info "探测 XanMod 软件源: $candidate"
-        write_deb822_source "$probe_file" "$candidate" "$codename"
-        if xanmod_source_is_usable "$probe_file"; then
-            selected="$candidate"
+    for repository in "${XANMOD_REPOSITORIES[@]}"; do
+        info "探测 XanMod 软件源: $repository"
+        write_xanmod_deb822_source "$source_temp" "$repository" "$codename"
+        if xanmod_source_is_usable "$source_temp"; then
+            selected_repository="$repository"
             break
         fi
-        warn "软件源不可用: $candidate"
+        warn "XanMod 软件源不可用: $repository"
     done
 
-    if [[ -z "$selected" ]]; then
+    if [[ -z "$selected_repository" ]]; then
+        rm -f "$source_temp" "$source_new"
         trap - RETURN
-        rm -f "$probe_file"
         error "所有 XanMod 软件源均不可用，未修改正式 APT 配置"
         return 1
     fi
 
-    install -m 644 "$probe_file" "${XANMOD_SOURCE_DEB822}.new"
-    mv -f "${XANMOD_SOURCE_DEB822}.new" "$XANMOD_SOURCE_DEB822"
+    install -m 644 "$source_temp" "$source_new"
+    mv -f "$source_new" "$XANMOD_SOURCE_DEB822"
     rm -f "$XANMOD_SOURCE_LIST"
+    rm -f "$source_temp"
     trap - RETURN
-    rm -f "$probe_file"
-    echo "XanMod 软件源: 已配置（Deb822 / $codename / $selected）"
+    echo "XanMod 软件源: 已配置（Deb822 / $codename / $selected_repository）"
 }
 
 get_installed_xanmod_packages() {
@@ -656,52 +668,41 @@ install_xanmod() {
     fi
 
     echo "检测到适合当前环境的 XanMod 包: $target_package"
-
     installed_packages=$(get_installed_xanmod_packages || true)
 
     if package_is_installed "$target_package"; then
         echo "XanMod 目标包: 已安装（$target_package）"
-
         if [[ "$(get_running_xanmod_package || true)" == "$target_package" ]]; then
             echo "当前内核: $(uname -r)（匹配 CPU 检测结果）"
         else
             echo "当前内核: $(uname -r)（目标内核将在下次重启后生效）"
         fi
-
         return 0
     fi
 
     if [[ -n "$installed_packages" ]]; then
         warn "已安装的 XanMod 包与 CPU 检测结果不匹配: $(tr '\n' ' ' <<< "$installed_packages")"
         warn "建议安装: $target_package"
-
         read -r -p "是否安装检测到的正确版本 $target_package？[Y/n]: " install_choice
         install_choice="${install_choice:-Y}"
-
         if [[ ! "$install_choice" =~ ^[Yy]$ ]]; then
             echo "XanMod 内核: 保留现有安装"
             return 0
         fi
-
         echo "说明: 旧 XanMod 包将保留，确认新内核可正常启动后再手动清理。"
     fi
 
     configure_xanmod_repository || return 1
-
     info "更新软件包索引..."
-
     if ! apt-get update; then
         error "XanMod 软件源索引更新失败"
         return 1
     fi
-
     info "安装 XanMod 内核包: $target_package"
-
     if ! apt-get install -y "$target_package"; then
         error "XanMod 内核安装失败"
         return 1
     fi
-
     if ! package_is_installed "$target_package"; then
         error "XanMod 内核安装后验证失败"
         return 1
@@ -749,14 +750,11 @@ show_xanmod_status() {
         echo "  推荐包: 无"
     fi
 
-    if [[ -s "$XANMOD_KEYRING" ]] && key_has_expected_fingerprint "$XANMOD_KEYRING"; then
-        echo "  签名密钥: 已验证"
-    else
-        echo "  签名密钥: 未配置或校验失败"
-    fi
-
     if source_file=$(get_xanmod_source_file); then
-        echo "  软件源: 已配置（Deb822）"
+        case "$source_file" in
+            *.sources) echo "  软件源: 已配置（Deb822）" ;;
+            *) echo "  软件源: 已配置（传统 list）" ;;
+        esac
         echo "  软件源文件: $source_file"
     else
         echo "  软件源: 未配置或配置未通过校验"
@@ -801,35 +799,23 @@ main() {
     case "$action" in
         all)
             info "🎨 配置系统定制功能..."
-
             echo
             configure_motd
-
             echo
             configure_chinese_locale
-
             echo
             install_xanmod
-
             show_xanmod_status
             success "系统定制配置完成"
             ;;
-        motd)
-            configure_motd
-            ;;
-        locale)
-            configure_chinese_locale
-            ;;
+        motd) configure_motd ;;
+        locale) configure_chinese_locale ;;
         xanmod)
             install_xanmod
             show_xanmod_status
             ;;
-        status)
-            show_xanmod_status
-            ;;
-        help|--help|-h)
-            show_help
-            ;;
+        status) show_xanmod_status ;;
+        help|--help|-h) show_help ;;
         *)
             error "未知参数: $action"
             show_help
