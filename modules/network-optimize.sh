@@ -196,29 +196,38 @@ create_network_config() {
 
     cat > "$target_file" <<'EOF'
 # 由 network-optimize.sh 自动生成。
-# 面向 BBR、代理、端口转发与高连接数 VPS 的稳定配置。
+# 适用于 Debian 13 代理、转发及中高延迟公网 VPS。
 
-# 1. 队列调度
-# fq 与 BBR pacing 配合，优先兼顾起速与吞吐。
-net.core.default_qdisc = fq
-
-# 2. TCP Fast Open
-# 3 = 同时启用客户端与服务端。
-net.ipv4.tcp_fastopen = 3
-
-# 3. IPv4 转发与代理/端口转发兼容
+# 1. IPv4 转发
 net.ipv4.ip_forward = 1
 
-# 宽松反向路径过滤：
-# 比严格模式更兼容代理、转发、策略路由与非对称回程。
+# 2. 代理与非对称路由兼容
 net.ipv4.conf.all.rp_filter = 2
 net.ipv4.conf.default.rp_filter = 2
 
-# 4. 文件句柄与连接队列
-fs.file-max = 1048576
+# 3. 队列调度
+net.core.default_qdisc = fq
+
+# 4. TCP Fast Open
+net.ipv4.tcp_fastopen = 3
+
+# 5. 连接与接收队列
 net.core.somaxconn = 32768
+net.ipv4.tcp_max_syn_backlog = 8192
 net.core.netdev_max_backlog = 16384
+
+# 6. 临时端口
 net.ipv4.ip_local_port_range = 1024 65535
+
+# 7. TCP/UDP 缓冲区
+net.core.rmem_max = 33554432
+net.core.wmem_max = 33554432
+net.ipv4.tcp_rmem = 4096 131072 33554432
+net.ipv4.tcp_wmem = 4096 65536 33554432
+
+# 8. 长连接与复杂路径
+net.ipv4.tcp_slow_start_after_idle = 0
+net.ipv4.tcp_mtu_probing = 1
 EOF
 
     if [[ "$enable_bbr" == "true" ]]; then
@@ -388,10 +397,16 @@ show_status() {
     local ip_forward
     local rp_filter_all
     local rp_filter_default
-    local file_max
     local somaxconn
+    local syn_backlog
     local backlog
     local port_range
+    local rmem_max
+    local wmem_max
+    local tcp_rmem
+    local tcp_wmem
+    local slow_start_after_idle
+    local mtu_probing
 
     available_cc=$(cat /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null || echo "未知")
     current_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "未知")
@@ -400,10 +415,16 @@ show_status() {
     ip_forward=$(sysctl -n net.ipv4.ip_forward 2>/dev/null || echo "未知")
     rp_filter_all=$(sysctl -n net.ipv4.conf.all.rp_filter 2>/dev/null || echo "未知")
     rp_filter_default=$(sysctl -n net.ipv4.conf.default.rp_filter 2>/dev/null || echo "未知")
-    file_max=$(sysctl -n fs.file-max 2>/dev/null || echo "未知")
     somaxconn=$(sysctl -n net.core.somaxconn 2>/dev/null || echo "未知")
+    syn_backlog=$(sysctl -n net.ipv4.tcp_max_syn_backlog 2>/dev/null || echo "未知")
     backlog=$(sysctl -n net.core.netdev_max_backlog 2>/dev/null || echo "未知")
     port_range=$(sysctl -n net.ipv4.ip_local_port_range 2>/dev/null || echo "未知")
+    rmem_max=$(sysctl -n net.core.rmem_max 2>/dev/null || echo "未知")
+    wmem_max=$(sysctl -n net.core.wmem_max 2>/dev/null || echo "未知")
+    tcp_rmem=$(sysctl -n net.ipv4.tcp_rmem 2>/dev/null || echo "未知")
+    tcp_wmem=$(sysctl -n net.ipv4.tcp_wmem 2>/dev/null || echo "未知")
+    slow_start_after_idle=$(sysctl -n net.ipv4.tcp_slow_start_after_idle 2>/dev/null || echo "未知")
+    mtu_probing=$(sysctl -n net.ipv4.tcp_mtu_probing 2>/dev/null || echo "未知")
 
     echo "========== 网络优化状态 =========="
     echo "配置文件: $NETWORK_CONF"
@@ -429,10 +450,22 @@ show_status() {
 
     echo
     echo "连接容量:"
-    echo "  fs.file-max: $file_max"
     echo "  somaxconn: $somaxconn"
+    echo "  tcp_max_syn_backlog: $syn_backlog"
     echo "  netdev_max_backlog: $backlog"
     echo "  临时端口范围: $port_range"
+
+    echo
+    echo "缓冲区:"
+    echo "  rmem_max: $rmem_max"
+    echo "  wmem_max: $wmem_max"
+    echo "  tcp_rmem: $tcp_rmem"
+    echo "  tcp_wmem: $tcp_wmem"
+
+    echo
+    echo "TCP 行为:"
+    echo "  slow_start_after_idle: $slow_start_after_idle"
+    echo "  mtu_probing: $mtu_probing"
 
     echo
     echo "兼容迁移:"
