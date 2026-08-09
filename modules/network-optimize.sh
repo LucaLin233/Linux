@@ -34,7 +34,8 @@ readonly IPERF_PARALLEL=4
 readonly IPERF_MAX_PEERS=2
 readonly CLOUDFLARE_PARALLEL=8
 readonly CLOUDFLARE_DURATION=6
-readonly CLOUDFLARE_REQUEST_BYTES=250000000
+readonly CLOUDFLARE_DOWNLOAD_BYTES=50000000
+readonly CLOUDFLARE_UPLOAD_BYTES=250000000
 readonly TRAFFIC_TOTAL_LIMIT_BYTES=90000000000
 readonly TRAFFIC_DIRECTION_LIMIT_BYTES=45000000000
 
@@ -713,6 +714,8 @@ run_iperf_test() {
     local bps=""
     local cpu=""
     local retransmits=""
+    local sent_bytes=""
+    local retransmit_percent=""
     local stats=""
     local limited="false"
     local reverse=()
@@ -753,10 +756,11 @@ run_iperf_test() {
                 (.end.sum_received.bits_per_second
                     // .end.sum_sent.bits_per_second // ""),
                 (.end.cpu_utilization_percent.host_total // ""),
-                (.end.sum_sent.retransmits // "")
+                (.end.sum_sent.retransmits // ""),
+                (.end.sum_sent.bytes // "")
             ] | join("|")
         ' "$output" 2>/dev/null || true)
-        IFS='|' read -r bps cpu retransmits <<< "$stats"
+        IFS='|' read -r bps cpu retransmits sent_bytes <<< "$stats"
     fi
     rm -f "$output"
 
@@ -765,10 +769,19 @@ run_iperf_test() {
             'BEGIN {if (seconds > 0) printf "%.0f", bytes * 8 / seconds}')
     fi
     [[ "$bps" =~ ^[0-9]+([.][0-9]+)?$ ]] || return 1
+    if [[ "$retransmits" =~ ^[0-9]+$ && "$sent_bytes" =~ ^[0-9]+$ ]] &&
+        (( sent_bytes > 0 )); then
+        retransmit_percent=$(awk -v retransmits="$retransmits" -v bytes="$sent_bytes" '
+            BEGIN {
+                packets = bytes / 1448
+                if (packets > 0) printf "%.4f", retransmits * 100 / packets
+            }
+        ')
+    fi
 
-    printf '%s|%s|%s\n' \
+    printf '%s|%s|%s|%s\n' \
         "$(awk -v bps="$bps" 'BEGIN {printf "%.0f", bps / 1000000}')" \
-        "${cpu:-?}" "${retransmits:-?}"
+        "${cpu:-?}" "${retransmits:-?}" "${retransmit_percent:-?}"
 }
 
 format_cpu_percent() {
@@ -794,6 +807,8 @@ probe_iperf_bandwidth() {
     local download_cpu
     local upload_retransmits
     local download_retransmits
+    local upload_retransmit_percent
+    local download_retransmit_percent
     local best_upload=0
     local best_download=0
     local successful_peers=0
@@ -816,17 +831,17 @@ probe_iperf_bandwidth() {
             download_result=$(run_iperf_test "$host" "$port" download || true)
             [[ -n "$upload_result$download_result" ]] || continue
 
-            upload=""; upload_cpu=""; upload_retransmits=""
-            download=""; download_cpu=""; download_retransmits=""
+            upload=""; upload_cpu=""; upload_retransmits=""; upload_retransmit_percent=""
+            download=""; download_cpu=""; download_retransmits=""; download_retransmit_percent=""
             [[ -n "$upload_result" ]] &&
-                IFS='|' read -r upload upload_cpu upload_retransmits <<< "$upload_result"
+                IFS='|' read -r upload upload_cpu upload_retransmits upload_retransmit_percent <<< "$upload_result"
             [[ -n "$download_result" ]] &&
-                IFS='|' read -r download download_cpu download_retransmits <<< "$download_result"
+                IFS='|' read -r download download_cpu download_retransmits download_retransmit_percent <<< "$download_result"
             upload_cpu=$(format_cpu_percent "$upload_cpu")
             download_cpu=$(format_cpu_percent "$download_cpu")
 
             info "iperf3 成功节点：$location/$provider $host:$port（RTT ${rtt} ms）"
-            info "节点结果：下载 ${download:-失败} Mbps（CPU ${download_cpu:-?}% / 重传 ${download_retransmits:-?}），上传 ${upload:-失败} Mbps（CPU ${upload_cpu:-?}% / 重传 ${upload_retransmits:-?}）"
+            info "节点结果：下载 ${download:-失败} Mbps（CPU ${download_cpu:-?}% / 重传率 ${download_retransmit_percent:-?}% [${download_retransmits:-?} 次]），上传 ${upload:-失败} Mbps（CPU ${upload_cpu:-?}% / 重传率 ${upload_retransmit_percent:-?}% [${upload_retransmits:-?} 次]）"
 
             [[ -n "$upload" ]] && (( upload > best_upload )) && best_upload=$upload
             [[ -n "$download" ]] && (( download > best_download )) && best_download=$download
@@ -857,7 +872,7 @@ cloudflare_worker() {
             curl -4 --noproxy '*' --fail --silent --output /dev/null \
                 --header 'Accept-Encoding: identity' \
                 --connect-timeout 4 --max-time "$remaining" \
-                "$SPEED_DOWNLOAD_URL?bytes=$CLOUDFLARE_REQUEST_BYTES" || break
+                "$SPEED_DOWNLOAD_URL?bytes=$CLOUDFLARE_DOWNLOAD_BYTES" || break
         else
             curl -4 --noproxy '*' --fail --silent --output /dev/null \
                 --header 'Content-Type: application/octet-stream' \
@@ -886,7 +901,7 @@ probe_cloudflare_direction() {
     traffic_budget_reached "$direction" && return 1
     if [[ "$direction" == "upload" ]]; then
         upload_file=$(mktemp) || return 1
-        if ! truncate -s "$CLOUDFLARE_REQUEST_BYTES" "$upload_file"; then
+        if ! truncate -s "$CLOUDFLARE_UPLOAD_BYTES" "$upload_file"; then
             rm -f "$upload_file"
             return 1
         fi
@@ -941,9 +956,18 @@ probe_cloudflare_direction() {
     '
 }
 
+format_bandwidth_result() {
+    if [[ "$1" =~ ^[0-9]+$ ]]; then
+        echo " $1 Mbps"
+    else
+        echo "失败"
+    fi
+}
+
 probe_cloudflare_bandwidth() {
     local upload=""
     local download=""
+    local crosscheck=""
 
     command -v curl >/dev/null 2>&1 || return 1
     info "使用 8 流 Cloudflare 交叉验证；iperf3 不可用时同时作为回退..."
@@ -952,7 +976,7 @@ probe_cloudflare_bandwidth() {
     upload=$(probe_cloudflare_direction upload || true)
 
     if [[ -n "$download" || -n "$upload" ]]; then
-        info "Cloudflare 结果：下载 ${download:-失败} Mbps，上传 ${upload:-失败} Mbps"
+        info "Cloudflare 结果：下载$(format_bandwidth_result "$download")，上传$(format_bandwidth_result "$upload")"
     else
         warn "Cloudflare 交叉验证失败：两个方向均未获得足够有效流量"
     fi
@@ -967,10 +991,12 @@ probe_cloudflare_bandwidth() {
     fi
     [[ -n "$DETECTED_DOWNLOAD_MBPS$DETECTED_UPLOAD_MBPS" ]] || return 1
 
+    [[ -n "$download" ]] && crosscheck="download"
+    [[ -n "$upload" ]] && crosscheck="${crosscheck:+$crosscheck/}upload"
     if [[ "$BANDWIDTH_SOURCE" == "unknown" ]]; then
-        BANDWIDTH_SOURCE="Cloudflare, ${CLOUDFLARE_PARALLEL} parallel streams"
-    elif [[ -n "$download$upload" ]]; then
-        BANDWIDTH_SOURCE="$BANDWIDTH_SOURCE + Cloudflare cross-check"
+        BANDWIDTH_SOURCE="Cloudflare $crosscheck, ${CLOUDFLARE_PARALLEL} parallel streams"
+    elif [[ -n "$crosscheck" ]]; then
+        BANDWIDTH_SOURCE="$BANDWIDTH_SOURCE + Cloudflare $crosscheck cross-check"
     fi
 }
 
