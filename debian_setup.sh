@@ -8,7 +8,7 @@
 set -uo pipefail
 
 # === 全局常量 ===
-readonly SCRIPT_VERSION="4.1.0"
+readonly SCRIPT_VERSION="4.1.1"
 SCRIPT_COMMIT="${SCRIPT_COMMIT:-unknown}"
 
 readonly MODULE_BASE_URL="https://raw.githubusercontent.com/LucaLin233/Linux"
@@ -742,6 +742,7 @@ get_system_status() {
     local ssh_root_login
     local network_ip
     local network_interface
+    local route_info
 
     cpu_cores=$(nproc 2>/dev/null || echo "未知")
     memory_info=$(LANG=C free -h 2>/dev/null | awk 'NR == 2 {print $3 "/" $2}' || echo "未知")
@@ -805,8 +806,44 @@ get_system_status() {
 
     echo "SSH: 端口=${ssh_ports:-未知} | Root 登录=${ssh_root_login:-未知}"
 
-    network_ip=$(hostname -I 2>/dev/null | awk '{print $1}')
-    network_interface=$(ip route 2>/dev/null | awk '/^default/ {print $5; exit}')
+    route_info=$(ip -4 route get 1.1.1.1 2>/dev/null || true)
+    network_interface=$(awk '
+        {
+            for (i = 1; i < NF; i++) {
+                if ($i == "dev") {
+                    print $(i + 1)
+                    exit
+                }
+            }
+        }
+    ' <<< "$route_info")
+    network_ip=$(awk '
+        {
+            for (i = 1; i < NF; i++) {
+                if ($i == "src") {
+                    print $(i + 1)
+                    exit
+                }
+            }
+        }
+    ' <<< "$route_info")
+
+    if [[ -z "$network_interface" ]]; then
+        network_interface=$(ip -4 route show default 2>/dev/null | awk '
+            {
+                for (i = 1; i < NF; i++) {
+                    if ($i == "dev") {
+                        print $(i + 1)
+                        exit
+                    }
+                }
+            }
+        ')
+    fi
+    if [[ -z "$network_ip" && -n "$network_interface" ]]; then
+        network_ip=$(ip -4 -o address show dev "$network_interface" scope global 2>/dev/null |
+            awk 'NR == 1 {split($4, address, "/"); print address[1]}')
+    fi
 
     echo "网络: ${network_ip:-未知} via ${network_interface:-未知}"
 }

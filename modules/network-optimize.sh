@@ -34,6 +34,7 @@ readonly IPERF_PARALLEL=4
 readonly IPERF_MAX_PEERS=2
 readonly CLOUDFLARE_PARALLEL=8
 readonly CLOUDFLARE_DURATION=6
+readonly CLOUDFLARE_REQUEST_BYTES=250000000
 readonly TRAFFIC_TOTAL_LIMIT_BYTES=90000000000
 readonly TRAFFIC_DIRECTION_LIMIT_BYTES=45000000000
 
@@ -85,6 +86,12 @@ DETECTED_DOWNLOAD_MBPS=""
 DETECTED_UPLOAD_MBPS=""
 DETECTED_RTT_MS=""
 RTT_SOURCE="unknown"
+CHINA_RTT_MS=""
+GLOBAL_RTT_MS=""
+CHINA_RTT_METHOD=""
+GLOBAL_RTT_METHOD=""
+CHINA_RTT_SAMPLES=""
+GLOBAL_RTT_SAMPLES=""
 BANDWIDTH_SOURCE="unknown"
 RAM_MB=0
 MEMORY_CAP_BYTES=0
@@ -433,7 +440,9 @@ measure_ping_group() {
     cleanup_temp_dir "$temp_dir"
 
     (( ${#values[@]} > 0 )) || return 1
-    printf '%s\n' "${values[@]}" | median_values
+    printf '%s %s %s\n' \
+        "$(printf '%s\n' "${values[@]}" | median_values)" \
+        "${#values[@]}" "$#"
 }
 
 measure_tcp_target() {
@@ -486,7 +495,9 @@ measure_tcp_group() {
     cleanup_temp_dir "$temp_dir"
 
     (( ${#values[@]} > 0 )) || return 1
-    printf '%s\n' "${values[@]}" | median_values
+    printf '%s %s %s\n' \
+        "$(printf '%s\n' "${values[@]}" | median_values)" \
+        "${#values[@]}" "$#"
 }
 
 clamp_auto_rtt() {
@@ -497,45 +508,68 @@ clamp_auto_rtt() {
 }
 
 detect_rtt() {
-    local china_rtt=""
-    local global_rtt=""
+    local china_result=""
+    local global_result=""
+    local custom_result=""
     local custom_rtt=""
+    local custom_success=""
+    local custom_total=""
 
     if (( ${#CUSTOM_RTT_TARGETS[@]} > 0 )); then
-        custom_rtt=$(measure_ping_group "${CUSTOM_RTT_TARGETS[@]}" || true)
-        if [[ -n "$custom_rtt" ]]; then
+        custom_result=$(measure_ping_group "${CUSTOM_RTT_TARGETS[@]}" || true)
+        if [[ -n "$custom_result" ]]; then
             RTT_SOURCE="custom ICMP"
         else
-            custom_rtt=$(measure_tcp_group "${CUSTOM_RTT_TARGETS[@]}" || true)
-            [[ -n "$custom_rtt" ]] && RTT_SOURCE="custom TCP/443"
+            custom_result=$(measure_tcp_group "${CUSTOM_RTT_TARGETS[@]}" || true)
+            [[ -n "$custom_result" ]] && RTT_SOURCE="custom TCP/443"
         fi
-        [[ -n "$custom_rtt" ]] || return 1
+        [[ -n "$custom_result" ]] || return 1
+        read -r custom_rtt custom_success custom_total <<< "$custom_result"
         DETECTED_RTT_MS=$(clamp_auto_rtt "$custom_rtt")
+        RTT_SOURCE="$RTT_SOURCE, ${custom_success}/${custom_total} targets"
         return 0
     fi
 
-    china_rtt=$(measure_ping_group "${CHINA_PING_TARGETS[@]}" || true)
-    if [[ -z "$china_rtt" ]]; then
-        china_rtt=$(measure_tcp_group "${CHINA_TCP_TARGETS[@]}" || true)
+    china_result=$(measure_ping_group "${CHINA_PING_TARGETS[@]}" || true)
+    if [[ -n "$china_result" ]]; then
+        CHINA_RTT_METHOD="ICMP"
+    else
+        china_result=$(measure_tcp_group "${CHINA_TCP_TARGETS[@]}" || true)
+        [[ -n "$china_result" ]] && CHINA_RTT_METHOD="TCP/443"
+    fi
+    if [[ -n "$china_result" ]]; then
+        read -r CHINA_RTT_MS CHINA_RTT_SAMPLES _ <<< "$china_result"
+        CHINA_RTT_SAMPLES="$CHINA_RTT_SAMPLES/${#CHINA_PING_TARGETS[@]}"
+        [[ "$CHINA_RTT_METHOD" == "TCP/443" ]] &&
+            CHINA_RTT_SAMPLES="${CHINA_RTT_SAMPLES%/*}/${#CHINA_TCP_TARGETS[@]}"
     fi
 
-    global_rtt=$(measure_ping_group "${GLOBAL_PING_TARGETS[@]}" || true)
-    if [[ -z "$global_rtt" ]]; then
-        global_rtt=$(measure_tcp_group "${GLOBAL_TCP_TARGETS[@]}" || true)
+    global_result=$(measure_ping_group "${GLOBAL_PING_TARGETS[@]}" || true)
+    if [[ -n "$global_result" ]]; then
+        GLOBAL_RTT_METHOD="ICMP"
+    else
+        global_result=$(measure_tcp_group "${GLOBAL_TCP_TARGETS[@]}" || true)
+        [[ -n "$global_result" ]] && GLOBAL_RTT_METHOD="TCP/443"
+    fi
+    if [[ -n "$global_result" ]]; then
+        read -r GLOBAL_RTT_MS GLOBAL_RTT_SAMPLES _ <<< "$global_result"
+        GLOBAL_RTT_SAMPLES="$GLOBAL_RTT_SAMPLES/${#GLOBAL_PING_TARGETS[@]}"
+        [[ "$GLOBAL_RTT_METHOD" == "TCP/443" ]] &&
+            GLOBAL_RTT_SAMPLES="${GLOBAL_RTT_SAMPLES%/*}/${#GLOBAL_TCP_TARGETS[@]}"
     fi
 
-    if [[ -n "$china_rtt" && -n "$global_rtt" ]]; then
-        if (( china_rtt >= global_rtt )); then
-            DETECTED_RTT_MS="$china_rtt"
+    if [[ -n "$CHINA_RTT_MS" && -n "$GLOBAL_RTT_MS" ]]; then
+        if (( CHINA_RTT_MS >= GLOBAL_RTT_MS )); then
+            DETECTED_RTT_MS="$CHINA_RTT_MS"
         else
-            DETECTED_RTT_MS="$global_rtt"
+            DETECTED_RTT_MS="$GLOBAL_RTT_MS"
         fi
         RTT_SOURCE="max(CN, global)"
-    elif [[ -n "$china_rtt" ]]; then
-        DETECTED_RTT_MS="$china_rtt"
+    elif [[ -n "$CHINA_RTT_MS" ]]; then
+        DETECTED_RTT_MS="$CHINA_RTT_MS"
         RTT_SOURCE="CN targets"
-    elif [[ -n "$global_rtt" ]]; then
-        DETECTED_RTT_MS="$global_rtt"
+    elif [[ -n "$GLOBAL_RTT_MS" ]]; then
+        DETECTED_RTT_MS="$GLOBAL_RTT_MS"
         RTT_SOURCE="global targets"
     else
         return 1
@@ -544,8 +578,30 @@ detect_rtt() {
     DETECTED_RTT_MS=$(clamp_auto_rtt "$DETECTED_RTT_MS")
 }
 
+route_value_after() {
+    local key="$1"
+    awk -v key="$key" '
+        {
+            for (i = 1; i < NF; i++) {
+                if ($i == key) {
+                    print $(i + 1)
+                    exit
+                }
+            }
+        }
+    '
+}
+
 detect_default_iface() {
-    ip -4 route show default 2>/dev/null | awk 'NR == 1 {print $5}'
+    local iface=""
+
+    iface=$(ip -4 route get 1.1.1.1 2>/dev/null | route_value_after dev)
+    if [[ -z "$iface" ]]; then
+        iface=$(ip -4 route show default 2>/dev/null | route_value_after dev)
+    fi
+
+    [[ -n "$iface" && -d "/sys/class/net/$iface" ]] || return 1
+    echo "$iface"
 }
 
 read_iface_counter() {
@@ -655,6 +711,9 @@ run_iperf_test() {
     local end_bytes
     local transferred
     local bps=""
+    local cpu=""
+    local retransmits=""
+    local stats=""
     local limited="false"
     local reverse=()
 
@@ -689,10 +748,15 @@ run_iperf_test() {
         'BEGIN {printf "%.3f", (end - start) / 1000000000}')
 
     if [[ "$limited" != "true" ]]; then
-        bps=$(jq -r '
-            .end.sum_received.bits_per_second
-            // .end.sum_sent.bits_per_second // empty
+        stats=$(jq -r '
+            [
+                (.end.sum_received.bits_per_second
+                    // .end.sum_sent.bits_per_second // ""),
+                (.end.cpu_utilization_percent.host_total // ""),
+                (.end.sum_sent.retransmits // "")
+            ] | join("|")
         ' "$output" 2>/dev/null || true)
+        IFS='|' read -r bps cpu retransmits <<< "$stats"
     fi
     rm -f "$output"
 
@@ -701,7 +765,18 @@ run_iperf_test() {
             'BEGIN {if (seconds > 0) printf "%.0f", bytes * 8 / seconds}')
     fi
     [[ "$bps" =~ ^[0-9]+([.][0-9]+)?$ ]] || return 1
-    awk -v bps="$bps" 'BEGIN {printf "%.0f\n", bps / 1000000}'
+
+    printf '%s|%s|%s\n' \
+        "$(awk -v bps="$bps" 'BEGIN {printf "%.0f", bps / 1000000}')" \
+        "${cpu:-?}" "${retransmits:-?}"
+}
+
+format_cpu_percent() {
+    if [[ "$1" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+        awk -v value="$1" 'BEGIN {printf "%.1f", value}'
+    else
+        echo "?"
+    fi
 }
 
 probe_iperf_bandwidth() {
@@ -711,8 +786,14 @@ probe_iperf_bandwidth() {
     local location
     local provider
     local port
+    local upload_result
+    local download_result
     local upload
     local download
+    local upload_cpu
+    local download_cpu
+    local upload_retransmits
+    local download_retransmits
     local best_upload=0
     local best_download=0
     local successful_peers=0
@@ -731,12 +812,21 @@ probe_iperf_bandwidth() {
 
         for port in {5201..5210}; do
             tcp_port_open "$host" "$port" || continue
-            info "iperf3 节点：$location/$provider $host:$port（RTT ${rtt} ms）"
+            upload_result=$(run_iperf_test "$host" "$port" upload || true)
+            download_result=$(run_iperf_test "$host" "$port" download || true)
+            [[ -n "$upload_result$download_result" ]] || continue
 
-            upload=$(run_iperf_test "$host" "$port" upload || true)
-            download=$(run_iperf_test "$host" "$port" download || true)
-            [[ -n "$upload$download" ]] || continue
-            info "节点结果：下载 ${download:-失败} Mbps，上传 ${upload:-失败} Mbps"
+            upload=""; upload_cpu=""; upload_retransmits=""
+            download=""; download_cpu=""; download_retransmits=""
+            [[ -n "$upload_result" ]] &&
+                IFS='|' read -r upload upload_cpu upload_retransmits <<< "$upload_result"
+            [[ -n "$download_result" ]] &&
+                IFS='|' read -r download download_cpu download_retransmits <<< "$download_result"
+            upload_cpu=$(format_cpu_percent "$upload_cpu")
+            download_cpu=$(format_cpu_percent "$download_cpu")
+
+            info "iperf3 成功节点：$location/$provider $host:$port（RTT ${rtt} ms）"
+            info "节点结果：下载 ${download:-失败} Mbps（CPU ${download_cpu:-?}% / 重传 ${download_retransmits:-?}），上传 ${upload:-失败} Mbps（CPU ${upload_cpu:-?}% / 重传 ${upload_retransmits:-?}）"
 
             [[ -n "$upload" ]] && (( upload > best_upload )) && best_upload=$upload
             [[ -n "$download" ]] && (( download > best_download )) && best_download=$download
@@ -756,19 +846,27 @@ probe_iperf_bandwidth() {
 cloudflare_worker() {
     local direction="$1"
     local upload_file="${2:-}"
+    local deadline=$((SECONDS + CLOUDFLARE_DURATION))
+    local remaining
 
-    if [[ "$direction" == "download" ]]; then
-        curl -4 --noproxy '*' --silent --output /dev/null \
-            --header 'Accept-Encoding: identity' \
-            --connect-timeout 4 --max-time "$CLOUDFLARE_DURATION" \
-            "$SPEED_DOWNLOAD_URL?bytes=10000000000" || true
-    else
-        curl -4 --noproxy '*' --silent --output /dev/null \
-            --header 'Content-Type: application/octet-stream' \
-            --header 'Expect:' \
-            --connect-timeout 4 --max-time "$CLOUDFLARE_DURATION" \
-            --request POST --upload-file "$upload_file" "$SPEED_UPLOAD_URL" || true
-    fi
+    while (( SECONDS < deadline )); do
+        remaining=$((deadline - SECONDS))
+        (( remaining > 0 )) || break
+
+        if [[ "$direction" == "download" ]]; then
+            curl -4 --noproxy '*' --fail --silent --output /dev/null \
+                --header 'Accept-Encoding: identity' \
+                --connect-timeout 4 --max-time "$remaining" \
+                "$SPEED_DOWNLOAD_URL?bytes=$CLOUDFLARE_REQUEST_BYTES" || break
+        else
+            curl -4 --noproxy '*' --fail --silent --output /dev/null \
+                --header 'Content-Type: application/octet-stream' \
+                --header 'Expect:' \
+                --connect-timeout 4 --max-time "$remaining" \
+                --request POST --upload-file "$upload_file" \
+                "$SPEED_UPLOAD_URL" || break
+        fi
+    done
 }
 
 probe_cloudflare_direction() {
@@ -788,7 +886,7 @@ probe_cloudflare_direction() {
     traffic_budget_reached "$direction" && return 1
     if [[ "$direction" == "upload" ]]; then
         upload_file=$(mktemp) || return 1
-        if ! truncate -s 10000000000 "$upload_file"; then
+        if ! truncate -s "$CLOUDFLARE_REQUEST_BYTES" "$upload_file"; then
             rm -f "$upload_file"
             return 1
         fi
@@ -853,6 +951,12 @@ probe_cloudflare_bandwidth() {
     download=$(probe_cloudflare_direction download || true)
     upload=$(probe_cloudflare_direction upload || true)
 
+    if [[ -n "$download" || -n "$upload" ]]; then
+        info "Cloudflare 结果：下载 ${download:-失败} Mbps，上传 ${upload:-失败} Mbps"
+    else
+        warn "Cloudflare 交叉验证失败：两个方向均未获得足够有效流量"
+    fi
+
     if [[ -n "$download" ]] &&
         { [[ -z "$DETECTED_DOWNLOAD_MBPS" ]] || (( download > DETECTED_DOWNLOAD_MBPS )); }; then
         DETECTED_DOWNLOAD_MBPS="$download"
@@ -884,6 +988,27 @@ round_bandwidth() {
     echo "$rounded"
 }
 
+show_probe_environment() {
+    local driver="virtual"
+    local rx_queues
+    local tx_queues
+    local current_cc
+    local default_qdisc
+    local root_qdisc
+    local driver_path
+
+    driver_path=$(readlink -f "/sys/class/net/$PROBE_IFACE/device/driver" 2>/dev/null || true)
+    [[ -n "$driver_path" ]] && driver="${driver_path##*/}"
+    rx_queues=$(find "/sys/class/net/$PROBE_IFACE/queues" -maxdepth 1 -name 'rx-*' 2>/dev/null | wc -l)
+    tx_queues=$(find "/sys/class/net/$PROBE_IFACE/queues" -maxdepth 1 -name 'tx-*' 2>/dev/null | wc -l)
+    current_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo unknown)
+    default_qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo unknown)
+    root_qdisc=$(tc qdisc show dev "$PROBE_IFACE" 2>/dev/null | awk 'NR == 1 {print $2}')
+
+    info "测速环境：接口 $PROBE_IFACE / 驱动 $driver / RX-TX 队列 ${rx_queues}-${tx_queues}"
+    info "测速前网络栈：CC $current_cc / default_qdisc $default_qdisc / root_qdisc ${root_qdisc:-unknown}"
+}
+
 probe_bandwidth() {
     local raw_download
     local raw_upload
@@ -895,6 +1020,7 @@ probe_bandwidth() {
         return 1
     }
 
+    show_probe_environment
     info "自动测量公网带宽（90 GB 停止阈值，保留余量确保不超过 100 GB）..."
     probe_iperf_bandwidth || true
     # 公共 iperf3 节点可能忙碌或单向限速；只要预算允许，再用并行 Cloudflare
@@ -1050,20 +1176,26 @@ resolve_tuning_values() {
     fi
 }
 
+format_mib() {
+    awk -v bytes="$1" 'BEGIN {printf "%.1f", bytes / 1048576}'
+}
+
 show_tuning_plan() {
     echo "========== 网络动态配置计划 =========="
     echo "模式: $TUNING_MODE"
     echo "内存: ${RAM_MB} MiB"
-    echo "内存缓冲区上限: $((MEMORY_CAP_BYTES / 1024 / 1024)) MiB"
+    echo "内存缓冲区上限: $(format_mib "$MEMORY_CAP_BYTES") MiB"
     echo "下载带宽: ${DETECTED_DOWNLOAD_MBPS:-未知} Mbps"
     echo "上传带宽: ${DETECTED_UPLOAD_MBPS:-未知} Mbps"
     echo "带宽来源: $BANDWIDTH_SOURCE"
+    [[ -n "$CHINA_RTT_MS" ]] && echo "中国组 RTT: ${CHINA_RTT_MS} ms（$CHINA_RTT_METHOD，$CHINA_RTT_SAMPLES）"
+    [[ -n "$GLOBAL_RTT_MS" ]] && echo "全球组 RTT: ${GLOBAL_RTT_MS} ms（$GLOBAL_RTT_METHOD，$GLOBAL_RTT_SAMPLES）"
     echo "RTT: ${DETECTED_RTT_MS:-未知} ms"
     echo "RTT 来源: $RTT_SOURCE"
     echo "接收 BDP: $((RX_BDP_BYTES / 1024)) KiB"
     echo "发送 BDP: $((TX_BDP_BYTES / 1024)) KiB"
-    echo "rmem_max: $((RMEM_MAX_BYTES / 1024 / 1024)) MiB"
-    echo "wmem_max: $((WMEM_MAX_BYTES / 1024 / 1024)) MiB"
+    echo "rmem_max: $(format_mib "$RMEM_MAX_BYTES") MiB"
+    echo "wmem_max: $(format_mib "$WMEM_MAX_BYTES") MiB"
     echo "计算依据: $CALCULATION_REASON"
 }
 
@@ -1079,6 +1211,8 @@ create_network_config() {
 # 下载带宽: ${DETECTED_DOWNLOAD_MBPS:-unknown} Mbps
 # 上传带宽: ${DETECTED_UPLOAD_MBPS:-unknown} Mbps
 # 带宽来源: $BANDWIDTH_SOURCE
+# 中国组 RTT: ${CHINA_RTT_MS:-unknown} ms (${CHINA_RTT_METHOD:-unknown}, ${CHINA_RTT_SAMPLES:-unknown})
+# 全球组 RTT: ${GLOBAL_RTT_MS:-unknown} ms (${GLOBAL_RTT_METHOD:-unknown}, ${GLOBAL_RTT_SAMPLES:-unknown})
 # RTT: ${DETECTED_RTT_MS:-unknown} ms
 # RTT 来源: $RTT_SOURCE
 # 缓冲区依据: $CALCULATION_REASON
@@ -1324,7 +1458,7 @@ show_status() {
     echo "配置文件: $NETWORK_CONF"
     [[ -f "$NETWORK_CONF" ]] && echo "配置状态: 已存在" || echo "配置状态: 未创建"
     if [[ -f "$NETWORK_CONF" ]]; then
-        grep -E '^# (模式|内存|下载带宽|上传带宽|带宽来源|RTT|RTT 来源|缓冲区依据):'             "$NETWORK_CONF" | sed 's/^# /  /'
+        grep -E '^# (模式|内存|下载带宽|上传带宽|带宽来源|中国组 RTT|全球组 RTT|RTT|RTT 来源|缓冲区依据):'             "$NETWORK_CONF" | sed 's/^# /  /'
     fi
     [[ -f "$NETWORK_INITIAL_BACKUP" ]] && echo "初始备份: $NETWORK_INITIAL_BACKUP"
     [[ -f "$NETWORK_PREVIOUS_BACKUP" ]] && echo "上次备份: $NETWORK_PREVIOUS_BACKUP"
