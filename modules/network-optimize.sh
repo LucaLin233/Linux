@@ -26,12 +26,36 @@ readonly NETWORK_CONF="/etc/sysctl.d/99-network-optimize.conf"
 readonly NETWORK_INITIAL_BACKUP="/etc/sysctl.d/99-network-optimize.conf.initial-backup"
 readonly NETWORK_PREVIOUS_BACKUP="/etc/sysctl.d/99-network-optimize.conf.previous-backup"
 
-# Cloudflare 官方网络质量测试接口。最大测试流量为上下行各 84 MiB。
+# 首选附近公共 iperf3 节点进行多流双向测速；Cloudflare 用于并行交叉验证和回退。
 readonly SPEED_DOWNLOAD_URL="https://speed.cloudflare.com/__down"
 readonly SPEED_UPLOAD_URL="https://speed.cloudflare.com/__up"
-readonly -a SPEED_TEST_MIB=(4 16 64)
-readonly SPEED_STAGE_TIMEOUT=8
-readonly SPEED_CONTINUE_SECONDS="1.5"
+readonly IPERF_DURATION=5
+readonly IPERF_PARALLEL=4
+readonly IPERF_MAX_PEERS=2
+readonly CLOUDFLARE_PARALLEL=8
+readonly CLOUDFLARE_DURATION=6
+readonly TRAFFIC_TOTAL_LIMIT_BYTES=90000000000
+readonly TRAFFIC_DIRECTION_LIMIT_BYTES=45000000000
+
+# 公共节点参考 tcpfit，覆盖常见 VPS 机房区域。端口范围为 5201–5210。
+readonly IPERF_PEER_POOL='speedtest.hkg12.hk.leaseweb.net|香港|Leaseweb
+speedtest.sin1.sg.leaseweb.net|新加坡|Leaseweb
+sgp.proof.ovh.net|新加坡|OVH
+speedtest.syd12.au.leaseweb.net|悉尼|Leaseweb
+speedtest.tyo11.jp.leaseweb.net|东京|Leaseweb
+speedtest.fra1.de.leaseweb.net|法兰克福|Leaseweb
+speedtest.ams2.nl.leaseweb.net|阿姆斯特丹|Leaseweb
+ams.speedtest.clouvider.net|阿姆斯特丹|Clouvider
+speedtest.lon12.uk.leaseweb.net|伦敦|Leaseweb
+lon.speedtest.clouvider.net|伦敦|Clouvider
+speedtest.lax12.us.leaseweb.net|洛杉矶|Leaseweb
+speedtest.sfo12.us.leaseweb.net|旧金山|Leaseweb
+speedtest.sea11.us.leaseweb.net|西雅图|Leaseweb
+speedtest.dal13.us.leaseweb.net|达拉斯|Leaseweb
+speedtest.chi11.us.leaseweb.net|芝加哥|Leaseweb
+speedtest.nyc1.us.leaseweb.net|纽约|Leaseweb
+speedtest.mia11.us.leaseweb.net|迈阿密|Leaseweb
+speedtest.mtl2.ca.leaseweb.net|蒙特利尔|Leaseweb'
 
 # 中国大陆目标参考 tcpfit，刻意排除可能在海外命中 Anycast 的 223.5.5.5。
 readonly -a CHINA_PING_TARGETS=(
@@ -69,6 +93,9 @@ TX_BDP_BYTES=0
 RMEM_MAX_BYTES=33554432
 WMEM_MAX_BYTES=33554432
 CALCULATION_REASON="static 32 MiB"
+PROBE_IFACE=""
+TRAFFIC_RX_START=0
+TRAFFIC_TX_START=0
 
 # 旧版 kernel2.sh 使用的配置文件。
 readonly LEGACY_KERNEL_CONF="/etc/sysctl.d/99-kernel.conf"
@@ -346,16 +373,13 @@ detect_memory_mb() {
 
 calculate_memory_cap() {
     local ram_mb="$1"
+    local cap=$((ram_mb * 32768)) # RAM / 32
+    local minimum=$((8 * 1024 * 1024))
+    local maximum=$((256 * 1024 * 1024))
 
-    if (( ram_mb <= 512 )); then
-        echo $((8 * 1024 * 1024))
-    elif (( ram_mb <= 1024 )); then
-        echo $((16 * 1024 * 1024))
-    elif (( ram_mb <= 2048 )); then
-        echo $((32 * 1024 * 1024))
-    else
-        echo $((64 * 1024 * 1024))
-    fi
+    (( cap < minimum )) && cap=$minimum
+    (( cap > maximum )) && cap=$maximum
+    echo "$cap"
 }
 
 median_values() {
@@ -520,130 +544,382 @@ detect_rtt() {
     DETECTED_RTT_MS=$(clamp_auto_rtt "$DETECTED_RTT_MS")
 }
 
-measure_download_stage() {
-    local mib="$1"
-    local bytes=$((mib * 1024 * 1024))
-    local result
-
-    result=$(curl -4 --noproxy '*' --silent --show-error --output /dev/null \
-        --header 'Accept-Encoding: identity' \
-        --connect-timeout 4 --max-time "$SPEED_STAGE_TIMEOUT" \
-        --write-out '%{size_download} %{time_total} %{speed_download}' \
-        "$SPEED_DOWNLOAD_URL?bytes=$bytes" 2>/dev/null) || return 1
-
-    awk -v expected="$bytes" '
-        {
-            if ($1 < expected * 0.9 || $2 <= 0 || $3 <= 0) exit 1
-            printf "%.0f %.3f\n", $3 * 8 / 1000000, $2
-        }
-    ' <<< "$result"
+detect_default_iface() {
+    ip -4 route show default 2>/dev/null | awk 'NR == 1 {print $5}'
 }
 
-measure_upload_stage() {
-    local mib="$1"
-    local result
+read_iface_counter() {
+    local direction="$1"
+    cat "/sys/class/net/$PROBE_IFACE/statistics/${direction}_bytes" 2>/dev/null
+}
 
-    result=$(dd if=/dev/zero bs=1048576 count="$mib" status=none 2>/dev/null |
-        curl -4 --noproxy '*' --silent --show-error --output /dev/null \
+traffic_mark() {
+    PROBE_IFACE=$(detect_default_iface)
+    [[ -n "$PROBE_IFACE" ]] || return 1
+    TRAFFIC_RX_START=$(read_iface_counter rx)
+    TRAFFIC_TX_START=$(read_iface_counter tx)
+    is_positive_integer "$TRAFFIC_RX_START" 0 9223372036854775807 || return 1
+    is_positive_integer "$TRAFFIC_TX_START" 0 9223372036854775807 || return 1
+}
+
+traffic_used_bytes() {
+    local direction="${1:-total}"
+    local rx
+    local tx
+    local rx_used
+    local tx_used
+
+    rx=$(read_iface_counter rx)
+    tx=$(read_iface_counter tx)
+    [[ "$rx" =~ ^[0-9]+$ && "$tx" =~ ^[0-9]+$ ]] || return 1
+
+    rx_used=$((rx - TRAFFIC_RX_START))
+    tx_used=$((tx - TRAFFIC_TX_START))
+    (( rx_used < 0 )) && rx_used=0
+    (( tx_used < 0 )) && tx_used=0
+
+    case "$direction" in
+        download) echo "$rx_used" ;;
+        upload) echo "$tx_used" ;;
+        total) echo $((rx_used + tx_used)) ;;
+        *) return 1 ;;
+    esac
+}
+
+traffic_budget_reached() {
+    local direction="$1"
+    local total
+    local directional
+
+    total=$(traffic_used_bytes total) || return 0
+    directional=$(traffic_used_bytes "$direction") || return 0
+    (( total >= TRAFFIC_TOTAL_LIMIT_BYTES ||
+        directional >= TRAFFIC_DIRECTION_LIMIT_BYTES ))
+}
+
+kill_process_tree() {
+    local pid="$1"
+    pkill -TERM -P "$pid" 2>/dev/null || true
+    kill -TERM "$pid" 2>/dev/null || true
+    sleep 0.2
+    pkill -KILL -P "$pid" 2>/dev/null || true
+    kill -KILL "$pid" 2>/dev/null || true
+}
+
+rank_iperf_peers() {
+    local temp_dir
+    local host
+    local location
+    local provider
+    local index=0
+    local file
+
+    command -v ping >/dev/null 2>&1 || return 1
+    temp_dir=$(mktemp -d) || return 1
+
+    while IFS='|' read -r host location provider; do
+        [[ -n "$host" ]] || continue
+        ((index += 1))
+        (
+            local_rtt=$(measure_ping_target "$host" || true)
+            [[ -n "$local_rtt" ]] &&
+                printf '%s|%s|%s|%s\n' "$local_rtt" "$host" "$location" "$provider" \
+                    > "$temp_dir/$index"
+        ) &
+    done <<< "$IPERF_PEER_POOL"
+    wait || true
+
+    for file in "$temp_dir"/*; do
+        [[ -s "$file" ]] || continue
+        cat "$file"
+    done | sort -t '|' -k1,1n
+    cleanup_temp_dir "$temp_dir"
+}
+
+tcp_port_open() {
+    local host="$1"
+    local port="$2"
+    timeout 3 bash -c "exec 3<>/dev/tcp/$host/$port" 2>/dev/null
+}
+
+run_iperf_test() {
+    local host="$1"
+    local port="$2"
+    local direction="$3"
+    local output
+    local pid
+    local started
+    local ended
+    local elapsed
+    local start_bytes
+    local end_bytes
+    local transferred
+    local bps=""
+    local limited="false"
+    local reverse=()
+
+    [[ "$direction" == "download" ]] && reverse=(-R)
+    traffic_budget_reached "$direction" && return 1
+
+    output=$(mktemp) || return 1
+    start_bytes=$(traffic_used_bytes "$direction") || {
+        rm -f "$output"
+        return 1
+    }
+    started=$(date +%s%N)
+
+    iperf3 -c "$host" -p "$port" -t "$IPERF_DURATION" -P "$IPERF_PARALLEL" \
+        "${reverse[@]}" -J > "$output" 2>&1 &
+    pid=$!
+
+    while kill -0 "$pid" 2>/dev/null; do
+        if traffic_budget_reached "$direction"; then
+            limited="true"
+            kill_process_tree "$pid"
+            break
+        fi
+        sleep 0.05
+    done
+    wait "$pid" 2>/dev/null || true
+
+    ended=$(date +%s%N)
+    end_bytes=$(traffic_used_bytes "$direction" || echo "$start_bytes")
+    transferred=$((end_bytes - start_bytes))
+    elapsed=$(awk -v start="$started" -v end="$ended" \
+        'BEGIN {printf "%.3f", (end - start) / 1000000000}')
+
+    if [[ "$limited" != "true" ]]; then
+        bps=$(jq -r '
+            .end.sum_received.bits_per_second
+            // .end.sum_sent.bits_per_second // empty
+        ' "$output" 2>/dev/null || true)
+    fi
+    rm -f "$output"
+
+    if [[ -z "$bps" && "$transferred" -ge 33554432 ]]; then
+        bps=$(awk -v bytes="$transferred" -v seconds="$elapsed" \
+            'BEGIN {if (seconds > 0) printf "%.0f", bytes * 8 / seconds}')
+    fi
+    [[ "$bps" =~ ^[0-9]+([.][0-9]+)?$ ]] || return 1
+    awk -v bps="$bps" 'BEGIN {printf "%.0f\n", bps / 1000000}'
+}
+
+probe_iperf_bandwidth() {
+    local ranked
+    local rtt
+    local host
+    local location
+    local provider
+    local port
+    local upload
+    local download
+    local best_upload=0
+    local best_download=0
+    local successful_peers=0
+
+    command -v iperf3 >/dev/null 2>&1 || return 1
+    command -v jq >/dev/null 2>&1 || return 1
+    command -v timeout >/dev/null 2>&1 || return 1
+
+    ranked=$(rank_iperf_peers || true)
+    [[ -n "$ranked" ]] || return 1
+
+    while IFS='|' read -r rtt host location provider; do
+        [[ -n "$host" ]] || continue
+        (( rtt <= 150 )) || continue
+        traffic_budget_reached upload && traffic_budget_reached download && break
+
+        for port in {5201..5210}; do
+            tcp_port_open "$host" "$port" || continue
+            info "iperf3 节点：$location/$provider $host:$port（RTT ${rtt} ms）"
+
+            upload=$(run_iperf_test "$host" "$port" upload || true)
+            download=$(run_iperf_test "$host" "$port" download || true)
+            [[ -n "$upload$download" ]] || continue
+            info "节点结果：下载 ${download:-失败} Mbps，上传 ${upload:-失败} Mbps"
+
+            [[ -n "$upload" ]] && (( upload > best_upload )) && best_upload=$upload
+            [[ -n "$download" ]] && (( download > best_download )) && best_download=$download
+            ((successful_peers += 1))
+            break
+        done
+
+        (( successful_peers >= IPERF_MAX_PEERS )) && break
+    done <<< "$ranked"
+
+    (( best_upload > 0 || best_download > 0 )) || return 1
+    (( best_upload > 0 )) && DETECTED_UPLOAD_MBPS=$best_upload
+    (( best_download > 0 )) && DETECTED_DOWNLOAD_MBPS=$best_download
+    BANDWIDTH_SOURCE="public iperf3, ${IPERF_PARALLEL} streams"
+}
+
+cloudflare_worker() {
+    local direction="$1"
+    local upload_file="${2:-}"
+
+    if [[ "$direction" == "download" ]]; then
+        curl -4 --noproxy '*' --silent --output /dev/null \
+            --header 'Accept-Encoding: identity' \
+            --connect-timeout 4 --max-time "$CLOUDFLARE_DURATION" \
+            "$SPEED_DOWNLOAD_URL?bytes=10000000000" || true
+    else
+        curl -4 --noproxy '*' --silent --output /dev/null \
             --header 'Content-Type: application/octet-stream' \
             --header 'Expect:' \
-            --connect-timeout 4 --max-time "$SPEED_STAGE_TIMEOUT" \
-            --data-binary @- \
-            --write-out '%{size_upload} %{time_total} %{speed_upload}' \
-            "$SPEED_UPLOAD_URL" 2>/dev/null) || return 1
+            --connect-timeout 4 --max-time "$CLOUDFLARE_DURATION" \
+            --request POST --upload-file "$upload_file" "$SPEED_UPLOAD_URL" || true
+    fi
+}
 
-    awk -v expected="$((mib * 1024 * 1024))" '
-        {
-            if ($1 < expected * 0.9 || $2 <= 0 || $3 <= 0) exit 1
-            printf "%.0f %.3f\n", $3 * 8 / 1000000, $2
+probe_cloudflare_direction() {
+    local direction="$1"
+    local started
+    local ended
+    local elapsed
+    local start_bytes
+    local end_bytes
+    local transferred
+    local alive
+    local index
+    local pid
+    local upload_file=""
+    local -a pids=()
+
+    traffic_budget_reached "$direction" && return 1
+    if [[ "$direction" == "upload" ]]; then
+        upload_file=$(mktemp) || return 1
+        if ! truncate -s 10000000000 "$upload_file"; then
+            rm -f "$upload_file"
+            return 1
+        fi
+    fi
+
+    start_bytes=$(traffic_used_bytes "$direction") || {
+        [[ -n "$upload_file" ]] && rm -f "$upload_file"
+        return 1
+    }
+    started=$(date +%s%N)
+
+    for ((index = 0; index < CLOUDFLARE_PARALLEL; index++)); do
+        cloudflare_worker "$direction" "$upload_file" &
+        pids+=("$!")
+    done
+
+    while true; do
+        alive="false"
+        for pid in "${pids[@]}"; do
+            if kill -0 "$pid" 2>/dev/null; then
+                alive="true"
+                break
+            fi
+        done
+        [[ "$alive" == "true" ]] || break
+
+        if traffic_budget_reached "$direction"; then
+            for pid in "${pids[@]}"; do
+                kill_process_tree "$pid"
+            done
+            break
+        fi
+        sleep 0.05
+    done
+    for pid in "${pids[@]}"; do
+        wait "$pid" 2>/dev/null || true
+    done
+    [[ -n "$upload_file" ]] && rm -f "$upload_file"
+
+    ended=$(date +%s%N)
+    end_bytes=$(traffic_used_bytes "$direction") || return 1
+    transferred=$((end_bytes - start_bytes))
+    (( transferred >= 33554432 )) || return 1
+
+    elapsed=$(awk -v start="$started" -v end="$ended" \
+        'BEGIN {printf "%.3f", (end - start) / 1000000000}')
+    awk -v bytes="$transferred" -v seconds="$elapsed" '
+        BEGIN {
+            if (seconds <= 0) exit 1
+            printf "%.0f\n", bytes * 8 / seconds / 1000000
         }
-    ' <<< "$result"
+    '
 }
 
-should_continue_speed_test() {
-    local duration="$1"
-    awk -v duration="$duration" -v threshold="$SPEED_CONTINUE_SECONDS" \
-        'BEGIN {exit !(duration < threshold)}'
+probe_cloudflare_bandwidth() {
+    local upload=""
+    local download=""
+
+    command -v curl >/dev/null 2>&1 || return 1
+    info "使用 8 流 Cloudflare 交叉验证；iperf3 不可用时同时作为回退..."
+
+    download=$(probe_cloudflare_direction download || true)
+    upload=$(probe_cloudflare_direction upload || true)
+
+    if [[ -n "$download" ]] &&
+        { [[ -z "$DETECTED_DOWNLOAD_MBPS" ]] || (( download > DETECTED_DOWNLOAD_MBPS )); }; then
+        DETECTED_DOWNLOAD_MBPS="$download"
+    fi
+    if [[ -n "$upload" ]] &&
+        { [[ -z "$DETECTED_UPLOAD_MBPS" ]] || (( upload > DETECTED_UPLOAD_MBPS )); }; then
+        DETECTED_UPLOAD_MBPS="$upload"
+    fi
+    [[ -n "$DETECTED_DOWNLOAD_MBPS$DETECTED_UPLOAD_MBPS" ]] || return 1
+
+    if [[ "$BANDWIDTH_SOURCE" == "unknown" ]]; then
+        BANDWIDTH_SOURCE="Cloudflare, ${CLOUDFLARE_PARALLEL} parallel streams"
+    elif [[ -n "$download$upload" ]]; then
+        BANDWIDTH_SOURCE="$BANDWIDTH_SOURCE + Cloudflare cross-check"
+    fi
 }
 
-probe_download_bandwidth() {
-    local mib
-    local result
-    local bandwidth=""
-    local duration=""
-
-    for mib in "${SPEED_TEST_MIB[@]}"; do
-        result=$(measure_download_stage "$mib" || true)
-        [[ -n "$result" ]] || break
-        read -r bandwidth duration <<< "$result"
-        should_continue_speed_test "$duration" || break
-    done
-
-    [[ -n "$bandwidth" ]] || return 1
-    echo "$bandwidth"
-}
-
-probe_upload_bandwidth() {
-    local mib
-    local result
-    local bandwidth=""
-    local duration=""
-
-    for mib in "${SPEED_TEST_MIB[@]}"; do
-        result=$(measure_upload_stage "$mib" || true)
-        [[ -n "$result" ]] || break
-        read -r bandwidth duration <<< "$result"
-        should_continue_speed_test "$duration" || break
-    done
-
-    [[ -n "$bandwidth" ]] || return 1
-    echo "$bandwidth"
-}
-
-conservative_bandwidth_tier() {
+round_bandwidth() {
     local measured="$1"
-    local adjusted
-    local selected=1
-    local tier
-    local -a tiers=(10 25 50 100 200 300 500 750 1000 1500 2500 5000 10000)
+    local rounded
 
-    adjusted=$((measured * 80 / 100))
-    (( adjusted < 1 )) && adjusted=1
-
-    for tier in "${tiers[@]}"; do
-        (( tier <= adjusted )) || break
-        selected="$tier"
-    done
-    echo "$selected"
+    if (( measured < 100 )); then
+        rounded=$((((measured + 5) / 10) * 10))
+    else
+        rounded=$((((measured + 25) / 50) * 50))
+    fi
+    (( rounded < 1 )) && rounded=1
+    (( rounded > 100000 )) && rounded=100000
+    echo "$rounded"
 }
 
 probe_bandwidth() {
-    local raw_download=""
-    local raw_upload=""
+    local raw_download
+    local raw_upload
+    local total_used
 
-    command -v curl >/dev/null 2>&1 || return 1
+    command -v ip >/dev/null 2>&1 || return 1
+    traffic_mark || {
+        warn "无法读取默认网卡流量计数器，跳过主动测速以确保流量上限"
+        return 1
+    }
 
-    info "自动估算公网带宽（Cloudflare，上下行总流量最多约 168 MiB）..."
-    raw_download=$(probe_download_bandwidth || true)
-    raw_upload=$(probe_upload_bandwidth || true)
+    info "自动测量公网带宽（90 GB 停止阈值，保留余量确保不超过 100 GB）..."
+    probe_iperf_bandwidth || true
+    # 公共 iperf3 节点可能忙碌或单向限速；只要预算允许，再用并行 Cloudflare
+    # 交叉验证，并对每个方向保留较高结果。
+    probe_cloudflare_bandwidth || true
 
-    [[ -n "$raw_download$raw_upload" ]] || return 1
-
-    if [[ -n "$raw_download" ]]; then
-        DETECTED_DOWNLOAD_MBPS=$(conservative_bandwidth_tier "$raw_download")
-    fi
-    if [[ -n "$raw_upload" ]]; then
-        DETECTED_UPLOAD_MBPS=$(conservative_bandwidth_tier "$raw_upload")
-    fi
+    [[ -n "$DETECTED_DOWNLOAD_MBPS$DETECTED_UPLOAD_MBPS" ]] || return 1
+    raw_download="$DETECTED_DOWNLOAD_MBPS"
+    raw_upload="$DETECTED_UPLOAD_MBPS"
 
     if [[ -z "$DETECTED_UPLOAD_MBPS" && -n "$DETECTED_DOWNLOAD_MBPS" ]]; then
         DETECTED_UPLOAD_MBPS="$DETECTED_DOWNLOAD_MBPS"
-        (( DETECTED_UPLOAD_MBPS > 1000 )) && DETECTED_UPLOAD_MBPS=1000
+        BANDWIDTH_SOURCE="$BANDWIDTH_SOURCE; upload inferred"
     elif [[ -z "$DETECTED_DOWNLOAD_MBPS" && -n "$DETECTED_UPLOAD_MBPS" ]]; then
         DETECTED_DOWNLOAD_MBPS="$DETECTED_UPLOAD_MBPS"
+        BANDWIDTH_SOURCE="$BANDWIDTH_SOURCE; download inferred"
     fi
 
-    BANDWIDTH_SOURCE="Cloudflare 80% tier"
+    DETECTED_DOWNLOAD_MBPS=$(round_bandwidth "$DETECTED_DOWNLOAD_MBPS")
+    DETECTED_UPLOAD_MBPS=$(round_bandwidth "$DETECTED_UPLOAD_MBPS")
+    total_used=$(traffic_used_bytes total || echo 0)
+
+    info "原始测速：下载 ${raw_download:-缺失} Mbps，上传 ${raw_upload:-缺失} Mbps"
+    info "计算带宽：下载 $DETECTED_DOWNLOAD_MBPS Mbps，上传 $DETECTED_UPLOAD_MBPS Mbps"
+    info "测速流量：$(awk -v bytes="$total_used" 'BEGIN {printf "%.2f GB", bytes / 1000000000}')"
 }
 
 calculate_buffer_max() {
@@ -674,6 +950,10 @@ install_probe_dependencies() {
 
     command -v curl >/dev/null 2>&1 || packages+=(curl)
     command -v ping >/dev/null 2>&1 || packages+=(iputils-ping)
+    command -v iperf3 >/dev/null 2>&1 || packages+=(iperf3)
+    command -v jq >/dev/null 2>&1 || packages+=(jq)
+    command -v pkill >/dev/null 2>&1 || packages+=(procps)
+    command -v timeout >/dev/null 2>&1 || packages+=(coreutils)
     [[ -s /etc/ssl/certs/ca-certificates.crt ]] || packages+=(ca-certificates)
     (( ${#packages[@]} > 0 )) || return 0
 
@@ -1126,8 +1406,9 @@ install/plan 选项：
 默认行为：
   - 自动安装缺少的最小探测依赖
   - 自动测量中国大陆与全球 RTT，自动结果限制在 10–300 ms
-  - 使用 Cloudflare 官方端点估算上下行带宽，总流量最多约 168 MiB
-  - 根据 2 × BDP 与系统内存动态设置 TCP 缓冲区上限
+  - 首选附近公共 iperf3 节点进行多流双向测速，Cloudflare 作为并行回退
+  - 自动测速在约 90 GB 时停止，保留余量确保总量不超过 100 GB
+  - 根据 2 × BDP 动态设置缓冲区，上限为 RAM / 32 且不超过 256 MiB
   - 探测失败时按内存使用保守配置
   - 只在本次运行计算和应用，不创建定时任务
 EOF
