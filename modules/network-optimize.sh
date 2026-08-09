@@ -25,6 +25,8 @@ set -euo pipefail
 readonly NETWORK_CONF="/etc/sysctl.d/99-network-optimize.conf"
 readonly NETWORK_INITIAL_BACKUP="/etc/sysctl.d/99-network-optimize.conf.initial-backup"
 readonly NETWORK_PREVIOUS_BACKUP="/etc/sysctl.d/99-network-optimize.conf.previous-backup"
+readonly BBR_MODULES_FILE="/etc/modules-load.d/network-optimize-bbr.conf"
+readonly LOCK_FILE="/run/lock/network-optimize.lock"
 
 # 首选附近公共 iperf3 节点进行多流双向测速；Cloudflare 用于并行交叉验证和回退。
 readonly SPEED_DOWNLOAD_URL="https://speed.cloudflare.com/__down"
@@ -101,6 +103,8 @@ TX_BDP_BYTES=0
 RMEM_MAX_BYTES=33554432
 WMEM_MAX_BYTES=33554432
 CALCULATION_REASON="static 32 MiB"
+RMEM_REASON="static 32 MiB"
+WMEM_REASON="static 32 MiB"
 PROBE_IFACE=""
 TRAFFIC_RX_START=0
 TRAFFIC_TX_START=0
@@ -161,6 +165,17 @@ require_root() {
     fi
 }
 
+take_lock() {
+    if ! exec 9>"$LOCK_FILE"; then
+        error "无法创建执行锁：$LOCK_FILE"
+        return 1
+    fi
+    if ! flock -n 9; then
+        error "另一个 network-optimize 实例正在运行"
+        return 1
+    fi
+}
+
 # === 环境与 BBR 检测 ===
 detect_container() {
     if [[ -f /proc/user_beancounters ]] ||
@@ -174,6 +189,15 @@ detect_container() {
 
 bbr_available() {
     grep -qw bbr /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null
+}
+
+persist_bbr_module() {
+    local temp_file
+
+    temp_file=$(mktemp /etc/modules-load.d/network-optimize-bbr.conf.new.XXXXXX) || return 1
+    printf '%s\n' tcp_bbr > "$temp_file"
+    chmod 644 "$temp_file"
+    mv "$temp_file" "$BBR_MODULES_FILE"
 }
 
 ensure_bbr_available() {
@@ -1090,6 +1114,26 @@ calculate_buffer_max() {
     echo "$desired"
 }
 
+buffer_limit_reason() {
+    local bandwidth_mbps="$1"
+    local rtt_ms="$2"
+    local memory_cap="$3"
+    local minimum=$((8 * 1024 * 1024))
+    local mib=$((1024 * 1024))
+    local desired
+
+    desired=$((bandwidth_mbps * rtt_ms * 250))
+    desired=$((((desired + mib - 1) / mib) * mib))
+
+    if (( desired < minimum )); then
+        echo "8 MiB floor"
+    elif (( desired > memory_cap )); then
+        echo "RAM / 32 cap"
+    else
+        echo "2 x BDP"
+    fi
+}
+
 needs_automatic_probe() {
     [[ "$TUNING_MODE" == "auto" && "$NO_PROBE" != "true" ]] || return 1
     [[ -z "$MANUAL_RTT_MS" ||
@@ -1140,7 +1184,9 @@ resolve_tuning_values() {
     if [[ "$TUNING_MODE" == "static" ]]; then
         RMEM_MAX_BYTES=33554432
         WMEM_MAX_BYTES=33554432
-        CALCULATION_REASON="static 32 MiB"
+        RMEM_REASON="static 32 MiB"
+        WMEM_REASON="static 32 MiB"
+        CALCULATION_REASON="rmem: $RMEM_REASON; wmem: $WMEM_REASON"
         BANDWIDTH_SOURCE="not used"
         RTT_SOURCE="not used"
         return 0
@@ -1194,11 +1240,15 @@ resolve_tuning_values() {
         TX_BDP_BYTES=$((upload_mbps * rtt_ms * 125))
         RMEM_MAX_BYTES=$(calculate_buffer_max "$download_mbps" "$rtt_ms" "$MEMORY_CAP_BYTES")
         WMEM_MAX_BYTES=$(calculate_buffer_max "$upload_mbps" "$rtt_ms" "$MEMORY_CAP_BYTES")
-        CALCULATION_REASON="2 x BDP, capped by RAM"
+        RMEM_REASON=$(buffer_limit_reason "$download_mbps" "$rtt_ms" "$MEMORY_CAP_BYTES")
+        WMEM_REASON=$(buffer_limit_reason "$upload_mbps" "$rtt_ms" "$MEMORY_CAP_BYTES")
+        CALCULATION_REASON="rmem: $RMEM_REASON; wmem: $WMEM_REASON"
     else
         RMEM_MAX_BYTES="$MEMORY_CAP_BYTES"
         WMEM_MAX_BYTES="$MEMORY_CAP_BYTES"
-        CALCULATION_REASON="probe incomplete, RAM fallback"
+        RMEM_REASON="RAM fallback"
+        WMEM_REASON="RAM fallback"
+        CALCULATION_REASON="rmem: $RMEM_REASON; wmem: $WMEM_REASON"
     fi
 }
 
@@ -1338,6 +1388,33 @@ apply_network_config() {
     sysctl -p "$config_file"
 }
 
+normalize_sysctl_value() {
+    awk '{$1 = $1; print}'
+}
+
+verify_network_config() {
+    local config_file="$1"
+    local key
+    local expected
+    local actual
+    local failed="false"
+
+    while IFS='=' read -r key expected; do
+        key="${key//[[:space:]]/}"
+        [[ -z "$key" || "$key" == \#* ]] && continue
+
+        expected=$(printf '%s\n' "$expected" | normalize_sysctl_value)
+        actual=$(sysctl -n "$key" 2>/dev/null | normalize_sysctl_value || true)
+        if [[ -z "$actual" || "$actual" != "$expected" ]]; then
+            error "验证失败: $key，期望 '$expected'，实际 '${actual:-不可用}'"
+            failed="true"
+        fi
+    done < "$config_file"
+
+    [[ "$failed" == "false" ]] || return 1
+    success "运行时 sysctl 已与生成配置一致"
+}
+
 install_optimization() {
     local temp_config
     local runtime_backup
@@ -1393,6 +1470,11 @@ install_optimization() {
         rm -f "$temp_config" "$runtime_backup"
         return 1
     fi
+    if ! verify_network_config "$temp_config"; then
+        restore_runtime_values "$runtime_backup"
+        rm -f "$temp_config" "$runtime_backup"
+        return 1
+    fi
 
     if ! mv "$temp_config" "$NETWORK_CONF"; then
         error "写入网络配置文件失败"
@@ -1404,7 +1486,13 @@ install_optimization() {
     rm -f "$runtime_backup"
     success "网络优化配置已写入：$NETWORK_CONF"
 
-    if [[ "$bbr_enabled" != "true" ]]; then
+    if [[ "$bbr_enabled" == "true" ]]; then
+        if persist_bbr_module; then
+            success "BBR 模块已设置为开机加载：$BBR_MODULES_FILE"
+        else
+            warn "无法写入 BBR 模块开机加载配置；当前运行不受影响"
+        fi
+    else
         warn "BBR 未启用；其余网络与转发参数已正常应用"
     fi
 
@@ -1436,9 +1524,17 @@ restore_optimization() {
         warn "请重启系统，以清除已移除参数的运行时值"
     fi
 
+    if [[ -f "$NETWORK_CONF" ]] &&
+        grep -Eq '^[[:space:]]*net\.ipv4\.tcp_congestion_control[[:space:]]*=[[:space:]]*bbr' \
+            "$NETWORK_CONF"; then
+        persist_bbr_module || warn "恢复后无法持久化 BBR 模块加载"
+    else
+        rm -f "$BBR_MODULES_FILE"
+    fi
+
     echo
     echo "注意："
-    echo "  restore 仅恢复新版脚本管理的 $NETWORK_CONF。"
+    echo "  restore 会同步恢复 $NETWORK_CONF 并按拥塞控制配置处理 $BBR_MODULES_FILE。"
     echo "  不会自动修改旧版历史归档、limits.conf 或 nproc 配置。"
     echo "  建议重启系统，使所有未持久化的旧参数彻底恢复默认状态。"
 }
@@ -1592,20 +1688,25 @@ main() {
     case "$COMMAND" in
         install)
             require_root
-            for required_command in sysctl mv cp find modprobe ip; do
+            for required_command in sysctl mv cp find modprobe ip flock; do
                 if ! command -v "$required_command" >/dev/null 2>&1; then
                     error "缺少必要命令: $required_command"
                     exit 1
                 fi
             done
+            take_lock
             install_optimization
             ;;
         plan)
+            command -v flock >/dev/null 2>&1 || { error "缺少必要命令: flock"; exit 1; }
+            take_lock
             resolve_tuning_values
             show_tuning_plan
             ;;
         restore)
             require_root
+            command -v flock >/dev/null 2>&1 || { error "缺少必要命令: flock"; exit 1; }
+            take_lock
             command -v sysctl >/dev/null 2>&1 || {
                 error "缺少必要命令: sysctl"
                 exit 1
