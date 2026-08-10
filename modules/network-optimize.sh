@@ -34,6 +34,7 @@ readonly SPEED_UPLOAD_URL="https://speed.cloudflare.com/__up"
 readonly IPERF_DURATION=5
 readonly IPERF_PARALLEL=4
 readonly IPERF_MAX_PEERS=2
+readonly -a IPERF_PORTS=(5201 5202 5203 5204 5205 5206 5207 5208 5209 5210 5200)
 readonly CLOUDFLARE_PARALLEL=8
 readonly CLOUDFLARE_DURATION=6
 readonly CLOUDFLARE_DOWNLOAD_BYTES=50000000
@@ -41,7 +42,7 @@ readonly CLOUDFLARE_UPLOAD_BYTES=250000000
 readonly TRAFFIC_TOTAL_LIMIT_BYTES=90000000000
 readonly TRAFFIC_DIRECTION_LIMIT_BYTES=45000000000
 
-# 公共节点参考 tcpfit，覆盖常见 VPS 机房区域。端口范围为 5201–5210。
+# 公共节点参考 tcpfit，覆盖常见 VPS 机房区域。端口范围为 5201–5210，并兼容 5200。
 readonly IPERF_PEER_POOL='speedtest.hkg12.hk.leaseweb.net|香港|Leaseweb
 speedtest.sin1.sg.leaseweb.net|新加坡|Leaseweb
 sgp.proof.ovh.net|新加坡|OVH
@@ -74,6 +75,7 @@ readonly -a CHINA_TCP_TARGETS=(www.baidu.com www.qq.com www.163.com)
 readonly -a GLOBAL_TCP_TARGETS=(www.cloudflare.com www.google.com www.wikipedia.org)
 readonly AUTO_RTT_MIN_MS=10
 readonly AUTO_RTT_MAX_MS=300
+readonly AUTO_RTT_CALC_FLOOR_MS=150
 
 # 参数与计算结果。命令行参数优先于自动探测。
 COMMAND="install"
@@ -88,7 +90,9 @@ declare -a CUSTOM_RTT_TARGETS=()
 DETECTED_DOWNLOAD_MBPS=""
 DETECTED_UPLOAD_MBPS=""
 DETECTED_RTT_MS=""
+OBSERVED_RTT_MS=""
 RTT_SOURCE="unknown"
+RTT_POLICY="unknown"
 CHINA_RTT_MS=""
 GLOBAL_RTT_MS=""
 CHINA_RTT_METHOD=""
@@ -108,6 +112,7 @@ WMEM_REASON="static 32 MiB"
 PROBE_IFACE=""
 TRAFFIC_RX_START=0
 TRAFFIC_TX_START=0
+PREFERRED_IPERF_PORT=""
 
 # 旧版 kernel2.sh 使用的配置文件。
 readonly LEGACY_KERNEL_CONF="/etc/sysctl.d/99-kernel.conf"
@@ -166,9 +171,19 @@ require_root() {
 }
 
 take_lock() {
-    if ! exec 9>"$LOCK_FILE"; then
-        error "无法创建执行锁：$LOCK_FILE"
-        return 1
+    local lock_file="$LOCK_FILE"
+
+    if ! { exec 9>"$lock_file"; } 2>/dev/null; then
+        if (( EUID != 0 )); then
+            lock_file="${XDG_RUNTIME_DIR:-/tmp}/network-optimize-${UID}.lock"
+            if ! { exec 9>"$lock_file"; } 2>/dev/null; then
+                error "无法创建执行锁：$lock_file"
+                return 1
+            fi
+        else
+            error "无法创建执行锁：$lock_file"
+            return 1
+        fi
     fi
     if ! flock -n 9; then
         error "另一个 network-optimize 实例正在运行"
@@ -687,9 +702,24 @@ kill_process_tree() {
     kill -KILL "$pid" 2>/dev/null || true
 }
 
+resolve_ipv4() {
+    getent ahostsv4 "$1" 2>/dev/null |
+        awk '/STREAM/ {print $1; exit}'
+}
+
+ordered_iperf_ports() {
+    local port
+
+    [[ -n "$PREFERRED_IPERF_PORT" ]] && echo "$PREFERRED_IPERF_PORT"
+    for port in "${IPERF_PORTS[@]}"; do
+        [[ "$port" == "$PREFERRED_IPERF_PORT" ]] || echo "$port"
+    done
+}
+
 rank_iperf_peers() {
     local temp_dir
     local host
+    local peer_ip
     local location
     local provider
     local index=0
@@ -702,9 +732,12 @@ rank_iperf_peers() {
         [[ -n "$host" ]] || continue
         ((index += 1))
         (
-            local_rtt=$(measure_ping_target "$host" || true)
+            peer_ip=$(resolve_ipv4 "$host" || true)
+            [[ -n "$peer_ip" ]] || exit 0
+            local_rtt=$(measure_ping_target "$peer_ip" || true)
             [[ -n "$local_rtt" ]] &&
-                printf '%s|%s|%s|%s\n' "$local_rtt" "$host" "$location" "$provider" \
+                printf '%s|%s|%s|%s|%s\n' \
+                    "$local_rtt" "$host" "$peer_ip" "$location" "$provider" \
                     > "$temp_dir/$index"
         ) &
     done <<< "$IPERF_PEER_POOL"
@@ -718,9 +751,9 @@ rank_iperf_peers() {
 }
 
 tcp_port_open() {
-    local host="$1"
+    local ipv4="$1"
     local port="$2"
-    timeout 3 bash -c "exec 3<>/dev/tcp/$host/$port" 2>/dev/null
+    timeout 3 bash -c "exec 3<>/dev/tcp/$ipv4/$port" 2>/dev/null
 }
 
 run_iperf_test() {
@@ -754,7 +787,7 @@ run_iperf_test() {
     }
     started=$(date +%s%N)
 
-    iperf3 -c "$host" -p "$port" -t "$IPERF_DURATION" -P "$IPERF_PARALLEL" \
+    iperf3 -4 -c "$host" -p "$port" -t "$IPERF_DURATION" -P "$IPERF_PARALLEL" \
         "${reverse[@]}" -J > "$output" 2>&1 &
     pid=$!
 
@@ -820,6 +853,7 @@ probe_iperf_bandwidth() {
     local ranked
     local rtt
     local host
+    local peer_ip
     local location
     local provider
     local port
@@ -844,15 +878,15 @@ probe_iperf_bandwidth() {
     ranked=$(rank_iperf_peers || true)
     [[ -n "$ranked" ]] || return 1
 
-    while IFS='|' read -r rtt host location provider; do
+    while IFS='|' read -r rtt host peer_ip location provider; do
         [[ -n "$host" ]] || continue
         (( rtt <= 150 )) || continue
         traffic_budget_reached upload && traffic_budget_reached download && break
 
-        for port in {5201..5210}; do
-            tcp_port_open "$host" "$port" || continue
-            upload_result=$(run_iperf_test "$host" "$port" upload || true)
-            download_result=$(run_iperf_test "$host" "$port" download || true)
+        while IFS= read -r port; do
+            tcp_port_open "$peer_ip" "$port" || continue
+            upload_result=$(run_iperf_test "$peer_ip" "$port" upload || true)
+            download_result=$(run_iperf_test "$peer_ip" "$port" download || true)
             [[ -n "$upload_result$download_result" ]] || continue
 
             upload=""; upload_cpu=""; upload_retransmits=""; upload_retransmit_percent=""
@@ -864,14 +898,15 @@ probe_iperf_bandwidth() {
             upload_cpu=$(format_cpu_percent "$upload_cpu")
             download_cpu=$(format_cpu_percent "$download_cpu")
 
-            info "iperf3 成功节点：$location/$provider $host:$port（RTT ${rtt} ms）"
+            PREFERRED_IPERF_PORT="$port"
+            info "iperf3 成功节点：$location/$provider $host [$peer_ip]:$port（IPv4 RTT ${rtt} ms）"
             info "节点结果：下载 ${download:-失败} Mbps（CPU ${download_cpu:-?}% / 重传率 ${download_retransmit_percent:-?}% [${download_retransmits:-?} 次]），上传 ${upload:-失败} Mbps（CPU ${upload_cpu:-?}% / 重传率 ${upload_retransmit_percent:-?}% [${upload_retransmits:-?} 次]）"
 
             [[ -n "$upload" ]] && (( upload > best_upload )) && best_upload=$upload
             [[ -n "$download" ]] && (( download > best_download )) && best_download=$download
             ((successful_peers += 1))
             break
-        done
+        done < <(ordered_iperf_ports)
 
         (( successful_peers >= IPERF_MAX_PEERS )) && break
     done <<< "$ranked"
@@ -1189,6 +1224,7 @@ resolve_tuning_values() {
         CALCULATION_REASON="rmem: $RMEM_REASON; wmem: $WMEM_REASON"
         BANDWIDTH_SOURCE="not used"
         RTT_SOURCE="not used"
+        RTT_POLICY="not used"
         return 0
     fi
 
@@ -1202,10 +1238,18 @@ resolve_tuning_values() {
     if [[ -n "$MANUAL_RTT_MS" ]]; then
         rtt_ms="$MANUAL_RTT_MS"
         RTT_SOURCE="command line"
+        RTT_POLICY="manual override"
     elif [[ "$NO_PROBE" != "true" ]]; then
         info "自动探测中国大陆与全球 RTT..."
         if detect_rtt; then
-            rtt_ms="$DETECTED_RTT_MS"
+            OBSERVED_RTT_MS="$DETECTED_RTT_MS"
+            rtt_ms="$OBSERVED_RTT_MS"
+            if (( rtt_ms < AUTO_RTT_CALC_FLOOR_MS )); then
+                rtt_ms=$AUTO_RTT_CALC_FLOOR_MS
+                RTT_POLICY="150 ms coverage floor"
+            else
+                RTT_POLICY="observed RTT"
+            fi
         else
             warn "RTT 探测失败，将使用内存保守配置"
         fi
@@ -1266,8 +1310,10 @@ show_tuning_plan() {
     echo "带宽来源: $BANDWIDTH_SOURCE"
     [[ -n "$CHINA_RTT_MS" ]] && echo "中国组 RTT: ${CHINA_RTT_MS} ms（$CHINA_RTT_METHOD，$CHINA_RTT_SAMPLES）"
     [[ -n "$GLOBAL_RTT_MS" ]] && echo "全球组 RTT: ${GLOBAL_RTT_MS} ms（$GLOBAL_RTT_METHOD，$GLOBAL_RTT_SAMPLES）"
-    echo "RTT: ${DETECTED_RTT_MS:-未知} ms"
+    [[ -n "$OBSERVED_RTT_MS" ]] && echo "观测 RTT: ${OBSERVED_RTT_MS} ms"
+    echo "计算 RTT: ${DETECTED_RTT_MS:-未知} ms"
     echo "RTT 来源: $RTT_SOURCE"
+    echo "RTT 策略: $RTT_POLICY"
     echo "接收 BDP: $((RX_BDP_BYTES / 1024)) KiB"
     echo "发送 BDP: $((TX_BDP_BYTES / 1024)) KiB"
     echo "rmem_max: $(format_mib "$RMEM_MAX_BYTES") MiB"
@@ -1289,8 +1335,10 @@ create_network_config() {
 # 带宽来源: $BANDWIDTH_SOURCE
 # 中国组 RTT: ${CHINA_RTT_MS:-unknown} ms (${CHINA_RTT_METHOD:-unknown}, ${CHINA_RTT_SAMPLES:-unknown})
 # 全球组 RTT: ${GLOBAL_RTT_MS:-unknown} ms (${GLOBAL_RTT_METHOD:-unknown}, ${GLOBAL_RTT_SAMPLES:-unknown})
-# RTT: ${DETECTED_RTT_MS:-unknown} ms
+# 观测 RTT: ${OBSERVED_RTT_MS:-unknown} ms
+# 计算 RTT: ${DETECTED_RTT_MS:-unknown} ms
 # RTT 来源: $RTT_SOURCE
+# RTT 策略: $RTT_POLICY
 # 缓冲区依据: $CALCULATION_REASON
 # 适用于 Debian 13 代理、转发及中高延迟公网 VPS。
 
@@ -1580,7 +1628,7 @@ show_status() {
     echo "配置文件: $NETWORK_CONF"
     [[ -f "$NETWORK_CONF" ]] && echo "配置状态: 已存在" || echo "配置状态: 未创建"
     if [[ -f "$NETWORK_CONF" ]]; then
-        grep -E '^# (模式|内存|下载带宽|上传带宽|带宽来源|中国组 RTT|全球组 RTT|RTT|RTT 来源|缓冲区依据):'             "$NETWORK_CONF" | sed 's/^# /  /'
+        grep -E '^# (模式|内存|下载带宽|上传带宽|带宽来源|中国组 RTT|全球组 RTT|观测 RTT|计算 RTT|RTT 来源|RTT 策略|缓冲区依据):'             "$NETWORK_CONF" | sed 's/^# /  /'
     fi
     [[ -f "$NETWORK_INITIAL_BACKUP" ]] && echo "初始备份: $NETWORK_INITIAL_BACKUP"
     [[ -f "$NETWORK_PREVIOUS_BACKUP" ]] && echo "上次备份: $NETWORK_PREVIOUS_BACKUP"
@@ -1661,7 +1709,7 @@ install/plan 选项：
 
 默认行为：
   - 自动安装缺少的最小探测依赖
-  - 自动测量中国大陆与全球 RTT，自动结果限制在 10–300 ms
+  - 自动测量中国大陆与全球 RTT，BDP 计算使用 150 ms 下限并保留观测值
   - 首选附近公共 iperf3 节点进行多流双向测速，Cloudflare 作为并行回退
   - 自动测速在约 90 GB 时停止，保留余量确保总量不超过 100 GB
   - 根据 2 × BDP 动态设置缓冲区，上限为 RAM / 32 且不超过 256 MiB
@@ -1688,7 +1736,7 @@ main() {
     case "$COMMAND" in
         install)
             require_root
-            for required_command in sysctl mv cp find modprobe ip flock; do
+            for required_command in sysctl mv cp find modprobe ip flock getent; do
                 if ! command -v "$required_command" >/dev/null 2>&1; then
                     error "缺少必要命令: $required_command"
                     exit 1
@@ -1699,6 +1747,7 @@ main() {
             ;;
         plan)
             command -v flock >/dev/null 2>&1 || { error "缺少必要命令: flock"; exit 1; }
+            command -v getent >/dev/null 2>&1 || { error "缺少必要命令: getent"; exit 1; }
             take_lock
             resolve_tuning_values
             show_tuning_plan
