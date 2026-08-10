@@ -86,6 +86,85 @@ bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/debian
 菜单编号由主脚本按模块顺序动态生成。模块元数据中的 `order=10`、`20` 等值仅用于排序，
 不是用户需要输入的编号。
 
+### 单独远程运行模块
+
+直接运行模块会绕过主脚本的系统预检查、基础依赖安装、固定 Commit、统一日志和部署摘要。
+新服务器优先运行主脚本并选择“自定义选择”；仅需重跑或单独配置某项功能时，再直接运行模块。
+
+最小化安装的 Debian 建议先准备与主脚本相同的基础依赖：
+
+```bash
+sudo apt update
+sudo apt install -y curl wget git jq rsync sudo dnsutils cron psmisc locales gpg gpg-agent dirmngr
+```
+
+以下命令从 `main` 分支下载并立即执行最新模块。
+
+> ⚠️ 以下代码块是命令索引。**每次只复制并执行需要的模块命令，不要整段执行。** 整段执行会依次
+> 修改系统、网络、Shell、Docker、自动更新和 SSH 配置，并可能产生大量流量、自动重启或导致失联。
+
+```bash
+RAW_BASE="https://raw.githubusercontent.com/LucaLin233/Linux/main/modules"
+
+# 1. Zram、时区和 Chrony
+sudo bash <(curl -fsSL "$RAW_BASE/system-optimize.sh")
+
+# 2. 欢迎信息、中文环境和可选 XanMod
+sudo bash <(curl -fsSL "$RAW_BASE/system-customize.sh")
+
+# 3. 网络优化；默认会自动探测并应用，可能产生大量流量
+sudo bash <(curl -fsSL "$RAW_BASE/network-optimize.sh")
+
+# 4. Zsh、Oh My Zsh、Powerlevel10k 和插件
+sudo bash <(curl -fsSL "$RAW_BASE/zsh-setup.sh")
+
+# 5. Mise、Python 和 Node.js；请先完成第 4 项
+sudo bash <(curl -fsSL "$RAW_BASE/mise-setup.sh")
+
+# 6. NextTrace、Speedtest、htop、jq、tree 等工具
+sudo bash <(curl -fsSL "$RAW_BASE/tools-setup.sh")
+
+# 7. Docker Engine、Compose 和 Buildx
+sudo bash <(curl -fsSL "$RAW_BASE/docker-setup.sh")
+
+# 8. 每周系统与内核更新；需要时会自动重启
+sudo bash <(curl -fsSL "$RAW_BASE/auto-update-setup.sh")
+
+# 9. SSH 安全配置；操作前先确认控制台和云防火墙可用
+sudo bash <(curl -fsSL "$RAW_BASE/ssh-security.sh")
+```
+
+`system-customize.sh` 支持只运行指定功能：
+
+```bash
+RAW_BASE="https://raw.githubusercontent.com/LucaLin233/Linux/main/modules"
+sudo bash <(curl -fsSL "$RAW_BASE/system-customize.sh") motd
+sudo bash <(curl -fsSL "$RAW_BASE/system-customize.sh") locale
+sudo bash <(curl -fsSL "$RAW_BASE/system-customize.sh") xanmod
+sudo bash <(curl -fsSL "$RAW_BASE/system-customize.sh") status
+sudo bash <(curl -fsSL "$RAW_BASE/system-customize.sh") help
+```
+
+`network-optimize.sh` 支持先计算、手动指定参数、查看状态和恢复配置：
+
+```bash
+RAW_BASE="https://raw.githubusercontent.com/LucaLin233/Linux/main/modules"
+# 不执行外部测速，只显示保守配置计划
+bash <(curl -fsSL "$RAW_BASE/network-optimize.sh") plan --no-probe
+
+# 使用明确的带宽和 RTT，避免自动测速
+sudo bash <(curl -fsSL "$RAW_BASE/network-optimize.sh") \
+  install --download-mbps 1000 --upload-mbps 500 --rtt-ms 180
+
+bash <(curl -fsSL "$RAW_BASE/network-optimize.sh") status
+sudo bash <(curl -fsSL "$RAW_BASE/network-optimize.sh") restore
+bash <(curl -fsSL "$RAW_BASE/network-optimize.sh") help
+```
+
+> `RAW_BASE` 只在当前 Shell 会话有效。上述进程替换语法需要 Bash 或 Zsh；不要改成
+> `curl ... | sudo bash`，否则交互模块可能无法正常读取终端输入。SSH、自动更新、内核和网络
+> 模块具有断连、重启或大量流量风险，执行前请阅读“高风险提醒”。
+
 ### 新增模块
 
 新增脚本只需放入 `modules/`，无需修改主脚本。文件名必须匹配：
