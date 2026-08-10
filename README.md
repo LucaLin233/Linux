@@ -1,31 +1,87 @@
 # Linux Scripts Collection
 
-一个面向 Debian 系列系统的个人 Linux 运维脚本仓库，包含系统初始化、环境配置、网络优化、服务部署和日常管理工具。
+面向 Debian VPS 的系统初始化、网络调优、运行时配置和日常运维脚本集合。
 
-部分脚本使用 AI 工具辅助编写，经过人工检查、修改，并已在个人 VPS 环境中进行功能测试。由于发行版版本、内核、虚拟化环境和软件源配置可能存在差异，使用前仍应阅读脚本并做好备份。
+脚本会修改系统配置、安装软件包或管理服务。使用前请阅读对应说明并备份重要数据；生产环境建议
+先在相同 Debian 版本的测试机验证。
 
-## 项目内容
+## 支持范围
 
-### Debian 一键部署
+- 一键部署与模块：Debian 12 或更高版本，Bash，systemd，root 权限；
+- 独立工具：以脚本顶部说明为准；大部分面向 Debian 系列系统；
+- `xanmod-install.sh`：主要面向 amd64/x86-64；
+- 需要访问 GitHub、Debian 软件源和各工具的上游服务。
 
-[`debian_setup.sh`](debian_setup.sh) 是仓库的主要入口，仅支持 Debian 12 及以上版本。脚本支持全部安装或自定义选择，并会解析模块依赖、按固定 commit 下载模块、记录执行日志以及生成部署摘要。
+## 快速开始
 
-其功能由 `modules/` 下的模块组成：
+```bash
+git clone https://github.com/LucaLin233/Linux.git
+cd Linux
+sudo ./debian_setup.sh
+```
 
-| 模块 | 功能 |
-| --- | --- |
-| `system-optimize.sh` | 根据内存配置 Zram、设置时区并配置 Chrony 时间同步 |
-| `system-customize.sh` | 配置动态 MOTD、中文 Locale，并可选安装 XanMod 内核 |
-| `network-optimize.sh` | 配置 BBR、fq、IPv4 转发及代理和端口转发相关参数 |
-| `zsh-setup.sh` | 安装 Zsh、Oh My Zsh、Powerlevel10k 和常用插件 |
-| `mise-setup.sh` | 安装 Mise，管理 Python、Node.js 及运行时更新 |
-| `tools-setup.sh` | 安装 NextTrace、Speedtest CLI 和常用系统工具 |
-| `docker-setup.sh` | 通过 Docker 官方仓库安装 Docker Engine、Compose 和 Buildx |
-| `auto-update-setup.sh` | 配置定期系统与内核更新，并在需要时自动重启 |
-| `ssh-security.sh` | 配置 SSH 端口、Root 登录策略和认证方式 |
+也可以直接运行最新主脚本：
 
-主脚本会从固定 Commit 的 `modules/*.sh` 自动发现模块。新增模块时无需修改
-`debian_setup.sh`，只需在模块脚本的 shebang 后声明元数据：
+```bash
+sudo bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/debian_setup.sh)
+```
+
+> 运行过程中可能安装软件、修改 sysctl、SSH、Shell、定时任务和 systemd 服务。不要在未备份、
+> 无控制台或无法接受中断的生产机上直接选择全部安装。
+
+## Debian 一键部署
+
+[`debian_setup.sh`](debian_setup.sh) 是主要入口。它会：
+
+1. 检查 Debian、root、磁盘和网络；
+2. 安装基础依赖并更新软件包索引；
+3. 获取 GitHub 最新 Commit；
+4. 从该固定 Commit 自动发现、下载和校验 `modules/*.sh`；
+5. 解析模块顺序和依赖，执行全部或用户选择的模块；
+6. 写入部署日志和摘要。
+
+常用选项：
+
+```bash
+sudo ./debian_setup.sh --check-status
+sudo ./debian_setup.sh --clean-cache
+./debian_setup.sh --version
+./debian_setup.sh --help
+```
+
+主要文件：
+
+```text
+/var/log/debian-setup.log
+/root/deployment_summary.txt
+/var/cache/debian-setup/
+```
+
+### 部署模块
+
+| 顺序 | 模块 | 功能 | 主要影响 |
+| ---: | --- | --- | --- |
+| 10 | `system-optimize.sh` | 按内存配置 Zram、时区和 Chrony | 默认时区可设为上海；启用 Chrony 后停用 timesyncd |
+| 20 | `system-customize.sh` | 动态 MOTD、中文 Locale、可选 XanMod | 可能修改 Locale、欢迎信息和内核 |
+| 30 | `network-optimize.sh` | BBR、fq、动态 TCP 缓冲区和转发参数 | 自动测速最多约 90 GB；写入独立 sysctl 配置 |
+| 40 | `zsh-setup.sh` | Zsh、Oh My Zsh、Powerlevel10k 和插件 | 备份后重写 root 的 `.zshrc`，可修改默认 Shell |
+| 50 | `mise-setup.sh` | Mise、Python、Node.js 和依赖迁移 | 配置 Shell 集成及每周 Mise 自动更新 |
+| 60 | `tools-setup.sh` | NextTrace、Speedtest、htop、jq、tree 等 | 可能添加 NextTrace 第三方 APT 源 |
+| 70 | `docker-setup.sh` | Docker Engine、Compose、Buildx、日志轮转 | 添加 Docker 官方 APT 源并管理 Docker 服务 |
+| 80 | `auto-update-setup.sh` | 定时完整升级系统和内核 | 更新后需要重启时会等待 30 秒自动重启 |
+| 90 | `ssh-security.sh` | SSH 端口、Root 登录与认证策略 | 完整管理 `sshd_config`，操作不当可能失去远程连接 |
+
+当前只有 `mise-setup` 声明 `zsh-setup` 为强依赖；其他模块可以单独执行。
+
+### 新增模块
+
+新增脚本只需放入 `modules/`，无需修改主脚本。文件名必须匹配：
+
+```text
+[a-z0-9][a-z0-9-]*.sh
+```
+
+脚本开头声明：
 
 ```bash
 #!/usr/bin/env bash
@@ -35,115 +91,172 @@
 # debian-setup:enabled=true
 ```
 
-模块文件名必须匹配 `[a-z0-9][a-z0-9-]*.sh`。`depends` 使用空格分隔依赖模块；
-目前只有 `mise-setup` 将 `zsh-setup` 声明为强依赖。主脚本会检查模块语法、未知依赖
-和循环依赖，并按照 `order` 与模块文件名生成稳定执行顺序。
+主脚本会检查 Bash 语法、未知依赖和循环依赖，并按照 `order` 和文件名生成稳定顺序。
+退出码约定：`0` 成功、`2` 部分完成、其他值失败。
 
-### 独立工具
+## 独立工具
 
-`tools/` 中的脚本可按需单独使用：
+`tools/` 下的脚本不会被一键部署自动执行，应按需手动运行。
 
-| 脚本 | 功能 |
-| --- | --- |
-| `cloudflare_tunnel.sh` | 安装、配置、更新或卸载 Cloudflare Tunnel |
-| `sbinstall.sh` | 在 Debian 系列系统上安装或卸载 sing-box，并创建 systemd 服务 |
-| `kernel.sh` / `kernel2.sh` | 两套独立的网络与内核参数优化方案，请按需选择，不要与新版网络模块重复使用 |
-| `xanmod-install.sh` | 在 Debian 上检测 CPU 指令集并安装对应 XanMod 内核 |
-| `setup-motd.sh` | 单独部署动态系统欢迎信息 |
-| `push.sh` | 通过 SSH/rsync 向多台服务器并发推送文件 |
+### Cloudflare Tunnel
 
-### 配置文件
-
-- `p10k-config.zsh`：Powerlevel10k 配置，由 Zsh 模块使用。
-
-## 环境要求
-
-- 一键部署脚本：Debian 12 或更高版本
-- `sbinstall.sh`：Debian、Ubuntu 等 Debian 系列系统
-- Bash 和 systemd
-- Root 权限或可用的 `sudo`
-- 可访问 GitHub 等脚本所需的上游服务
-
-独立工具的具体支持范围可能不同，请在执行前阅读对应脚本顶部说明。
-
-## 使用方法
-
-### 克隆仓库
+安装、升级或彻底卸载 cloudflared Tunnel；安装流程会配置 systemd 服务和每日自动更新。
 
 ```bash
-git clone https://github.com/LucaLin233/Linux.git
-cd Linux
+sudo ./tools/cloudflare_tunnel.sh install
+sudo ./tools/cloudflare_tunnel.sh upgrade
+sudo ./tools/cloudflare_tunnel.sh uninstall
 ```
 
-### 运行一键部署脚本
+Token 属于敏感凭据，不要写入日志、README 或提交到 Git。
+`uninstall` 会删除本脚本管理的二进制、服务、自动更新和配置文件。
+
+### 出口流量整形 tcshape
+
+从 tcpfit 移植限速器拐点 Sweep 与 `HTB + fq` Shape。它不会修改基础 sysctl，适用于存在
+出口 policer 的特定 VPS，不是通用必选优化。
+
+首次运行：
 
 ```bash
-chmod +x debian_setup.sh
-sudo ./debian_setup.sh
+sudo ./tools/traffic-shape.sh
 ```
 
-`debian_setup.sh` 会引导选择全部模块或自定义模块。通常无需手动执行 `modules/` 下的脚本。
-
-### 运行独立工具
+随后可使用短命令：
 
 ```bash
-chmod +x tools/cloudflare_tunnel.sh
-sudo ./tools/cloudflare_tunnel.sh
+sudo tcshape s        # 自动选公共节点并扫描
+sudo tcshape a        # 应用最近推荐值
+sudo tcshape on 480   # 手动限制为 480 Mbit
+sudo tcshape off      # 关闭并恢复原 qdisc
+sudo tcshape st       # 查看状态
 ```
 
-将文件名替换为需要使用的实际脚本。例如：
+Sweep 可能消耗大量上传流量，并会临时替换默认出口接口的根 qdisc。单方向上限约 45 GB，
+双向合计上限约 90 GB。未检测到限速器或未找到拐点时，不建议且不能自动应用整形。
+
+详细参数、安全边界和恢复说明见 [`docs/traffic-shape.md`](docs/traffic-shape.md)。
+
+### 旧版网络优化脚本
 
 ```bash
-chmod +x tools/sbinstall.sh
+sudo ./tools/kernel.sh install -c    # 国内场景
+sudo ./tools/kernel.sh install -i    # 国际场景
+sudo ./tools/kernel.sh status
+sudo ./tools/kernel.sh restore
+
+sudo ./tools/kernel2.sh install
+sudo ./tools/kernel2.sh status
+sudo ./tools/kernel2.sh restore
+```
+
+`kernel.sh`、`kernel2.sh` 和 `modules/network-optimize.sh` 会管理重叠的 sysctl、BBR、资源限制
+或根 qdisc。**不要叠加执行。** 新部署优先使用 `network-optimize.sh`；旧脚本主要用于已有环境的
+兼容和恢复。
+
+### 多服务器文件推送
+
+[`tools/push.sh`](tools/push.sh) 使用 SSH 和 rsync 并发同步文件，支持密钥或密码认证。
+
+```bash
+./tools/push.sh --generate-config
+./tools/push.sh --test-auth
+./tools/push.sh TASK_NAME
+./tools/push.sh /local/path/ /remote/path/
+```
+
+默认生成当前目录的 `config.conf`，权限为 `600`，且仓库已通过 `.gitignore` 忽略根目录和
+`tools/` 下的该文件。推荐密钥认证，不要把密码直接写进仓库。
+
+> 示例配置默认 `DELETE_EXTRA="true"`，等同于 rsync 删除目标端多余文件。首次使用前必须核对
+> 源路径、目标路径和服务器列表，必要时将它改为 `false`。
+
+### sing-box 安装
+
+```bash
 sudo ./tools/sbinstall.sh install
+sudo ./tools/sbinstall.sh uninstall
 ```
 
-### 单独运行模块
+安装前需要准备有效的 `/root/proxy/config.json` 以及脚本要求的证书文件权限。脚本会下载
+sing-box、创建目录和 systemd 服务；卸载会停止并移除本脚本管理的服务和程序文件。
 
-仅在明确了解模块依赖及影响时单独执行模块：
+### 独立动态 MOTD
 
 ```bash
-chmod +x modules/network-optimize.sh
-sudo ./modules/network-optimize.sh status
+sudo ./tools/setup-motd.sh
 ```
 
-## 使用前须知
+用于只部署动态登录欢迎信息，与 `modules/system-customize.sh` 的 MOTD 功能重叠；已经运行系统
+定制模块时通常无需再次执行。
 
-- 脚本会安装软件包，并可能修改 SSH、sysctl、内核、Shell、定时任务及 systemd 服务配置。
-- 执行系统级操作前，请备份重要数据和相关配置文件。
-- 修改 SSH 配置时应保留一个已连接会话，并先验证新连接，避免失去服务器访问权限。
-- `kernel.sh`、`kernel2.sh` 与 `modules/network-optimize.sh` 存在功能重叠，请选择其中一种方案。
-- 生产环境使用前，建议先在相同系统版本的测试环境中验证。
-- 网络代理相关工具应在当地法律法规及服务条款允许的范围内使用。
+### XanMod 内核
+
+```bash
+sudo ./tools/xanmod-install.sh
+sudo ./tools/xanmod-install.sh status
+sudo ./tools/xanmod-install.sh help
+```
+
+脚本检测 x86-64 psABI 级别并选择适合的 XanMod 包。内核安装完成后通常需要重启才能生效；
+请保留可用旧内核和控制台访问方式。
+
+## 配置文件
+
+- [`p10k-config.zsh`](p10k-config.zsh)：供 Zsh 模块使用的 Powerlevel10k 配置；
+- `config.conf`：`push.sh` 生成的本地配置，可能包含敏感信息，不应提交；
+- [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md)：第三方代码来源和许可证。
+
+## 功能重叠与选择
+
+| 需求 | 推荐脚本 | 避免同时使用 |
+| --- | --- | --- |
+| 新 Debian VPS 网络基础调优 | `modules/network-optimize.sh` | `kernel.sh`、`kernel2.sh` |
+| 特定出口 policer 检测与整形 | `tools/traffic-shape.sh` | tcpfit Shape、CAKE、TBF、其他 HTB |
+| 一键系统定制 | `system-customize.sh` | 重复运行 `setup-motd.sh` |
+| 仅安装 XanMod | `xanmod-install.sh` | 同时让多个脚本反复管理内核源 |
+
+`network-optimize.sh` 与 `traffic-shape.sh` 职责不同，可以配合：前者管理 BBR、缓冲区和默认
+`fq`，后者在确实检测到 policer 后才使用 HTB 控制聚合出口速率，并保留 fq 叶子 pacing。
+
+## 高风险提醒
+
+- **SSH**：修改端口或认证前，先放行云安全组/防火墙，并保持当前会话直到新连接验证成功；
+- **自动更新**：系统或内核更新后可能自动重启；
+- **网络测速**：`network-optimize` 和 tcshape 都可能产生大量流量；
+- **qdisc**：不要叠加多个整形工具；tcshape 遇到高级或未知 qdisc 会拒绝覆盖；
+- **内核**：安装新内核前确认磁盘空间、架构和可用的旧内核；
+- **rsync**：`DELETE_EXTRA=true` 会删除目标端多余文件；
+- **凭据**：不要提交 Token、密码、私钥、`.env` 或 `config.conf`。
 
 ## 问题排查
 
-脚本执行失败时，请优先检查：
+先收集完整、脱敏的信息：
 
-1. 是否使用了受支持的系统版本和 Root 权限。
-2. 网络是否可以访问脚本引用的软件源和 GitHub。
-3. APT/dpkg 是否被其他进程占用。
-4. 终端输出、systemd 日志及脚本生成的日志文件。
+```bash
+cat /etc/os-release
+uname -a
+sudo tail -n 200 /var/log/debian-setup.log
+systemctl --failed
+journalctl -p warning -b --no-pager
+```
 
-一键部署脚本的主要输出文件：
+根据故障再检查对应服务：
 
-- 日志：`/var/log/debian-setup.log`
-- 部署摘要：`/root/deployment_summary.txt`
+```bash
+systemctl status ssh docker chrony cron tcshape.service
+sshd -t
+tc qdisc show
+sysctl net.ipv4.tcp_congestion_control net.core.default_qdisc
+```
 
-如仍无法解决，可提交 Issue，并附上系统版本、执行命令和已脱敏的完整错误日志。
+提交 Issue 时请提供系统版本、执行命令、退出码和已脱敏的完整日志，不要包含 Token、密码、
+私钥、服务器清单或公网管理地址。
 
-## 免责声明
+## 许可证与免责声明
 
-本仓库中的脚本按“原样”提供，不提供任何形式的担保。使用者应自行检查代码、评估风险，并承担执行脚本产生的后果。
+本仓库采用 [MIT License](LICENSE)。第三方移植代码见
+[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md)。
 
-## 许可证
-
-本项目采用 [MIT License](LICENSE) 开源许可证。
-
-## 相关文档
-
-- [Debian Reference](https://www.debian.org/doc/manuals/debian-reference/)
-- [sing-box Documentation](https://sing-box.sagernet.org/)
-- [Cloudflare Tunnel Documentation](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/)
-- [Docker Engine on Debian](https://docs.docker.com/engine/install/debian/)
-- [Mise Documentation](https://mise.jdx.dev/)
+脚本按“原样”提供，不附带任何担保。发行版、内核、虚拟化、机房网络和软件源存在差异，使用者
+应自行审查、备份、验证并承担操作后果。

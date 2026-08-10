@@ -114,6 +114,7 @@ LOG_FILE="/var/log/push.log"
 STRICT_HOST_KEY_CHECKING="accept-new"
 USER_KNOWN_HOSTS_FILE="/dev/null"
 EOF
+    chmod 600 "$config_file"
     echo -e "${GREEN}${ICON_SUCCESS} 配置文件已生成: ${WHITE}$config_file${NC}"
 }
 

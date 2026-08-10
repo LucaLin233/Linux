@@ -1,0 +1,3 @@
+# tools/push.sh 可能生成并读取包含服务器或认证信息的配置。
+/config.conf
+/tools/config.conf
