@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# debian-setup:name=系统工具（NextTrace、测速、htop 等）
+# debian-setup:order=60
+# debian-setup:depends=
+# debian-setup:enabled=true
 # 系统工具配置模块
 # 功能：安装 NextTrace、Speedtest CLI 及常用系统工具
 

@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# debian-setup:name=系统优化（Zram、时区、Chrony 时间同步）
+# debian-setup:order=10
+# debian-setup:depends=
+# debian-setup:enabled=true
 # 系统优化模块
 # 功能：智能 Zram 配置、时区设置、Chrony 时间同步
 

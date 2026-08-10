@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# debian-setup:name=系统定制（欢迎信息、中文环境、XanMod 内核）
+# debian-setup:order=20
+# debian-setup:depends=
+# debian-setup:enabled=true
 # 系统定制模块
 # 功能：配置动态欢迎信息、中文 Locale，并可选安装 XanMod 内核
 #

@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# debian-setup:name=Mise、Python、Node.js 版本管理
+# debian-setup:order=50
+# debian-setup:depends=zsh-setup
+# debian-setup:enabled=true
 # Mise 版本管理器配置模块
 # 功能：安装或更新 Mise、配置 Shell 集成、管理 Python/Node.js、
 #       升级运行时后迁移依赖，并配置每周自动更新。

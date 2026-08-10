@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# debian-setup:name=网络优化（BBR、fq、IPv4 转发）
+# debian-setup:order=30
+# debian-setup:depends=
+# debian-setup:enabled=true
 # 网络优化模块
 # 功能：自动探测带宽、RTT 与内存，动态配置 BBR、fq、TCP 缓冲区及 IPv4 转发参数。
 # 无参数运行等同于 install：自动探测一次、立即应用，不创建定时任务。

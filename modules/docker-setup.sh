@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# debian-setup:name=Docker 容器化平台
+# debian-setup:order=70
+# debian-setup:depends=
+# debian-setup:enabled=true
 # Docker 容器化平台配置模块
 # 功能：通过 Docker 官方 APT 仓库安装 Docker、Compose、Buildx，
 #       并可选配置容器日志轮转。

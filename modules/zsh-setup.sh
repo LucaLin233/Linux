@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# debian-setup:name=Zsh Shell 环境
+# debian-setup:order=40
+# debian-setup:depends=
+# debian-setup:enabled=true
 # Zsh Shell 环境配置模块
 # 功能：安装 Zsh、Oh My Zsh、Powerlevel10k 及常用插件
 

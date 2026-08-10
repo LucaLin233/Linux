@@ -24,6 +24,21 @@
 | `auto-update-setup.sh` | 配置定期系统与内核更新，并在需要时自动重启 |
 | `ssh-security.sh` | 配置 SSH 端口、Root 登录策略和认证方式 |
 
+主脚本会从固定 Commit 的 `modules/*.sh` 自动发现模块。新增模块时无需修改
+`debian_setup.sh`，只需在模块脚本的 shebang 后声明元数据：
+
+```bash
+#!/usr/bin/env bash
+# debian-setup:name=模块显示名称
+# debian-setup:order=100
+# debian-setup:depends=
+# debian-setup:enabled=true
+```
+
+模块文件名必须匹配 `[a-z0-9][a-z0-9-]*.sh`。`depends` 使用空格分隔依赖模块；
+目前只有 `mise-setup` 将 `zsh-setup` 声明为强依赖。主脚本会检查模块语法、未知依赖
+和循环依赖，并按照 `order` 与模块文件名生成稳定执行顺序。
+
 ### 独立工具
 
 `tools/` 中的脚本可按需单独使用：

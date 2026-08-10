@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# debian-setup:name=自动更新系统与内核
+# debian-setup:order=80
+# debian-setup:depends=
+# debian-setup:enabled=true
 # 自动更新系统配置模块
 # 功能：每周安全更新系统与内核，必要时自动重启
 

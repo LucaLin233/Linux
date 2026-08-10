@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# debian-setup:name=SSH 安全配置
+# debian-setup:order=90
+# debian-setup:depends=
+# debian-setup:enabled=true
 # SSH 安全配置模块
 # 功能：配置 SSH 端口、Root 登录策略与认证方式。
 # 策略：完整替换主配置，保留并加载 sshd_config.d 扩展配置。

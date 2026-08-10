@@ -8,11 +8,12 @@
 set -uo pipefail
 
 # === 全局常量 ===
-readonly SCRIPT_VERSION="4.1.1"
+readonly SCRIPT_VERSION="4.2.0"
 SCRIPT_COMMIT="${SCRIPT_COMMIT:-unknown}"
 
 readonly MODULE_BASE_URL="https://raw.githubusercontent.com/LucaLin233/Linux"
 readonly GITHUB_API_URL="https://api.github.com/repos/LucaLin233/Linux/commits/main"
+readonly MODULES_API_URL="https://api.github.com/repos/LucaLin233/Linux/contents/modules"
 
 LOG_FILE="/var/log/debian-setup.log"
 readonly SUMMARY_FILE="/root/deployment_summary.txt"
@@ -29,39 +30,12 @@ FILTERED_ARGS=()
 declare -A MODULE_STATUS
 declare -A MODULE_EXEC_TIME
 
-# === 模块定义 ===
-declare -A MODULES=(
-    ["system-optimize"]="系统优化（Zram、时区、Chrony 时间同步）"
-    ["system-customize"]="系统定制（欢迎信息、中文环境、XanMod 内核）"
-    ["network-optimize"]="网络优化（BBR、fq、IPv4 转发）"
-    ["zsh-setup"]="Zsh Shell 环境"
-    ["mise-setup"]="Mise、Python、Node.js 版本管理"
-    ["tools-setup"]="系统工具（NextTrace、测速、htop 等）"
-    ["docker-setup"]="Docker 容器化平台"
-    ["auto-update-setup"]="自动更新系统与内核"
-    ["ssh-security"]="SSH 安全配置"
-)
-
-# === 模块依赖 ===
-declare -A MODULE_DEPS=(
-    ["system-customize"]="system-optimize"
-    ["network-optimize"]="system-optimize"
-    ["zsh-setup"]="system-optimize"
-    ["mise-setup"]="system-optimize zsh-setup"
-)
-
-# === 标准执行顺序 ===
-readonly MODULE_ORDER=(
-    system-optimize
-    system-customize
-    network-optimize
-    zsh-setup
-    mise-setup
-    tools-setup
-    docker-setup
-    auto-update-setup
-    ssh-security
-)
+# 模块注册信息从固定 Commit 的 modules/*.sh 元数据动态生成。
+declare -A MODULES
+declare -A MODULE_DEPS
+declare -A MODULE_ORDER_VALUE
+declare -A MODULE_FILES
+MODULE_ORDER=()
 
 # === 颜色 ===
 readonly C_RED='\033[0;31m'
@@ -428,27 +402,43 @@ module_in_list() {
 resolve_dependencies() {
     local all_needed=()
     local added_deps=()
+    local sorted=()
     local module
     local choice
     local continue_choice
+    local -A visit_state=()
 
     collect_dependencies() {
         local current_module="$1"
         local dependency
 
-        if module_in_list "$current_module" "${all_needed[@]}"; then
-            return 0
+        case "${visit_state[$current_module]:-}" in
+            visiting)
+                log "检测到模块循环依赖：$current_module" "error"
+                return 1
+                ;;
+            done)
+                return 0
+                ;;
+        esac
+
+        if [[ -z "${MODULES[$current_module]:-}" ]]; then
+            log "依赖的模块不存在或不可用：$current_module" "error"
+            return 1
         fi
 
+        visit_state["$current_module"]="visiting"
+
         for dependency in ${MODULE_DEPS[$current_module]:-}; do
-            collect_dependencies "$dependency"
+            collect_dependencies "$dependency" || return 1
         done
 
+        visit_state["$current_module"]="done"
         all_needed+=("$current_module")
     }
 
     for module in "${SELECTED_MODULES[@]}"; do
-        collect_dependencies "$module"
+        collect_dependencies "$module" || return 1
     done
 
     for module in "${all_needed[@]}"; do
@@ -457,31 +447,28 @@ resolve_dependencies() {
         fi
     done
 
-    if (( ${#added_deps[@]} == 0 )); then
-        return 0
-    fi
+    if (( ${#added_deps[@]} > 0 )); then
+        echo
+        log "检测到模块依赖：${added_deps[*]}" "warn"
 
-    echo
-    log "检测到模块依赖：${added_deps[*]}" "warn"
+        read -r -p "是否自动添加依赖模块？[Y/n]: " choice
+        choice="${choice:-Y}"
 
-    read -r -p "是否自动添加依赖模块？[Y/n]: " choice
-    choice="${choice:-Y}"
+        if [[ ! "$choice" =~ ^[Yy]$ ]]; then
+            log "未自动添加依赖模块，将仅执行已选择的模块" "warn"
 
-    if [[ ! "$choice" =~ ^[Yy]$ ]]; then
-        log "未自动添加依赖模块，将仅执行已选择的模块" "warn"
+            read -r -p "确认系统已满足依赖并继续执行？[y/N]: " continue_choice
 
-        read -r -p "确认系统已满足依赖并继续执行？[y/N]: " continue_choice
+            if [[ ! "$continue_choice" =~ ^[Yy]$ ]]; then
+                log "已取消部署" "info"
+                exit 0
+            fi
 
-        if [[ ! "$continue_choice" =~ ^[Yy]$ ]]; then
-            log "已取消部署" "info"
-            exit 0
+            all_needed=("${SELECTED_MODULES[@]}")
         fi
-
-        return 0
     fi
 
-    local sorted=()
-
+    # 无论用户输入编号的先后如何，都按模块声明的稳定顺序执行。
     for module in "${MODULE_ORDER[@]}"; do
         if module_in_list "$module" "${all_needed[@]}"; then
             sorted+=("$module")
@@ -489,7 +476,10 @@ resolve_dependencies() {
     done
 
     SELECTED_MODULES=("${sorted[@]}")
-    log "已加入依赖，最终模块顺序：${SELECTED_MODULES[*]}" "success"
+
+    if (( ${#added_deps[@]} > 0 )) && [[ "$choice" =~ ^[Yy]$ ]]; then
+        log "已加入依赖，最终模块顺序：${SELECTED_MODULES[*]}" "success"
+    fi
 }
 
 # =============================================================================
@@ -544,6 +534,116 @@ download_with_retry() {
     return 1
 }
 
+read_module_metadata() {
+    local module_file="$1"
+    local key="$2"
+
+    awk -v key="$key" '
+        $0 ~ "^#[[:space:]]*debian-setup:" key "=" {
+            value = $0
+            sub("^#[[:space:]]*debian-setup:" key "=[[:space:]]*", "", value)
+            sub("[[:space:]]*$", "", value)
+            print value
+            exit
+        }
+    ' "$module_file"
+}
+
+register_module() {
+    local module="$1"
+    local module_file="$2"
+    local name
+    local order
+    local depends
+    local enabled
+    local dependency
+
+    if ! bash -n "$module_file"; then
+        log "模块语法检查失败，已跳过：$module" "error"
+        return 1
+    fi
+
+    name=$(read_module_metadata "$module_file" "name")
+    order=$(read_module_metadata "$module_file" "order")
+    depends=$(read_module_metadata "$module_file" "depends")
+    enabled=$(read_module_metadata "$module_file" "enabled")
+
+    name="${name:-$module}"
+    order="${order:-900}"
+    enabled="${enabled:-true}"
+
+    if [[ "$enabled" == "false" ]]; then
+        return 2
+    fi
+
+    if [[ "$enabled" != "true" ]]; then
+        log "模块 enabled 元数据无效，已跳过：$module" "error"
+        return 1
+    fi
+
+    if [[ ! "$order" =~ ^[0-9]+$ ]] || (( 10#$order > 999999 )); then
+        log "模块 order 元数据无效，已跳过：$module" "error"
+        return 1
+    fi
+
+    for dependency in $depends; do
+        if [[ ! "$dependency" =~ ^[a-z0-9][a-z0-9-]*$ ]]; then
+            log "模块依赖名称无效，已跳过：$module -> $dependency" "error"
+            return 1
+        fi
+    done
+
+    MODULES["$module"]="$name"
+    MODULE_DEPS["$module"]="$depends"
+    MODULE_ORDER_VALUE["$module"]="$((10#$order))"
+    MODULE_FILES["$module"]="$module_file"
+}
+
+remove_module_registration() {
+    local module="$1"
+
+    unset 'MODULES[$module]'
+    unset 'MODULE_DEPS[$module]'
+    unset 'MODULE_ORDER_VALUE[$module]'
+    unset 'MODULE_FILES[$module]'
+}
+
+validate_module_dependencies() {
+    local changed=true
+    local module
+    local dependency
+
+    # 重复检查，确保依赖于已被剔除模块的模块也会被剔除。
+    while [[ "$changed" == "true" ]]; do
+        changed=false
+
+        for module in "${!MODULES[@]}"; do
+            for dependency in ${MODULE_DEPS[$module]:-}; do
+                if [[ -z "${MODULES[$dependency]:-}" ]]; then
+                    log "模块依赖不存在，已跳过：$module -> $dependency" "error"
+                    remove_module_registration "$module"
+                    changed=true
+                    break
+                fi
+            done
+        done
+    done
+}
+
+build_module_order() {
+    local module
+
+    mapfile -t MODULE_ORDER < <(
+        for module in "${!MODULES[@]}"; do
+            printf '%010d\t%s\n' \
+                "${MODULE_ORDER_VALUE[$module]}" \
+                "$module"
+        done |
+            sort -k1,1n -k2,2 |
+            awk -F '\t' '{print $2}'
+    )
+}
+
 download_module() {
     local module="$1"
     local module_file="$TEMP_DIR/${module}.sh"
@@ -556,6 +656,76 @@ download_module() {
     fi
 
     chmod 700 "$module_file"
+}
+
+discover_and_prepare_modules() {
+    local index_file="$TEMP_DIR/modules-index.json"
+    local file_name
+    local module
+    local module_file
+    local register_result
+    local -a module_files=()
+
+    log "从固定 Commit 发现部署模块：${LATEST_COMMIT:0:7}"
+
+    if ! curl -fsSL \
+        --connect-timeout 10 \
+        --max-time 30 \
+        "${MODULES_API_URL}?ref=${LATEST_COMMIT}" \
+        -o "$index_file"; then
+        log "无法获取 modules 目录列表" "error"
+        return 1
+    fi
+
+    if ! jq -e 'type == "array"' "$index_file" >/dev/null 2>&1; then
+        log "GitHub modules 目录响应格式异常" "error"
+        return 1
+    fi
+
+    mapfile -t module_files < <(
+        jq -r '
+            .[]
+            | select(.type == "file")
+            | .name
+            | select(test("^[a-z0-9][a-z0-9-]*\\.sh$"))
+        ' "$index_file" |
+            sort -u
+    )
+
+    if (( ${#module_files[@]} == 0 )); then
+        log "modules 目录中没有符合命名规范的脚本" "error"
+        return 1
+    fi
+
+    for file_name in "${module_files[@]}"; do
+        module="${file_name%.sh}"
+        module_file="$TEMP_DIR/$file_name"
+
+        if ! download_module "$module"; then
+            log "模块下载失败，已跳过：$module" "error"
+            continue
+        fi
+
+        if register_module "$module" "$module_file"; then
+            continue
+        else
+            register_result=$?
+        fi
+
+        if (( register_result != 2 )); then
+            rm -f "$module_file"
+        fi
+    done
+
+    validate_module_dependencies
+    build_module_order
+
+    if (( ${#MODULE_ORDER[@]} == 0 )); then
+        log "没有可用的部署模块" "error"
+        return 1
+    fi
+
+    log "模块发现完成：${#MODULE_ORDER[@]} 个可用模块" "success"
 }
 
 # =============================================================================
@@ -679,7 +849,7 @@ self_update() {
 
 execute_module() {
     local module="$1"
-    local module_file="$TEMP_DIR/${module}.sh"
+    local module_file="${MODULE_FILES[$module]:-}"
     local start_time
     local end_time
     local duration
@@ -986,15 +1156,7 @@ Debian 系统部署脚本 v$SCRIPT_VERSION
   --version, -v     显示版本信息
 
 模块：
-  system-optimize    系统优化（Zram、时区、Chrony）
-  system-customize   系统定制（欢迎信息、中文环境、XanMod）
-  network-optimize   网络优化（BBR、fq、IPv4 转发）
-  zsh-setup          Zsh Shell 环境
-  mise-setup         Mise、Python、Node.js
-  tools-setup        系统工具
-  docker-setup       Docker 平台
-  auto-update-setup  自动更新系统与内核
-  ssh-security       SSH 安全配置
+  启动部署后，从固定 Commit 的 modules/*.sh 自动发现并生成选择菜单。
 
 文件位置：
   日志: $LOG_FILE
@@ -1085,6 +1247,10 @@ main() {
         exit 1
     fi
 
+    if ! discover_and_prepare_modules; then
+        exit 1
+    fi
+
     select_deployment_mode
 
     if (( ${#SELECTED_MODULES[@]} == 0 )); then
@@ -1092,7 +1258,7 @@ main() {
         exit 0
     fi
 
-    resolve_dependencies
+    resolve_dependencies || exit 1
 
     echo
     echo "最终执行计划：${SELECTED_MODULES[*]}"
@@ -1106,36 +1272,7 @@ main() {
         exit 0
     fi
 
-    echo
-    log "正在准备 ${#SELECTED_MODULES[@]} 个模块..."
-
-    local download_failed=0
     local module
-
-    for module in "${SELECTED_MODULES[@]}"; do
-        if ! download_module "$module"; then
-            MODULE_STATUS["$module"]="failed"
-            ((download_failed++))
-            log "模块下载失败：$module" "error"
-        fi
-    done
-
-    if (( download_failed == 0 )); then
-        log "模块准备完成" "success"
-    fi
-
-    if (( download_failed > 0 )); then
-        log "共有 $download_failed 个模块下载失败" "warn"
-
-        local continue_choice
-        read -r -p "是否继续执行已成功下载的模块？[y/N]: " continue_choice
-
-        if [[ ! "$continue_choice" =~ ^[Yy]$ ]]; then
-            log "用户取消执行" "info"
-            generate_summary
-            exit 1
-        fi
-    fi
 
     echo
     echo "$LINE"
