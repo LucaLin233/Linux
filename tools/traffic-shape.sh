@@ -9,7 +9,7 @@
 set -uo pipefail
 umask 022
 
-readonly VERSION="1.0.1"
+readonly VERSION="1.0.2"
 readonly INSTALL_PATH="/usr/local/sbin/tcshape"
 readonly STATE_DIR="/var/lib/tcshape"
 readonly CONFIG_FILE="/etc/tcshape.conf"
@@ -199,7 +199,7 @@ detect_iface() {
 
 root_qdisc_kind() {
     tc qdisc show dev "$1" 2>/dev/null |
-        awk '$1 == "qdisc" && $3 == "root" {print $2; found=1; exit} NR == 1 {fallback=$2} END {if (!found && fallback) print fallback}' |
+        awk '$1 == "qdisc" && $4 == "root" {print $2; found=1; exit} NR == 1 {fallback=$2} END {if (!found && fallback) print fallback}' |
         head -n 1
 }
 
@@ -212,9 +212,15 @@ read_config_value() {
 
 is_own_shaper() {
     local iface="$1"
+    local configured_iface
     [[ -f "$CONFIG_FILE" && -f "$SERVICE_FILE" ]] || return 1
     grep -Fq 'tcshape-managed' "$SERVICE_FILE" 2>/dev/null || return 1
-    tc qdisc show dev "$iface" 2>/dev/null | grep -Eq '^qdisc htb 1:.* root'
+    configured_iface=$(read_config_value INTERFACE || true)
+    [[ "$configured_iface" == "$iface" ]] || return 1
+    tc qdisc show dev "$iface" 2>/dev/null |
+        awk '$1 == "qdisc" && $2 == "htb" && $3 == "1:" && $4 == "root" {found=1} END {exit !found}' || return 1
+    tc class show dev "$iface" 2>/dev/null |
+        grep -Eq '^class htb 1:10([[:space:]]|$)'
 }
 
 check_external_conflicts() {
@@ -660,7 +666,7 @@ run_iperf() {
                 kill_process_tree "$pid"
                 break
             fi
-            sleep 1
+            sleep 0.2
         done
 
         wait "$pid" 2>/dev/null
@@ -703,7 +709,22 @@ calc_margin() {
 }
 
 calc_step() {
-    awk -v bw="$1" 'BEGIN {step=int(bw/300+0.5)*10; if(step<20)step=20; printf "%d", step}'
+    awk -v bw="$1" 'BEGIN {
+        if (bw > 2500) step=int((bw/12)/10+0.5)*10
+        else step=int(bw/300+0.5)*10
+        if(step<20)step=20
+        printf "%d", step
+    }'
+}
+
+calc_test_duration() {
+    awk -v bw="$1" 'BEGIN {
+        if (bw <= 0) {print 12; exit}
+        seconds=int(16000/bw+0.999)
+        if(seconds<3)seconds=3
+        if(seconds>12)seconds=12
+        print seconds
+    }'
 }
 
 auto_pick_peer() {
@@ -749,11 +770,11 @@ auto_pick_peer() {
                 printf '可用（%s Mbit，端口 %s）\n' "$gp" "$used_port" >&2
                 if (( rtt <= ideal )); then
                     rm -rf "$temp_dir"
-                    printf '%s:%s\n' "$host" "$used_port"
+                    printf '%s|%s|%s\n' "$host" "$used_port" "$gp"
                     return 0
                 fi
                 [[ -n "$fallback" ]] || {
-                    fallback="$host:$used_port"
+                    fallback="$host|$used_port|$gp"
                     fallback_rtt="$rtt"
                 }
                 ;;
@@ -811,16 +832,18 @@ validate_peer_path() {
     local peer="$1"
     local nominal="$2"
     local iface="$3"
+    local test_duration="${4:-8}"
     local rate result rc gp retrans port loss
 
+    (( test_duration > 8 )) && test_duration=8
     rate=$((nominal * 40 / 100)); (( rate < 20 )) && rate=20
     apply_test_shaper "$iface" "$rate" || return 1
-    result=$(run_iperf "$peer" 8 2)
+    result=$(run_iperf "$peer" "$test_duration" 2)
     rc=$?
     (( rc == 75 )) && return 75
     (( rc == 0 )) || return 1
     read -r gp retrans port <<< "$result"
-    loss=$(loss_pct "$retrans" "$gp" 8)
+    loss=$(loss_pct "$retrans" "$gp" "$test_duration")
 
     if awk -v g="$gp" -v r="$rate" 'BEGIN {exit !(g < r*0.7)}'; then
         warn "对端吞吐不足：${gp}/${rate} Mbit"
@@ -836,8 +859,8 @@ validate_peer_path() {
 cmd_scan() {
     local peer=""
     local lo="" hi="" step="" margin="" nominal=""
-    local duration=12 gap=3 assume_yes=false user_range=false
-    local iface picked result rc gp retrans port loss
+    local duration="" gap=3 assume_yes=false user_range=false
+    local iface picked result rc gp retrans port loss estimated_gp=""
     local last_ok="" broke_at="" base_loss="" peer_slow=0
 
     while (( $# > 0 )); do
@@ -857,10 +880,10 @@ cmd_scan() {
         esac
     done
 
-    for value in "$duration" "${nominal:-1}" "${lo:-1}" "${hi:-1}" "${step:-1}" "${margin:-1}" "$PEER_PORT"; do
+    for value in "${duration:-12}" "${nominal:-1}" "${lo:-1}" "${hi:-1}" "${step:-1}" "${margin:-1}" "$PEER_PORT"; do
         is_positive_integer "$value" 1 100000 || { error "扫描参数必须是正整数"; return 1; }
     done
-    duration=$((10#$duration))
+    [[ -n "$duration" ]] && duration=$((10#$duration))
     PEER_PORT=$((10#$PEER_PORT))
     [[ -n "$nominal" ]] && nominal=$((10#$nominal))
     [[ -n "$lo" ]] && lo=$((10#$lo))
@@ -868,7 +891,7 @@ cmd_scan() {
     [[ -n "$step" ]] && step=$((10#$step))
     [[ -n "$margin" ]] && margin=$((10#$margin))
 
-    (( duration <= 120 )) || { error "--dur 最大 120 秒"; return 1; }
+    [[ -z "$duration" ]] || (( duration <= 120 )) || { error "--dur 最大 120 秒"; return 1; }
     is_positive_integer "$PEER_PORT" 1 65535 || { error "端口无效"; return 1; }
 
     if [[ -n "$lo" || -n "$hi" ]]; then
@@ -901,10 +924,13 @@ cmd_scan() {
             return 2
         fi
         (( rc == 0 )) || return 2
-        peer="${picked%:*}"
-        PEER_PORT="${picked##*:}"
+        IFS='|' read -r peer PEER_PORT estimated_gp <<< "$picked"
+    fi
+    if [[ -z "$duration" ]]; then
+        duration=$(calc_test_duration "${estimated_gp:-0}")
     fi
     info "测速节点：$peer:$PEER_PORT"
+    info "单档测试时长：${duration}s"
 
     rm -f "$STATE_DIR/sweep.result" 2>/dev/null || true
     qdisc_save "$iface"
@@ -950,7 +976,7 @@ cmd_scan() {
     fi
 
     info "验证节点路径..."
-    validate_peer_path "$peer" "$nominal" "$iface"
+    validate_peer_path "$peer" "$nominal" "$iface" "$duration"
     rc=$?
     if (( rc != 0 )); then
         if (( rc == 75 )); then

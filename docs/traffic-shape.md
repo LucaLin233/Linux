@@ -87,8 +87,9 @@ sudo tcshape off
 
 工具在每轮测试前及 iperf3 运行过程中检查网卡计数。达到任一限制时立即停止本工具启动的
 iperf3，并恢复 qdisc。流量上限与扫描速率不是同一概念：没有丢包时会直接判定无 policer，
-不会为了耗尽 45 GB 而继续扫描；存在明显丢包时才进入拐点扫描。高速线路仍可能产生数十 GB
-上传流量，请先确认 VPS 流量套餐。
+不会为了耗尽 45 GB 而继续扫描；存在明显丢包时才进入拐点扫描。高速线路会根据自动选点时
+测得的速率缩短单档时长，并在 2.5 Gbit 以上增大粗扫步长，尽量在 45 GB 内完成粗扫、细扫
+和异常复测。显式传入 `--dur` 时则尊重用户指定值。
 
 ## Shape 行为
 
@@ -127,7 +128,8 @@ CAKE、TBF、NETEM、TAPRIO、非本工具 HTB、根队列或 mq 子队列的自
 ```
 
 `mq` 自动生成的 `class mq`、标准 fq/fq_codel 子队列，以及独立的 clsact/ingress filter 不视为
-冲突：替换根 qdisc 时 clsact/ingress 会继续保留，关闭后由内核恢复 mq 拓扑。检测到
+冲突：替换根 qdisc 时 clsact/ingress 会继续保留，关闭后由内核恢复 mq 拓扑。已经由 tcshape
+管理的 `HTB + fq` 也允许再次 Sweep；测试结束后会重新应用原固定速率。检测到
 `tcpfit-qdisc.service` 时也会拒绝运行。Sweep 遇到退出、错误、`Ctrl-C`、`TERM` 或流量超限
 时都会执行恢复流程。
 
