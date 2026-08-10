@@ -14,16 +14,27 @@
 
 ## 快速开始
 
+推荐直接远程运行最新主脚本。脚本需要交互输入，因此使用进程替换，避免将标准输入占用为脚本内容：
+
+```bash
+sudo bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/debian_setup.sh)
+```
+
+如需先审阅再执行：
+
+```bash
+curl -fsSLo /tmp/debian_setup.sh \
+  https://raw.githubusercontent.com/LucaLin233/Linux/main/debian_setup.sh
+less /tmp/debian_setup.sh
+sudo bash /tmp/debian_setup.sh
+```
+
+需要修改脚本或离线保留副本时，再克隆仓库：
+
 ```bash
 git clone https://github.com/LucaLin233/Linux.git
 cd Linux
 sudo ./debian_setup.sh
-```
-
-也可以直接运行最新主脚本：
-
-```bash
-sudo bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/debian_setup.sh)
 ```
 
 > 运行过程中可能安装软件、修改 sysctl、SSH、Shell、定时任务和 systemd 服务。不要在未备份、
@@ -43,10 +54,10 @@ sudo bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/d
 常用选项：
 
 ```bash
-sudo ./debian_setup.sh --check-status
-sudo ./debian_setup.sh --clean-cache
-./debian_setup.sh --version
-./debian_setup.sh --help
+sudo bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/debian_setup.sh) --check-status
+sudo bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/debian_setup.sh) --clean-cache
+bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/debian_setup.sh) --version
+bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/debian_setup.sh) --help
 ```
 
 主要文件：
@@ -59,19 +70,21 @@ sudo ./debian_setup.sh --clean-cache
 
 ### 部署模块
 
-| 顺序 | 模块 | 功能 | 主要影响 |
+| 菜单编号 | 模块 | 功能 | 主要影响 |
 | ---: | --- | --- | --- |
-| 10 | `system-optimize.sh` | 按内存配置 Zram、时区和 Chrony | 默认时区可设为上海；启用 Chrony 后停用 timesyncd |
-| 20 | `system-customize.sh` | 动态 MOTD、中文 Locale、可选 XanMod | 可能修改 Locale、欢迎信息和内核 |
-| 30 | `network-optimize.sh` | BBR、fq、动态 TCP 缓冲区和转发参数 | 自动测速最多约 90 GB；写入独立 sysctl 配置 |
-| 40 | `zsh-setup.sh` | Zsh、Oh My Zsh、Powerlevel10k 和插件 | 备份后重写 root 的 `.zshrc`，可修改默认 Shell |
-| 50 | `mise-setup.sh` | Mise、Python、Node.js 和依赖迁移 | 配置 Shell 集成及每周 Mise 自动更新 |
-| 60 | `tools-setup.sh` | NextTrace、Speedtest、htop、jq、tree 等 | 可能添加 NextTrace 第三方 APT 源 |
-| 70 | `docker-setup.sh` | Docker Engine、Compose、Buildx、日志轮转 | 添加 Docker 官方 APT 源并管理 Docker 服务 |
-| 80 | `auto-update-setup.sh` | 定时完整升级系统和内核 | 更新后需要重启时会等待 30 秒自动重启 |
-| 90 | `ssh-security.sh` | SSH 端口、Root 登录与认证策略 | 完整管理 `sshd_config`，操作不当可能失去远程连接 |
+| 1 | `system-optimize.sh` | 按内存配置 Zram、时区和 Chrony | 默认时区可设为上海；启用 Chrony 后停用 timesyncd |
+| 2 | `system-customize.sh` | 动态 MOTD、中文 Locale、可选 XanMod | 可能修改 Locale、欢迎信息和内核 |
+| 3 | `network-optimize.sh` | BBR、fq、动态 TCP 缓冲区和转发参数 | 自动测速最多约 90 GB；写入独立 sysctl 配置 |
+| 4 | `zsh-setup.sh` | Zsh、Oh My Zsh、Powerlevel10k 和插件 | 备份后重写 root 的 `.zshrc`，可修改默认 Shell |
+| 5 | `mise-setup.sh` | Mise、Python、Node.js 和依赖迁移 | 配置 Shell 集成及每周 Mise 自动更新 |
+| 6 | `tools-setup.sh` | NextTrace、Speedtest、htop、jq、tree 等 | 可能添加 NextTrace 第三方 APT 源 |
+| 7 | `docker-setup.sh` | Docker Engine、Compose、Buildx、日志轮转 | 添加 Docker 官方 APT 源并管理 Docker 服务 |
+| 8 | `auto-update-setup.sh` | 定时完整升级系统和内核 | 更新后需要重启时会等待 30 秒自动重启 |
+| 9 | `ssh-security.sh` | SSH 端口、Root 登录与认证策略 | 完整管理 `sshd_config`，操作不当可能失去远程连接 |
 
 当前只有 `mise-setup` 声明 `zsh-setup` 为强依赖；其他模块可以单独执行。
+菜单编号由主脚本按模块顺序动态生成。模块元数据中的 `order=10`、`20` 等值仅用于排序，
+不是用户需要输入的编号。
 
 ### 新增模块
 
@@ -103,9 +116,9 @@ sudo ./debian_setup.sh --clean-cache
 安装、升级或彻底卸载 cloudflared Tunnel；安装流程会配置 systemd 服务和每日自动更新。
 
 ```bash
-sudo ./tools/cloudflare_tunnel.sh install
-sudo ./tools/cloudflare_tunnel.sh upgrade
-sudo ./tools/cloudflare_tunnel.sh uninstall
+sudo bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/tools/cloudflare_tunnel.sh) install
+sudo bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/tools/cloudflare_tunnel.sh) upgrade
+sudo bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/tools/cloudflare_tunnel.sh) uninstall
 ```
 
 Token 属于敏感凭据，不要写入日志、README 或提交到 Git。
@@ -119,7 +132,7 @@ Token 属于敏感凭据，不要写入日志、README 或提交到 Git。
 首次运行：
 
 ```bash
-sudo ./tools/traffic-shape.sh
+sudo bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/tools/traffic-shape.sh)
 ```
 
 随后可使用短命令：
@@ -140,14 +153,14 @@ Sweep 可能消耗大量上传流量，并会临时替换默认出口接口的�
 ### 旧版网络优化脚本
 
 ```bash
-sudo ./tools/kernel.sh install -c    # 国内场景
-sudo ./tools/kernel.sh install -i    # 国际场景
-sudo ./tools/kernel.sh status
-sudo ./tools/kernel.sh restore
+sudo bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/tools/kernel.sh) install -c    # 国内场景
+sudo bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/tools/kernel.sh) install -i    # 国际场景
+sudo bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/tools/kernel.sh) status
+sudo bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/tools/kernel.sh) restore
 
-sudo ./tools/kernel2.sh install
-sudo ./tools/kernel2.sh status
-sudo ./tools/kernel2.sh restore
+sudo bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/tools/kernel2.sh) install
+sudo bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/tools/kernel2.sh) status
+sudo bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/tools/kernel2.sh) restore
 ```
 
 `kernel.sh`、`kernel2.sh` 和 `modules/network-optimize.sh` 会管理重叠的 sysctl、BBR、资源限制
@@ -158,7 +171,10 @@ sudo ./tools/kernel2.sh restore
 
 [`tools/push.sh`](tools/push.sh) 使用 SSH 和 rsync 并发同步文件，支持密钥或密码认证。
 
+该工具依赖本地 `config.conf` 和待推送文件，不适合远程即用方式，请克隆仓库后运行：
 ```bash
+git clone https://github.com/LucaLin233/Linux.git
+cd Linux
 ./tools/push.sh --generate-config
 ./tools/push.sh --test-auth
 ./tools/push.sh TASK_NAME
@@ -174,8 +190,8 @@ sudo ./tools/kernel2.sh restore
 ### sing-box 安装
 
 ```bash
-sudo ./tools/sbinstall.sh install
-sudo ./tools/sbinstall.sh uninstall
+sudo bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/tools/sbinstall.sh) install
+sudo bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/tools/sbinstall.sh) uninstall
 ```
 
 安装前需要准备有效的 `/root/proxy/config.json` 以及脚本要求的证书文件权限。脚本会下载
@@ -184,7 +200,7 @@ sing-box、创建目录和 systemd 服务；卸载会停止并移除本脚本管
 ### 独立动态 MOTD
 
 ```bash
-sudo ./tools/setup-motd.sh
+sudo bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/tools/setup-motd.sh)
 ```
 
 用于只部署动态登录欢迎信息，与 `modules/system-customize.sh` 的 MOTD 功能重叠；已经运行系统
@@ -193,9 +209,9 @@ sudo ./tools/setup-motd.sh
 ### XanMod 内核
 
 ```bash
-sudo ./tools/xanmod-install.sh
-sudo ./tools/xanmod-install.sh status
-sudo ./tools/xanmod-install.sh help
+sudo bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/tools/xanmod-install.sh)
+sudo bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/tools/xanmod-install.sh) status
+sudo bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/tools/xanmod-install.sh) help
 ```
 
 脚本检测 x86-64 psABI 级别并选择适合的 XanMod 包。内核安装完成后通常需要重启才能生效；
