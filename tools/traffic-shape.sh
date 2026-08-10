@@ -9,7 +9,7 @@
 set -uo pipefail
 umask 022
 
-readonly VERSION="1.0.0"
+readonly VERSION="1.0.1"
 readonly INSTALL_PATH="/usr/local/sbin/tcshape"
 readonly STATE_DIR="/var/lib/tcshape"
 readonly CONFIG_FILE="/etc/tcshape.conf"
@@ -24,7 +24,7 @@ readonly TRAFFIC_DIRECTION_LIMIT_BYTES=45000000000
 readonly PORT_POOL="5201 5202 5203 5204 5205 5206 5207 5208 5209 5210 5200"
 readonly PROBE_PORTS="5201 5202 5203 5200"
 readonly LOSS_THRESHOLD="0.1"
-readonly SCAN_CAP_MBIT=2500
+readonly SCAN_CAP_MBIT=100000
 
 IP_FAMILY="-4"
 PEER_PORT="5201"
@@ -243,10 +243,50 @@ check_external_conflicts() {
     esac
 
     if ! is_own_shaper "$iface"; then
-        if tc class show dev "$iface" 2>/dev/null | grep -q . ||
-            tc filter show dev "$iface" 2>/dev/null | grep -q .; then
-            error "当前接口存在自定义 class/filter，拒绝覆盖"
+        local class_output
+        local root_filter_output
+        local unsafe_child_qdisc
+
+        class_output=$(tc class show dev "$iface" 2>/dev/null || true)
+        root_filter_output=$(tc filter show dev "$iface" parent root 2>/dev/null || true)
+
+        # mq 会为每个硬件发送队列生成固有的 class mq；它不是用户自定义规则。
+        # clsact/ingress filter 不属于根 qdisc，替换 root 时会原样保留。
+        if [[ "$kind" == "mq" ]]; then
+            if printf '%s\n' "$class_output" |
+                awk 'NF && !($1 == "class" && $2 == "mq") {found=1} END {exit !found}'; then
+                error "当前 mq 根队列下存在非 mq class，拒绝覆盖"
+                return 1
+            fi
+
+            unsafe_child_qdisc=$(tc qdisc show dev "$iface" 2>/dev/null |
+                awk '$1 == "qdisc" && $4 == "parent" && $2 !~ /^(fq|fq_codel|pfifo_fast|noqueue|clsact|ingress)$/ {print $2; exit}')
+            if [[ -n "$unsafe_child_qdisc" ]]; then
+                error "当前 mq 使用自定义子 qdisc：$unsafe_child_qdisc，拒绝覆盖"
+                return 1
+            fi
+        elif [[ -n "$class_output" ]]; then
+            error "当前根 qdisc 存在自定义 class，拒绝覆盖"
             return 1
+        fi
+
+        if [[ -n "$root_filter_output" ]]; then
+            error "当前根 qdisc 存在自定义 filter，拒绝覆盖"
+            return 1
+        fi
+
+        if [[ "$kind" == "mq" ]]; then
+            local parent_id
+            local child_filter_output
+            while IFS= read -r parent_id; do
+                [[ -n "$parent_id" ]] || continue
+                child_filter_output=$(tc filter show dev "$iface" parent "$parent_id" 2>/dev/null || true)
+                if [[ -n "$child_filter_output" ]]; then
+                    error "当前 mq 子队列 $parent_id 存在自定义 filter，拒绝覆盖"
+                    return 1
+                fi
+            done < <(printf '%s\n' "$class_output" |
+                awk '$1 == "class" && $2 == "mq" {print $3}')
         fi
     fi
 }
@@ -285,10 +325,16 @@ restore_simple_qdisc() {
 
     tc qdisc del dev "$iface" root 2>/dev/null || true
     case "$kind" in
-        ""|noqueue|mq)
+        "")
+            return 0
+            ;;
+        noqueue|mq)
+            sleep 1
+            [[ "$(root_qdisc_kind "$iface")" == "$kind" ]] || return 1
             ;;
         pfifo_fast|fq|fq_codel)
             tc qdisc add dev "$iface" root "$kind" 2>/dev/null || return 1
+            [[ "$(root_qdisc_kind "$iface")" == "$kind" ]] || return 1
             ;;
         *)
             return 1
@@ -884,13 +930,6 @@ cmd_scan() {
         loss=$(loss_pct "$retrans" "$gp" "$duration")
         printf '不限速：%s Mbit / 重传 %s / 丢包 %s%%\n' "$gp" "$retrans" "$loss"
 
-        if (( gp > SCAN_CAP_MBIT )); then
-            warn "不限速已达到 ${gp} Mbit，超过扫描上限，不建议整形"
-            save_sweep_result "NO_POLICER" "UNSHAPED_MBIT=$gp" "PEER=$peer"
-            traffic_report
-            return 0
-        fi
-
         if ! awk -v loss="$loss" -v threshold="$LOSS_THRESHOLD" 'BEGIN {exit !(loss > threshold)}'; then
             warn "未检测到限速器，不建议执行流量整形"
             save_sweep_result "NO_POLICER" "UNSHAPED_MBIT=$gp" "PEER=$peer"
@@ -1016,10 +1055,28 @@ cmd_scan() {
             (( rc == 0 )) || continue
             read -r gp retrans port <<< "$result"
             loss=$(loss_pct "$retrans" "$gp" "$duration")
+            hits=0
+
             if awk -v l="$loss" -v t="$LOSS_THRESHOLD" -v b="$base_loss" 'BEGIN {exit !((l>t) && (b<=0 || l>=b*10))}'; then
+                hits=1
+                for retry in 2 3; do
+                    sleep "$gap"
+                    test_result=$(run_iperf "$peer" "$duration" 1); rc=$?
+                    (( rc == 75 )) && { save_sweep_result "BUDGET_EXCEEDED" "PEER=$peer"; return 2; }
+                    (( rc == 0 )) || continue
+                    read -r test_gp test_rt test_port <<< "$test_result"
+                    test_loss=$(loss_pct "$test_rt" "$test_gp" "$duration")
+                    awk -v l="$test_loss" -v t="$LOSS_THRESHOLD" -v b="$base_loss" 'BEGIN {exit !((l>t) && (b<=0 || l>=b*10))}' && ((hits++))
+                done
+            fi
+
+            if (( hits >= 2 )); then
+                printf '%-10s %-12s %-10s %-10s %s\n' "$rate" "$gp" "$retrans" "$loss" "拐点"
                 broke_at="$rate"
                 break
             fi
+
+            printf '%-10s %-12s %-10s %-10s %s\n' "$rate" "$gp" "$retrans" "$loss" "正常"
             last_ok="$rate"
         done
         [[ -n "$broke_at" ]] || broke_at="$coarse_broke"

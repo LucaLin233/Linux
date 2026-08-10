@@ -86,7 +86,9 @@ sudo tcshape off
 ```
 
 工具在每轮测试前及 iperf3 运行过程中检查网卡计数。达到任一限制时立即停止本工具启动的
-iperf3，并恢复 qdisc。高速线路仍可能产生数十 GB 上传流量，请先确认 VPS 流量套餐。
+iperf3，并恢复 qdisc。流量上限与扫描速率不是同一概念：没有丢包时会直接判定无 policer，
+不会为了耗尽 45 GB 而继续扫描；存在明显丢包时才进入拐点扫描。高速线路仍可能产生数十 GB
+上传流量，请先确认 VPS 流量套餐。
 
 ## Shape 行为
 
@@ -121,11 +123,13 @@ fq、fq_codel、pfifo_fast、mq、noqueue
 发现以下配置时拒绝覆盖：
 
 ```text
-CAKE、TBF、NETEM、TAPRIO、非本工具 HTB、自定义 class/filter
+CAKE、TBF、NETEM、TAPRIO、非本工具 HTB、根队列或 mq 子队列的自定义 class/filter
 ```
 
-检测到 `tcpfit-qdisc.service` 时也会拒绝运行。Sweep 遇到退出、错误、`Ctrl-C`、`TERM` 或
-流量超限时都会执行恢复流程。
+`mq` 自动生成的 `class mq`、标准 fq/fq_codel 子队列，以及独立的 clsact/ingress filter 不视为
+冲突：替换根 qdisc 时 clsact/ingress 会继续保留，关闭后由内核恢复 mq 拓扑。检测到
+`tcpfit-qdisc.service` 时也会拒绝运行。Sweep 遇到退出、错误、`Ctrl-C`、`TERM` 或流量超限
+时都会执行恢复流程。
 
 ## 验证与排查
 
