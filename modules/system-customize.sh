@@ -116,12 +116,21 @@ ensure_package() {
 backup_managed_file() {
     local file="$1"
     local backup_prefix="$file"
-    local state_dir="/var/lib/linux-setup/apt-source-backups"
+    local state_dir=""
     local suffix
     local legacy_state
     local state_file
 
-    if [[ "$file" == /etc/apt/sources.list.d/* ]]; then
+    case "$file" in
+        /etc/apt/sources.list.d/*)
+            state_dir="/var/lib/linux-setup/apt-source-backups"
+            ;;
+        /etc/update-motd.d/*)
+            state_dir="/var/lib/linux-setup/motd-backups"
+            ;;
+    esac
+
+    if [[ -n "$state_dir" ]]; then
         install -d -m 0700 "$state_dir"
         backup_prefix="$state_dir/$(basename "$file")"
 
@@ -133,7 +142,6 @@ backup_managed_file() {
                 state_file="${state_file}.legacy.$(date +%s).$$"
             fi
             mv "$legacy_state" "$state_file" || return 1
-            chmod 600 "$state_file" 2>/dev/null || true
         done
     fi
 
@@ -165,14 +173,24 @@ get_managed_backup_prefix() {
     local target="$1"
     local state_prefix
 
-    if [[ "$target" == /etc/apt/sources.list.d/* ]]; then
-        state_prefix="/var/lib/linux-setup/apt-source-backups/$(basename "$target")"
-        if [[ -e "${state_prefix}.initial-backup" || -e "${state_prefix}.initial-absent" ||
-            -e "${state_prefix}.initial-unknown" || -e "${state_prefix}.previous-backup" ||
-            -e "${state_prefix}.previous-absent" ]]; then
-            printf '%s\n' "$state_prefix"
+    case "$target" in
+        /etc/apt/sources.list.d/*)
+            state_prefix="/var/lib/linux-setup/apt-source-backups/$(basename "$target")"
+            ;;
+        /etc/update-motd.d/*)
+            state_prefix="/var/lib/linux-setup/motd-backups/$(basename "$target")"
+            ;;
+        *)
+            printf '%s\n' "$target"
             return 0
-        fi
+            ;;
+    esac
+
+    if [[ -e "${state_prefix}.initial-backup" || -e "${state_prefix}.initial-absent" ||
+        -e "${state_prefix}.initial-unknown" || -e "${state_prefix}.previous-backup" ||
+        -e "${state_prefix}.previous-absent" ]]; then
+        printf '%s\n' "$state_prefix"
+        return 0
     fi
 
     printf '%s\n' "$target"

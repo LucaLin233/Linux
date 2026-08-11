@@ -334,7 +334,8 @@ sudo bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/t
 
 用于只部署动态登录欢迎信息，与 `modules/system-customize.sh` 的 MOTD 功能重叠；已经运行系统
 定制模块时通常无需再次执行。脚本会备份并清空静态登录欢迎文件；其中静态 MOTD 会被替换为
-普通空文件，避免其链接到运行时动态 MOTD 时被 PAM 重复显示。
+普通空文件，避免其链接到运行时动态 MOTD 时被 PAM 重复显示。动态 MOTD 脚本的备份保存在
+`/var/lib/linux-setup/motd-backups`，不会留在可执行的 `update-motd.d` 目录中。
 
 ### XanMod 内核
 

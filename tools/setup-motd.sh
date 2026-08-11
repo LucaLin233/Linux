@@ -30,9 +30,42 @@ require_root() {
 
 backup_initial_file() {
     local file="$1"
-    [[ -e "$file" || -L "$file" ]] || return 0
-    [[ -e "${file}.initial-backup" || -L "${file}.initial-backup" ]] ||
-        cp -a "$file" "${file}.initial-backup"
+    local backup_prefix="$file"
+    local state_dir=""
+    local suffix
+    local legacy_state
+    local state_file
+
+    if [[ "$file" == /etc/update-motd.d/* ]]; then
+        state_dir="/var/lib/linux-setup/motd-backups"
+        install -d -m 0700 "$state_dir"
+        backup_prefix="$state_dir/$(basename "$file")"
+
+        for suffix in initial-backup previous-backup initial-absent previous-absent initial-unknown; do
+            legacy_state="${file}.${suffix}"
+            [[ -e "$legacy_state" || -L "$legacy_state" ]] || continue
+            state_file="${backup_prefix}.${suffix}"
+            if [[ -e "$state_file" || -L "$state_file" ]]; then
+                state_file="${state_file}.legacy.$(date +%s).$$"
+            fi
+            mv "$legacy_state" "$state_file" || return 1
+        done
+    fi
+
+    if [[ -e "${backup_prefix}.initial-backup" ||
+        -e "${backup_prefix}.initial-absent" ||
+        -e "${backup_prefix}.initial-unknown" ]]; then
+        return 0
+    fi
+
+    if [[ -f "$file" ]] &&
+        grep -Eq '由 (system-customize|setup-motd)\.sh 自动生成' "$file"; then
+        install -D -m 0600 /dev/null "${backup_prefix}.initial-unknown"
+    elif [[ -e "$file" || -L "$file" ]]; then
+        cp -a "$file" "${backup_prefix}.initial-backup"
+    else
+        install -D -m 0600 /dev/null "${backup_prefix}.initial-absent"
+    fi
 }
 
 replace_with_empty_regular_file() {
@@ -58,6 +91,7 @@ configure_motd() {
 
     local file
     for file in /etc/update-motd.d/10-uname /etc/update-motd.d/50-motd-news; do
+        backup_initial_file "$file" || return 1
         if [[ -x "$file" ]]; then
             chmod -x "$file"
             info "已禁用原生 MOTD 脚本: $(basename "$file")"
@@ -185,7 +219,7 @@ main() {
     require_root
 
     local required_command
-    for required_command in awk basename cat chmod cp df grep hostname install sed sleep uname uptime; do
+    for required_command in awk basename cat chmod cp date df grep hostname install mv sed sleep uname uptime; do
         if ! command -v "$required_command" >/dev/null 2>&1; then
             error "缺少必要命令: $required_command"
             exit 1
