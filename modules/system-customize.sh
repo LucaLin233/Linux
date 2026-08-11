@@ -159,6 +159,14 @@ backup_managed_file() {
 }
 
 # === 动态欢迎信息 ===
+replace_with_empty_regular_file() {
+    local file="$1"
+
+    # Debian/Ubuntu 镜像的静态欢迎文件可能链接到运行时动态文件。
+    # 直接重定向清空会保留链接，导致 PAM 两次读取同一动态 MOTD。
+    install -m 0644 /dev/null "$file"
+}
+
 configure_motd() {
     if ! ask_yes_no "是否配置自定义动态欢迎信息？[Y/n]: " "Y"; then
         echo "欢迎信息: 已跳过"
@@ -171,9 +179,9 @@ configure_motd() {
     backup_managed_file /etc/motd || return 1
     backup_managed_file /etc/issue || return 1
     backup_managed_file /etc/issue.net || return 1
-    : > /etc/motd
-    : > /etc/issue
-    : > /etc/issue.net
+    replace_with_empty_regular_file /etc/motd
+    replace_with_empty_regular_file /etc/issue
+    replace_with_empty_regular_file /etc/issue.net
 
     backup_managed_file "$MOTD_SCRIPT" || return 1
 
@@ -186,7 +194,7 @@ configure_motd() {
         fi
     done
 
-    cat > "$MOTD_SCRIPT" <<'SCRIPT'
+    install -m 0755 /dev/stdin "$MOTD_SCRIPT" <<'SCRIPT'
 #!/usr/bin/env bash
 # 由 system-customize.sh 自动生成。
 # 欢迎横幅与系统状态面板。
@@ -238,15 +246,15 @@ pick_color() {
     fi
 }
 
-read -r _ user1 nice1 system1 idle1 _ < <(grep '^cpu ' /proc/stat)
-total1=$((user1 + nice1 + system1 + idle1))
-busy1=$((user1 + nice1 + system1))
+read -r _ user1 nice1 system1 idle1 iowait1 irq1 softirq1 steal1 _ < <(grep '^cpu ' /proc/stat)
+total1=$((user1 + nice1 + system1 + idle1 + iowait1 + irq1 + softirq1 + steal1))
+busy1=$((user1 + nice1 + system1 + irq1 + softirq1 + steal1))
 
 sleep 0.5
 
-read -r _ user2 nice2 system2 idle2 _ < <(grep '^cpu ' /proc/stat)
-total2=$((user2 + nice2 + system2 + idle2))
-busy2=$((user2 + nice2 + system2))
+read -r _ user2 nice2 system2 idle2 iowait2 irq2 softirq2 steal2 _ < <(grep '^cpu ' /proc/stat)
+total2=$((user2 + nice2 + system2 + idle2 + iowait2 + irq2 + softirq2 + steal2))
+busy2=$((user2 + nice2 + system2 + irq2 + softirq2 + steal2))
 
 total_delta=$((total2 - total1))
 busy_delta=$((busy2 - busy1))
@@ -294,8 +302,6 @@ printf "  ${LABEL}内存${RESET}      ${VALUE}%s / %s  (${memory_color}%s%%${VAL
 printf "  ${LABEL}磁盘${RESET}      ${VALUE}%s  (${disk_color}%s%%${VALUE})${RESET}\n" \
     "$disk_usage" "$disk_percent"
 SCRIPT
-
-    chmod 755 "$MOTD_SCRIPT"
 
     echo "欢迎信息: 已配置"
     echo
@@ -1018,8 +1024,8 @@ main() {
     require_root
 
     local required_command
-    for required_command in apt-get awk cat chmod curl dpkg grep hostname install \
-        mktemp mv rm sed sort tr uname apt-cache; do
+    for required_command in apt-get apt-cache awk basename cat chmod cp curl df dpkg grep \
+        hostname install mktemp mv rm sed sleep sort tr uname uptime; do
         if ! command -v "$required_command" >/dev/null 2>&1; then
             error "缺少必要命令: $required_command"
             exit 1

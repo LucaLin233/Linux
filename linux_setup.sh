@@ -1287,7 +1287,9 @@ main() {
     init_logging
     create_temp_dir
 
-    trap cleanup EXIT INT TERM
+    trap cleanup EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
 
     TOTAL_START_TIME=$(date +%s)
 
