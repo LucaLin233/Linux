@@ -351,7 +351,7 @@ sudo bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/t
 | 仅安装 XanMod | `xanmod-install.sh` | 同时让多个脚本反复管理内核源 |
 
 `network-optimize.sh` 与 `traffic-shape.sh` 职责不同，可以配合：前者管理 BBR、缓冲区和默认
-`fq`、仅上联网卡接收 RA 的 IPv6 转发和按能力启用的 TCP/Conntrack 参数，后者在确实检测到 policer 后才使用 HTB 控制聚合出口速率，并保留 fq 叶子 pacing。
+`fq`、仅上联网卡接收 RA 的 IPv6 转发和按能力启用的 TCP/Conntrack 参数；现有 Docker、veth、CNI 与隧道接口的 RA 会在运行时设为 `0` 并纳入回滚快照。后者在确实检测到 policer 后才使用 HTB 控制聚合出口速率，并保留 fq 叶子 pacing。
 
 ## 高风险提醒
 

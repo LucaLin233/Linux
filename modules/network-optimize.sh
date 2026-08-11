@@ -1404,6 +1404,61 @@ EOF
     fi
 }
 
+is_virtual_ipv6_ra_interface() {
+    case "$1" in
+        docker*|br-*|veth*|virbr*|cni*|flannel*|kube*|lxc*|podman*|tailscale*|tun*|tap*|wg*)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+capture_virtual_ipv6_ra_values() {
+    local output_file="$1"
+    local accept_ra_path
+    local interface
+
+    for accept_ra_path in /proc/sys/net/ipv6/conf/*/accept_ra; do
+        [[ -e "$accept_ra_path" ]] || continue
+        interface=$(basename "$(dirname "$accept_ra_path")")
+        [[ "$interface" =~ ^[A-Za-z0-9_-]+$ ]] || continue
+        is_virtual_ipv6_ra_interface "$interface" || continue
+        printf 'net.ipv6.conf.%s.accept_ra=%s\n' \
+            "$interface" "$(cat "$accept_ra_path")" >> "$output_file"
+    done
+}
+
+normalize_virtual_ipv6_ra() {
+    local runtime_backup="$1"
+    local key
+    local value
+    local interface
+    local normalized=0
+
+    while IFS='=' read -r key value; do
+        [[ "$key" =~ ^net\.ipv6\.conf\.([A-Za-z0-9_-]+)\.accept_ra$ ]] || continue
+        interface="${BASH_REMATCH[1]}"
+        is_virtual_ipv6_ra_interface "$interface" || continue
+        [[ -e "/proc/sys/net/ipv6/conf/$interface/accept_ra" ]] || continue
+
+        if ! sysctl -w "$key=0" >/dev/null 2>&1; then
+            error "无法禁用虚拟接口 IPv6 RA: $interface"
+            return 1
+        fi
+        if [[ "$(sysctl -n "$key" 2>/dev/null || true)" != "0" ]]; then
+            error "虚拟接口 IPv6 RA 验证失败: $interface"
+            return 1
+        fi
+        ((normalized += 1))
+    done < "$runtime_backup"
+
+    if (( normalized > 0 )); then
+        info "已禁用 $normalized 个容器或隧道虚拟接口的 IPv6 RA"
+    fi
+}
+
 append_ipv6_forwarding_config() {
     local target_file="$1"
     local interface
@@ -1426,11 +1481,8 @@ EOF
     # 后端的 NIC。IPv4 默认路由可覆盖尚未获得 IPv6 RA 的 AWS/Azure 网卡。
     while IFS= read -r interface; do
         [[ "$interface" =~ ^[A-Za-z0-9_-]+$ ]] || continue
-        case "$interface" in
-            all|default|lo|docker*|br-*|veth*|virbr*|cni*|flannel*|kube*|lxc*|podman*|tailscale*|tun*|tap*|wg*)
-                continue
-                ;;
-        esac
+        case "$interface" in all|default|lo) continue ;; esac
+        is_virtual_ipv6_ra_interface "$interface" && continue
         [[ -e "/proc/sys/net/ipv6/conf/$interface/accept_ra" ]] || continue
         interfaces+=("$interface")
     done < <(
@@ -1741,6 +1793,7 @@ install_optimization() {
         rm -f "$temp_config" "$runtime_backup"
         return 1
     fi
+    capture_virtual_ipv6_ra_values "$runtime_backup"
 
     install -d -m 0755 /var/lib/linux-setup
     prepare_legacy_backup_state
@@ -1760,6 +1813,11 @@ install_optimization() {
 
     # 应用前已保存全部涉及参数的运行值，失败时逐项回滚。
     if ! apply_network_config "$temp_config"; then
+        restore_runtime_values "$runtime_backup"
+        rm -f "$temp_config" "$runtime_backup"
+        return 1
+    fi
+    if ! normalize_virtual_ipv6_ra "$runtime_backup"; then
         restore_runtime_values "$runtime_backup"
         rm -f "$temp_config" "$runtime_backup"
         return 1
