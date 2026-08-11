@@ -3,13 +3,14 @@
 # 出口限速器拐点扫描与 HTB + fq 流量整形工具
 #
 # Sweep/shape portions adapted from Kylin010/tcpfit.
-# Upstream commit: 3e285932e5f212eef9be9591ebba9a78a3b4d1c7
+# Upstream version: v0.5.4
+# Upstream commit: 65885816bb77be38d041218f1bf62fe4ebe5c300
 # Licensed under the MIT License. See THIRD_PARTY_NOTICES.md.
 
 set -uo pipefail
 umask 022
 
-readonly VERSION="1.0.2"
+readonly VERSION="1.0.3"
 readonly INSTALL_PATH="/usr/local/sbin/tcshape"
 readonly STATE_DIR="/var/lib/tcshape"
 readonly CONFIG_FILE="/etc/tcshape.conf"
@@ -310,11 +311,37 @@ apply_qdisc() {
         limit 40960 flow_limit 8192 maxrate "${rate}mbit" || return 1
 }
 
+tc_rate_mbit() {
+    local output="${1:-}"
+    local raw
+
+    raw=$(grep -oE 'rate [0-9.]+[KMGTkmgt]?bit' <<< "$output" 2>/dev/null || true)
+    raw="${raw%%$'\n'*}"
+    raw="${raw#rate }"
+    [[ -n "$raw" ]] || return 1
+
+    awk -v value="$raw" 'BEGIN {
+        unit=value
+        sub(/^[0-9.]+/, "", unit)
+        sub(/bit$/, "", unit)
+        number=value+0
+        if (unit=="K" || unit=="k") number/=1000
+        else if (unit=="G" || unit=="g") number*=1000
+        else if (unit=="T" || unit=="t") number*=1000000
+        else if (unit=="") number/=1000000
+        if (number==int(number)) printf "%d", number
+        else printf "%g", number
+    }'
+}
+
 verify_qdisc_rate() {
     local iface="$1"
     local rate="$2"
-    tc class show dev "$iface" 2>/dev/null |
-        grep -Eq "class htb 1:10.* rate ${rate}Mbit"
+    local applied
+
+    applied=$(tc_rate_mbit "$(tc class show dev "$iface" 2>/dev/null)") || return 1
+    awk -v applied="$applied" -v expected="$rate" \
+        'BEGIN {exit !(applied > expected*0.99 && applied < expected*1.01)}'
 }
 
 qdisc_save() {
@@ -458,6 +485,7 @@ EOF
 
 cmd_set() {
     local rate="${1:-}"
+    local requested_iface="${2:-}"
     local iface
     local previous_config=""
 
@@ -467,7 +495,15 @@ cmd_set() {
     }
     rate=$((10#$rate))
 
-    iface=$(detect_iface) || { error "无法确定默认出口接口"; return 1; }
+    if [[ -n "$requested_iface" ]]; then
+        [[ "$requested_iface" =~ ^[[:alnum:]_.:-]+$ && -d "/sys/class/net/$requested_iface" ]] || {
+            error "Sweep 记录的出口接口不存在：$requested_iface"
+            return 1
+        }
+        iface="$requested_iface"
+    else
+        iface=$(detect_iface) || { error "无法确定默认出口接口"; return 1; }
+    fi
     check_external_conflicts "$iface" || return 1
 
     if [[ -f "$CONFIG_FILE" ]]; then
@@ -638,12 +674,21 @@ probe_peer_port() {
     return 1
 }
 
+parse_iperf_json() {
+    local file="$1"
+    jq -r '[
+        .end.sum_sent.bits_per_second // 0,
+        .end.sum_sent.retransmits // 0,
+        .end.sum_received.bits_per_second // 0
+    ] | @tsv' "$file" 2>/dev/null
+}
+
 run_iperf() {
     local host="$1"
     local duration="$2"
     local parallel="$3"
     local first_port="${4:-$PEER_PORT}"
-    local port tmp pid started result bps retrans rc
+    local port tmp pid started result sender_bps receiver_bps retrans rc
 
     for port in $(port_order "$first_port"); do
         traffic_budget_reached && return 75
@@ -674,12 +719,16 @@ run_iperf() {
         rm -f "$PID_FILE"
 
         if (( rc == 0 )); then
-            result=$(jq -r '[.end.sum_sent.bits_per_second // 0, .end.sum_sent.retransmits // 0] | @tsv' "$tmp" 2>/dev/null || true)
-            read -r bps retrans <<< "$result"
-            if [[ "$bps" =~ ^[0-9]+([.][0-9]+)?$ ]] &&
-                awk -v b="$bps" 'BEGIN {exit !(b > 0)}'; then
+            result=$(parse_iperf_json "$tmp" || true)
+            read -r sender_bps retrans receiver_bps <<< "$result"
+            if [[ "$sender_bps" =~ ^[0-9]+([.][0-9]+)?$ ]] &&
+                awk -v b="$sender_bps" 'BEGIN {exit !(b > 0)}'; then
                 rm -f "$tmp"
-                awk -v b="$bps" -v r="$retrans" -v p="$port" 'BEGIN {printf "%.0f %d %d\n", b/1000000, r, p}'
+                awk -v s="$sender_bps" -v r="$retrans" -v p="$port" -v recv="$receiver_bps" 'BEGIN {
+                    printf "%.0f %d %d", s/1000000, r, p
+                    if (recv > 0) printf " %.0f", recv/1000000
+                    printf "\n"
+                }'
                 return 0
             fi
         fi
@@ -700,7 +749,9 @@ loss_pct() {
 
 calc_margin() {
     local bw="$1"
-    if (( bw <= 100 )); then echo 5
+    if (( bw <= 30 )); then echo 1
+    elif (( bw <= 60 )); then echo 2
+    elif (( bw <= 100 )); then echo 5
     elif (( bw <= 300 )); then echo 10
     elif (( bw <= 600 )); then echo 15
     elif (( bw <= 1000 )); then echo 25
@@ -717,6 +768,23 @@ calc_step() {
     }'
 }
 
+calc_auto_step() {
+    local lo="$1"
+    local hi="$2"
+    awk -v lo="$lo" -v hi="$hi" 'BEGIN {
+        step=int((hi-lo)/10+0.5)
+        if (step<1) step=1
+        printf "%d", step
+    }'
+}
+
+calc_validation_rate() {
+    local nominal="$1"
+    local rate=$((nominal * 40 / 100))
+    (( rate < 1 )) && rate=1
+    printf '%d\n' "$rate"
+}
+
 calc_test_duration() {
     awk -v bw="$1" 'BEGIN {
         if (bw <= 0) {print 12; exit}
@@ -729,7 +797,7 @@ calc_test_duration() {
 
 auto_pick_peer() {
     local temp_dir
-    local host location provider rtt file port result gp rt used_port
+    local host location provider rtt file port result gp rt used_port receiver goodput
     local fallback=""
     local fallback_rtt=""
     local ideal=50
@@ -766,15 +834,16 @@ auto_pick_peer() {
         result=$(run_iperf "$host" 3 1 "$port")
         case $? in
             0)
-                read -r gp rt used_port <<< "$result"
-                printf '可用（%s Mbit，端口 %s）\n' "$gp" "$used_port" >&2
+                read -r gp rt used_port receiver <<< "$result"
+                goodput="${receiver:-$gp}"
+                printf '可用（接收 %s Mbit，端口 %s）\n' "$goodput" "$used_port" >&2
                 if (( rtt <= ideal )); then
                     rm -rf "$temp_dir"
-                    printf '%s|%s|%s\n' "$host" "$used_port" "$gp"
+                    printf '%s|%s|%s\n' "$host" "$used_port" "$goodput"
                     return 0
                 fi
                 [[ -n "$fallback" ]] || {
-                    fallback="$host|$used_port|$gp"
+                    fallback="$host|$used_port|$goodput"
                     fallback_rtt="$rtt"
                 }
                 ;;
@@ -833,20 +902,21 @@ validate_peer_path() {
     local nominal="$2"
     local iface="$3"
     local test_duration="${4:-8}"
-    local rate result rc gp retrans port loss
+    local rate result rc sender retrans port receiver goodput loss
 
     (( test_duration > 8 )) && test_duration=8
-    rate=$((nominal * 40 / 100)); (( rate < 20 )) && rate=20
+    rate=$(calc_validation_rate "$nominal")
     apply_test_shaper "$iface" "$rate" || return 1
     result=$(run_iperf "$peer" "$test_duration" 2)
     rc=$?
     (( rc == 75 )) && return 75
     (( rc == 0 )) || return 1
-    read -r gp retrans port <<< "$result"
-    loss=$(loss_pct "$retrans" "$gp" "$test_duration")
+    read -r sender retrans port receiver <<< "$result"
+    goodput="${receiver:-$sender}"
+    loss=$(loss_pct "$retrans" "$sender" "$test_duration")
 
-    if awk -v g="$gp" -v r="$rate" 'BEGIN {exit !(g < r*0.7)}'; then
-        warn "对端吞吐不足：${gp}/${rate} Mbit"
+    if awk -v g="$goodput" -v r="$rate" -v loss="$loss" 'BEGIN {exit !(g < r*0.7 && loss <= 0.05)}'; then
+        warn "对端吞吐不足：${goodput}/${rate} Mbit"
         return 1
     fi
     if awk -v loss="$loss" 'BEGIN {exit !(loss > 0.05)}'; then
@@ -860,7 +930,7 @@ cmd_scan() {
     local peer=""
     local lo="" hi="" step="" margin="" nominal=""
     local duration="" gap=3 assume_yes=false user_range=false
-    local iface picked result rc gp retrans port loss estimated_gp=""
+    local iface picked result rc gp retrans port receiver goodput loss estimated_gp=""
     local last_ok="" broke_at="" base_loss="" peer_slow=0
 
     while (( $# > 0 )); do
@@ -952,26 +1022,28 @@ cmd_scan() {
             return 2
         fi
         (( rc == 0 )) || { error "不限速探测失败"; save_sweep_result "FAILED" "PEER=$peer"; return 2; }
-        read -r gp retrans port <<< "$result"
+        read -r gp retrans port receiver <<< "$result"
+        goodput="${receiver:-$gp}"
         loss=$(loss_pct "$retrans" "$gp" "$duration")
-        printf '不限速：%s Mbit / 重传 %s / 丢包 %s%%\n' "$gp" "$retrans" "$loss"
+        printf '不限速：发送 %s Mbit / 接收 %s Mbit / 重传 %s / 丢包 %s%%\n' \
+            "$gp" "$goodput" "$retrans" "$loss"
 
         if ! awk -v loss="$loss" -v threshold="$LOSS_THRESHOLD" 'BEGIN {exit !(loss > threshold)}'; then
             warn "未检测到限速器，不建议执行流量整形"
-            save_sweep_result "NO_POLICER" "UNSHAPED_MBIT=$gp" "PEER=$peer"
+            save_sweep_result "NO_POLICER" "UNSHAPED_MBIT=$goodput" "UNSHAPED_SENDER_MBIT=$gp" "PEER=$peer"
             traffic_report
             return 0
         fi
 
-        lo=$(awk -v g="$gp" 'BEGIN {printf "%d", g*0.95}')
+        lo=$(awk -v g="$goodput" 'BEGIN {printf "%d", g*0.95}')
         (( lo < 1 )) && lo=1
-        hi=$(awk -v g="$gp" -v loss="$loss" -v cap="$SCAN_CAP_MBIT" 'BEGIN {
+        hi=$(awk -v g="$goodput" -v loss="$loss" -v cap="$SCAN_CAP_MBIT" 'BEGIN {
             factor=1.25+loss/100*2; if(factor>2.5)factor=2.5
             value=g*factor; if(value>cap)value=cap
             printf "%d", value
         }')
-        nominal="${nominal:-$gp}"
-        step="${step:-$(calc_step "$nominal")}"
+        nominal="${nominal:-$goodput}"
+        step="${step:-$(calc_auto_step "$lo" "$hi")}"
         (( hi <= lo )) && hi=$((lo + step))
     fi
 
@@ -993,7 +1065,7 @@ cmd_scan() {
     info "扫描 ${lo}-${hi} Mbit，步长 ${step}，每档 ${duration}s"
     printf '%-10s %-12s %-10s %-10s %s\n' "Rate" "Goodput" "Retrans" "Loss%" "Result"
 
-    local rate retry hits test_result test_gp test_rt test_port test_loss
+    local rate retry hits test_result test_gp test_rt test_port test_recv test_loss
     local points=()
     for ((rate=lo; rate<=hi; rate+=step)); do points+=("$rate"); done
     [[ " ${points[*]} " == *" $hi "* ]] || points+=("$hi")
@@ -1013,7 +1085,8 @@ cmd_scan() {
             continue
         fi
 
-        read -r gp retrans port <<< "$result"
+        read -r gp retrans port receiver <<< "$result"
+        goodput="${receiver:-$gp}"
         loss=$(loss_pct "$retrans" "$gp" "$duration")
         [[ -n "$base_loss" ]] || base_loss="$loss"
         hits=0
@@ -1025,7 +1098,7 @@ cmd_scan() {
                 rc=$?
                 (( rc == 75 )) && { save_sweep_result "BUDGET_EXCEEDED" "PEER=$peer"; return 2; }
                 (( rc == 0 )) || continue
-                read -r test_gp test_rt test_port <<< "$test_result"
+                read -r test_gp test_rt test_port test_recv <<< "$test_result"
                 test_loss=$(loss_pct "$test_rt" "$test_gp" "$duration")
                 awk -v l="$test_loss" -v t="$LOSS_THRESHOLD" -v b="$base_loss" 'BEGIN {exit !((l>t) && (b<=0 || l>=b*10))}' && ((hits++))
             done
@@ -1037,7 +1110,8 @@ cmd_scan() {
             break
         fi
 
-        if awk -v g="$gp" -v r="$rate" 'BEGIN {exit !(g < r*0.7)}'; then
+        if awk -v g="$goodput" -v r="$rate" -v loss="$loss" -v threshold="$LOSS_THRESHOLD" \
+            'BEGIN {exit !(g < r*0.7 && loss <= threshold)}'; then
             ((peer_slow++))
             printf '%-10s %-12s %-10s %-10s %s\n' "$rate" "$gp" "$retrans" "$loss" "节点偏慢"
             if (( peer_slow >= 3 )); then
@@ -1070,7 +1144,7 @@ cmd_scan() {
 
     # 在最后安全档与粗扫拐点之间进行一次细扫。
     if (( broke_at - last_ok > 5 )); then
-        local fine=$((step / 4)); (( fine < 5 )) && fine=5
+        local fine=$((step / 4)); (( fine < 1 )) && fine=1
         local coarse_broke="$broke_at"
         info "细扫 ${last_ok}-${coarse_broke} Mbit，步长 ${fine}"
         broke_at=""
@@ -1079,7 +1153,8 @@ cmd_scan() {
             result=$(run_iperf "$peer" "$duration" 1); rc=$?
             (( rc == 75 )) && { save_sweep_result "BUDGET_EXCEEDED" "PEER=$peer"; return 2; }
             (( rc == 0 )) || continue
-            read -r gp retrans port <<< "$result"
+            read -r gp retrans port receiver <<< "$result"
+            goodput="${receiver:-$gp}"
             loss=$(loss_pct "$retrans" "$gp" "$duration")
             hits=0
 
@@ -1090,7 +1165,7 @@ cmd_scan() {
                     test_result=$(run_iperf "$peer" "$duration" 1); rc=$?
                     (( rc == 75 )) && { save_sweep_result "BUDGET_EXCEEDED" "PEER=$peer"; return 2; }
                     (( rc == 0 )) || continue
-                    read -r test_gp test_rt test_port <<< "$test_result"
+                    read -r test_gp test_rt test_port test_recv <<< "$test_result"
                     test_loss=$(loss_pct "$test_rt" "$test_gp" "$duration")
                     awk -v l="$test_loss" -v t="$LOSS_THRESHOLD" -v b="$base_loss" 'BEGIN {exit !((l>t) && (b<=0 || l>=b*10))}' && ((hits++))
                 done
@@ -1124,7 +1199,7 @@ cmd_scan() {
 
 cmd_apply() {
     local result_file="$STATE_DIR/sweep.result"
-    local status recommend
+    local status recommend result_iface
     [[ -f "$result_file" ]] || { error "没有 Sweep 结果，请先执行：tcshape s"; return 1; }
     status=$(read_config_value STATUS "$result_file" || true)
 
@@ -1138,7 +1213,8 @@ cmd_apply() {
     fi
 
     recommend=$(read_config_value RECOMMEND_MBIT "$result_file") || return 1
-    cmd_set "$recommend"
+    result_iface=$(read_config_value INTERFACE "$result_file" || true)
+    cmd_set "$recommend" "$result_iface"
 }
 
 cmd_status() {
@@ -1211,4 +1287,6 @@ main() {
     esac
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi

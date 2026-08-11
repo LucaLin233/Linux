@@ -1,8 +1,10 @@
 # tcshape：出口限速器扫描与流量整形
 
-`tools/traffic-shape.sh` 从 [Kylin010/tcpfit](https://github.com/Kylin010/tcpfit)
-移植 Sweep 与 Shape 核心逻辑，用于检测 VPS 出口 policer 的限速拐点，并在用户确认后应用
-`HTB + fq` 出口整形。
+`tools/traffic-shape.sh` 以 [Kylin010/tcpfit](https://github.com/Kylin010/tcpfit)
+`v0.5.4`（提交 `65885816bb77be38d041218f1bf62fe4ebe5c300`）为当前移植基线，选择性移植
+Sweep 与 Shape 核心逻辑，用于检测 VPS 出口 policer 的限速拐点，并在用户确认后应用
+`HTB + fq` 出口整形。tcshape 是独立、安全边界更严格的工具，不追求完整复制 tcpfit 的命令、
+交互流程或 TCP/sysctl 调优功能。
 
 基础 BBR、TCP 缓冲区与 sysctl 调优仍由 `modules/network-optimize.sh` 管理；tcshape 不修改
 任何 sysctl。
@@ -56,10 +58,11 @@ sudo tcshape off
 1. 检查当前 qdisc 与其他整形服务冲突；
 2. 记录网卡流量计数和原根 qdisc；
 3. 自动选择附近且可用的公共 iperf3 节点；
-4. 不限速单流探测是否存在 policer；
-5. 在 `HTB + fq` 下进行粗扫、异常复测和细扫；
-6. 恢复原 qdisc；
-7. 仅保存结果，不自动应用整形。
+4. 不限速单流同时读取发送端重传与接收端实际吞吐，判断是否存在 policer；
+5. 根据接收端吞吐推导扫描区间；小带宽和窄区间会自动使用更细步长；
+6. 在 `HTB + fq` 下进行粗扫、异常复测和细扫；
+7. 恢复原 qdisc；
+8. 仅保存结果，不自动应用整形。
 
 结果可能是：
 
@@ -111,11 +114,12 @@ HTB root：控制所有连接的总出口速率
 ```
 
 `tcshape off` 仅移除本工具创建的 HTB，恢复首次启用前记录的简单 qdisc；不会删除或修改
-`/etc/sysctl.d/99-network-optimize.conf`。
+`/etc/sysctl.d/99-network-optimize.conf`。`tcshape apply` 会使用 Sweep 结果中记录的接口，避免
+IPv4 与 IPv6 使用不同出口时把推荐值应用到另一张网卡。
 
 ## qdisc 安全边界
 
-允许自动接管并恢复：
+允许自动接管并按该 qdisc 类型的默认参数恢复：
 
 ```text
 fq、fq_codel、pfifo_fast、mq、noqueue
@@ -127,8 +131,9 @@ fq、fq_codel、pfifo_fast、mq、noqueue
 CAKE、TBF、NETEM、TAPRIO、非本工具 HTB、根队列或 mq 子队列的自定义 class/filter
 ```
 
-`mq` 自动生成的 `class mq`、标准 fq/fq_codel 子队列，以及独立的 clsact/ingress filter 不视为
-冲突：替换根 qdisc 时 clsact/ingress 会继续保留，关闭后由内核恢复 mq 拓扑。已经由 tcshape
+带自定义参数的 `fq`/`fq_codel` 无法逐项原样恢复，不应交给 tcshape 接管；当前自动恢复仅保证
+恢复 qdisc 类型及其默认参数。`mq` 自动生成的 `class mq`、标准 fq/fq_codel 子队列，以及独立的
+clsact/ingress filter 不视为冲突：替换根 qdisc 时 clsact/ingress 会继续保留，关闭后由内核恢复 mq 拓扑。已经由 tcshape
 管理的 `HTB + fq` 也允许再次 Sweep；测试结束后会重新应用原固定速率。检测到
 `tcpfit-qdisc.service` 时也会拒绝运行。Sweep 遇到退出、错误、`Ctrl-C`、`TERM` 或流量超限
 时都会执行恢复流程。

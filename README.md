@@ -255,8 +255,8 @@ Token 属于敏感凭据，不要写入日志、README 或提交到 Git。
 
 ### 出口流量整形 tcshape
 
-从 tcpfit 移植限速器拐点 Sweep 与 `HTB + fq` Shape。它不会修改基础 sysctl，适用于存在
-出口 policer 的特定 VPS，不是通用必选优化。
+基于 tcpfit `v0.5.4` 选择性移植限速器拐点 Sweep 与 `HTB + fq` Shape。它不会修改基础
+sysctl，适用于存在出口 policer 的特定 VPS，不是通用必选优化。
 
 首次运行：
 
