@@ -1407,31 +1407,44 @@ EOF
 append_ipv6_forwarding_config() {
     local target_file="$1"
     local interface
+    local interface_path
     local -a interfaces=()
 
     [[ -e /proc/sys/net/ipv6/conf/all/forwarding ]] || return 0
     [[ -e /proc/sys/net/ipv6/conf/all/accept_ra ]] || return 0
 
-    # accept_ra=2 必须先于 forwarding=1 应用。这样 AWS、Azure 等依赖 RA
-    # 提供默认路由或前缀的主机，在启用转发后仍继续接收 RA。
+    # forwarding=1 时，accept_ra=1 不再接收 RA；只有云平台上联接口需要 2。
+    # 先把全局和新接口基线恢复为 1，避免 Docker bridge/veth 接受容器侧 RA。
     cat >> "$target_file" <<'EOF'
 
-# IPv6 转发；保留云平台 Router Advertisement
-net.ipv6.conf.all.accept_ra = 2
-net.ipv6.conf.default.accept_ra = 2
+# IPv6 转发；仅上联接口在转发模式下继续接收 Router Advertisement
+net.ipv6.conf.all.accept_ra = 1
+net.ipv6.conf.default.accept_ra = 1
 EOF
 
-    # 所有当前存在的非 loopback 接口都显式设置 accept_ra=2。不能只依赖
-    # 当前 IPv6 默认路由：云平台可能在脚本运行后才通过 RA 下发路由和前缀。
+    # 上联候选：IPv4/IPv6 默认路由、已有全局 IPv6 地址，以及有硬件设备
+    # 后端的 NIC。IPv4 默认路由可覆盖尚未获得 IPv6 RA 的 AWS/Azure 网卡。
     while IFS= read -r interface; do
         [[ "$interface" =~ ^[A-Za-z0-9_-]+$ ]] || continue
-        case "$interface" in all|default|lo) continue ;; esac
+        case "$interface" in
+            all|default|lo|docker*|br-*|veth*|virbr*|cni*|flannel*|kube*|lxc*|podman*|tailscale*|tun*|tap*|wg*)
+                continue
+                ;;
+        esac
+        [[ -e "/proc/sys/net/ipv6/conf/$interface/accept_ra" ]] || continue
         interfaces+=("$interface")
     done < <(
-        for accept_ra_path in /proc/sys/net/ipv6/conf/*/accept_ra; do
-            [[ -e "$accept_ra_path" ]] || continue
-            basename "$(dirname "$accept_ra_path")"
-        done | sort -u
+        {
+            ip -o route show default 2>/dev/null |
+                awk '{for (i=1; i<=NF; i++) if ($i == "dev") print $(i+1)}'
+            ip -o -6 route show default 2>/dev/null |
+                awk '{for (i=1; i<=NF; i++) if ($i == "dev") print $(i+1)}'
+            ip -o -6 address show scope global 2>/dev/null | awk '{print $2}'
+            for interface_path in /sys/class/net/*/device; do
+                [[ -e "$interface_path" ]] || continue
+                basename "$(dirname "$interface_path")"
+            done
+        } | sort -u
     )
 
     for interface in "${interfaces[@]}"; do

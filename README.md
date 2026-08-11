@@ -76,7 +76,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/linux_
 | ---: | --- | --- | --- |
 | 1 | `system-optimize.sh` | Zram、系统 sysctl、journald、THP、时区和 Chrony | 为 headless VPS 设置 Panic 恢复、日志上限和低干扰 THP 策略；Ubuntu 可能安装内核模块、固件与 CPU 微码 |
 | 2 | `system-customize.sh` | 动态 MOTD、中文 Locale、可选 XanMod | 可能修改 Locale、欢迎信息和内核 |
-| 3 | `network-optimize.sh` | BBR、fq、动态 TCP 缓冲区、IPv4/IPv6 转发 | 使用 `accept_ra=2` 保留云平台 IPv6 RA；自动测速最多约 90 GB |
+| 3 | `network-optimize.sh` | BBR、fq、动态 TCP 缓冲区、IPv4/IPv6 转发 | 仅在上联网卡使用 `accept_ra=2` 保留云平台 IPv6 RA；自动测速最多约 90 GB |
 | 4 | `zsh-setup.sh` | Zsh、Oh My Zsh、Powerlevel10k 和插件 | 备份后重写 root 的 `.zshrc`，可修改默认 Shell |
 | 5 | `mise-setup.sh` | Mise、Python、Node.js 和依赖迁移 | 配置 Shell 集成及每周 Mise 自动更新 |
 | 6 | `tools-setup.sh` | NextTrace、Speedtest、htop、jq、tree 等 | 可能添加 NextTrace 第三方 APT 源 |
@@ -351,7 +351,7 @@ sudo bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/t
 | 仅安装 XanMod | `xanmod-install.sh` | 同时让多个脚本反复管理内核源 |
 
 `network-optimize.sh` 与 `traffic-shape.sh` 职责不同，可以配合：前者管理 BBR、缓冲区和默认
-`fq`、RA 安全的 IPv6 转发和按能力启用的 TCP/Conntrack 参数，后者在确实检测到 policer 后才使用 HTB 控制聚合出口速率，并保留 fq 叶子 pacing。
+`fq`、仅上联网卡接收 RA 的 IPv6 转发和按能力启用的 TCP/Conntrack 参数，后者在确实检测到 policer 后才使用 HTB 控制聚合出口速率，并保留 fq 叶子 pacing。
 
 ## 高风险提醒
 
