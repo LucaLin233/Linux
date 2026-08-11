@@ -801,6 +801,12 @@ install_xanmod() {
     if package_is_installed "$target_package"; then
         echo "XanMod 目标包: 已安装（$target_package）"
 
+        # 4.x 版本可能使用旧密钥路径或旧软件源格式。即使内核包已经安装，
+        # 仍需校验并按当前格式修复软件源，确保后续内核可以正常更新。
+        if ! configure_xanmod_repository; then
+            warn "XanMod 已安装，但软件源校验或修复失败；当前内核不受影响"
+        fi
+
         if [[ "$(get_running_xanmod_package || true)" == "$target_package" ]]; then
             echo "当前内核: $(uname -r)（匹配 CPU 检测结果）"
         else
