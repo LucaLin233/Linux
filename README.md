@@ -272,10 +272,16 @@ sudo tcshape a        # 应用最近推荐值
 sudo tcshape on 480   # 手动限制为 480 Mbit
 sudo tcshape off      # 关闭并恢复原 qdisc
 sudo tcshape st       # 查看状态
+sudo tcshape u        # 从 LucaLin233/Linux main 检查更新
 ```
 
 Sweep 可能消耗大量上传流量，并会临时替换默认出口接口的根 qdisc。单方向上限约 45 GB，
 双向合计上限约 90 GB。未检测到限速器或未找到拐点时，不建议且不能自动应用整形。
+
+`tcshape u`/`tcshape update` 会读取 `LucaLin233/Linux` 的 `main` 最新提交，按固定 Commit 下载并
+校验受管标记、版本号和 Bash 语法，再原子替换短命令。上一版本保存在
+`/usr/local/sbin/tcshape.previous`；配置、Sweep 结果和当前 qdisc 不会被修改。已安装 `1.0.3`
+或更早版本的机器需要先按上面的“首次运行”命令升级一次，之后才能使用更新短命令。
 
 详细参数、安全边界和恢复说明见 [`docs/traffic-shape.md`](docs/traffic-shape.md)。
 

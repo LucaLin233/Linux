@@ -53,6 +53,33 @@ sudo tcshape off
 默认 IPv4；使用 `-6` 才启用 IPv6。省略 `HOST` 时，工具参考 tcpfit 的节点池，根据 RTT、
 端口可达性和 iperf3 实际结果自动选择公共服务器，并轮换 `5201–5210` 和 `5200`。
 
+## 更新短命令
+
+```bash
+sudo tcshape u
+sudo tcshape update
+sudo tcshape update --yes   # 非交互确认
+```
+
+更新流程：
+
+1. 从 GitHub API 获取 `LucaLin233/Linux` 的 `main` 最新 Commit；
+2. 按该固定 Commit 下载 `tools/traffic-shape.sh`，避免分支在下载期间变化；
+3. 校验 `tcshape-managed` 标记、更新源、版本号以及 `bash -n`；
+4. 备份当前程序到 `/usr/local/sbin/tcshape.previous`；
+5. 使用同目录临时文件和原子 `mv` 替换 `/usr/local/sbin/tcshape`。
+
+更新只替换短命令，不修改 `/etc/tcshape.conf`、Sweep 结果、systemd 服务文件或当前 qdisc。
+菜单内更新完成后会直接用新版本重新进入菜单；命令行更新则从下一次执行开始使用新版本。
+发布脚本改动时必须同步递增脚本顶部的 `VERSION`，相同版本号不会重复覆盖。
+
+需要回退上一版本时：
+
+```bash
+sudo install -m 0755 /usr/local/sbin/tcshape.previous /usr/local/sbin/tcshape
+sudo tcshape --version
+```
+
 ## Sweep 行为
 
 1. 检查当前 qdisc 与其他整形服务冲突；

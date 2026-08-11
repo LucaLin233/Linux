@@ -25,6 +25,15 @@ assert_ok() {
     printf 'PASS: %s\n' "$name"
 }
 
+assert_fail() {
+    local name="$1"
+    shift
+    if "$@"; then
+        fail "$name: command unexpectedly succeeded"
+    fi
+    printf 'PASS: %s\n' "$name"
+}
+
 assert_eq "1000" "$(tc_rate_mbit 'class htb 1:10 root rate 1Gbit ceil 1Gbit')" \
     "parse Gbit rate"
 assert_eq "2500" "$(tc_rate_mbit 'class htb 1:10 root rate 2500Mbit ceil 2500Mbit')" \
@@ -46,8 +55,19 @@ assert_eq "6" "$(calc_validation_rate 15)" "validation rate for 15 Mbit"
 assert_eq "1" "$(calc_auto_step 17 31)" "auto step for narrow range"
 assert_eq "20" "$(calc_auto_step 100 300)" "auto step for wide range"
 
-fixture=$(mktemp)
-trap 'rm -f "$fixture"' EXIT
+assert_eq "1.0.4" "$(script_version "$ROOT_DIR/tools/traffic-shape.sh")" \
+    "extract update version"
+assert_ok "validate managed update file" validate_update_file \
+    "$ROOT_DIR/tools/traffic-shape.sh" "1.0.4"
+
+temp_dir=$(mktemp -d)
+trap 'rm -rf "$temp_dir"' EXIT
+invalid_update="$temp_dir/invalid-update.sh"
+sed 's#readonly UPDATE_REPO="LucaLin233/Linux"#readonly UPDATE_REPO="other/repo"#' \
+    "$ROOT_DIR/tools/traffic-shape.sh" > "$invalid_update"
+assert_fail "reject update from another repository" validate_update_file "$invalid_update" "1.0.4"
+
+fixture="$temp_dir/iperf.json"
 cat > "$fixture" <<'JSON'
 {
   "end": {

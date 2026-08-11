@@ -10,8 +10,11 @@
 set -uo pipefail
 umask 022
 
-readonly VERSION="1.0.3"
+readonly VERSION="1.0.4"
 readonly INSTALL_PATH="/usr/local/sbin/tcshape"
+readonly UPDATE_REPO="LucaLin233/Linux"
+readonly UPDATE_BRANCH="main"
+readonly UPDATE_SCRIPT_PATH="tools/traffic-shape.sh"
 readonly STATE_DIR="/var/lib/tcshape"
 readonly CONFIG_FILE="/etc/tcshape.conf"
 readonly SERVICE_FILE="/etc/systemd/system/tcshape.service"
@@ -81,6 +84,7 @@ tcshape - 出口限速器扫描与流量整形
   tcshape on 480        设置 480 Mbit 整形
   tcshape off           移除本工具整形
   tcshape st            查看状态
+  tcshape u             从官方仓库检查更新
 
 完整命令：
   tcshape scan [HOST] [--port N] [--nominal N] [--from N --to N]
@@ -89,6 +93,7 @@ tcshape - 出口限速器扫描与流量整形
   tcshape set RATE
   tcshape status
   tcshape off
+  tcshape update [--yes]
 EOF
 }
 
@@ -137,6 +142,133 @@ install_self() {
     ok "已安装短命令：tcshape"
 }
 
+script_version() {
+    local file="$1"
+    awk -F'"' '/^readonly VERSION="[0-9]+[.][0-9]+[.][0-9]+"$/ {print $2; exit}' "$file" 2>/dev/null
+}
+
+validate_update_file() {
+    local file="$1"
+    local expected_version="$2"
+    local detected_version
+
+    [[ -s "$file" ]] || return 1
+    grep -Fq '# tcshape-managed' "$file" || return 1
+    grep -Fq "readonly UPDATE_REPO=\"$UPDATE_REPO\"" "$file" || return 1
+    detected_version=$(script_version "$file") || return 1
+    [[ "$detected_version" == "$expected_version" ]] || return 1
+    bash -n "$file" >/dev/null 2>&1
+}
+
+cmd_update() {
+    local from_menu=false
+    local assume_yes=false
+    local metadata commit latest download_url temp_dir downloaded answer
+    local new_file backup_file newest
+
+    while (( $# > 0 )); do
+        case "$1" in
+            --from-menu) from_menu=true; shift ;;
+            --yes|-y) assume_yes=true; shift ;;
+            *) error "未知参数：$1"; return 1 ;;
+        esac
+    done
+
+    command -v curl >/dev/null 2>&1 || { error "需要 curl"; return 1; }
+    command -v jq >/dev/null 2>&1 || { error "需要 jq"; return 1; }
+
+    info "检查更新：$UPDATE_REPO/$UPDATE_BRANCH"
+    metadata=$(curl -fsSL --max-time 15 \
+        "https://api.github.com/repos/$UPDATE_REPO/commits/$UPDATE_BRANCH" 2>/dev/null) || {
+        error "无法查询最新提交，请检查网络或稍后再试"
+        return 2
+    }
+    commit=$(jq -r '.sha // empty' <<< "$metadata" 2>/dev/null || true)
+    [[ "$commit" =~ ^[0-9a-f]{40}$ ]] || {
+        error "GitHub 返回的提交信息无效"
+        return 2
+    }
+
+    temp_dir=$(mktemp -d) || return 1
+    downloaded="$temp_dir/traffic-shape.sh"
+    download_url="https://raw.githubusercontent.com/$UPDATE_REPO/$commit/$UPDATE_SCRIPT_PATH"
+    if ! curl -fsSL --max-time 60 "$download_url" -o "$downloaded"; then
+        rm -rf "$temp_dir"
+        error "更新脚本下载失败"
+        return 2
+    fi
+
+    latest=$(script_version "$downloaded" || true)
+    if [[ -z "$latest" ]] || ! validate_update_file "$downloaded" "$latest"; then
+        rm -rf "$temp_dir"
+        error "下载文件未通过标记、版本或 Bash 语法校验，未更新"
+        return 2
+    fi
+
+    if [[ "$latest" == "$VERSION" ]]; then
+        rm -rf "$temp_dir"
+        ok "已是最新版本 v$VERSION（提交 ${commit:0:12}）"
+        return 0
+    fi
+
+    newest=$(printf '%s\n%s\n' "$VERSION" "$latest" | sort -V | tail -n 1)
+    if [[ "$newest" == "$VERSION" ]]; then
+        rm -rf "$temp_dir"
+        ok "当前 v$VERSION 比仓库中的 v$latest 更新"
+        return 0
+    fi
+
+    echo "当前版本：v$VERSION"
+    echo "最新版本：v$latest"
+    echo "来源提交：$commit"
+    echo "更新地址：https://github.com/$UPDATE_REPO/commit/$commit"
+    if [[ "$assume_yes" != "true" ]]; then
+        read -r -p "现在更新？[Y/n]: " answer
+        [[ -z "$answer" || "$answer" =~ ^[Yy]$ ]] || {
+            rm -rf "$temp_dir"
+            info "已取消"
+            return 0
+        }
+    fi
+
+    [[ -f "$INSTALL_PATH" ]] && grep -Fq '# tcshape-managed' "$INSTALL_PATH" || {
+        rm -rf "$temp_dir"
+        error "$INSTALL_PATH 不属于 tcshape，拒绝覆盖"
+        return 1
+    }
+
+    new_file=$(mktemp /usr/local/sbin/.tcshape.update.XXXXXX) || {
+        rm -rf "$temp_dir"
+        return 1
+    }
+    backup_file=$(mktemp /usr/local/sbin/.tcshape.previous.XXXXXX) || {
+        rm -f "$new_file"
+        rm -rf "$temp_dir"
+        return 1
+    }
+
+    if ! install -m 0755 "$downloaded" "$new_file" ||
+        ! install -m 0755 "$INSTALL_PATH" "$backup_file" ||
+        ! mv -f "$backup_file" "${INSTALL_PATH}.previous" ||
+        ! mv -f "$new_file" "$INSTALL_PATH"; then
+        rm -f "$new_file" "$backup_file"
+        rm -rf "$temp_dir"
+        error "更新写入失败，原程序未被覆盖或可从 ${INSTALL_PATH}.previous 恢复"
+        return 2
+    fi
+    rm -rf "$temp_dir"
+
+    ok "已更新到 v$latest（提交 ${commit:0:12}）"
+    info "配置、Sweep 结果和 qdisc 状态未修改"
+    info "上一版本备份：${INSTALL_PATH}.previous"
+
+    if [[ "$from_menu" == "true" ]]; then
+        info "使用新版本重新进入菜单"
+        exec "$INSTALL_PATH" menu
+    fi
+    warn "当前进程仍是 v$VERSION；下次运行 tcshape 将使用 v$latest"
+}
+
 ensure_dependencies() {
     if [[ ! -f /etc/debian_version ]] || ! command -v apt-get >/dev/null 2>&1; then
         error "依赖自动安装仅支持 Debian"
@@ -148,6 +280,7 @@ ensure_dependencies() {
     local package_name
     local missing=()
     local required=(
+        "curl:curl"
         "tc:iproute2"
         "ip:iproute2"
         "iperf3:iperf3"
@@ -1241,9 +1374,10 @@ menu() {
     echo "3) 应用推荐值"
     echo "4) 手动设置"
     echo "5) 关闭整形"
-    echo "6) 退出"
+    echo "6) 检查更新"
+    echo "7) 退出"
     local choice rate
-    read -r -p "选择 [1-6]（默认 1）: " choice
+    read -r -p "选择 [1-7]（默认 1）: " choice
     choice="${choice:-1}"
     case "$choice" in
         1) cmd_status ;;
@@ -1251,7 +1385,8 @@ menu() {
         3) cmd_apply ;;
         4) read -r -p "速率 Mbit: " rate; cmd_set "$rate" ;;
         5) cmd_off ;;
-        6) return 0 ;;
+        6) cmd_update --from-menu ;;
+        7) return 0 ;;
         *) error "无效选择"; return 1 ;;
     esac
 }
@@ -1283,6 +1418,7 @@ main() {
         on|set) cmd_set "${1:-}" ;;
         off) cmd_off ;;
         st|status) cmd_status ;;
+        u|update) cmd_update "$@" ;;
         *) error "未知命令：$command"; usage; return 1 ;;
     esac
 }
