@@ -1421,16 +1421,17 @@ net.ipv6.conf.all.accept_ra = 2
 net.ipv6.conf.default.accept_ra = 2
 EOF
 
+    # 所有当前存在的非 loopback 接口都显式设置 accept_ra=2。不能只依赖
+    # 当前 IPv6 默认路由：云平台可能在脚本运行后才通过 RA 下发路由和前缀。
     while IFS= read -r interface; do
         [[ "$interface" =~ ^[A-Za-z0-9_-]+$ ]] || continue
-        [[ "$interface" != "lo" ]] || continue
-        [[ -e "/proc/sys/net/ipv6/conf/$interface/accept_ra" ]] || continue
+        case "$interface" in all|default|lo) continue ;; esac
         interfaces+=("$interface")
     done < <(
-        {
-            ip -o -6 route show default 2>/dev/null | awk '{for (i=1; i<=NF; i++) if ($i == "dev") print $(i+1)}'
-            ip -o -6 address show scope global 2>/dev/null | awk '{print $2}'
-        } | sort -u
+        for accept_ra_path in /proc/sys/net/ipv6/conf/*/accept_ra; do
+            [[ -e "$accept_ra_path" ]] || continue
+            basename "$(dirname "$accept_ra_path")"
+        done | sort -u
     )
 
     for interface in "${interfaces[@]}"; do

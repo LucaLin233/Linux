@@ -112,11 +112,33 @@ ensure_package() {
 
 backup_managed_file() {
     local file="$1"
-    local initial_backup="${file}.initial-backup"
-    local previous_backup="${file}.previous-backup"
-    local initial_absent="${file}.initial-absent"
-    local previous_absent="${file}.previous-absent"
-    local initial_unknown="${file}.initial-unknown"
+    local backup_prefix="$file"
+    local state_dir="/var/lib/linux-setup/apt-source-backups"
+    local suffix
+    local legacy_state
+    local state_file
+
+    if [[ "$file" == /etc/apt/sources.list.d/* ]]; then
+        install -d -m 0700 "$state_dir"
+        backup_prefix="$state_dir/$(basename "$file")"
+
+        for suffix in initial-backup previous-backup initial-absent previous-absent initial-unknown; do
+            legacy_state="${file}.${suffix}"
+            [[ -e "$legacy_state" || -L "$legacy_state" ]] || continue
+            state_file="${backup_prefix}.${suffix}"
+            if [[ -e "$state_file" || -L "$state_file" ]]; then
+                state_file="${state_file}.legacy.$(date +%s).$$"
+            fi
+            mv "$legacy_state" "$state_file" || return 1
+            chmod 600 "$state_file" 2>/dev/null || true
+        done
+    fi
+
+    local initial_backup="${backup_prefix}.initial-backup"
+    local previous_backup="${backup_prefix}.previous-backup"
+    local initial_absent="${backup_prefix}.initial-absent"
+    local previous_absent="${backup_prefix}.previous-absent"
+    local initial_unknown="${backup_prefix}.initial-unknown"
 
     if [[ ! -e "$initial_backup" && ! -e "$initial_absent" && ! -e "$initial_unknown" ]]; then
         if [[ -f "$file" ]] && grep -Fq '由 system-customize.sh 自动生成' "$file"; then
@@ -688,6 +710,7 @@ configure_xanmod_repository() {
     local repository
     local selected_repository=""
     local managed_file
+    local state_prefix
 
     ensure_package "gpg" "gpg" || return 1
     codename=$(get_os_codename) || {
@@ -704,7 +727,15 @@ configure_xanmod_repository() {
     if { [[ -f "$XANMOD_SOURCE_DEB822" ]] && grep -Fq "Signed-By: $XANMOD_KEYRING" "$XANMOD_SOURCE_DEB822"; } ||
         { [[ -f "$XANMOD_SOURCE_LIST" ]] && grep -Fq 'xanmod' "$XANMOD_SOURCE_LIST"; }; then
         for managed_file in "$XANMOD_KEYRING" "$XANMOD_SOURCE_LIST" "$XANMOD_SOURCE_DEB822"; do
-            if [[ ! -e "${managed_file}.initial-backup" && ! -e "${managed_file}.initial-absent" &&
+            if [[ "$managed_file" == /etc/apt/sources.list.d/* ]]; then
+                state_prefix="/var/lib/linux-setup/apt-source-backups/$(basename "$managed_file")"
+                if [[ ! -e "${state_prefix}.initial-backup" && ! -e "${state_prefix}.initial-absent" &&
+                    ! -e "${state_prefix}.initial-unknown" &&
+                    ! -e "${managed_file}.initial-backup" && ! -e "${managed_file}.initial-absent" &&
+                    ! -e "${managed_file}.initial-unknown" ]]; then
+                    install -D -m 0600 /dev/null "${state_prefix}.initial-unknown"
+                fi
+            elif [[ ! -e "${managed_file}.initial-backup" && ! -e "${managed_file}.initial-absent" &&
                 ! -e "${managed_file}.initial-unknown" ]]; then
                 install -D -m 0600 /dev/null "${managed_file}.initial-unknown"
             fi

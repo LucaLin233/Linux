@@ -30,11 +30,33 @@ APT_UPDATED=false
 
 backup_managed_file() {
     local target="$1"
-    local initial_backup="${target}.initial-backup"
-    local previous_backup="${target}.previous-backup"
-    local initial_absent="${target}.initial-absent"
-    local previous_absent="${target}.previous-absent"
-    local initial_unknown="${target}.initial-unknown"
+    local backup_prefix="$target"
+    local state_dir="/var/lib/linux-setup/apt-source-backups"
+    local suffix
+    local legacy_state
+    local state_file
+
+    if [[ "$target" == /etc/apt/sources.list.d/* ]]; then
+        install -d -m 0700 "$state_dir"
+        backup_prefix="$state_dir/$(basename "$target")"
+
+        for suffix in initial-backup previous-backup initial-absent previous-absent initial-unknown; do
+            legacy_state="${target}.${suffix}"
+            [[ -e "$legacy_state" || -L "$legacy_state" ]] || continue
+            state_file="${backup_prefix}.${suffix}"
+            if [[ -e "$state_file" || -L "$state_file" ]]; then
+                state_file="${state_file}.legacy.$(date +%s).$$"
+            fi
+            mv "$legacy_state" "$state_file" || return 1
+            chmod 600 "$state_file" 2>/dev/null || true
+        done
+    fi
+
+    local initial_backup="${backup_prefix}.initial-backup"
+    local previous_backup="${backup_prefix}.previous-backup"
+    local initial_absent="${backup_prefix}.initial-absent"
+    local previous_absent="${backup_prefix}.previous-absent"
+    local initial_unknown="${backup_prefix}.initial-unknown"
 
     if [[ ! -e "$initial_backup" && ! -e "$initial_absent" && ! -e "$initial_unknown" ]]; then
         if [[ -e "$target" || -L "$target" ]]; then
@@ -154,10 +176,19 @@ configure_docker_repository() {
     local architecture
     local key_temp
     local managed_file
+    local state_prefix
 
     if docker_repository_configured; then
         for managed_file in "$DOCKER_KEYRING" "$DOCKER_SOURCE"; do
-            if [[ ! -e "${managed_file}.initial-backup" && ! -e "${managed_file}.initial-absent" &&
+            if [[ "$managed_file" == /etc/apt/sources.list.d/* ]]; then
+                state_prefix="/var/lib/linux-setup/apt-source-backups/$(basename "$managed_file")"
+                if [[ ! -e "${state_prefix}.initial-backup" && ! -e "${state_prefix}.initial-absent" &&
+                    ! -e "${state_prefix}.initial-unknown" &&
+                    ! -e "${managed_file}.initial-backup" && ! -e "${managed_file}.initial-absent" &&
+                    ! -e "${managed_file}.initial-unknown" ]]; then
+                    install -D -m 0600 /dev/null "${state_prefix}.initial-unknown"
+                fi
+            elif [[ ! -e "${managed_file}.initial-backup" && ! -e "${managed_file}.initial-absent" &&
                 ! -e "${managed_file}.initial-unknown" ]]; then
                 install -D -m 0600 /dev/null "${managed_file}.initial-unknown"
             fi

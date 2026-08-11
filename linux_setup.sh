@@ -214,6 +214,40 @@ pre_check() {
 }
 
 # =============================================================================
+# 旧版 APT 软件源备份迁移
+# =============================================================================
+
+migrate_legacy_apt_source_backups() {
+    local source_dir="/etc/apt/sources.list.d"
+    local state_dir="/var/lib/linux-setup/apt-source-backups"
+    local base
+    local suffix
+    local source
+    local destination
+
+    [[ -d "$source_dir" ]] || return 0
+    install -d -m 0700 "$state_dir"
+
+    for base in docker.sources nexttrace.sources xanmod-release.list xanmod-release.sources; do
+        for suffix in initial-backup previous-backup initial-absent previous-absent initial-unknown; do
+            source="$source_dir/${base}.${suffix}"
+            [[ -e "$source" || -L "$source" ]] || continue
+            destination="$state_dir/${base}.${suffix}"
+
+            if [[ -e "$destination" || -L "$destination" ]]; then
+                destination="${destination}.legacy.$(date +%s).$$"
+            fi
+
+            mv "$source" "$destination" || {
+                log "无法迁移旧版 APT 软件源备份：$source" "warn"
+                continue
+            }
+            chmod 600 "$destination" 2>/dev/null || true
+        done
+    done
+}
+
+# =============================================================================
 # 依赖安装
 # =============================================================================
 
@@ -1272,6 +1306,7 @@ main() {
     self_update
 
     pre_check
+    migrate_legacy_apt_source_backups
     install_dependencies
     system_update
     fix_hosts_file

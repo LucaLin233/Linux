@@ -102,6 +102,7 @@ Docker 模块会按发行版自动选择 Docker 官方 Debian 或 Ubuntu APT 仓
 - `initial`：第一次可信修改前的配置；旧版没有记录且无法证明原始状态时标记为 `initial-unknown`，不会猜测；
 - `previous`：本次运行前的配置，每次运行更新一次；
 - 共享配置（Crontab、`.zshrc`、`.bashrc`）按模块分别保存状态，避免不同模块互相覆盖；
+- APT 软件源备份统一存放在 `/var/lib/linux-setup/apt-source-backups/`，避免 APT 扫描备份文件时产生无效扩展名提示；
 - 恢复配置不会卸载软件包、内核、容器、Mise 运行时或用户数据。
 
 支持恢复子命令的模块默认恢复 `previous`；追加 `initial` 恢复首次可信状态：
