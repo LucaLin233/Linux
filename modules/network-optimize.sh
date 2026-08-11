@@ -1536,13 +1536,17 @@ EOF
         (( target_conntrack < 65536 )) && target_conntrack=65536
         (( target_conntrack > 1048576 )) && target_conntrack=1048576
 
-        if [[ "$current_conntrack" =~ ^[0-9]+$ ]] && (( target_conntrack > current_conntrack )); then
-            cat >> "$target_file" <<EOF
+        # 每次都写入最终值，保证重复运行后配置仍可跨重启持久化。
+        # 当前值更高时沿用当前值，绝不降低管理员已有配置。
+        if [[ "$current_conntrack" =~ ^[0-9]+$ ]] && (( current_conntrack > target_conntrack )); then
+            target_conntrack="$current_conntrack"
+        fi
 
-# 按内存保守扩展 Conntrack 上限，不降低现有配置
+        cat >> "$target_file" <<EOF
+
+# 按内存保守设置 Conntrack 上限，不降低现有配置
 net.netfilter.nf_conntrack_max = $target_conntrack
 EOF
-        fi
     fi
 }
 
