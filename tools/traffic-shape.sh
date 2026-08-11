@@ -10,7 +10,7 @@
 set -uo pipefail
 umask 022
 
-readonly VERSION="1.0.5"
+readonly VERSION="1.0.6"
 readonly INSTALL_PATH="/usr/local/sbin/tcshape"
 readonly UPDATE_REPO="LucaLin233/Linux"
 readonly UPDATE_BRANCH="main"
@@ -120,29 +120,92 @@ take_lock() {
     fi
 }
 
+validate_install_file() {
+    local file="$1"
+    local detected_version
+
+    [[ -s "$file" ]] || return 1
+    grep -Fq '# tcshape-managed' "$file" || return 1
+    detected_version=$(script_version "$file") || return 1
+    [[ -n "$detected_version" ]] || return 1
+    bash -n "$file" >/dev/null 2>&1
+}
+
+install_target_is_replaceable() {
+    local target="$1"
+    [[ ! -e "$target" ]] && return 0
+    grep -Fq '# tcshape-managed' "$target" 2>/dev/null && return 0
+    [[ -f "$target" && ! -L "$target" && ! -s "$target" ]]
+}
+
 install_self() {
+    local requested_command="${1:-menu}"
+    shift || true
+    local source_file="$0"
+    local source_version=""
+    local downloaded=""
+    local temp_file=""
+    local download_url="https://raw.githubusercontent.com/$UPDATE_REPO/$UPDATE_BRANCH/$UPDATE_SCRIPT_PATH"
+
     [[ "$0" == "$INSTALL_PATH" ]] && return 0
 
-    if [[ -e "$INSTALL_PATH" ]] &&
-        ! grep -Fq '# tcshape-managed' "$INSTALL_PATH" 2>/dev/null; then
+    # bash <(curl ...) 使用的 /dev/fd/* 往往不可再次读取或显示为 0 字节，不能直接复制。
+    if ! validate_install_file "$source_file"; then
+        command -v curl >/dev/null 2>&1 || {
+            error "当前启动源不可安全复制，且系统缺少 curl"
+            return 1
+        }
+        downloaded=$(mktemp) || return 1
+        if ! curl -fsSL --max-time 60 "$download_url" -o "$downloaded"; then
+            rm -f "$downloaded"
+            error "无法重新下载可安装的 tcshape"
+            return 2
+        fi
+        source_version=$(script_version "$downloaded" || true)
+        if [[ -z "$source_version" ]] || ! validate_update_file "$downloaded" "$source_version"; then
+            rm -f "$downloaded"
+            error "重新下载的 tcshape 未通过来源、版本或语法校验"
+            return 2
+        fi
+        source_file="$downloaded"
+        info "当前启动源不可复制，已从官方仓库重新获取 v$source_version"
+    else
+        source_version=$(script_version "$source_file")
+    fi
+
+    if ! install_target_is_replaceable "$INSTALL_PATH"; then
+        rm -f "$downloaded"
         error "$INSTALL_PATH 已存在且不属于本工具，拒绝覆盖"
         return 1
     fi
+    if [[ -f "$INSTALL_PATH" && ! -L "$INSTALL_PATH" && ! -s "$INSTALL_PATH" ]]; then
+        warn "检测到旧版遗留的零字节 $INSTALL_PATH，将安全替换"
+    fi
 
-    if [[ -f "$INSTALL_PATH" ]] && cmp -s "$0" "$INSTALL_PATH"; then
+    if [[ -f "$INSTALL_PATH" ]] && cmp -s "$source_file" "$INSTALL_PATH"; then
+        rm -f "$downloaded"
         return 0
     fi
 
-    local temp_file
-    install -d -m 0755 /usr/local/sbin || return 1
-    temp_file=$(mktemp /usr/local/sbin/.tcshape.XXXXXX) || return 1
-    if ! install -m 0755 "$0" "$temp_file" || ! mv -f "$temp_file" "$INSTALL_PATH"; then
-        rm -f "$temp_file"
-        error "无法安装短命令：$INSTALL_PATH"
+    install -d -m 0755 /usr/local/sbin || { rm -f "$downloaded"; return 1; }
+    temp_file=$(mktemp /usr/local/sbin/.tcshape.XXXXXX) || {
+        rm -f "$downloaded"
+        return 1
+    }
+    if ! install -m 0755 "$source_file" "$temp_file" ||
+        ! validate_install_file "$temp_file" ||
+        ! mv -f "$temp_file" "$INSTALL_PATH"; then
+        rm -f "$temp_file" "$downloaded"
+        error "无法安全安装短命令：$INSTALL_PATH"
         return 1
     fi
+    rm -f "$downloaded"
 
-    ok "已安装短命令：tcshape"
+    ok "已安装短命令：tcshape v$source_version"
+    if [[ "$source_version" != "$VERSION" ]]; then
+        info "使用已安装的新版本重新执行当前命令"
+        exec "$INSTALL_PATH" "$requested_command" "$@"
+    fi
 }
 
 script_version() {
@@ -1557,7 +1620,7 @@ main() {
         return $?
     fi
 
-    install_self || return 1
+    install_self "$command" "$@" || return 1
     ensure_dependencies || return 1
     take_lock
 

@@ -261,8 +261,12 @@ sysctl，适用于存在出口 policer 的特定 VPS，不是通用必选优化�
 首次运行：
 
 ```bash
-sudo bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/tools/traffic-shape.sh)
+curl -fsSLo /tmp/tcshape.sh https://raw.githubusercontent.com/LucaLin233/Linux/main/tools/traffic-shape.sh && sudo bash /tmp/tcshape.sh
 ```
+
+该写法先落盘再执行，兼容 Termius，也避免部分 Bash 进程替换场景中的 `/dev/fd/*` 无法二次读取。
+新版仍会识别 `bash <(curl ...)`：若启动源不可复制，会从官方仓库重新下载并校验后安装；检测到
+旧版遗留的零字节 `/usr/local/sbin/tcshape` 时会自动安全替换，非空且无受管标记的文件仍拒绝覆盖。
 
 随后可使用短命令：
 

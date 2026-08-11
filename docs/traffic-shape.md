@@ -40,11 +40,22 @@ sudo apt-get update
 
 ## 安装与短命令
 
-首次运行会静默安装缺失依赖，并把自身安装为 `/usr/local/sbin/tcshape`：
+首次运行会静默安装缺失依赖，并把自身安装为 `/usr/local/sbin/tcshape`。Termius 等终端推荐
+先下载到普通文件再执行：
+
+```bash
+curl -fsSLo /tmp/tcshape.sh https://raw.githubusercontent.com/LucaLin233/Linux/main/tools/traffic-shape.sh && sudo bash /tmp/tcshape.sh
+```
+
+直接运行仓库文件也可以：
 
 ```bash
 sudo ./tools/traffic-shape.sh
 ```
+
+脚本不会直接复制不可再次读取或显示为零字节的 `/dev/fd/*`；这类启动源会触发官方仓库重新下载、
+受管标记、版本和 Bash 语法校验。历史版本留下的零字节 `/usr/local/sbin/tcshape` 会自动替换；
+非空、符号链接或没有 `tcshape-managed` 标记的未知文件仍拒绝覆盖。
 
 常用命令：
 

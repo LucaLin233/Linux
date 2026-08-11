@@ -55,17 +55,33 @@ assert_eq "6" "$(calc_validation_rate 15)" "validation rate for 15 Mbit"
 assert_eq "1" "$(calc_auto_step 17 31)" "auto step for narrow range"
 assert_eq "20" "$(calc_auto_step 100 300)" "auto step for wide range"
 
-assert_eq "1.0.5" "$(script_version "$ROOT_DIR/tools/traffic-shape.sh")" \
+assert_eq "1.0.6" "$(script_version "$ROOT_DIR/tools/traffic-shape.sh")" \
     "extract update version"
+assert_ok "validate install source" validate_install_file \
+    "$ROOT_DIR/tools/traffic-shape.sh"
 assert_ok "validate managed update file" validate_update_file \
-    "$ROOT_DIR/tools/traffic-shape.sh" "1.0.5"
+    "$ROOT_DIR/tools/traffic-shape.sh" "1.0.6"
 
 temp_dir=$(mktemp -d)
 trap 'rm -rf "$temp_dir"' EXIT
 invalid_update="$temp_dir/invalid-update.sh"
 sed 's#readonly UPDATE_REPO="LucaLin233/Linux"#readonly UPDATE_REPO="other/repo"#' \
     "$ROOT_DIR/tools/traffic-shape.sh" > "$invalid_update"
-assert_fail "reject update from another repository" validate_update_file "$invalid_update" "1.0.5"
+assert_fail "reject update from another repository" validate_update_file "$invalid_update" "1.0.6"
+
+empty_install="$temp_dir/empty-tcshape"
+unknown_install="$temp_dir/unknown-tcshape"
+managed_install="$temp_dir/managed-tcshape"
+empty_link="$temp_dir/empty-link"
+: > "$empty_install"
+printf '#!/usr/bin/env bash\necho unknown\n' > "$unknown_install"
+cp "$ROOT_DIR/tools/traffic-shape.sh" "$managed_install"
+ln -s "$empty_install" "$empty_link"
+assert_fail "reject empty install source" validate_install_file "$empty_install"
+assert_ok "allow replacing zero-byte legacy target" install_target_is_replaceable "$empty_install"
+assert_ok "allow replacing managed target" install_target_is_replaceable "$managed_install"
+assert_fail "reject unknown nonempty target" install_target_is_replaceable "$unknown_install"
+assert_fail "reject symlink target" install_target_is_replaceable "$empty_link"
 
 check_os_file() {
     check_supported_system "$1" >/dev/null 2>&1
