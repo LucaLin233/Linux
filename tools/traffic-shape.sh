@@ -10,7 +10,7 @@
 set -uo pipefail
 umask 022
 
-readonly VERSION="1.0.4"
+readonly VERSION="1.0.5"
 readonly INSTALL_PATH="/usr/local/sbin/tcshape"
 readonly UPDATE_REPO="LucaLin233/Linux"
 readonly UPDATE_BRANCH="main"
@@ -29,7 +29,10 @@ readonly PORT_POOL="5201 5202 5203 5204 5205 5206 5207 5208 5209 5210 5200"
 readonly PROBE_PORTS="5201 5202 5203 5200"
 readonly LOSS_THRESHOLD="0.1"
 readonly SCAN_CAP_MBIT=100000
+readonly SWEEP_MAX_AGE_SECONDS=86400
 
+OS_ID=""
+OS_VERSION_ID=""
 IP_FAMILY="-4"
 PEER_PORT="5201"
 TRAFFIC_IFACE=""
@@ -89,7 +92,7 @@ tcshape - 出口限速器扫描与流量整形
 完整命令：
   tcshape scan [HOST] [--port N] [--nominal N] [--from N --to N]
                        [--step N] [--dur N] [--margin N] [--yes] [-4|-6]
-  tcshape apply
+  tcshape apply [--force]
   tcshape set RATE
   tcshape status
   tcshape off
@@ -269,11 +272,62 @@ cmd_update() {
     warn "当前进程仍是 v$VERSION；下次运行 tcshape 将使用 v$latest"
 }
 
-ensure_dependencies() {
-    if [[ ! -f /etc/debian_version ]] || ! command -v apt-get >/dev/null 2>&1; then
-        error "依赖自动安装仅支持 Debian"
+os_release_value() {
+    local key="$1"
+    local file="$2"
+    awk -F= -v key="$key" '$1 == key {
+        value=substr($0, index($0, "=") + 1)
+        sub(/^"/, "", value)
+        sub(/"$/, "", value)
+        print value
+        exit
+    }' "$file" 2>/dev/null
+}
+
+version_at_least() {
+    local current="$1"
+    local minimum="$2"
+    [[ -n "$current" ]] || return 1
+    [[ "$(printf '%s\n%s\n' "$current" "$minimum" | sort -V | tail -n 1)" == "$current" ]]
+}
+
+check_supported_system() {
+    local os_release="${1:-/etc/os-release}"
+
+    [[ -r "$os_release" ]] || {
+        error "无法读取系统信息：$os_release"
         return 1
-    fi
+    }
+    OS_ID=$(os_release_value ID "$os_release")
+    OS_VERSION_ID=$(os_release_value VERSION_ID "$os_release")
+
+    case "$OS_ID" in
+        debian)
+            version_at_least "$OS_VERSION_ID" "12" || {
+                error "仅支持 Debian 12 或更高版本；当前：${OS_VERSION_ID:-未知}"
+                return 1
+            }
+            ;;
+        ubuntu)
+            version_at_least "$OS_VERSION_ID" "22.04" || {
+                error "仅支持 Ubuntu 22.04 或更高版本；当前：${OS_VERSION_ID:-未知}"
+                return 1
+            }
+            ;;
+        *)
+            error "仅支持 Debian 12+ 或 Ubuntu 22.04+；当前系统：${OS_ID:-未知} ${OS_VERSION_ID:-}"
+            return 1
+            ;;
+    esac
+
+    command -v apt-get >/dev/null 2>&1 || {
+        error "系统缺少 apt-get"
+        return 1
+    }
+}
+
+ensure_dependencies() {
+    check_supported_system || return 1
 
     local dependency
     local command_name
@@ -309,8 +363,21 @@ ensure_dependencies() {
         return 1
     fi
 
+    for package_name in "${missing[@]}"; do
+        if ! apt-cache show "$package_name" >/dev/null 2>&1; then
+            if [[ "$OS_ID" == "ubuntu" && "$package_name" == "iperf3" ]]; then
+                error "Ubuntu 软件源中找不到 iperf3，请先启用 universe："
+                error "  sudo apt-get install -y software-properties-common"
+                error "  sudo add-apt-repository universe && sudo apt-get update"
+            else
+                error "APT 软件源中找不到依赖：$package_name"
+            fi
+            return 1
+        fi
+    done
+
     if ! DEBIAN_FRONTEND=noninteractive apt-get install -y "${missing[@]}"; then
-        error "依赖安装失败"
+        error "依赖安装失败（系统：$OS_ID $OS_VERSION_ID）"
         return 1
     fi
 }
@@ -1330,9 +1397,59 @@ cmd_scan() {
     traffic_report
 }
 
+sweep_result_age() {
+    local created_at="$1"
+    local now="${2:-$(date +%s)}"
+    [[ "$created_at" =~ ^[0-9]+$ && "$now" =~ ^[0-9]+$ ]] || return 1
+    (( created_at <= now + 300 )) || return 1
+    (( created_at > now )) && created_at="$now"
+    printf '%d\n' $((now - created_at))
+}
+
+sweep_result_is_fresh() {
+    local age="$1"
+    [[ "$age" =~ ^[0-9]+$ ]] && (( age <= SWEEP_MAX_AGE_SECONDS ))
+}
+
+format_age() {
+    local seconds="$1"
+    if (( seconds >= 86400 )); then
+        printf '%d天%d小时' $((seconds / 86400)) $(((seconds % 86400) / 3600))
+    elif (( seconds >= 3600 )); then
+        printf '%d小时%d分钟' $((seconds / 3600)) $(((seconds % 3600) / 60))
+    elif (( seconds >= 60 )); then
+        printf '%d分钟' $((seconds / 60))
+    else
+        printf '%d秒' "$seconds"
+    fi
+}
+
+recommendation_is_active() {
+    local iface="$1"
+    local rate="$2"
+    local configured_iface configured_rate
+
+    is_own_shaper "$iface" || return 1
+    configured_iface=$(read_config_value INTERFACE || true)
+    configured_rate=$(read_config_value RATE_MBIT || true)
+    [[ "$configured_iface" == "$iface" && "$configured_rate" == "$rate" ]] || return 1
+    verify_qdisc_rate "$iface" "$rate" || return 1
+    systemctl is-enabled --quiet tcshape.service 2>/dev/null || return 1
+    systemctl is-active --quiet tcshape.service 2>/dev/null
+}
+
 cmd_apply() {
     local result_file="$STATE_DIR/sweep.result"
-    local status recommend result_iface
+    local status recommend result_iface created_at age created_text
+    local force=false
+
+    while (( $# > 0 )); do
+        case "$1" in
+            --force) force=true; shift ;;
+            *) error "未知参数：$1"; return 1 ;;
+        esac
+    done
+
     [[ -f "$result_file" ]] || { error "没有 Sweep 结果，请先执行：tcshape s"; return 1; }
     status=$(read_config_value STATUS "$result_file" || true)
 
@@ -1346,7 +1463,40 @@ cmd_apply() {
     fi
 
     recommend=$(read_config_value RECOMMEND_MBIT "$result_file") || return 1
+    is_positive_integer "$recommend" 1 100000 || {
+        error "Sweep 推荐值无效"
+        return 1
+    }
+    recommend=$((10#$recommend))
     result_iface=$(read_config_value INTERFACE "$result_file" || true)
+
+    if [[ -n "$result_iface" ]] && recommendation_is_active "$result_iface" "$recommend"; then
+        ok "推荐整形已启用：${recommend} Mbit（接口 $result_iface），无需重复应用"
+        return 0
+    fi
+
+    created_at=$(read_config_value CREATED_AT "$result_file" || true)
+    age=$(sweep_result_age "$created_at" || true)
+    if [[ -z "$age" ]]; then
+        if [[ "$force" != "true" ]]; then
+            error "Sweep 结果缺少有效时间，拒绝应用"
+            error "请重新执行 tcshape s；确认仍要使用旧结果可执行：tcshape apply --force"
+            return 1
+        fi
+        warn "正在强制应用时间未知的 Sweep 结果"
+    else
+        created_text=$(date -d "@$created_at" '+%F %T %Z' 2>/dev/null || echo "$created_at")
+        info "Sweep 结果：$created_text（$(format_age "$age")前），推荐 ${recommend} Mbit"
+        if ! sweep_result_is_fresh "$age"; then
+            if [[ "$force" != "true" ]]; then
+                error "Sweep 结果已超过 24 小时，拒绝应用旧推荐值"
+                error "请重新执行 tcshape s；确认仍要使用旧结果可执行：tcshape apply --force"
+                return 1
+            fi
+            warn "正在强制应用超过 24 小时的 Sweep 结果"
+        fi
+    fi
+
     cmd_set "$recommend" "$result_iface"
 }
 
@@ -1414,7 +1564,7 @@ main() {
     case "$command" in
         menu) menu ;;
         s|scan) cmd_scan "$@" ;;
-        a|apply) cmd_apply ;;
+        a|apply) cmd_apply "$@" ;;
         on|set) cmd_set "${1:-}" ;;
         off) cmd_off ;;
         st|status) cmd_status ;;

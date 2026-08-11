@@ -9,6 +9,23 @@ Sweep 与 Shape 核心逻辑，用于检测 VPS 出口 policer 的限速拐点�
 基础 BBR、TCP 缓冲区与 sysctl 调优仍由 `modules/network-optimize.sh` 管理；tcshape 不修改
 任何 sysctl。
 
+## 系统要求
+
+明确支持：
+
+- Debian 12 或更高版本；
+- Ubuntu 22.04 或更高版本。
+
+脚本通过 `/etc/os-release` 校验发行版和版本，并要求 root、systemd、APT 以及可管理 qdisc 的
+内核权限。OpenVZ、LXC、Docker 等环境即使发行版符合要求，也必须具备 `CAP_NET_ADMIN`。
+Ubuntu 找不到 `iperf3` 时会停止并提示启用 `universe`：
+
+```bash
+sudo apt-get install -y software-properties-common
+sudo add-apt-repository universe
+sudo apt-get update
+```
+
 ## 适用场景
 
 适合不限速发送时出现明显重传，而略低于端口上限发送时丢包明显下降的 VPS。若 Sweep 未检测到
@@ -44,7 +61,7 @@ sudo tcshape st       # 查看状态
 ```bash
 sudo tcshape scan [HOST] [--port N] [--nominal N] [--from N --to N]
                   [--step N] [--dur N] [--margin N] [--yes] [-4|-6]
-sudo tcshape apply
+sudo tcshape apply [--force]
 sudo tcshape set RATE
 sudo tcshape status
 sudo tcshape off
@@ -143,6 +160,18 @@ HTB root：控制所有连接的总出口速率
 `tcshape off` 仅移除本工具创建的 HTB，恢复首次启用前记录的简单 qdisc；不会删除或修改
 `/etc/sysctl.d/99-network-optimize.conf`。`tcshape apply` 会使用 Sweep 结果中记录的接口，避免
 IPv4 与 IPv6 使用不同出口时把推荐值应用到另一张网卡。
+
+`tcshape a`/`tcshape apply` 默认只应用 24 小时内的 `KNEE_FOUND` 结果，并显示测试时间、结果
+年龄和推荐速率。超过 24 小时或缺少有效时间的结果会被拒绝，应重新执行 Sweep；确认线路、
+套餐和出口接口均未变化时，才使用：
+
+```bash
+sudo tcshape apply --force
+```
+
+如果相同推荐速率已经由 tcshape 完整启用，脚本直接返回成功，不重建 qdisc，因此不会因为忘记
+是否执行过 `tcshape a` 而产生重复限速或额外网络抖动。`--force` 只绕过时间检查，不会绕过
+Sweep 状态、推荐值、接口和 qdisc 所有权检查。
 
 ## qdisc 安全边界
 

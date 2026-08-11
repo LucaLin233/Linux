@@ -268,15 +268,21 @@ sudo bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/t
 
 ```bash
 sudo tcshape s        # 自动选公共节点并扫描
-sudo tcshape a        # 应用最近推荐值
+sudo tcshape a        # 应用 24 小时内的最近推荐值
 sudo tcshape on 480   # 手动限制为 480 Mbit
 sudo tcshape off      # 关闭并恢复原 qdisc
 sudo tcshape st       # 查看状态
 sudo tcshape u        # 从 LucaLin233/Linux main 检查更新
+sudo tcshape apply --force  # 明确强制使用超过 24 小时的旧推荐值
 ```
+
+tcshape 明确支持 Debian 12+ 与 Ubuntu 22.04+，要求 root、systemd、APT 及内核允许管理
+qdisc。Ubuntu 软件源缺少 `iperf3` 时会提示先启用 `universe`，不会继续半安装。
 
 Sweep 可能消耗大量上传流量，并会临时替换默认出口接口的根 qdisc。单方向上限约 45 GB，
 双向合计上限约 90 GB。未检测到限速器或未找到拐点时，不建议且不能自动应用整形。
+`tcshape a` 默认只接受 24 小时内的成功结果；相同推荐值已完整启用时直接返回，不重建 qdisc。
+超过 24 小时的结果应重新扫描，仅在明确确认线路未变化时使用 `tcshape apply --force`。
 
 `tcshape u`/`tcshape update` 会读取 `LucaLin233/Linux` 的 `main` 最新提交，按固定 Commit 下载并
 校验受管标记、版本号和 Bash 语法，再原子替换短命令。上一版本保存在
