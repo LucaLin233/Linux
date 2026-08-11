@@ -74,9 +74,9 @@ bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/linux_
 
 | 菜单编号 | 模块 | 功能 | 主要影响 |
 | ---: | --- | --- | --- |
-| 1 | `system-optimize.sh` | 按内存配置 Zram、时区和 Chrony | Ubuntu 缺少 Zram 时安装当前 `linux-modules-extra-*` 及对应完整内核元包，确保后续内核继续携带模块；可能额外安装固件与 CPU 微码 |
+| 1 | `system-optimize.sh` | Zram、系统 sysctl、journald、THP、时区和 Chrony | 为 headless VPS 设置 Panic 恢复、日志上限和低干扰 THP 策略；Ubuntu 可能安装内核模块、固件与 CPU 微码 |
 | 2 | `system-customize.sh` | 动态 MOTD、中文 Locale、可选 XanMod | 可能修改 Locale、欢迎信息和内核 |
-| 3 | `network-optimize.sh` | BBR、fq、动态 TCP 缓冲区和转发参数 | 自动测速最多约 90 GB；写入独立 sysctl 配置 |
+| 3 | `network-optimize.sh` | BBR、fq、动态 TCP 缓冲区、IPv4/IPv6 转发 | 使用 `accept_ra=2` 保留云平台 IPv6 RA；自动测速最多约 90 GB |
 | 4 | `zsh-setup.sh` | Zsh、Oh My Zsh、Powerlevel10k 和插件 | 备份后重写 root 的 `.zshrc`，可修改默认 Shell |
 | 5 | `mise-setup.sh` | Mise、Python、Node.js 和依赖迁移 | 配置 Shell 集成及每周 Mise 自动更新 |
 | 6 | `tools-setup.sh` | NextTrace、Speedtest、htop、jq、tree 等 | 可能添加 NextTrace 第三方 APT 源 |
@@ -89,6 +89,31 @@ SSH 模块要求系统已安装并运行 `openssh-server`；精简镜像请先�
 Docker 模块会按发行版自动选择 Docker 官方 Debian 或 Ubuntu APT 仓库。
 菜单编号由主脚本按模块顺序动态生成。模块元数据中的 `order=10`、`20` 等值仅用于排序，
 不是用户需要输入的编号。
+
+### 配置备份与恢复
+
+模块修改受管配置前会保留两级状态：
+
+```text
+*.initial-backup / *.initial-absent
+*.previous-backup / *.previous-absent
+```
+
+- `initial`：第一次可信修改前的配置；旧版没有记录且无法证明原始状态时标记为 `initial-unknown`，不会猜测；
+- `previous`：本次运行前的配置，每次运行更新一次；
+- 共享配置（Crontab、`.zshrc`、`.bashrc`）按模块分别保存状态，避免不同模块互相覆盖；
+- 恢复配置不会卸载软件包、内核、容器、Mise 运行时或用户数据。
+
+支持恢复子命令的模块默认恢复 `previous`；追加 `initial` 恢复首次可信状态：
+
+```bash
+sudo bash module.sh restore
+sudo bash module.sh restore initial
+```
+
+已经运行旧版脚本的服务器首次执行新版时，会先把当前配置保存为 `previous`。现有
+`initial-backup` 永不覆盖；无法确认的旧版初始状态会拒绝 `restore initial`，普通 `restore`
+仍可回到升级新版前的配置。
 
 ### 单独远程运行模块
 
@@ -110,7 +135,7 @@ sudo apt install -y curl wget git jq rsync sudo dnsutils cron psmisc locales gpg
 ```bash
 RAW_BASE="https://raw.githubusercontent.com/LucaLin233/Linux/main/modules"
 
-# 1. Zram、时区和 Chrony
+# 1. Zram、系统调优、journald、THP、时区和 Chrony
 sudo bash <(curl -fsSL "$RAW_BASE/system-optimize.sh")
 
 # 2. 欢迎信息、中文环境和可选 XanMod
@@ -138,6 +163,14 @@ sudo bash <(curl -fsSL "$RAW_BASE/auto-update-setup.sh")
 sudo bash <(curl -fsSL "$RAW_BASE/ssh-security.sh")
 ```
 
+`system-optimize.sh` 的 `restore` 只恢复该模块管理的配置和关联运行值，不卸载已安装软件：
+
+```bash
+RAW_BASE="https://raw.githubusercontent.com/LucaLin233/Linux/main/modules"
+sudo bash <(curl -fsSL "$RAW_BASE/system-optimize.sh") restore
+sudo bash <(curl -fsSL "$RAW_BASE/system-optimize.sh") restore initial
+```
+
 `system-customize.sh` 支持只运行指定功能：
 
 ```bash
@@ -162,6 +195,7 @@ sudo bash <(curl -fsSL "$RAW_BASE/network-optimize.sh") \
 
 bash <(curl -fsSL "$RAW_BASE/network-optimize.sh") status
 sudo bash <(curl -fsSL "$RAW_BASE/network-optimize.sh") restore
+sudo bash <(curl -fsSL "$RAW_BASE/network-optimize.sh") restore initial
 bash <(curl -fsSL "$RAW_BASE/network-optimize.sh") help
 ```
 
@@ -316,12 +350,14 @@ sudo bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/t
 | 仅安装 XanMod | `xanmod-install.sh` | 同时让多个脚本反复管理内核源 |
 
 `network-optimize.sh` 与 `traffic-shape.sh` 职责不同，可以配合：前者管理 BBR、缓冲区和默认
-`fq`，后者在确实检测到 policer 后才使用 HTB 控制聚合出口速率，并保留 fq 叶子 pacing。
+`fq`、RA 安全的 IPv6 转发和按能力启用的 TCP/Conntrack 参数，后者在确实检测到 policer 后才使用 HTB 控制聚合出口速率，并保留 fq 叶子 pacing。
 
 ## 高风险提醒
 
 - **SSH**：修改端口或认证前，先放行云安全组/防火墙，并保持当前会话直到新连接验证成功；
 - **自动更新**：系统或内核更新后可能自动重启；
+- **系统优化**：首次写入 journald 限额时会重启 `systemd-journald`，并设置 Kernel Panic 30 秒后重启；
+- **IPv6 转发**：网络模块会使用 `accept_ra=2` 保留云平台 RA，但仍需确认云安全组和主机防火墙允许预期的 IPv6 流量；
 - **网络测速**：`network-optimize` 和 tcshape 都可能产生大量流量；
 - **qdisc**：不要叠加多个整形工具；tcshape 遇到高级或未知 qdisc 会拒绝覆盖；
 - **内核**：安装新内核前确认磁盘空间、架构和可用的旧内核；

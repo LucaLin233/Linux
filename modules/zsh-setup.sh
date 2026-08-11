@@ -16,6 +16,11 @@ readonly PLUGINS_DIR="$CUSTOM_DIR/plugins"
 readonly ZSHRC_FILE="$HOME/.zshrc"
 readonly ZSHRC_INITIAL_BACKUP="$HOME/.zshrc.initial-backup"
 readonly ZSHRC_PREVIOUS_BACKUP="$HOME/.zshrc.previous-backup"
+readonly ZSHRC_INITIAL_ABSENT="$HOME/.zshrc.initial-absent"
+readonly ZSHRC_INITIAL_UNKNOWN="$HOME/.zshrc.initial-unknown"
+readonly ZSHRC_PREVIOUS_ABSENT="$HOME/.zshrc.previous-absent"
+readonly P10K_FILE="$HOME/.p10k.zsh"
+readonly ZSH_STATE_DIR="/var/lib/linux-setup/zsh"
 
 # === 日志函数 ===
 log() {
@@ -39,14 +44,58 @@ debug_log() {
 
 # === 辅助函数 ===
 backup_zshrc() {
-    [[ -f "$ZSHRC_FILE" ]] || return 0
-
-    if [[ ! -f "$ZSHRC_INITIAL_BACKUP" ]]; then
-        cp -a "$ZSHRC_FILE" "$ZSHRC_INITIAL_BACKUP" || return 1
+    if [[ ! -e "$ZSHRC_INITIAL_BACKUP" && ! -e "$ZSHRC_INITIAL_ABSENT" &&
+        ! -e "$ZSHRC_INITIAL_UNKNOWN" ]]; then
+        if [[ -f "$ZSHRC_FILE" ]] && grep -Fq '此文件由 zsh-setup.sh 自动生成' "$ZSHRC_FILE"; then
+            install -m 0600 /dev/null "$ZSHRC_INITIAL_UNKNOWN" || return 1
+        elif [[ -f "$ZSHRC_FILE" ]]; then
+            cp -a "$ZSHRC_FILE" "$ZSHRC_INITIAL_BACKUP" || return 1
+        else
+            install -m 0600 /dev/null "$ZSHRC_INITIAL_ABSENT" || return 1
+        fi
     fi
 
-    cp -a "$ZSHRC_FILE" "$ZSHRC_PREVIOUS_BACKUP" || return 1
-    chmod 600 "$ZSHRC_INITIAL_BACKUP" "$ZSHRC_PREVIOUS_BACKUP" 2>/dev/null || true
+    rm -f "$ZSHRC_PREVIOUS_BACKUP" "$ZSHRC_PREVIOUS_ABSENT"
+    if [[ -f "$ZSHRC_FILE" ]]; then
+        cp -a "$ZSHRC_FILE" "$ZSHRC_PREVIOUS_BACKUP" || return 1
+        chmod 600 "$ZSHRC_PREVIOUS_BACKUP" 2>/dev/null || true
+    else
+        install -m 0600 /dev/null "$ZSHRC_PREVIOUS_ABSENT" || return 1
+    fi
+}
+
+backup_zsh_auxiliary_state() {
+    local current_shell
+
+    install -d -m 0700 "$ZSH_STATE_DIR"
+    if [[ -e "$ZSHRC_INITIAL_UNKNOWN" ]]; then
+        [[ -e "$ZSH_STATE_DIR/p10k.initial-unknown" ]] || install -m 0600 /dev/null "$ZSH_STATE_DIR/p10k.initial-unknown"
+        [[ -e "$ZSH_STATE_DIR/shell.initial-unknown" ]] || install -m 0600 /dev/null "$ZSH_STATE_DIR/shell.initial-unknown"
+    fi
+    if [[ ! -e "$ZSH_STATE_DIR/p10k.initial-backup" && ! -e "$ZSH_STATE_DIR/p10k.initial-absent" &&
+        ! -e "$ZSH_STATE_DIR/p10k.initial-unknown" ]]; then
+        if [[ -f "$P10K_FILE" ]]; then
+            cp -a "$P10K_FILE" "$ZSH_STATE_DIR/p10k.initial-backup" || return 1
+        else
+            install -m 0600 /dev/null "$ZSH_STATE_DIR/p10k.initial-absent" || return 1
+        fi
+    fi
+    rm -f "$ZSH_STATE_DIR/p10k.previous-backup" "$ZSH_STATE_DIR/p10k.previous-absent"
+    if [[ -f "$P10K_FILE" ]]; then
+        cp -a "$P10K_FILE" "$ZSH_STATE_DIR/p10k.previous-backup" || return 1
+    else
+        install -m 0600 /dev/null "$ZSH_STATE_DIR/p10k.previous-absent" || return 1
+    fi
+
+    current_shell=$(getent passwd root 2>/dev/null | cut -d: -f7)
+    if [[ ! -f "$ZSH_STATE_DIR/shell.initial" && ! -f "$ZSH_STATE_DIR/shell.initial-unknown" ]]; then
+        printf '%s
+' "$current_shell" > "$ZSH_STATE_DIR/shell.initial"
+        chmod 600 "$ZSH_STATE_DIR/shell.initial"
+    fi
+    printf '%s
+' "$current_shell" > "$ZSH_STATE_DIR/shell.previous"
+    chmod 600 "$ZSH_STATE_DIR/shell.previous"
 }
 
 install_oh_my_zsh() {
@@ -436,7 +485,7 @@ setup_theme() {
             ;;
         6)
             echo "主题: 配置向导（首次进入 Zsh 时启动）"
-            rm -f "$HOME/.p10k.zsh"
+            rm -f "$P10K_FILE"
             return 0
             ;;
         *)
@@ -449,8 +498,8 @@ setup_theme() {
         --connect-timeout 10 \
         --max-time 30 \
         "$config_url" \
-        -o "$HOME/.p10k.zsh"; then
-        chmod 644 "$HOME/.p10k.zsh" 2>/dev/null || true
+        -o "$P10K_FILE"; then
+        chmod 644 "$P10K_FILE" 2>/dev/null || true
         return 0
     fi
 
@@ -495,6 +544,7 @@ main() {
     # 先备份，确保 Oh My Zsh 安装器或后续完整生成配置前，
     # 已保存本次执行前的 .zshrc。
     backup_zshrc || exit 1
+    backup_zsh_auxiliary_state || exit 1
 
     echo
     if ! install_components; then

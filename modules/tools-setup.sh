@@ -18,6 +18,29 @@ readonly NEXTTRACE_INSTALLER_URL="https://nxtrace.org/nt"
 APT_UPDATED=false
 NEXTTRACE_BACKUP_PATH=""
 
+backup_managed_file() {
+    local target="$1"
+    local initial_backup="${target}.initial-backup"
+    local previous_backup="${target}.previous-backup"
+    local initial_absent="${target}.initial-absent"
+    local previous_absent="${target}.previous-absent"
+    local initial_unknown="${target}.initial-unknown"
+
+    if [[ ! -e "$initial_backup" && ! -e "$initial_absent" && ! -e "$initial_unknown" ]]; then
+        if [[ -e "$target" || -L "$target" ]]; then
+            cp -a "$target" "$initial_backup" || return 1
+        else
+            install -D -m 0600 /dev/null "$initial_absent" || return 1
+        fi
+    fi
+    rm -f "$previous_backup" "$previous_absent"
+    if [[ -e "$target" || -L "$target" ]]; then
+        cp -a "$target" "$previous_backup" || return 1
+    else
+        install -D -m 0600 /dev/null "$previous_absent" || return 1
+    fi
+}
+
 # === 日志函数 ===
 log() {
     local msg="$1"
@@ -189,12 +212,22 @@ nexttrace_source_configured() {
 configure_nexttrace_repository() {
     local key_temp=""
     local attempt
+    local managed_file
 
     if nexttrace_source_configured; then
+        for managed_file in "$NEXTTRACE_KEYRING" "$NEXTTRACE_SOURCE"; do
+            if [[ ! -e "${managed_file}.initial-backup" && ! -e "${managed_file}.initial-absent" &&
+                ! -e "${managed_file}.initial-unknown" ]]; then
+                install -D -m 0600 /dev/null "${managed_file}.initial-unknown"
+            fi
+            backup_managed_file "$managed_file" || return 1
+        done
         return 0
     fi
 
     install -d -m 0755 /etc/apt/keyrings
+    backup_managed_file "$NEXTTRACE_KEYRING" || return 1
+    backup_managed_file "$NEXTTRACE_SOURCE" || return 1
 
     if ! key_temp=$(mktemp); then
         log "无法创建 NextTrace 密钥临时文件" "error"
@@ -502,7 +535,7 @@ main() {
     require_root
 
     local command_name
-    for command_name in apt-get curl dpkg grep install mktemp mv; do
+    for command_name in apt-get curl dpkg grep install mktemp mv cp; do
         if ! command -v "$command_name" >/dev/null 2>&1; then
             log "缺少必要命令: $command_name" "error"
             exit 1

@@ -13,7 +13,6 @@ readonly DOCKER_KEYRING="/etc/apt/keyrings/docker.asc"
 readonly DOCKER_SOURCE="/etc/apt/sources.list.d/docker.sources"
 readonly DOCKER_DAEMON_DIR="/etc/docker"
 readonly DOCKER_DAEMON_CONFIG="$DOCKER_DAEMON_DIR/daemon.json"
-readonly DOCKER_DAEMON_INITIAL_BACKUP="$DOCKER_DAEMON_DIR/daemon.json.initial-backup"
 readonly DOCKER_DAEMON_PREVIOUS_BACKUP="$DOCKER_DAEMON_DIR/daemon.json.previous-backup"
 
 DOCKER_GPG_URL=""
@@ -28,6 +27,29 @@ readonly DOCKER_PACKAGES=(
 )
 
 APT_UPDATED=false
+
+backup_managed_file() {
+    local target="$1"
+    local initial_backup="${target}.initial-backup"
+    local previous_backup="${target}.previous-backup"
+    local initial_absent="${target}.initial-absent"
+    local previous_absent="${target}.previous-absent"
+    local initial_unknown="${target}.initial-unknown"
+
+    if [[ ! -e "$initial_backup" && ! -e "$initial_absent" && ! -e "$initial_unknown" ]]; then
+        if [[ -e "$target" || -L "$target" ]]; then
+            cp -a "$target" "$initial_backup" || return 1
+        else
+            install -D -m 0600 /dev/null "$initial_absent" || return 1
+        fi
+    fi
+    rm -f "$previous_backup" "$previous_absent"
+    if [[ -e "$target" || -L "$target" ]]; then
+        cp -a "$target" "$previous_backup" || return 1
+    else
+        install -D -m 0600 /dev/null "$previous_absent" || return 1
+    fi
+}
 
 log() {
     local message="$1"
@@ -131,8 +153,16 @@ configure_docker_repository() {
     local codename
     local architecture
     local key_temp
+    local managed_file
 
     if docker_repository_configured; then
+        for managed_file in "$DOCKER_KEYRING" "$DOCKER_SOURCE"; do
+            if [[ ! -e "${managed_file}.initial-backup" && ! -e "${managed_file}.initial-absent" &&
+                ! -e "${managed_file}.initial-unknown" ]]; then
+                install -D -m 0600 /dev/null "${managed_file}.initial-unknown"
+            fi
+            backup_managed_file "$managed_file" || return 1
+        done
         return 0
     fi
 
@@ -143,6 +173,8 @@ configure_docker_repository() {
 
     architecture=$(dpkg --print-architecture)
     install -d -m 0755 /etc/apt/keyrings
+    backup_managed_file "$DOCKER_KEYRING" || return 1
+    backup_managed_file "$DOCKER_SOURCE" || return 1
 
     if ! key_temp=$(mktemp); then
         error "无法创建 Docker GPG 密钥临时文件"
@@ -328,14 +360,13 @@ is_log_rotation_configured() {
 }
 
 backup_daemon_config() {
-    [[ -f "$DOCKER_DAEMON_CONFIG" ]] || return 0
-
-    if [[ ! -f "$DOCKER_DAEMON_INITIAL_BACKUP" ]]; then
-        cp -a "$DOCKER_DAEMON_CONFIG" "$DOCKER_DAEMON_INITIAL_BACKUP" || return 1
+    if is_log_rotation_configured &&
+        [[ ! -e "${DOCKER_DAEMON_CONFIG}.initial-backup" &&
+            ! -e "${DOCKER_DAEMON_CONFIG}.initial-absent" &&
+            ! -e "${DOCKER_DAEMON_CONFIG}.initial-unknown" ]]; then
+        install -D -m 0600 /dev/null "${DOCKER_DAEMON_CONFIG}.initial-unknown"
     fi
-
-    cp -a "$DOCKER_DAEMON_CONFIG" "$DOCKER_DAEMON_PREVIOUS_BACKUP" || return 1
-    chmod 600 "$DOCKER_DAEMON_INITIAL_BACKUP" "$DOCKER_DAEMON_PREVIOUS_BACKUP" 2>/dev/null || true
+    backup_managed_file "$DOCKER_DAEMON_CONFIG"
 }
 
 restore_daemon_config() {

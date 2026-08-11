@@ -1,16 +1,20 @@
 #!/usr/bin/env bash
-# linux-setup:name=系统优化（Zram、时区、Chrony 时间同步）
+# linux-setup:name=系统优化（Zram、日志、THP、时间同步）
 # linux-setup:order=10
 # linux-setup:depends=
 # linux-setup:enabled=true
 # 系统优化模块
-# 功能：智能 Zram 配置、时区设置、Chrony 时间同步
+# 功能：智能 Zram、系统 sysctl、journald 限额、THP 策略、时区与 Chrony。
 
 set -euo pipefail
 
 # === 常量定义 ===
 readonly ZRAM_CONFIG="/etc/systemd/zram-generator.conf"
 readonly SYSCTL_CONFIG="/etc/sysctl.d/99-zram.conf"
+readonly SYSTEM_TUNING_CONFIG="/etc/sysctl.d/99-system-optimize.conf"
+readonly JOURNALD_DROPIN="/etc/systemd/journald.conf.d/90-linux-setup.conf"
+readonly THP_CONFIG="/etc/tmpfiles.d/90-linux-setup-thp.conf"
+readonly STATE_DIR="/var/lib/linux-setup/system-optimize"
 readonly DEFAULT_TIMEZONE="Asia/Shanghai"
 readonly APT_LOCK_TIMEOUT=120
 readonly APT_LOCK_INTERVAL=5
@@ -31,6 +35,120 @@ log() {
     fi
 
     echo -e "${colors[$level]:-\033[0;32m}${msg}\033[0m" >&2
+}
+
+# === 配置文件备份与恢复 ===
+backup_managed_file() {
+    local target="$1"
+    local initial_backup="${target}.initial-backup"
+    local previous_backup="${target}.previous-backup"
+    local initial_absent="${target}.initial-absent"
+    local previous_absent="${target}.previous-absent"
+    local initial_unknown="${target}.initial-unknown"
+
+    if [[ ! -e "$initial_backup" && ! -e "$initial_absent" && ! -e "$initial_unknown" ]]; then
+        if [[ -e "$target" || -L "$target" ]]; then
+            cp -a "$target" "$initial_backup" || return 1
+        else
+            install -D -m 0600 /dev/null "$initial_absent" || return 1
+        fi
+    fi
+
+    rm -f "$previous_backup" "$previous_absent"
+    if [[ -e "$target" || -L "$target" ]]; then
+        cp -a "$target" "$previous_backup" || return 1
+    else
+        install -D -m 0600 /dev/null "$previous_absent" || return 1
+    fi
+}
+
+restore_managed_file() {
+    local target="$1"
+    local scope="$2"
+    local backup="${target}.${scope}-backup"
+    local absent="${target}.${scope}-absent"
+    local unknown="${target}.${scope}-unknown"
+
+    if [[ -e "$backup" || -L "$backup" ]]; then
+        install -d -m 0755 "$(dirname "$target")"
+        rm -f "$target"
+        cp -a "$backup" "$target"
+        return 0
+    fi
+
+    if [[ -e "$absent" ]]; then
+        rm -f "$target"
+        return 0
+    fi
+
+    if [[ -e "$unknown" ]]; then
+        log "初始状态未知，跳过恢复：$target" "warn"
+        return 2
+    fi
+
+    log "没有 $scope 配置状态，跳过恢复：$target" "warn"
+    return 2
+}
+
+prepare_legacy_backup_state() {
+    local target
+    local marker
+
+    while IFS='|' read -r target marker; do
+        [[ -n "$target" ]] || continue
+        if [[ ! -e "${target}.initial-backup" && ! -e "${target}.initial-absent" &&
+            ! -e "${target}.initial-unknown" && -f "$target" ]] &&
+            grep -Fq "$marker" "$target"; then
+            install -D -m 0600 /dev/null "${target}.initial-unknown"
+        fi
+    done <<EOF
+$ZRAM_CONFIG|Zram 配置：由 system-optimize.sh 自动生成
+$SYSCTL_CONFIG|Zram 相关内核参数：由 system-optimize.sh 自动生成
+EOF
+}
+
+backup_system_configs() {
+    local target
+
+    prepare_legacy_backup_state
+    for target in \
+        "$ZRAM_CONFIG" \
+        "$SYSCTL_CONFIG" \
+        "$SYSTEM_TUNING_CONFIG" \
+        "$JOURNALD_DROPIN" \
+        "$THP_CONFIG"; do
+        backup_managed_file "$target" || return 1
+    done
+}
+
+capture_sysctl_values() {
+    local config_file="$1"
+    local output_file="$2"
+    local key
+
+    : > "$output_file"
+    [[ -f "$config_file" ]] || return 0
+
+    while IFS='=' read -r key _; do
+        key="${key//[[:space:]]/}"
+        [[ -n "$key" && "$key" != \#* ]] || continue
+        if sysctl -n "$key" >/dev/null 2>&1; then
+            printf '%s=%s\n' "$key" "$(sysctl -n "$key")" >> "$output_file"
+        fi
+    done < "$config_file"
+}
+
+restore_sysctl_values() {
+    local values_file="$1"
+    local key
+    local value
+
+    [[ -f "$values_file" ]] || return 0
+    while IFS='=' read -r key value; do
+        [[ -n "$key" ]] || continue
+        sysctl -w "$key=$value" >/dev/null 2>&1 ||
+            log "运行值恢复失败：$key" "warn"
+    done < "$values_file"
 }
 
 # === APT 锁处理 ===
@@ -434,6 +552,193 @@ setup_zram() {
     show_swap_status
 }
 
+# === 通用系统调优 ===
+setup_system_tuning() {
+    local file_max
+    local temp_file
+
+    file_max=$(cat /proc/sys/fs/file-max 2>/dev/null || echo 0)
+    [[ "$file_max" =~ ^[0-9]+$ ]] || file_max=0
+    (( file_max < 1048576 )) && file_max=1048576
+
+    temp_file=$(mktemp) || return 1
+    cat > "$temp_file" <<EOF
+# 由 system-optimize.sh 自动生成。
+# Headless VPS 在 Kernel Panic 后等待 30 秒自动重启。
+kernel.panic = 30
+
+# 不降低管理员已经设置的更高系统文件句柄上限。
+fs.file-max = $file_max
+EOF
+
+    capture_sysctl_values "$temp_file" "$STATE_DIR/system-tuning.previous-runtime" || {
+        rm -f "$temp_file"
+        return 1
+    }
+    if [[ ! -f "$STATE_DIR/system-tuning.initial-runtime" ]]; then
+        install -m 0600 "$STATE_DIR/system-tuning.previous-runtime" \
+            "$STATE_DIR/system-tuning.initial-runtime" || {
+            rm -f "$temp_file"
+            return 1
+        }
+    fi
+
+    install -D -m 0644 "$temp_file" "$SYSTEM_TUNING_CONFIG"
+    rm -f "$temp_file"
+    if ! sysctl -p "$SYSTEM_TUNING_CONFIG" >/dev/null; then
+        restore_managed_file "$SYSTEM_TUNING_CONFIG" previous || true
+        restore_sysctl_values "$STATE_DIR/system-tuning.previous-runtime"
+        return 1
+    fi
+}
+
+setup_journald_limits() {
+    local temp_file
+
+    temp_file=$(mktemp) || return 1
+    cat > "$temp_file" <<'EOF'
+# 由 system-optimize.sh 自动生成。
+[Journal]
+SystemMaxUse=256M
+SystemKeepFree=512M
+RuntimeMaxUse=64M
+MaxRetentionSec=7day
+EOF
+
+    if [[ -f "$JOURNALD_DROPIN" ]] && cmp -s "$temp_file" "$JOURNALD_DROPIN"; then
+        rm -f "$temp_file"
+        return 0
+    fi
+
+    install -D -m 0644 "$temp_file" "$JOURNALD_DROPIN"
+    rm -f "$temp_file"
+
+    # journald 没有稳定的独立配置校验命令；cat-config 至少确认 drop-in 可被发现。
+    if command -v systemd-analyze >/dev/null 2>&1; then
+        systemd-analyze cat-config systemd/journald.conf >/dev/null
+    fi
+
+    if ! systemctl restart systemd-journald ||
+        ! systemctl is-active --quiet systemd-journald; then
+        restore_managed_file "$JOURNALD_DROPIN" previous || true
+        systemctl restart systemd-journald >/dev/null 2>&1 || true
+        return 1
+    fi
+}
+
+get_active_thp_mode() {
+    local path="$1"
+    awk '{for (i=1; i<=NF; i++) if ($i ~ /^\[.*\]$/) {gsub(/[\[\]]/, "", $i); print $i; exit}}' "$path"
+}
+
+setup_thp_policy() {
+    local enabled_path="/sys/kernel/mm/transparent_hugepage/enabled"
+    local defrag_path="/sys/kernel/mm/transparent_hugepage/defrag"
+    local enabled_mode
+    local defrag_mode
+    local enabled_target
+    local defrag_target
+
+    [[ -e "$enabled_path" ]] || return 0
+
+    enabled_mode=$(get_active_thp_mode "$enabled_path")
+    case "$enabled_mode" in always|madvise|never) ;; *) return 1 ;; esac
+    enabled_target="$enabled_mode"
+    [[ "$enabled_mode" == "always" ]] && enabled_target="madvise"
+
+    defrag_mode=""
+    defrag_target=""
+    if [[ -e "$defrag_path" ]]; then
+        defrag_mode=$(get_active_thp_mode "$defrag_path")
+        case "$defrag_mode" in always|defer|defer+madvise|madvise|never) ;; *) return 1 ;; esac
+        defrag_target="$defrag_mode"
+        case "$defrag_mode" in
+            always|defer) defrag_target="defer+madvise" ;;
+        esac
+    fi
+
+    printf '%s\n' "$enabled_mode" > "$STATE_DIR/thp-enabled.previous-runtime"
+    printf '%s\n' "$defrag_mode" > "$STATE_DIR/thp-defrag.previous-runtime"
+    chmod 600 "$STATE_DIR"/thp-*.previous-runtime
+    if [[ ! -f "$STATE_DIR/thp-enabled.initial-runtime" ]]; then
+        cp -a "$STATE_DIR/thp-enabled.previous-runtime" "$STATE_DIR/thp-enabled.initial-runtime"
+        cp -a "$STATE_DIR/thp-defrag.previous-runtime" "$STATE_DIR/thp-defrag.initial-runtime"
+    fi
+
+    install -d -m 0755 "$(dirname "$THP_CONFIG")"
+    {
+        echo "# 由 system-optimize.sh 自动生成。"
+        printf 'w- %s - - - - %s\n' "$enabled_path" "$enabled_target"
+        if [[ -n "$defrag_target" ]]; then
+            printf 'w- %s - - - - %s\n' "$defrag_path" "$defrag_target"
+        fi
+    } > "$THP_CONFIG"
+    chmod 644 "$THP_CONFIG"
+
+    if ! printf '%s\n' "$enabled_target" > "$enabled_path"; then
+        restore_managed_file "$THP_CONFIG" previous || true
+        return 1
+    fi
+    if [[ -n "$defrag_target" ]] &&
+        ! printf '%s\n' "$defrag_target" > "$defrag_path"; then
+        printf '%s\n' "$enabled_mode" > "$enabled_path" 2>/dev/null || true
+        restore_managed_file "$THP_CONFIG" previous || true
+        return 1
+    fi
+}
+
+restore_system_configs() {
+    local scope="${1:-previous}"
+    local target
+    local restored=false
+    local runtime_scope="$scope"
+    local thp_value
+
+    case "$scope" in previous|initial) ;; *)
+        log "恢复范围必须是 previous 或 initial" "error"
+        return 1
+    esac
+
+    for target in \
+        "$ZRAM_CONFIG" \
+        "$SYSCTL_CONFIG" \
+        "$SYSTEM_TUNING_CONFIG" \
+        "$JOURNALD_DROPIN" \
+        "$THP_CONFIG"; do
+        if restore_managed_file "$target" "$scope"; then
+            restored=true
+        fi
+    done
+
+    [[ "$restored" == "true" ]] || {
+        log "没有可恢复的可信配置" "error"
+        return 1
+    }
+
+    if [[ -f "$SYSCTL_CONFIG" ]]; then
+        sysctl -p "$SYSCTL_CONFIG" >/dev/null || log "Zram sysctl 恢复后部分参数应用失败" "warn"
+    fi
+    if [[ -f "$SYSTEM_TUNING_CONFIG" ]]; then
+        sysctl -p "$SYSTEM_TUNING_CONFIG" >/dev/null || log "系统 sysctl 恢复后部分参数应用失败" "warn"
+    fi
+    restore_sysctl_values "$STATE_DIR/system-tuning.${runtime_scope}-runtime"
+
+    if [[ -e /sys/kernel/mm/transparent_hugepage/enabled &&
+        -f "$STATE_DIR/thp-enabled.${runtime_scope}-runtime" ]]; then
+        thp_value=$(< "$STATE_DIR/thp-enabled.${runtime_scope}-runtime")
+        [[ -n "$thp_value" ]] && printf '%s\n' "$thp_value" > /sys/kernel/mm/transparent_hugepage/enabled
+    fi
+    if [[ -e /sys/kernel/mm/transparent_hugepage/defrag &&
+        -f "$STATE_DIR/thp-defrag.${runtime_scope}-runtime" ]]; then
+        thp_value=$(< "$STATE_DIR/thp-defrag.${runtime_scope}-runtime")
+        [[ -n "$thp_value" ]] && printf '%s\n' "$thp_value" > /sys/kernel/mm/transparent_hugepage/defrag
+    fi
+
+    systemctl daemon-reload
+    systemctl restart systemd-journald
+    log "系统配置已恢复到 $scope 状态；Zram 设备大小将在下次安全重启后完全按恢复配置生效" "success"
+}
+
 # === 时区配置 ===
 setup_timezone() {
     local current_tz
@@ -544,6 +849,9 @@ setup_chrony() {
 
 # === 主流程 ===
 main() {
+    local action="${1:-install}"
+    local restore_scope="${2:-previous}"
+
     if (( EUID != 0 )); then
         log "需要 root 权限运行" "error"
         exit 1
@@ -551,7 +859,7 @@ main() {
 
     local command_name
     for command_name in apt-cache apt-get awk depmod dpkg dpkg-query fuser modprobe \
-        swapon systemctl timedatectl uname; do
+        swapon systemctl timedatectl uname cp install dirname sysctl cmp; do
         if ! command -v "$command_name" >/dev/null 2>&1; then
             log "缺少必要命令: $command_name" "error"
             exit 1
@@ -561,7 +869,29 @@ main() {
     export SYSTEMD_PAGER=""
     export PAGER=""
 
+    if [[ "$action" == "restore" ]]; then
+        if (( $# > 2 )); then
+            log "用法：system-optimize.sh restore [initial]" "error"
+            exit 1
+        fi
+        case "$restore_scope" in previous|initial) ;; *)
+            log "恢复范围必须是 previous 或 initial" "error"
+            exit 1
+        esac
+        restore_system_configs "$restore_scope"
+        return
+    fi
+    if [[ "$action" != "install" ]]; then
+        log "未知命令：$action" "error"
+        exit 1
+    fi
+
     wait_for_apt || exit 1
+    install -d -m 0700 "$STATE_DIR"
+    backup_system_configs || {
+        log "系统配置备份失败，拒绝继续修改" "error"
+        exit 1
+    }
 
     log "🔧 智能系统优化配置..." "info"
 
@@ -569,6 +899,11 @@ main() {
 
     echo
     setup_zram || { log "Zram 配置失败，继续执行后续项目" "warn"; degraded=true; }
+
+    echo
+    setup_system_tuning || { log "系统 sysctl 调优失败" "warn"; degraded=true; }
+    setup_journald_limits || { log "journald 限额配置失败" "warn"; degraded=true; }
+    setup_thp_policy || { log "THP 策略配置失败" "warn"; degraded=true; }
 
     echo
     setup_timezone || { log "时区配置失败，继续执行后续项目" "warn"; degraded=true; }

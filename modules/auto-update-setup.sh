@@ -15,6 +15,7 @@ readonly UPDATE_LOCK="/var/lock/auto-update.lock"
 
 readonly DEFAULT_CRON="0 2 * * 0"
 readonly CRON_COMMENT="# Auto-update managed by linux_setup"
+readonly STATE_DIR="/var/lib/linux-setup/auto-update"
 
 readonly APT_LOCK_TIMEOUT=1800
 readonly APT_LOCK_INTERVAL=10
@@ -47,6 +48,51 @@ require_root() {
     if (( EUID != 0 )); then
         log "需要 root 权限运行" "error"
         exit 1
+    fi
+}
+
+backup_managed_file() {
+    local target="$1"
+    local initial_backup="${target}.initial-backup"
+    local previous_backup="${target}.previous-backup"
+    local initial_absent="${target}.initial-absent"
+    local previous_absent="${target}.previous-absent"
+    local initial_unknown="${target}.initial-unknown"
+
+    if [[ ! -e "$initial_backup" && ! -e "$initial_absent" && ! -e "$initial_unknown" ]]; then
+        if [[ -e "$target" || -L "$target" ]]; then
+            cp -a "$target" "$initial_backup" || return 1
+        else
+            install -D -m 0600 /dev/null "$initial_absent" || return 1
+        fi
+    fi
+    rm -f "$previous_backup" "$previous_absent"
+    if [[ -e "$target" || -L "$target" ]]; then
+        cp -a "$target" "$previous_backup" || return 1
+    else
+        install -D -m 0600 /dev/null "$previous_absent" || return 1
+    fi
+}
+
+backup_managed_cron_entries() {
+    local snapshot
+    install -d -m 0700 "$STATE_DIR"
+    snapshot=$(crontab -l 2>/dev/null | grep -E "$(printf '%s|%s' "$CRON_COMMENT" "$UPDATE_SCRIPT")" || true)
+    if [[ ! -e "$STATE_DIR/cron.initial" && ! -e "$STATE_DIR/cron.initial-absent" &&
+        ! -e "$STATE_DIR/cron.initial-unknown" ]]; then
+        if [[ -n "$snapshot" ]]; then
+            install -m 0600 /dev/null "$STATE_DIR/cron.initial-unknown"
+        else
+            install -m 0600 /dev/null "$STATE_DIR/cron.initial-absent"
+        fi
+    fi
+    rm -f "$STATE_DIR/cron.previous" "$STATE_DIR/cron.previous-absent"
+    if [[ -n "$snapshot" ]]; then
+        printf '%s
+' "$snapshot" > "$STATE_DIR/cron.previous"
+        chmod 600 "$STATE_DIR/cron.previous"
+    else
+        install -m 0600 /dev/null "$STATE_DIR/cron.previous-absent"
     fi
 }
 
@@ -409,7 +455,7 @@ main() {
     require_root
 
     local command
-    for command in apt-get crontab flock fuser systemctl mktemp find sort dpkg; do
+    for command in apt-get crontab flock fuser systemctl mktemp find sort dpkg install cp; do
         if ! command -v "$command" >/dev/null 2>&1; then
             log "缺少必要命令: $command" "error"
             exit 1
@@ -427,6 +473,13 @@ main() {
 
     echo
     ensure_cron_installed || exit 1
+    if [[ -f "$UPDATE_SCRIPT" ]] && grep -Fq '由 auto-update-setup.sh 自动生成' "$UPDATE_SCRIPT" &&
+        [[ ! -e "${UPDATE_SCRIPT}.initial-backup" && ! -e "${UPDATE_SCRIPT}.initial-absent" &&
+            ! -e "${UPDATE_SCRIPT}.initial-unknown" ]]; then
+        install -m 0600 /dev/null "${UPDATE_SCRIPT}.initial-unknown"
+    fi
+    backup_managed_file "$UPDATE_SCRIPT" || exit 1
+    backup_managed_cron_entries || exit 1
 
     echo
     create_update_script || exit 1

@@ -110,10 +110,30 @@ ensure_package() {
     fi
 }
 
-backup_initial_file() {
+backup_managed_file() {
     local file="$1"
-    [[ -e "$file" ]] || return 0
-    [[ -e "${file}.initial-backup" ]] || cp -a "$file" "${file}.initial-backup"
+    local initial_backup="${file}.initial-backup"
+    local previous_backup="${file}.previous-backup"
+    local initial_absent="${file}.initial-absent"
+    local previous_absent="${file}.previous-absent"
+    local initial_unknown="${file}.initial-unknown"
+
+    if [[ ! -e "$initial_backup" && ! -e "$initial_absent" && ! -e "$initial_unknown" ]]; then
+        if [[ -f "$file" ]] && grep -Fq '由 system-customize.sh 自动生成' "$file"; then
+            install -D -m 0600 /dev/null "$initial_unknown" || return 1
+        elif [[ -e "$file" || -L "$file" ]]; then
+            cp -a "$file" "$initial_backup" || return 1
+        else
+            install -D -m 0600 /dev/null "$initial_absent" || return 1
+        fi
+    fi
+
+    rm -f "$previous_backup" "$previous_absent"
+    if [[ -e "$file" || -L "$file" ]]; then
+        cp -a "$file" "$previous_backup" || return 1
+    else
+        install -D -m 0600 /dev/null "$previous_absent" || return 1
+    fi
 }
 
 # === 动态欢迎信息 ===
@@ -126,15 +146,18 @@ configure_motd() {
     install -d -m 0755 /etc/update-motd.d
     info "配置动态欢迎信息..."
 
-    backup_initial_file /etc/motd || return 1
-    backup_initial_file /etc/issue || return 1
-    backup_initial_file /etc/issue.net || return 1
+    backup_managed_file /etc/motd || return 1
+    backup_managed_file /etc/issue || return 1
+    backup_managed_file /etc/issue.net || return 1
     : > /etc/motd
     : > /etc/issue
     : > /etc/issue.net
 
+    backup_managed_file "$MOTD_SCRIPT" || return 1
+
     local file
     for file in /etc/update-motd.d/10-uname /etc/update-motd.d/50-motd-news; do
+        backup_managed_file "$file" || return 1
         if [[ -x "$file" ]]; then
             chmod -x "$file"
             info "已禁用原生 MOTD 脚本: $(basename "$file")"
@@ -308,9 +331,9 @@ configure_chinese_locale() {
         error "未找到 update-locale，locales 安装可能不完整"
         return 1
     fi
-    backup_initial_file /etc/locale.gen || return 1
-    backup_initial_file /etc/locale.conf || return 1
-    backup_initial_file /etc/default/locale || return 1
+    backup_managed_file /etc/locale.gen || return 1
+    backup_managed_file /etc/locale.conf || return 1
+    backup_managed_file /etc/default/locale || return 1
 
     info "配置中文 Locale..."
 
@@ -664,6 +687,7 @@ configure_xanmod_repository() {
     local source_new="${XANMOD_SOURCE_DEB822}.new"
     local repository
     local selected_repository=""
+    local managed_file
 
     ensure_package "gpg" "gpg" || return 1
     codename=$(get_os_codename) || {
@@ -677,6 +701,18 @@ configure_xanmod_repository() {
     fi
 
     install -d -m 0755 /etc/apt/keyrings
+    if { [[ -f "$XANMOD_SOURCE_DEB822" ]] && grep -Fq "Signed-By: $XANMOD_KEYRING" "$XANMOD_SOURCE_DEB822"; } ||
+        { [[ -f "$XANMOD_SOURCE_LIST" ]] && grep -Fq 'xanmod' "$XANMOD_SOURCE_LIST"; }; then
+        for managed_file in "$XANMOD_KEYRING" "$XANMOD_SOURCE_LIST" "$XANMOD_SOURCE_DEB822"; do
+            if [[ ! -e "${managed_file}.initial-backup" && ! -e "${managed_file}.initial-absent" &&
+                ! -e "${managed_file}.initial-unknown" ]]; then
+                install -D -m 0600 /dev/null "${managed_file}.initial-unknown"
+            fi
+        done
+    fi
+    backup_managed_file "$XANMOD_KEYRING" || return 1
+    backup_managed_file "$XANMOD_SOURCE_LIST" || return 1
+    backup_managed_file "$XANMOD_SOURCE_DEB822" || return 1
     install_xanmod_key || return 1
 
     if source_file=$(get_xanmod_source_file); then

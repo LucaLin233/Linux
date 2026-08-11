@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# linux-setup:name=网络优化（BBR、fq、IPv4 转发）
+# linux-setup:name=网络优化（BBR、fq、双栈转发）
 # linux-setup:order=30
 # linux-setup:depends=
 # linux-setup:enabled=true
 # 网络优化模块
-# 功能：自动探测带宽、RTT 与内存，动态配置 BBR、fq、TCP 缓冲区及 IPv4 转发参数。
+# 功能：自动探测带宽、RTT 与内存，动态配置 BBR、fq、TCP 缓冲区及 RA 安全的双栈转发。
 # 无参数运行等同于 install：自动探测一次、立即应用，不创建定时任务。
 #
 # 用法：
@@ -29,7 +29,18 @@ set -euo pipefail
 readonly NETWORK_CONF="/etc/sysctl.d/99-network-optimize.conf"
 readonly NETWORK_INITIAL_BACKUP="/etc/sysctl.d/99-network-optimize.conf.initial-backup"
 readonly NETWORK_PREVIOUS_BACKUP="/etc/sysctl.d/99-network-optimize.conf.previous-backup"
+readonly NETWORK_INITIAL_ABSENT="/etc/sysctl.d/99-network-optimize.conf.initial-absent"
+readonly NETWORK_INITIAL_UNKNOWN="/etc/sysctl.d/99-network-optimize.conf.initial-unknown"
+readonly NETWORK_PREVIOUS_ABSENT="/etc/sysctl.d/99-network-optimize.conf.previous-absent"
 readonly BBR_MODULES_FILE="/etc/modules-load.d/network-optimize-bbr.conf"
+readonly BBR_MODULES_INITIAL_BACKUP="${BBR_MODULES_FILE}.initial-backup"
+readonly BBR_MODULES_PREVIOUS_BACKUP="${BBR_MODULES_FILE}.previous-backup"
+readonly BBR_MODULES_INITIAL_ABSENT="${BBR_MODULES_FILE}.initial-absent"
+readonly BBR_MODULES_INITIAL_UNKNOWN="${BBR_MODULES_FILE}.initial-unknown"
+readonly BBR_MODULES_PREVIOUS_ABSENT="${BBR_MODULES_FILE}.previous-absent"
+readonly RUNTIME_INITIAL_BACKUP="/var/lib/linux-setup/network-optimize.initial-runtime"
+readonly RUNTIME_INITIAL_UNKNOWN="/var/lib/linux-setup/network-optimize.initial-runtime-unknown"
+readonly RUNTIME_PREVIOUS_BACKUP="/var/lib/linux-setup/network-optimize.previous-runtime"
 readonly LOCK_FILE="/run/lock/network-optimize.lock"
 
 # 首选附近公共 iperf3 节点进行多流双向测速；Cloudflare 用于并行交叉验证和回退。
@@ -83,6 +94,7 @@ readonly AUTO_RTT_CALC_FLOOR_MS=150
 
 # 参数与计算结果。命令行参数优先于自动探测。
 COMMAND="install"
+RESTORE_SCOPE="previous"
 TUNING_MODE="auto"
 NO_PROBE="false"
 MANUAL_BANDWIDTH_MBPS=""
@@ -165,6 +177,52 @@ error() {
 
 success() {
     log "$1" "success"
+}
+
+
+backup_managed_file() {
+    local target="$1"
+    local initial_backup="$2"
+    local previous_backup="$3"
+    local initial_absent="$4"
+    local previous_absent="$5"
+
+    local initial_unknown="${initial_backup%.initial-backup}.initial-unknown"
+
+    if [[ ! -e "$initial_backup" && ! -e "$initial_absent" && ! -e "$initial_unknown" ]]; then
+        if [[ -e "$target" || -L "$target" ]]; then
+            cp -a "$target" "$initial_backup" || return 1
+        else
+            install -D -m 0600 /dev/null "$initial_absent" || return 1
+        fi
+    fi
+
+    rm -f "$previous_backup" "$previous_absent"
+    if [[ -e "$target" || -L "$target" ]]; then
+        cp -a "$target" "$previous_backup" || return 1
+    else
+        install -D -m 0600 /dev/null "$previous_absent" || return 1
+    fi
+}
+
+restore_managed_file() {
+    local target="$1"
+    local backup="$2"
+    local absent="$3"
+
+    if [[ -e "$backup" || -L "$backup" ]]; then
+        install -d -m 0755 "$(dirname "$target")"
+        rm -f "$target"
+        cp -a "$backup" "$target"
+        return 0
+    fi
+
+    if [[ -e "$absent" ]]; then
+        rm -f "$target"
+        return 0
+    fi
+
+    return 1
 }
 
 require_root() {
@@ -348,6 +406,14 @@ parse_arguments() {
                 ;;
             --no-probe)
                 NO_PROBE="true"
+                shift
+                ;;
+            initial)
+                if [[ "$COMMAND" != "restore" ]]; then
+                    error "initial 只能用于 restore"
+                    return 1
+                fi
+                RESTORE_SCOPE="initial"
                 shift
                 ;;
             --help|-h)
@@ -1317,6 +1383,103 @@ show_tuning_plan() {
 }
 
 # === 新版网络配置 ===
+append_supported_tcp_settings() {
+    local target_file="$1"
+
+    cat >> "$target_file" <<'EOF'
+
+# TCP 自动调节与基础抗压
+net.ipv4.tcp_moderate_rcvbuf = 1
+net.ipv4.tcp_window_scaling = 1
+net.ipv4.tcp_syncookies = 1
+net.ipv4.tcp_notsent_lowat = 131072
+EOF
+
+    if [[ -e /proc/sys/net/ipv4/tcp_shrink_window ]]; then
+        echo "net.ipv4.tcp_shrink_window = 1" >> "$target_file"
+    fi
+
+    if [[ -e /proc/sys/net/ipv4/tcp_collapse_max_bytes ]]; then
+        echo "net.ipv4.tcp_collapse_max_bytes = 6291456" >> "$target_file"
+    fi
+}
+
+append_ipv6_forwarding_config() {
+    local target_file="$1"
+    local interface
+    local -a interfaces=()
+
+    [[ -e /proc/sys/net/ipv6/conf/all/forwarding ]] || return 0
+    [[ -e /proc/sys/net/ipv6/conf/all/accept_ra ]] || return 0
+
+    # accept_ra=2 必须先于 forwarding=1 应用。这样 AWS、Azure 等依赖 RA
+    # 提供默认路由或前缀的主机，在启用转发后仍继续接收 RA。
+    cat >> "$target_file" <<'EOF'
+
+# IPv6 转发；保留云平台 Router Advertisement
+net.ipv6.conf.all.accept_ra = 2
+net.ipv6.conf.default.accept_ra = 2
+EOF
+
+    while IFS= read -r interface; do
+        [[ "$interface" =~ ^[A-Za-z0-9_-]+$ ]] || continue
+        [[ "$interface" != "lo" ]] || continue
+        [[ -e "/proc/sys/net/ipv6/conf/$interface/accept_ra" ]] || continue
+        interfaces+=("$interface")
+    done < <(
+        {
+            ip -o -6 route show default 2>/dev/null | awk '{for (i=1; i<=NF; i++) if ($i == "dev") print $(i+1)}'
+            ip -o -6 address show scope global 2>/dev/null | awk '{print $2}'
+        } | sort -u
+    )
+
+    for interface in "${interfaces[@]}"; do
+        echo "net.ipv6.conf.${interface}.accept_ra = 2" >> "$target_file"
+    done
+
+    cat >> "$target_file" <<'EOF'
+net.ipv6.conf.default.forwarding = 1
+net.ipv6.conf.all.forwarding = 1
+EOF
+}
+
+append_adaptive_capacity_settings() {
+    local target_file="$1"
+    local current_conntrack
+    local target_conntrack
+    local peak_bandwidth=0
+
+    if [[ -n "${DETECTED_DOWNLOAD_MBPS:-}" ]] && (( DETECTED_DOWNLOAD_MBPS > peak_bandwidth )); then
+        peak_bandwidth="$DETECTED_DOWNLOAD_MBPS"
+    fi
+    if [[ -n "${DETECTED_UPLOAD_MBPS:-}" ]] && (( DETECTED_UPLOAD_MBPS > peak_bandwidth )); then
+        peak_bandwidth="$DETECTED_UPLOAD_MBPS"
+    fi
+
+    if (( peak_bandwidth >= 2500 )) && [[ -e /proc/sys/net/core/netdev_budget ]]; then
+        cat >> "$target_file" <<'EOF'
+
+# 高带宽链路增加单轮 NAPI 数据包预算
+net.core.netdev_budget = 600
+EOF
+    fi
+
+    if [[ -e /proc/sys/net/netfilter/nf_conntrack_max ]]; then
+        current_conntrack=$(cat /proc/sys/net/netfilter/nf_conntrack_max 2>/dev/null || echo 0)
+        target_conntrack=$((RAM_MB * 64))
+        (( target_conntrack < 65536 )) && target_conntrack=65536
+        (( target_conntrack > 1048576 )) && target_conntrack=1048576
+
+        if [[ "$current_conntrack" =~ ^[0-9]+$ ]] && (( target_conntrack > current_conntrack )); then
+            cat >> "$target_file" <<EOF
+
+# 按内存保守扩展 Conntrack 上限，不降低现有配置
+net.netfilter.nf_conntrack_max = $target_conntrack
+EOF
+        fi
+    fi
+}
+
 create_network_config() {
     local target_file="$1"
     local enable_bbr="$2"
@@ -1369,6 +1532,10 @@ net.ipv4.tcp_slow_start_after_idle = 0
 net.ipv4.tcp_mtu_probing = 1
 EOF
 
+    append_supported_tcp_settings "$target_file"
+    append_ipv6_forwarding_config "$target_file"
+    append_adaptive_capacity_settings "$target_file"
+
     if [[ "$enable_bbr" == "true" ]]; then
         cat >> "$target_file" <<'EOF'
 
@@ -1386,14 +1553,73 @@ EOF
     chmod 644 "$target_file"
 }
 
-backup_network_config() {
-    [[ -f "$NETWORK_CONF" ]] || return 0
-
-    if [[ ! -f "$NETWORK_INITIAL_BACKUP" ]]; then
-        cp -a "$NETWORK_CONF" "$NETWORK_INITIAL_BACKUP" || return 1
+prepare_legacy_backup_state() {
+    # 旧版没有 absent 标记。检测到脚本生成的现有文件时，无法证明它在
+    # 第一次运行前是否存在，因此标记 unknown，绝不把当前受管状态冒充初始状态。
+    if [[ -f "$NETWORK_CONF" ]] &&
+        grep -Fq '# 由 network-optimize.sh 自动生成。' "$NETWORK_CONF"; then
+        if [[ ! -e "$NETWORK_INITIAL_BACKUP" && ! -e "$NETWORK_INITIAL_ABSENT" &&
+            ! -e "$NETWORK_INITIAL_UNKNOWN" ]]; then
+            install -D -m 0600 /dev/null "$NETWORK_INITIAL_UNKNOWN"
+        fi
+        if [[ ! -e "$RUNTIME_INITIAL_BACKUP" && ! -e "$RUNTIME_INITIAL_UNKNOWN" ]]; then
+            install -D -m 0600 /dev/null "$RUNTIME_INITIAL_UNKNOWN"
+        fi
     fi
 
-    cp -a "$NETWORK_CONF" "$NETWORK_PREVIOUS_BACKUP"
+    if [[ ! -e "$BBR_MODULES_INITIAL_BACKUP" && ! -e "$BBR_MODULES_INITIAL_ABSENT" &&
+        ! -e "$BBR_MODULES_INITIAL_UNKNOWN" && -e "$BBR_MODULES_FILE" ]]; then
+        install -D -m 0600 /dev/null "$BBR_MODULES_INITIAL_UNKNOWN"
+    fi
+}
+
+merge_initial_runtime_values() {
+    local current_snapshot="$1"
+    local temp_file
+    local key
+    local value
+
+    [[ ! -e "$RUNTIME_INITIAL_UNKNOWN" ]] || return 0
+
+    if [[ ! -f "$RUNTIME_INITIAL_BACKUP" ]]; then
+        install -m 0600 "$current_snapshot" "$RUNTIME_INITIAL_BACKUP"
+        return $?
+    fi
+
+    temp_file=$(mktemp) || return 1
+    cp -a "$RUNTIME_INITIAL_BACKUP" "$temp_file" || {
+        rm -f "$temp_file"
+        return 1
+    }
+
+    while IFS='=' read -r key value; do
+        [[ -n "$key" ]] || continue
+        if ! grep -Fq "${key}=" "$temp_file"; then
+            printf '%s=%s\n' "$key" "$value" >> "$temp_file"
+        fi
+    done < "$current_snapshot"
+
+    install -m 0600 "$temp_file" "$RUNTIME_INITIAL_BACKUP"
+    rm -f "$temp_file"
+}
+
+backup_network_state() {
+    install -d -m 0755 /var/lib/linux-setup
+    prepare_legacy_backup_state
+
+    backup_managed_file \
+        "$NETWORK_CONF" \
+        "$NETWORK_INITIAL_BACKUP" \
+        "$NETWORK_PREVIOUS_BACKUP" \
+        "$NETWORK_INITIAL_ABSENT" \
+        "$NETWORK_PREVIOUS_ABSENT" || return 1
+
+    backup_managed_file \
+        "$BBR_MODULES_FILE" \
+        "$BBR_MODULES_INITIAL_BACKUP" \
+        "$BBR_MODULES_PREVIOUS_BACKUP" \
+        "$BBR_MODULES_INITIAL_ABSENT" \
+        "$BBR_MODULES_PREVIOUS_ABSENT"
 }
 
 capture_runtime_values() {
@@ -1502,7 +1728,18 @@ install_optimization() {
         return 1
     fi
 
-    backup_network_config || {
+    install -d -m 0755 /var/lib/linux-setup
+    prepare_legacy_backup_state
+    merge_initial_runtime_values "$runtime_backup" || {
+        rm -f "$temp_config" "$runtime_backup"
+        return 1
+    }
+    install -m 0600 "$runtime_backup" "$RUNTIME_PREVIOUS_BACKUP" || {
+        rm -f "$temp_config" "$runtime_backup"
+        return 1
+    }
+
+    backup_network_state || {
         rm -f "$temp_config" "$runtime_backup"
         return 1
     }
@@ -1543,43 +1780,67 @@ install_optimization() {
     echo "说明："
     echo "  - 无参数安装会自动探测一次并应用，不创建定时任务。"
     echo "  - IPv4 转发已启用，兼容 NAT、透明代理、网关与端口转发场景。"
-    echo "  - 未启用 IPv6 转发、route_localnet 或 MPTCP。"
+    echo "  - IPv6 转发已启用，并使用 accept_ra=2 保留云平台 RA。"
+    echo "  - 未启用 route_localnet 或 MPTCP。"
     echo "  - 新版不再管理 limits.conf、nproc 与 memlock。"
     echo "  - 已恢复旧脚本修改过的资源限制配置（若检测到对应备份）。"
     echo "  - 已移除的旧 sysctl 参数在重启前可能仍保留运行时值；重启后将完全按新版配置生效。"
 }
 
 restore_optimization() {
-    info "开始恢复新版网络优化配置..."
+    local scope="${1:-previous}"
+    local config_backup
+    local config_absent
+    local modules_backup
+    local modules_absent
+    local runtime_backup
 
-    if [[ -f "$NETWORK_PREVIOUS_BACKUP" ]]; then
-        cp -a "$NETWORK_PREVIOUS_BACKUP" "$NETWORK_CONF"
+    case "$scope" in
+        previous)
+            config_backup="$NETWORK_PREVIOUS_BACKUP"
+            config_absent="$NETWORK_PREVIOUS_ABSENT"
+            modules_backup="$BBR_MODULES_PREVIOUS_BACKUP"
+            modules_absent="$BBR_MODULES_PREVIOUS_ABSENT"
+            runtime_backup="$RUNTIME_PREVIOUS_BACKUP"
+            ;;
+        initial)
+            config_backup="$NETWORK_INITIAL_BACKUP"
+            config_absent="$NETWORK_INITIAL_ABSENT"
+            modules_backup="$BBR_MODULES_INITIAL_BACKUP"
+            modules_absent="$BBR_MODULES_INITIAL_ABSENT"
+            runtime_backup="$RUNTIME_INITIAL_BACKUP"
+            ;;
+        *)
+            error "恢复范围必须是 previous 或 initial"
+            return 1
+            ;;
+    esac
 
-        if apply_network_config "$NETWORK_CONF"; then
-            success "已恢复网络上一次配置：$NETWORK_PREVIOUS_BACKUP"
-        else
+    info "开始恢复网络优化配置（$scope）..."
+
+    if ! restore_managed_file "$NETWORK_CONF" "$config_backup" "$config_absent"; then
+        error "未找到可信的 $scope 网络配置状态，拒绝推测"
+        return 1
+    fi
+
+    if ! restore_managed_file "$BBR_MODULES_FILE" "$modules_backup" "$modules_absent"; then
+        warn "未找到可信的 $scope BBR 模块配置状态，保留当前文件"
+    fi
+
+    if [[ -f "$NETWORK_CONF" ]]; then
+        apply_network_config "$NETWORK_CONF" || {
             error "恢复网络配置后应用失败"
             return 1
-        fi
-    else
-        rm -f "$NETWORK_CONF"
-        warn "未找到新版网络配置备份，已删除 $NETWORK_CONF"
-        warn "请重启系统，以清除已移除参数的运行时值"
+        }
     fi
 
-    if [[ -f "$NETWORK_CONF" ]] &&
-        grep -Eq '^[[:space:]]*net\.ipv4\.tcp_congestion_control[[:space:]]*=[[:space:]]*bbr' \
-            "$NETWORK_CONF"; then
-        persist_bbr_module || warn "恢复后无法持久化 BBR 模块加载"
+    if [[ -f "$runtime_backup" ]]; then
+        restore_runtime_values "$runtime_backup"
     else
-        rm -f "$BBR_MODULES_FILE"
+        warn "没有 $scope 运行值快照；已恢复持久配置，部分已移除参数可能需重启后还原"
     fi
 
-    echo
-    echo "注意："
-    echo "  restore 会同步恢复 $NETWORK_CONF 并按拥塞控制配置处理 $BBR_MODULES_FILE。"
-    echo "  不会自动修改旧版历史归档、limits.conf 或 nproc 配置。"
-    echo "  建议重启系统，使所有未持久化的旧参数彻底恢复默认状态。"
+    success "网络配置已恢复到 $scope 状态"
 }
 
 show_status() {
@@ -1626,6 +1887,8 @@ show_status() {
         grep -E '^# (模式|内存|下载带宽|上传带宽|带宽来源|中国组 RTT|全球组 RTT|观测 RTT|计算 RTT|RTT 来源|RTT 策略|缓冲区依据):'             "$NETWORK_CONF" | sed 's/^# /  /'
     fi
     [[ -f "$NETWORK_INITIAL_BACKUP" ]] && echo "初始备份: $NETWORK_INITIAL_BACKUP"
+    [[ -f "$NETWORK_INITIAL_ABSENT" ]] && echo "初始状态: 配置文件原本不存在"
+    [[ -f "$NETWORK_INITIAL_UNKNOWN" ]] && echo "初始状态: 旧版未记录，无法安全推测"
     [[ -f "$NETWORK_PREVIOUS_BACKUP" ]] && echo "上次备份: $NETWORK_PREVIOUS_BACKUP"
 
     echo
@@ -1640,7 +1903,8 @@ show_status() {
     echo "  IPv4 转发: $ip_forward"
     echo "  rp_filter(all): $rp_filter_all"
     echo "  rp_filter(default): $rp_filter_default"
-    echo "  IPv6 转发: 未由本模块配置"
+    echo "  IPv6 转发: $(sysctl -n net.ipv6.conf.all.forwarding 2>/dev/null || echo "不可用")"
+    echo "  IPv6 RA(all): $(sysctl -n net.ipv6.conf.all.accept_ra 2>/dev/null || echo "不可用")"
     echo "  route_localnet: 未由本模块配置"
     echo "  MPTCP: 未由本模块配置"
 
@@ -1680,7 +1944,8 @@ show_help() {
 用法：
   network-optimize.sh [install] [选项]  自动计算并应用网络优化
   network-optimize.sh plan [选项]       只计算并显示计划，不修改系统
-  network-optimize.sh restore           恢复新版脚本修改前的配置
+  network-optimize.sh restore           恢复上一次运行前的配置
+  network-optimize.sh restore initial   恢复首次运行前的可信配置
   network-optimize.sh status            查看当前网络优化状态
   network-optimize.sh help              显示帮助
 
@@ -1731,7 +1996,7 @@ main() {
     case "$COMMAND" in
         install)
             require_root
-            for required_command in sysctl mv cp find modprobe ip flock getent; do
+            for required_command in sysctl mv cp find modprobe ip flock getent install dirname; do
                 if ! command -v "$required_command" >/dev/null 2>&1; then
                     error "缺少必要命令: $required_command"
                     exit 1
@@ -1755,7 +2020,7 @@ main() {
                 error "缺少必要命令: sysctl"
                 exit 1
             }
-            restore_optimization
+            restore_optimization "$RESTORE_SCOPE"
             ;;
         status)
             show_status

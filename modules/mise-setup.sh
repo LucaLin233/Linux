@@ -27,6 +27,7 @@ readonly MISE_CRON_COMMENT="# Mise Weekly Auto Update"
 readonly MISE_CRON_SCHEDULE="0 1 * * 0"
 readonly MISE_UPDATE_LOG="/var/log/mise-update.log"
 readonly MISE_UPDATE_LOCK="/var/lock/mise-self-update.lock"
+readonly MISE_STATE_DIR="/var/lib/linux-setup/mise"
 
 # === 日志 ===
 log() {
@@ -46,6 +47,75 @@ require_root() {
     if (( EUID != 0 )); then
         log "需要 root 权限运行" "error"
         exit 1
+    fi
+}
+
+backup_mise_file() {
+    local target="$1"
+    local name="$2"
+    local initial_backup="$MISE_STATE_DIR/${name}.initial-backup"
+    local previous_backup="$MISE_STATE_DIR/${name}.previous-backup"
+    local initial_absent="$MISE_STATE_DIR/${name}.initial-absent"
+    local previous_absent="$MISE_STATE_DIR/${name}.previous-absent"
+    local initial_unknown="$MISE_STATE_DIR/${name}.initial-unknown"
+
+    install -d -m 0700 "$MISE_STATE_DIR"
+    if [[ ! -e "$initial_backup" && ! -e "$initial_absent" && ! -e "$initial_unknown" ]]; then
+        if [[ -e "$target" || -L "$target" ]]; then
+            cp -a "$target" "$initial_backup" || return 1
+        else
+            install -m 0600 /dev/null "$initial_absent" || return 1
+        fi
+    fi
+    rm -f "$previous_backup" "$previous_absent"
+    if [[ -e "$target" || -L "$target" ]]; then
+        cp -a "$target" "$previous_backup" || return 1
+    else
+        install -m 0600 /dev/null "$previous_absent" || return 1
+    fi
+}
+
+backup_mise_configuration() {
+    local snapshot
+    local name
+
+    install -d -m 0700 "$MISE_STATE_DIR"
+    if { [[ -f "$MISE_ZSH_ACTIVATE_FILE" ]] && grep -Fq '由 mise-setup.sh 自动生成' "$MISE_ZSH_ACTIVATE_FILE"; } ||
+        { [[ -f "$MISE_BASH_ACTIVATE_FILE" ]] && grep -Fq '由 mise-setup.sh 自动生成' "$MISE_BASH_ACTIVATE_FILE"; }; then
+        for name in activate.zsh activate.bash config.toml zshrc bashrc cron; do
+            if [[ ! -e "$MISE_STATE_DIR/${name}.initial-backup" &&
+                ! -e "$MISE_STATE_DIR/${name}.initial-absent" &&
+                ! -e "$MISE_STATE_DIR/${name}.initial-unknown" &&
+                ! -e "$MISE_STATE_DIR/${name}.initial" ]]; then
+                install -m 0600 /dev/null "$MISE_STATE_DIR/${name}.initial-unknown"
+            fi
+        done
+    fi
+
+    backup_mise_file "$MISE_ZSH_ACTIVATE_FILE" activate.zsh || return 1
+    backup_mise_file "$MISE_BASH_ACTIVATE_FILE" activate.bash || return 1
+    backup_mise_file "$MISE_CONFIG_DIR/config.toml" config.toml || return 1
+    backup_mise_file "$ZSHRC_FILE" zshrc || return 1
+    backup_mise_file "$BASHRC_FILE" bashrc || return 1
+
+    snapshot=$(crontab -l 2>/dev/null | grep -E "$(printf '%s|%s' "$MISE_CRON_COMMENT" "$MISE_UPDATE_LOCK")" || true)
+    if [[ ! -e "$MISE_STATE_DIR/cron.initial" && ! -e "$MISE_STATE_DIR/cron.initial-absent" &&
+        ! -e "$MISE_STATE_DIR/cron.initial-unknown" ]]; then
+        if [[ -n "$snapshot" ]]; then
+            printf '%s
+' "$snapshot" > "$MISE_STATE_DIR/cron.initial"
+            chmod 600 "$MISE_STATE_DIR/cron.initial"
+        else
+            install -m 0600 /dev/null "$MISE_STATE_DIR/cron.initial-absent"
+        fi
+    fi
+    rm -f "$MISE_STATE_DIR/cron.previous" "$MISE_STATE_DIR/cron.previous-absent"
+    if [[ -n "$snapshot" ]]; then
+        printf '%s
+' "$snapshot" > "$MISE_STATE_DIR/cron.previous"
+        chmod 600 "$MISE_STATE_DIR/cron.previous"
+    else
+        install -m 0600 /dev/null "$MISE_STATE_DIR/cron.previous-absent"
     fi
 }
 
@@ -787,7 +857,7 @@ main() {
     require_root
 
     local command_name
-    for command_name in curl mktemp flock awk grep sort ldconfig; do
+    for command_name in curl mktemp flock awk grep sort ldconfig install cp crontab; do
         if ! command -v "$command_name" >/dev/null 2>&1; then
             log "缺少必要命令: $command_name" "error"
             exit 1
@@ -795,6 +865,10 @@ main() {
     done
 
     log "配置 Mise 版本管理器..." "info"
+    backup_mise_configuration || {
+        log "Mise 配置备份失败，拒绝继续修改" "error"
+        exit 1
+    }
 
     echo
     install_or_update_mise || exit 1
