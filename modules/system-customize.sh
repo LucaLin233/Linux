@@ -12,6 +12,9 @@
 #   bash system-customize.sh locale    # 仅配置中文环境
 #   bash system-customize.sh xanmod    # 仅配置 XanMod 内核
 #   bash system-customize.sh status    # 查看 XanMod 状态
+#   bash system-customize.sh restore   # 恢复上一次运行前的配置
+#   bash system-customize.sh restore initial
+#                                      # 恢复首次运行前的可信配置
 
 set -euo pipefail
 
@@ -156,6 +159,57 @@ backup_managed_file() {
     else
         install -D -m 0600 /dev/null "$previous_absent" || return 1
     fi
+}
+
+get_managed_backup_prefix() {
+    local target="$1"
+    local state_prefix
+
+    if [[ "$target" == /etc/apt/sources.list.d/* ]]; then
+        state_prefix="/var/lib/linux-setup/apt-source-backups/$(basename "$target")"
+        if [[ -e "${state_prefix}.initial-backup" || -e "${state_prefix}.initial-absent" ||
+            -e "${state_prefix}.initial-unknown" || -e "${state_prefix}.previous-backup" ||
+            -e "${state_prefix}.previous-absent" ]]; then
+            printf '%s\n' "$state_prefix"
+            return 0
+        fi
+    fi
+
+    printf '%s\n' "$target"
+}
+
+restore_managed_file() {
+    local target="$1"
+    local scope="$2"
+    local backup_prefix
+    local backup
+    local absent
+    local unknown
+
+    backup_prefix=$(get_managed_backup_prefix "$target") || return 1
+    backup="${backup_prefix}.${scope}-backup"
+    absent="${backup_prefix}.${scope}-absent"
+    unknown="${backup_prefix}.${scope}-unknown"
+
+    if [[ -e "$backup" || -L "$backup" ]]; then
+        install -d -m 0755 "$(dirname "$target")" || return 1
+        rm -f "$target" || return 1
+        cp -a "$backup" "$target" || return 1
+        return 0
+    fi
+
+    if [[ -e "$absent" ]]; then
+        rm -f "$target" || return 1
+        return 0
+    fi
+
+    if [[ -e "$unknown" ]]; then
+        warn "初始状态未知，跳过恢复：$target"
+        return 2
+    fi
+
+    warn "没有 $scope 配置状态，跳过恢复：$target"
+    return 2
 }
 
 # === 动态欢迎信息 ===
@@ -1004,6 +1058,90 @@ show_xanmod_status() {
     fi
 }
 
+restore_system_customization() {
+    local scope="${1:-previous}"
+    local target
+    local result
+    local restored_count=0
+    local restore_failed=false
+    local locale_restored=false
+    local apt_restored=false
+    local -a targets=(
+        /etc/motd
+        /etc/issue
+        /etc/issue.net
+        "$MOTD_SCRIPT"
+        /etc/update-motd.d/10-uname
+        /etc/update-motd.d/50-motd-news
+        /etc/locale.gen
+        /etc/locale.conf
+        /etc/default/locale
+        "$XANMOD_KEYRING"
+        "$XANMOD_SOURCE_LIST"
+        "$XANMOD_SOURCE_DEB822"
+    )
+
+    case "$scope" in
+        previous|initial) ;;
+        *)
+            error "恢复范围必须是 previous 或 initial"
+            return 1
+            ;;
+    esac
+
+    info "恢复系统定制配置到 $scope 状态..."
+
+    for target in "${targets[@]}"; do
+        if restore_managed_file "$target" "$scope"; then
+            ((restored_count += 1))
+            case "$target" in
+                /etc/locale.gen|/etc/locale.conf|/etc/default/locale)
+                    locale_restored=true
+                    ;;
+                "$XANMOD_KEYRING"|"$XANMOD_SOURCE_LIST"|"$XANMOD_SOURCE_DEB822")
+                    apt_restored=true
+                    ;;
+            esac
+        else
+            result=$?
+            (( result == 1 )) && restore_failed=true
+        fi
+    done
+
+    if (( restored_count == 0 )); then
+        error "没有可恢复的可信配置"
+        return 1
+    fi
+
+    if [[ "$locale_restored" == "true" ]]; then
+        if command -v locale-gen >/dev/null 2>&1; then
+            locale-gen || {
+                warn "Locale 配置已恢复，但 locale-gen 执行失败"
+                restore_failed=true
+            }
+        else
+            warn "Locale 配置已恢复，但缺少 locale-gen，区域数据尚未重新生成"
+            restore_failed=true
+        fi
+    fi
+
+    if [[ "$apt_restored" == "true" ]]; then
+        if ! apt-get update -qq; then
+            warn "XanMod 软件源配置已恢复，但 APT 索引更新失败"
+            restore_failed=true
+        fi
+    fi
+
+    echo "说明: 已安装的 XanMod 内核包不会被卸载。"
+
+    if [[ "$restore_failed" == "true" ]]; then
+        error "部分配置恢复或应用失败"
+        return 1
+    fi
+
+    success "系统定制配置已恢复到 $scope 状态（$restored_count 个文件状态）"
+}
+
 # === 主流程 ===
 show_help() {
     cat <<'EOF'
@@ -1014,6 +1152,9 @@ show_help() {
   system-customize.sh locale     仅配置中文环境
   system-customize.sh xanmod     仅检查并可选安装 XanMod 内核
   system-customize.sh status     查看 XanMod 状态
+  system-customize.sh restore    恢复上一次运行前的配置
+  system-customize.sh restore initial
+                                 恢复首次运行前的可信配置
   system-customize.sh help       显示本帮助
 EOF
 }
@@ -1024,7 +1165,7 @@ main() {
     require_root
 
     local required_command
-    for required_command in apt-get apt-cache awk basename cat chmod cp curl df dpkg grep \
+    for required_command in apt-get apt-cache awk basename cat chmod cp curl df dirname dpkg grep \
         hostname install mktemp mv rm sed sleep sort tr uname uptime; do
         if ! command -v "$required_command" >/dev/null 2>&1; then
             error "缺少必要命令: $required_command"
@@ -1060,6 +1201,9 @@ main() {
             ;;
         status)
             show_xanmod_status
+            ;;
+        restore)
+            restore_system_customization "${2:-previous}"
             ;;
         help|--help|-h)
             show_help

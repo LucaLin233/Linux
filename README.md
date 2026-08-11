@@ -180,8 +180,13 @@ sudo bash <(curl -fsSL "$RAW_BASE/system-customize.sh") motd
 sudo bash <(curl -fsSL "$RAW_BASE/system-customize.sh") locale
 sudo bash <(curl -fsSL "$RAW_BASE/system-customize.sh") xanmod
 sudo bash <(curl -fsSL "$RAW_BASE/system-customize.sh") status
+sudo bash <(curl -fsSL "$RAW_BASE/system-customize.sh") restore
+sudo bash <(curl -fsSL "$RAW_BASE/system-customize.sh") restore initial
 sudo bash <(curl -fsSL "$RAW_BASE/system-customize.sh") help
 ```
+
+`restore` 会统一恢复 MOTD、Locale 和 XanMod 软件源文件；默认恢复上一次运行前状态，
+`restore initial` 恢复首次运行前的可信状态。已安装的 XanMod 内核包不会被卸载。
 
 `network-optimize.sh` 支持先计算、手动指定参数、查看状态和恢复配置：
 
