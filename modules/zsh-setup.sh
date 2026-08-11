@@ -146,6 +146,9 @@ install_components() {
 
         if apt-get install -y zsh git >/dev/null 2>&1; then
             installed+=("Zsh")
+        elif command -v zsh >/dev/null 2>&1 && command -v git >/dev/null 2>&1; then
+            installed+=("Zsh" "Git")
+            log "APT 返回错误，但 Zsh 与 Git 已安装；系统可能存在其他未配置完成的软件包" "warn"
         else
             failed+=("Zsh/Git")
         fi
@@ -154,6 +157,9 @@ install_components() {
 
         if apt-get install -y git >/dev/null 2>&1; then
             installed+=("Git")
+        elif command -v git >/dev/null 2>&1; then
+            installed+=("Git")
+            log "APT 返回错误，但 Git 已安装；系统可能存在其他未配置完成的软件包" "warn"
         else
             failed+=("Git")
         fi

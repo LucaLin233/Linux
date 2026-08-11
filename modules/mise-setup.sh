@@ -824,6 +824,6 @@ main() {
     echo "请重新登录，或根据当前 Shell 执行：exec zsh / exec bash"
 }
 
-trap 'log "脚本在第 $LINENO 行执行失败" "error"' ERR
+trap 'exit_code=$?; (( exit_code == 2 )) || log "脚本在第 $LINENO 行执行失败" "error"' ERR
 
 main "$@"

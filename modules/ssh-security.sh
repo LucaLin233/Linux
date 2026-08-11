@@ -119,12 +119,18 @@ validate_port() {
     local port="$1"
     local current_ports="$2"
 
-    if ! [[ "$port" =~ ^[0-9]+$ ]] || (( port < 1024 || port > 65535 )); then
+    if ! [[ "$port" =~ ^[0-9]+$ ]] || (( port < 1 || port > 65535 )); then
         return 1
     fi
 
+    # 已生效的低位端口（通常为 22）必须允许继续保留；
+    # 只有新增端口才限制为非特权端口 1024-65535。
     if port_is_in_list "$port" "$current_ports"; then
         return 0
+    fi
+
+    if (( port < 1024 )); then
+        return 1
     fi
 
     if ss -ltnH 2>/dev/null |

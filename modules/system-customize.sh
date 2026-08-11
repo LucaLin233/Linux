@@ -870,6 +870,13 @@ show_xanmod_status() {
     local running_package=""
     local source_file=""
     local installed_packages
+    local codename
+    local repository_supported=true
+
+    codename=$(get_os_codename || true)
+    if [[ -z "$codename" ]] || ! xanmod_codename_supported "$codename"; then
+        repository_supported=false
+    fi
 
     echo
     echo "XanMod 状态："
@@ -893,22 +900,27 @@ show_xanmod_status() {
         echo "  当前运行包: 无（当前为非 XanMod 内核）"
     fi
 
-    if [[ -n "$recommended_package" ]]; then
-        echo "  推荐包: $recommended_package"
-    elif [[ -n "$running_package" ]]; then
-        echo "  推荐包: 无法检测；当前运行包可作为兼容性证据"
+    if [[ "$repository_supported" != "true" ]]; then
+        echo "  推荐包: 不适用（XanMod 官方仓库不支持 ${codename:-当前发行版}）"
+        echo "  软件源: 不适用"
     else
-        echo "  推荐包: 无"
-    fi
+        if [[ -n "$recommended_package" ]]; then
+            echo "  推荐包: $recommended_package"
+        elif [[ -n "$running_package" ]]; then
+            echo "  推荐包: 无法检测；当前运行包可作为兼容性证据"
+        else
+            echo "  推荐包: 无"
+        fi
 
-    if source_file=$(get_xanmod_source_file); then
-        case "$source_file" in
-            *.sources) echo "  软件源: 已配置（Deb822）" ;;
-            *) echo "  软件源: 已配置（传统 list）" ;;
-        esac
-        echo "  软件源文件: $source_file"
-    else
-        echo "  软件源: 未配置或配置未通过校验"
+        if source_file=$(get_xanmod_source_file); then
+            case "$source_file" in
+                *.sources) echo "  软件源: 已配置（Deb822）" ;;
+                *) echo "  软件源: 已配置（传统 list）" ;;
+            esac
+            echo "  软件源文件: $source_file"
+        else
+            echo "  软件源: 未配置或配置未通过校验"
+        fi
     fi
 
     installed_packages=$(get_installed_xanmod_packages || true)

@@ -205,7 +205,59 @@ zram_config_matches() {
         [[ "$current_swappiness" == "$target_swappiness" ]]
 }
 
+zram_kernel_module_available() {
+    [[ -d /sys/module/zram ]] || modprobe zram >/dev/null 2>&1
+}
+
+ensure_zram_kernel_module() {
+    if zram_kernel_module_available; then
+        return 0
+    fi
+
+    local os_id=""
+    local kernel_version
+    local extra_package
+    local apt_status=0
+
+    kernel_version=$(uname -r)
+    if [[ -r /etc/os-release ]]; then
+        # shellcheck disable=SC1091
+        . /etc/os-release
+        os_id="${ID:-}"
+    fi
+
+    if [[ "$os_id" == "ubuntu" ]]; then
+        extra_package="linux-modules-extra-${kernel_version}"
+
+        if apt-cache show --no-all-versions "$extra_package" >/dev/null 2>&1; then
+            log "当前 Ubuntu 内核缺少 Zram 模块，安装：$extra_package" "warn"
+            DEBIAN_FRONTEND=noninteractive apt-get install -y "$extra_package" || apt_status=$?
+            depmod -a "$kernel_version" >/dev/null 2>&1 || true
+
+            if zram_kernel_module_available; then
+                if (( apt_status != 0 )); then
+                    log "Zram 模块包已就绪，继续修复未完成的 dpkg 配置..." "warn"
+                    if ! DEBIAN_FRONTEND=noninteractive dpkg --configure -a; then
+                        log "dpkg 配置修复失败，请先修复软件包状态" "error"
+                        return 1
+                    fi
+                fi
+
+                log "Zram 内核模块已就绪" "info"
+                return 0
+            fi
+        else
+            log "当前软件源没有 $extra_package" "warn"
+        fi
+    fi
+
+    log "当前内核 $kernel_version 不提供 Zram 模块，已跳过 Zram，且不会安装 systemd-zram-generator" "warn"
+    return 1
+}
+
 install_zram_generator() {
+    ensure_zram_kernel_module || return 1
+
     if dpkg-query -W -f='${db:Status-Status}' systemd-zram-generator 2>/dev/null |
         grep -qx "installed"; then
         return 0
@@ -213,7 +265,7 @@ install_zram_generator() {
 
     log "安装 systemd-zram-generator..." "info"
 
-    if ! apt-get install -y systemd-zram-generator; then
+    if ! DEBIAN_FRONTEND=noninteractive apt-get install -y systemd-zram-generator; then
         log "systemd-zram-generator 安装失败" "error"
         return 1
     fi
@@ -409,7 +461,8 @@ main() {
     fi
 
     local command_name
-    for command_name in awk swapon systemctl timedatectl fuser; do
+    for command_name in apt-cache apt-get awk depmod dpkg dpkg-query fuser modprobe \
+        swapon systemctl timedatectl uname; do
         if ! command -v "$command_name" >/dev/null 2>&1; then
             log "缺少必要命令: $command_name" "error"
             exit 1
@@ -453,6 +506,6 @@ main() {
     fi
 }
 
-trap 'log "系统优化脚本在第 $LINENO 行执行失败" "error"' ERR
+trap 'exit_code=$?; (( exit_code == 2 )) || log "系统优化脚本在第 $LINENO 行执行失败" "error"' ERR
 
 main "$@"

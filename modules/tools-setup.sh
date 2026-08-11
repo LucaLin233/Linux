@@ -417,6 +417,7 @@ install_selected_tools() {
 
     local failed=()
     local tool
+    local apt_failed=false
 
     for tool in "$@"; do
         if [[ "$tool" == "nexttrace" ]]; then
@@ -427,13 +428,20 @@ install_selected_tools() {
     done
 
     if ! install_apt_tools "$mode" "$@"; then
+        apt_failed=true
         for tool in "$@"; do
-            [[ "$tool" != "nexttrace" ]] && failed+=("$tool")
+            [[ "$tool" == "nexttrace" ]] && continue
+            command_is_available "$tool" || failed+=("$tool")
         done
     fi
 
     if (( ${#failed[@]} > 0 )); then
-        log "部分工具操作失败：${failed[*]}" "warn"
+        log "以下工具仍不可用：${failed[*]}" "warn"
+        return 1
+    fi
+
+    if [[ "$apt_failed" == "true" ]]; then
+        log "APT 返回错误，但所选工具均已可用；请检查是否有其他未配置完成的软件包" "warn"
         return 1
     fi
 }
@@ -555,6 +563,6 @@ main() {
     log "✅ 系统工具配置完成" "success"
 }
 
-trap 'log "系统工具脚本在第 $LINENO 行执行失败" "error"' ERR
+trap 'exit_code=$?; (( exit_code == 2 )) || log "系统工具脚本在第 $LINENO 行执行失败" "error"' ERR
 
 main "$@"
