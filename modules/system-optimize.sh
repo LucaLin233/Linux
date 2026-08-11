@@ -264,7 +264,7 @@ ensure_ubuntu_kernel_meta_package() {
     log "该元包可能同时安装 linux-firmware、CPU 微码及其他内核运行依赖" "warn"
 
     if ! NEEDRESTART_MODE=a DEBIAN_FRONTEND=noninteractive \
-        apt-get install -y "$meta_package"; then
+        apt-get install -y --no-install-recommends "$meta_package"; then
         log "Ubuntu 内核元包安装失败；当前内核的 Zram 配置仍将继续" "warn"
         return 1
     fi
@@ -318,7 +318,7 @@ ensure_zram_kernel_module() {
 
             log "当前 Ubuntu 内核缺少 Zram 模块，安装：${kernel_packages[*]}" "warn"
             NEEDRESTART_MODE=a DEBIAN_FRONTEND=noninteractive \
-                apt-get install -y "${kernel_packages[@]}" || apt_status=$?
+                apt-get install -y --no-install-recommends "${kernel_packages[@]}" || apt_status=$?
             depmod -a "$kernel_version" >/dev/null 2>&1 || true
 
             if zram_kernel_module_available; then
