@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# debian-setup:name=Zsh Shell 环境
-# debian-setup:order=40
-# debian-setup:depends=
-# debian-setup:enabled=true
+# linux-setup:name=Zsh Shell 环境
+# linux-setup:order=40
+# linux-setup:depends=
+# linux-setup:enabled=true
 # Zsh Shell 环境配置模块
 # 功能：安装 Zsh、Oh My Zsh、Powerlevel10k 及常用插件
 
@@ -355,7 +355,7 @@ alias dlog='docker logs -f'
 # Compose 项目操作。
 alias dc='docker compose'
 alias dcd='docker compose down'
-alias dcu='docker compose downup -d'
+alias dcu='docker compose up -d'
 alias dcr='docker compose restart'
 alias dcre='docker compose pull && docker compose up -d --force-recreate'
 alias dcreup='docker compose down && docker compose pull && docker compose up -d --remove-orphans'

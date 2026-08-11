@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# debian-setup:name=系统定制（欢迎信息、中文环境、XanMod 内核）
-# debian-setup:order=20
-# debian-setup:depends=
-# debian-setup:enabled=true
+# linux-setup:name=系统定制（欢迎信息、中文环境、XanMod 内核）
+# linux-setup:order=20
+# linux-setup:depends=
+# linux-setup:enabled=true
 # 系统定制模块
 # 功能：配置动态欢迎信息、中文 Locale，并可选安装 XanMod 内核
 #
@@ -123,6 +123,7 @@ configure_motd() {
         return 0
     fi
 
+    install -d -m 0755 /etc/update-motd.d
     info "配置动态欢迎信息..."
 
     backup_initial_file /etc/motd || return 1
@@ -261,18 +262,37 @@ SCRIPT
 
 # === 中文 Locale ===
 get_locale_config_file() {
+    local os_id=""
     local version_id=""
+    local major_version=""
 
     if [[ -r /etc/os-release ]]; then
+        # shellcheck disable=SC1091
         . /etc/os-release
-        version_id="${VERSION_ID%%.*}"
+        os_id="${ID:-}"
+        version_id="${VERSION_ID:-}"
+        major_version="${version_id%%.*}"
     fi
 
-    if [[ "$version_id" =~ ^[0-9]+$ ]] && (( version_id >= 13 )); then
-        echo "/etc/locale.conf"
-    else
-        echo "/etc/default/locale"
-    fi
+    case "$os_id" in
+        debian)
+            if [[ "$major_version" =~ ^[0-9]+$ ]] && (( major_version >= 13 )); then
+                echo "/etc/locale.conf"
+            else
+                echo "/etc/default/locale"
+            fi
+            ;;
+        ubuntu)
+            if [[ "$version_id" == "24.04" ]]; then
+                echo "/etc/locale.conf"
+            else
+                echo "/etc/default/locale"
+            fi
+            ;;
+        *)
+            echo "/etc/default/locale"
+            ;;
+    esac
 }
 
 configure_chinese_locale() {
@@ -324,7 +344,7 @@ configure_chinese_locale() {
 }
 
 # === XanMod 内核 ===
-get_debian_codename() {
+get_os_codename() {
     if [[ -r /etc/os-release ]]; then
         . /etc/os-release
 
@@ -371,6 +391,8 @@ get_running_xanmod_package() {
     esac
 }
 
+# 可选文件参数供离线 CPU 特征测试使用。
+# shellcheck disable=SC2120
 detect_x86_64_psabi_level() {
     local cpuinfo_file="${1:-/proc/cpuinfo}"
 
@@ -577,6 +599,27 @@ xanmod_source_configured() {
     get_xanmod_source_file >/dev/null
 }
 
+xanmod_source_matches_codename() {
+    local source_file="$1"
+    local codename="$2"
+
+    case "$source_file" in
+        *.sources)
+            grep -Eq "^[[:space:]]*Suites:[[:space:]]*${codename}[[:space:]]*$" "$source_file"
+            ;;
+        *)
+            grep -Eq "^[[:space:]]*deb[[:space:]].*[[:space:]]${codename}[[:space:]]+main([[:space:]]|$)" "$source_file"
+            ;;
+    esac
+}
+
+xanmod_codename_supported() {
+    case "$1" in
+        bookworm|trixie|noble) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 write_xanmod_deb822_source() {
     local source_file="$1"
     local repository="$2"
@@ -623,20 +666,26 @@ configure_xanmod_repository() {
     local selected_repository=""
 
     ensure_package "gpg" "gpg" || return 1
-    codename=$(get_debian_codename) || {
-        error "无法识别 Debian 发行版代号"
+    codename=$(get_os_codename) || {
+        error "无法识别系统发行版代号"
         return 1
     }
+
+    if ! xanmod_codename_supported "$codename"; then
+        warn "XanMod 官方 APT 仓库不支持当前发行版代号：$codename"
+        return 1
+    fi
 
     install -d -m 0755 /etc/apt/keyrings
     install_xanmod_key || return 1
 
     if source_file=$(get_xanmod_source_file); then
-        if xanmod_source_is_usable "$source_file"; then
+        if xanmod_source_matches_codename "$source_file" "$codename" &&
+            xanmod_source_is_usable "$source_file"; then
             echo "XanMod 软件源: 已配置并可用（$source_file）"
             return 0
         fi
-        warn "现有 XanMod 软件源不可用，将重新选择镜像"
+        warn "现有 XanMod 软件源与当前发行版不匹配或不可用，将重新选择镜像"
     fi
 
     source_temp=$(mktemp --suffix=.sources) || return 1
@@ -692,8 +741,21 @@ install_xanmod() {
     local target_package
     local installed_packages
     local install_choice
+    local codename
+    local candidate_version
 
-    echo "XanMod 将在兼容时自动安装；Debian 原内核会保留，重启后才生效。"
+    codename=$(get_os_codename || true)
+    if [[ -z "$codename" ]]; then
+        warn "无法识别系统发行版代号，已跳过 XanMod 安装"
+        return 0
+    fi
+
+    if ! xanmod_codename_supported "$codename"; then
+        warn "XanMod 官方 APT 仓库不支持 $codename，已跳过内核安装"
+        return 0
+    fi
+
+    echo "XanMod 将在兼容时自动安装；系统原内核会保留，重启后才生效。"
 
     if ! ask_yes_no "是否安装 XanMod 内核？[Y/n]: " "Y"; then
         echo "XanMod 内核: 已跳过"
@@ -727,7 +789,7 @@ install_xanmod() {
         esac
 
         if [[ -z "${target_package:-}" ]]; then
-            warn "为避免安装不兼容内核，已保留 Debian 原内核"
+            warn "为避免安装不兼容内核，已保留系统原内核"
             return 0
         fi
     fi
@@ -772,7 +834,14 @@ install_xanmod() {
         return 1
     fi
 
-    info "安装 XanMod 内核包: $target_package"
+    candidate_version=$(apt-cache policy "$target_package" |
+        awk '/Candidate:/ {print $2; exit}')
+    if [[ -z "$candidate_version" || "$candidate_version" == "(none)" ]]; then
+        error "XanMod 软件源没有可安装的 $target_package 候选版本"
+        return 1
+    fi
+
+    info "安装 XanMod 内核包: $target_package（$candidate_version）"
 
     if ! apt-get install -y "$target_package"; then
         error "XanMod 内核安装失败"
@@ -786,7 +855,7 @@ install_xanmod() {
 
     success "XanMod 内核已安装: $target_package"
     echo "当前运行内核: $(uname -r)"
-    echo "说明: Debian 原内核未被移除；XanMod 将在下次系统重启后生效。"
+    echo "说明: 系统原内核未被移除；XanMod 将在下次系统重启后生效。"
 }
 
 show_xanmod_status() {
@@ -865,7 +934,7 @@ main() {
 
     local required_command
     for required_command in apt-get awk cat chmod curl dpkg grep hostname install \
-        mktemp mv rm sed sort tr uname; do
+        mktemp mv rm sed sort tr uname apt-cache; do
         if ! command -v "$required_command" >/dev/null 2>&1; then
             error "缺少必要命令: $required_command"
             exit 1

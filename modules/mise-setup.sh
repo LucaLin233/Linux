@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# debian-setup:name=Mise、Python、Node.js 版本管理
-# debian-setup:order=50
-# debian-setup:depends=zsh-setup
-# debian-setup:enabled=true
+# linux-setup:name=Mise、Python、Node.js 版本管理
+# linux-setup:order=50
+# linux-setup:depends=zsh-setup
+# linux-setup:enabled=true
 # Mise 版本管理器配置模块
 # 功能：安装或更新 Mise、配置 Shell 集成、管理 Python/Node.js、
 #       升级运行时后迁移依赖，并配置每周自动更新。
@@ -719,19 +719,22 @@ setup_node() {
 
 # === Mise 自动更新 ===
 ensure_cron_installed() {
-    if command -v crontab >/dev/null 2>&1; then
-        return 0
-    fi
+    if ! command -v crontab >/dev/null 2>&1; then
+        log "安装 Cron 服务..." "info"
 
-    log "安装 Cron 服务..." "info"
-
-    if ! apt-get install -y cron; then
-        log "Cron 服务安装失败" "error"
-        return 1
+        if ! apt-get install -y cron; then
+            log "Cron 服务安装失败" "error"
+            return 1
+        fi
     fi
 
     if ! systemctl enable --now cron >/dev/null 2>&1; then
         log "Cron 服务启动失败" "error"
+        return 1
+    fi
+
+    if ! systemctl is-active --quiet cron; then
+        log "Cron 服务未处于运行状态" "error"
         return 1
     fi
 }

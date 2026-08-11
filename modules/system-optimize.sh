@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# debian-setup:name=系统优化（Zram、时区、Chrony 时间同步）
-# debian-setup:order=10
-# debian-setup:depends=
-# debian-setup:enabled=true
+# linux-setup:name=系统优化（Zram、时区、Chrony 时间同步）
+# linux-setup:order=10
+# linux-setup:depends=
+# linux-setup:enabled=true
 # 系统优化模块
 # 功能：智能 Zram 配置、时区设置、Chrony 时间同步
 
@@ -75,7 +75,7 @@ show_swap_status() {
 
     echo "Swap 状态:"
 
-    while read -r device type size used priority; do
+    while read -r device _type size used priority; do
         [[ -z "$device" ]] && continue
 
         local display_type="磁盘"

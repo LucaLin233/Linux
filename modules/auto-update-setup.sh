@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# debian-setup:name=自动更新系统与内核
-# debian-setup:order=80
-# debian-setup:depends=
-# debian-setup:enabled=true
+# linux-setup:name=自动更新系统与内核
+# linux-setup:order=80
+# linux-setup:depends=
+# linux-setup:enabled=true
 # 自动更新系统配置模块
 # 功能：每周安全更新系统与内核，必要时自动重启
 
@@ -14,7 +14,7 @@ readonly UPDATE_LOG="/var/log/auto-update.log"
 readonly UPDATE_LOCK="/var/lock/auto-update.lock"
 
 readonly DEFAULT_CRON="0 2 * * 0"
-readonly CRON_COMMENT="# Auto-update managed by debian_setup"
+readonly CRON_COMMENT="# Auto-update managed by linux_setup"
 
 readonly APT_LOCK_TIMEOUT=1800
 readonly APT_LOCK_INTERVAL=10
@@ -254,7 +254,7 @@ get_installed_kernel_candidates() {
     if [[ "\$current_kernel" == *xanmod* ]]; then
         current_family="xanmod"
     else
-        current_family="debian"
+        current_family="stock"
     fi
 
     dpkg-query -W -f='\${binary:Package} \${db:Status-Status}\n' 'linux-image-*' 2>/dev/null |
@@ -267,7 +267,7 @@ get_installed_kernel_candidates() {
             if [[ "\$current_family" == "xanmod" && "\$kernel" != *xanmod* ]]; then
                 continue
             fi
-            if [[ "\$current_family" == "debian" && "\$kernel" == *xanmod* ]]; then
+            if [[ "\$current_family" == "stock" && "\$kernel" == *xanmod* ]]; then
                 continue
             fi
 

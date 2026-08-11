@@ -1,23 +1,23 @@
 #!/usr/bin/env bash
 # =============================================================================
-# Debian 系统部署脚本
-# 适用系统：Debian 12+
+# Linux 系统部署脚本
+# 适用系统：Debian 12+、Ubuntu 22.04/24.04
 # 功能：模块化部署、依赖处理、模块版本固定下载
 # =============================================================================
 
 set -uo pipefail
 
 # === 全局常量 ===
-readonly SCRIPT_VERSION="4.2.0"
+readonly SCRIPT_VERSION="5.0.0"
 SCRIPT_COMMIT="${SCRIPT_COMMIT:-unknown}"
 
 readonly MODULE_BASE_URL="https://raw.githubusercontent.com/LucaLin233/Linux"
 readonly GITHUB_API_URL="https://api.github.com/repos/LucaLin233/Linux/commits/main"
 readonly MODULES_API_URL="https://api.github.com/repos/LucaLin233/Linux/contents/modules"
 
-LOG_FILE="/var/log/debian-setup.log"
+LOG_FILE="/var/log/linux-setup.log"
 readonly SUMMARY_FILE="/root/deployment_summary.txt"
-readonly CACHE_DIR="/var/cache/debian-setup"
+readonly CACHE_DIR="/var/cache/linux-setup"
 readonly LINE="============================================================"
 
 TEMP_DIR=""
@@ -126,7 +126,7 @@ init_logging() {
 }
 
 create_temp_dir() {
-    if ! TEMP_DIR=$(mktemp -d -p /tmp debian-setup.XXXXXX); then
+    if ! TEMP_DIR=$(mktemp -d -p /tmp linux-setup.XXXXXX); then
         log "无法创建安全临时目录" "error"
         exit 1
     fi
@@ -144,10 +144,44 @@ pre_check() {
         exit 1
     fi
 
-    if [[ ! -f /etc/debian_version ]]; then
-        log "仅支持 Debian 系统" "error"
+    if [[ ! -r /etc/os-release ]]; then
+        log "无法读取 /etc/os-release，无法识别系统" "error"
         exit 1
     fi
+
+    local os_id
+    local version_id
+    local major_version
+
+    # shellcheck disable=SC1091
+    . /etc/os-release
+    os_id="${ID:-}"
+    version_id="${VERSION_ID:-}"
+    major_version="${version_id%%.*}"
+
+    case "$os_id" in
+        debian)
+            if [[ ! "$major_version" =~ ^[0-9]+$ ]] || (( major_version < 12 )); then
+                log "仅支持 Debian 12 或更高版本，当前版本：${version_id:-未知}" "error"
+                exit 1
+            fi
+            ;;
+        ubuntu)
+            case "$version_id" in
+                22.04|24.04) ;;
+                *)
+                    log "仅支持 Ubuntu 22.04 或 24.04，当前版本：${version_id:-未知}" "error"
+                    exit 1
+                    ;;
+            esac
+            ;;
+        *)
+            log "仅支持 Debian 12+、Ubuntu 22.04/24.04，当前系统：${PRETTY_NAME:-${os_id:-未知}}" "error"
+            exit 1
+            ;;
+    esac
+
+    log "检测到受支持系统：${PRETTY_NAME:-$os_id $version_id}"
 
     local free_space_kb
     free_space_kb=$(LANG=C df / 2>/dev/null |
@@ -539,9 +573,9 @@ read_module_metadata() {
     local key="$2"
 
     awk -v key="$key" '
-        $0 ~ "^#[[:space:]]*debian-setup:" key "=" {
+        $0 ~ "^#[[:space:]]*linux-setup:" key "=" {
             value = $0
-            sub("^#[[:space:]]*debian-setup:" key "=[[:space:]]*", "", value)
+            sub("^#[[:space:]]*linux-setup:" key "=[[:space:]]*", "", value)
             sub("[[:space:]]*$", "", value)
             print value
             exit
@@ -734,7 +768,7 @@ discover_and_prepare_modules() {
 
 try_cached_script() {
     local commit="$1"
-    local cached_script="$CACHE_DIR/debian_setup_${commit}.sh"
+    local cached_script="$CACHE_DIR/linux_setup_${commit}.sh"
 
     if [[ ! -s "$cached_script" ]]; then
         return 1
@@ -775,12 +809,12 @@ self_update() {
         return 0
     fi
 
-    if ! temp_script=$(mktemp "$TEMP_DIR/debian_setup_latest.XXXXXX.sh"); then
+    if ! temp_script=$(mktemp "$TEMP_DIR/linux_setup_latest.XXXXXX.sh"); then
         log "无法创建主脚本更新临时文件，继续使用当前版本" "warn"
         return 0
     fi
 
-    script_url="$MODULE_BASE_URL/$latest_commit/debian_setup.sh"
+    script_url="$MODULE_BASE_URL/$latest_commit/linux_setup.sh"
 
     if ! download_with_retry "$script_url" "$temp_script"; then
         rm -f "$temp_script"
@@ -811,7 +845,7 @@ self_update() {
     mkdir -p "$CACHE_DIR" 2>/dev/null || true
 
     if [[ -d "$CACHE_DIR" ]]; then
-        cached_script="$CACHE_DIR/debian_setup_${latest_commit}.sh"
+        cached_script="$CACHE_DIR/linux_setup_${latest_commit}.sh"
 
         if cp "$temp_script" "$cached_script"; then
             chmod 700 "$cached_script"
@@ -819,7 +853,7 @@ self_update() {
             find "$CACHE_DIR" \
                 -maxdepth 1 \
                 -type f \
-                -name 'debian_setup_*.sh' \
+                -name 'linux_setup_*.sh' \
                 -printf '%T@ %p\n' |
                 sort -nr |
                 awk 'NR > 3 {print $2}' |
@@ -1047,14 +1081,14 @@ generate_summary() {
     summary_content=$(
         {
             echo "$LINE"
-            echo "Debian 系统部署摘要"
+            echo "Linux 系统部署摘要"
             echo "$LINE"
             echo "脚本版本: $SCRIPT_VERSION"
             echo "模块 Commit: ${LATEST_COMMIT:-未知}"
             echo "部署时间: $(date '+%Y-%m-%d %H:%M:%S %Z')"
             echo "总耗时: ${total_time} 秒"
             echo "主机名: $(hostname)"
-            echo "系统: $(. /etc/os-release && echo "${PRETTY_NAME:-Debian}")"
+            echo "系统: $(. /etc/os-release && echo "${PRETTY_NAME:-Linux}")"
             echo
             echo "执行统计:"
             echo "总模块: $total_modules | 成功: $success_count | 部分完成: $degraded_count | 失败: $failed_count | 完成率: ${success_rate}%"
@@ -1135,7 +1169,7 @@ show_recommendations() {
     echo "  查看部署日志: tail -f $LOG_FILE"
     echo "  查看部署摘要: cat $SUMMARY_FILE"
     echo "  查看自动更新日志: tail -f /var/log/auto-update.log"
-    echo "  重新运行脚本: bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/debian_setup.sh)"
+    echo "  重新运行脚本: bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/linux_setup.sh)"
 }
 
 # =============================================================================
@@ -1144,7 +1178,7 @@ show_recommendations() {
 
 show_help() {
     cat <<EOF
-Debian 系统部署脚本 v$SCRIPT_VERSION
+Linux 系统部署脚本 v$SCRIPT_VERSION
 
 用法：
   \$0 [选项]
@@ -1193,7 +1227,7 @@ handle_arguments() {
                 exit 0
                 ;;
             --version|-v)
-                echo "Debian 系统部署脚本 v$SCRIPT_VERSION"
+                echo "Linux 系统部署脚本 v$SCRIPT_VERSION"
 
                 if [[ "$SCRIPT_COMMIT" != "unknown" ]]; then
                     echo "Commit: $SCRIPT_COMMIT"
@@ -1226,7 +1260,7 @@ main() {
     clear 2>/dev/null || true
 
     echo "$LINE"
-    echo "Debian 系统部署脚本 v$SCRIPT_VERSION"
+    echo "Linux 系统部署脚本 v$SCRIPT_VERSION"
 
     if [[ "$SCRIPT_COMMIT" != "unknown" ]]; then
         echo "Commit: ${SCRIPT_COMMIT:0:7}"

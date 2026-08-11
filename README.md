@@ -1,32 +1,34 @@
 # Linux Scripts Collection
 
-面向 Debian VPS 的系统初始化、网络调优、运行时配置和日常运维脚本集合。
+面向 Debian 与 Ubuntu VPS 的系统初始化、网络调优、运行时配置和日常运维脚本集合。
 
 脚本会修改系统配置、安装软件包或管理服务。使用前请阅读对应说明并备份重要数据；生产环境建议
-先在相同 Debian 版本的测试机验证。
+先在相同发行版与版本的测试机验证。
 
 ## 支持范围
 
-- 一键部署与模块：Debian 12 或更高版本，Bash，systemd，root 权限；
-- 独立工具：以脚本顶部说明为准；大部分面向 Debian 系列系统；
+- 一键部署与模块：Debian 12 或更高版本、Ubuntu 22.04/24.04，Bash，systemd，root 权限；
+- Ubuntu 需启用发行版软件源中的 `universe`，否则 Zram 或 Speedtest 等软件包可能不可用；
+- Ubuntu 22.04（Jammy）不在 XanMod 官方 APT 支持范围内，内核步骤会安全跳过；
+- 独立工具：以脚本顶部说明为准；大部分面向 Debian/Ubuntu 系统；
 - `xanmod-install.sh`：主要面向 amd64/x86-64；
-- 需要访问 GitHub、Debian 软件源和各工具的上游服务。
+- 需要访问 GitHub、系统 APT 软件源和各工具的上游服务。
 
 ## 快速开始
 
 推荐直接远程运行最新主脚本。脚本需要交互输入，因此使用进程替换，避免将标准输入占用为脚本内容：
 
 ```bash
-sudo bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/debian_setup.sh)
+sudo bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/linux_setup.sh)
 ```
 
 如需先审阅再执行：
 
 ```bash
-curl -fsSLo /tmp/debian_setup.sh \
-  https://raw.githubusercontent.com/LucaLin233/Linux/main/debian_setup.sh
-less /tmp/debian_setup.sh
-sudo bash /tmp/debian_setup.sh
+curl -fsSLo /tmp/linux_setup.sh \
+  https://raw.githubusercontent.com/LucaLin233/Linux/main/linux_setup.sh
+less /tmp/linux_setup.sh
+sudo bash /tmp/linux_setup.sh
 ```
 
 需要修改脚本或离线保留副本时，再克隆仓库：
@@ -34,17 +36,17 @@ sudo bash /tmp/debian_setup.sh
 ```bash
 git clone https://github.com/LucaLin233/Linux.git
 cd Linux
-sudo ./debian_setup.sh
+sudo ./linux_setup.sh
 ```
 
 > 运行过程中可能安装软件、修改 sysctl、SSH、Shell、定时任务和 systemd 服务。不要在未备份、
 > 无控制台或无法接受中断的生产机上直接选择全部安装。
 
-## Debian 一键部署
+## Linux 一键部署
 
-[`debian_setup.sh`](debian_setup.sh) 是主要入口。它会：
+[`linux_setup.sh`](linux_setup.sh) 是主要入口。它会：
 
-1. 检查 Debian、root、磁盘和网络；
+1. 检查 Debian/Ubuntu 版本、root、磁盘和网络；
 2. 安装基础依赖并更新软件包索引；
 3. 获取 GitHub 最新 Commit；
 4. 从该固定 Commit 自动发现、下载和校验 `modules/*.sh`；
@@ -54,18 +56,18 @@ sudo ./debian_setup.sh
 常用选项：
 
 ```bash
-sudo bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/debian_setup.sh) --check-status
-sudo bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/debian_setup.sh) --clean-cache
-bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/debian_setup.sh) --version
-bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/debian_setup.sh) --help
+sudo bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/linux_setup.sh) --check-status
+sudo bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/linux_setup.sh) --clean-cache
+bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/linux_setup.sh) --version
+bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/linux_setup.sh) --help
 ```
 
 主要文件：
 
 ```text
-/var/log/debian-setup.log
+/var/log/linux-setup.log
 /root/deployment_summary.txt
-/var/cache/debian-setup/
+/var/cache/linux-setup/
 ```
 
 ### 部署模块
@@ -83,6 +85,8 @@ bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/debian
 | 9 | `ssh-security.sh` | SSH 端口、Root 登录与认证策略 | 完整管理 `sshd_config`，操作不当可能失去远程连接 |
 
 当前只有 `mise-setup` 声明 `zsh-setup` 为强依赖；其他模块可以单独执行。
+SSH 模块要求系统已安装并运行 `openssh-server`；精简镜像请先执行 `sudo apt install -y openssh-server`。
+Docker 模块会按发行版自动选择 Docker 官方 Debian 或 Ubuntu APT 仓库。
 菜单编号由主脚本按模块顺序动态生成。模块元数据中的 `order=10`、`20` 等值仅用于排序，
 不是用户需要输入的编号。
 
@@ -91,7 +95,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/debian
 直接运行模块会绕过主脚本的系统预检查、基础依赖安装、固定 Commit、统一日志和部署摘要。
 新服务器优先运行主脚本并选择“自定义选择”；仅需重跑或单独配置某项功能时，再直接运行模块。
 
-最小化安装的 Debian 建议先准备与主脚本相同的基础依赖：
+最小化安装的 Debian/Ubuntu 建议先准备与主脚本相同的基础依赖：
 
 ```bash
 sudo apt update
@@ -177,10 +181,10 @@ bash <(curl -fsSL "$RAW_BASE/network-optimize.sh") help
 
 ```bash
 #!/usr/bin/env bash
-# debian-setup:name=模块显示名称
-# debian-setup:order=100
-# debian-setup:depends=
-# debian-setup:enabled=true
+# linux-setup:name=模块显示名称
+# linux-setup:order=100
+# linux-setup:depends=
+# linux-setup:enabled=true
 ```
 
 主脚本会检查 Bash 语法、未知依赖和循环依赖，并按照 `order` 和文件名生成稳定顺序。
@@ -306,7 +310,7 @@ sudo bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/t
 
 | 需求 | 推荐脚本 | 避免同时使用 |
 | --- | --- | --- |
-| 新 Debian VPS 网络基础调优 | `modules/network-optimize.sh` | `kernel.sh`、`kernel2.sh` |
+| 新 Debian/Ubuntu VPS 网络基础调优 | `modules/network-optimize.sh` | `kernel.sh`、`kernel2.sh` |
 | 特定出口 policer 检测与整形 | `tools/traffic-shape.sh` | tcpfit Shape、CAKE、TBF、其他 HTB |
 | 一键系统定制 | `system-customize.sh` | 重复运行 `setup-motd.sh` |
 | 仅安装 XanMod | `xanmod-install.sh` | 同时让多个脚本反复管理内核源 |
@@ -331,7 +335,7 @@ sudo bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/t
 ```bash
 cat /etc/os-release
 uname -a
-sudo tail -n 200 /var/log/debian-setup.log
+sudo tail -n 200 /var/log/linux-setup.log
 systemctl --failed
 journalctl -p warning -b --no-pager
 ```

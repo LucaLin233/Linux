@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# debian-setup:name=网络优化（BBR、fq、IPv4 转发）
-# debian-setup:order=30
-# debian-setup:depends=
-# debian-setup:enabled=true
+# linux-setup:name=网络优化（BBR、fq、IPv4 转发）
+# linux-setup:order=30
+# linux-setup:depends=
+# linux-setup:enabled=true
 # 网络优化模块
 # 功能：自动探测带宽、RTT 与内存，动态配置 BBR、fq、TCP 缓冲区及 IPv4 转发参数。
 # 无参数运行等同于 install：自动探测一次、立即应用，不创建定时任务。
@@ -258,22 +258,10 @@ migrate_legacy_kernel_config() {
 }
 
 migrate_legacy_sysctl_conf() {
-    # 旧版脚本为了兼容 Debian 12 升级 Debian 13 的环境，
-    # 会将存在的 /etc/sysctl.conf 迁移为 .bak。
+    # /etc/sysctl.conf 可能由系统或管理员维护。无法可靠确认来源时，
+    # 只管理独立的 sysctl.d 文件，不移动或覆盖主配置。
     [[ -s "$LEGACY_SYSCTL_CONF" ]] || return 0
-
-    if [[ -e "$LEGACY_SYSCTL_BACKUP" ]]; then
-        warn "检测到 $LEGACY_SYSCTL_CONF，但 $LEGACY_SYSCTL_BACKUP 已存在，保留当前文件不自动迁移"
-        return 0
-    fi
-
-    if mv "$LEGACY_SYSCTL_CONF" "$LEGACY_SYSCTL_BACKUP"; then
-        info "已迁移旧主 sysctl 配置：$LEGACY_SYSCTL_CONF → $LEGACY_SYSCTL_BACKUP"
-        return 0
-    fi
-
-    error "无法迁移旧主 sysctl 配置：$LEGACY_SYSCTL_CONF"
-    return 1
+    warn "检测到 $LEGACY_SYSCTL_CONF；为保留现有系统配置，不自动迁移或覆盖"
 }
 
 restore_legacy_limits() {

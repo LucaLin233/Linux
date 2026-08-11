@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# debian-setup:name=Docker 容器化平台
-# debian-setup:order=70
-# debian-setup:depends=
-# debian-setup:enabled=true
+# linux-setup:name=Docker 容器化平台
+# linux-setup:order=70
+# linux-setup:depends=
+# linux-setup:enabled=true
 # Docker 容器化平台配置模块
 # 功能：通过 Docker 官方 APT 仓库安装 Docker、Compose、Buildx，
 #       并可选配置容器日志轮转。
@@ -16,8 +16,8 @@ readonly DOCKER_DAEMON_CONFIG="$DOCKER_DAEMON_DIR/daemon.json"
 readonly DOCKER_DAEMON_INITIAL_BACKUP="$DOCKER_DAEMON_DIR/daemon.json.initial-backup"
 readonly DOCKER_DAEMON_PREVIOUS_BACKUP="$DOCKER_DAEMON_DIR/daemon.json.previous-backup"
 
-readonly DOCKER_GPG_URL="https://download.docker.com/linux/debian/gpg"
-readonly DOCKER_REPO_URL="https://download.docker.com/linux/debian"
+DOCKER_GPG_URL=""
+DOCKER_REPO_URL=""
 
 readonly DOCKER_PACKAGES=(
     docker-ce
@@ -67,23 +67,63 @@ apt_update_once() {
     APT_UPDATED=true
 }
 
-get_debian_codename() {
-    if [[ -r /etc/os-release ]]; then
-        . /etc/os-release
-
-        if [[ -n "${VERSION_CODENAME:-}" ]]; then
-            echo "$VERSION_CODENAME"
-            return 0
-        fi
+detect_supported_distribution() {
+    if [[ ! -r /etc/os-release ]]; then
+        error "无法读取 /etc/os-release，无法识别系统"
+        return 1
     fi
 
-    return 1
+    local os_id
+    local version_id
+    local major_version
+
+    # shellcheck disable=SC1091
+    . /etc/os-release
+    os_id="${ID:-}"
+    version_id="${VERSION_ID:-}"
+    major_version="${version_id%%.*}"
+
+    case "$os_id" in
+        debian)
+            if [[ ! "$major_version" =~ ^[0-9]+$ ]] || (( major_version < 12 )); then
+                error "Docker 模块仅支持 Debian 12+，当前版本：${version_id:-未知}"
+                return 1
+            fi
+            ;;
+        ubuntu)
+            if [[ "$version_id" != "22.04" && "$version_id" != "24.04" ]]; then
+                error "Docker 模块仅支持 Ubuntu 22.04/24.04，当前版本：${version_id:-未知}"
+                return 1
+            fi
+            ;;
+        *)
+            error "Docker 模块不支持当前系统：${PRETTY_NAME:-${os_id:-未知}}"
+            return 1
+            ;;
+    esac
+
+    if [[ -z "${VERSION_CODENAME:-}" ]]; then
+        error "无法识别系统发行版代号"
+        return 1
+    fi
+
+    DOCKER_GPG_URL="https://download.docker.com/linux/${os_id}/gpg"
+    DOCKER_REPO_URL="https://download.docker.com/linux/${os_id}"
+}
+
+get_os_codename() {
+    # detect_supported_distribution 已加载并验证 /etc/os-release。
+    printf '%s\n' "$VERSION_CODENAME"
 }
 
 docker_repository_configured() {
+    local codename
+    codename=$(get_os_codename) || return 1
+
     [[ -s "$DOCKER_KEYRING" ]] &&
         [[ -f "$DOCKER_SOURCE" ]] &&
         grep -Fq "$DOCKER_REPO_URL" "$DOCKER_SOURCE" &&
+        grep -Fxq "Suites: $codename" "$DOCKER_SOURCE" &&
         grep -Fq "Signed-By: $DOCKER_KEYRING" "$DOCKER_SOURCE"
 }
 
@@ -96,8 +136,8 @@ configure_docker_repository() {
         return 0
     fi
 
-    codename=$(get_debian_codename) || {
-        error "无法识别 Debian 发行版代号"
+    codename=$(get_os_codename) || {
+        error "无法识别系统发行版代号"
         return 1
     }
 
@@ -468,6 +508,7 @@ show_docker_summary() {
 
 main() {
     require_root
+    detect_supported_distribution || exit 1
 
     local command_name
     for command_name in apt-get curl dpkg dpkg-query grep install jq mktemp systemctl; do
