@@ -613,11 +613,12 @@ detect_rtt() {
 route_value_after() {
     local key="$1"
     awk -v key="$key" '
-        {
+        !found {
             for (i = 1; i < NF; i++) {
                 if ($i == key) {
                     print $(i + 1)
-                    exit
+                    found = 1
+                    break
                 }
             }
         }
@@ -696,7 +697,7 @@ kill_process_tree() {
 
 resolve_ipv4() {
     getent ahostsv4 "$1" 2>/dev/null |
-        awk '/STREAM/ {print $1; exit}'
+        awk '/STREAM/ && !found {print $1; found = 1}'
 }
 
 ordered_iperf_ports() {
@@ -1055,7 +1056,9 @@ round_bandwidth() {
     local measured="$1"
     local rounded
 
-    if (( measured < 100 )); then
+    if (( measured < 50 )); then
+        rounded="$measured"
+    elif (( measured < 200 )); then
         rounded=$((((measured + 5) / 10) * 10))
     else
         rounded=$((((measured + 25) / 50) * 50))
