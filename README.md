@@ -74,7 +74,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/linux_
 
 | 菜单编号 | 模块 | 功能 | 主要影响 |
 | ---: | --- | --- | --- |
-| 1 | `system-optimize.sh` | 按内存配置 Zram、时区和 Chrony | Ubuntu 缺少 Zram 模块时先安装当前内核对应的 `linux-modules-extra-*`；启用 Chrony 后停用 timesyncd |
+| 1 | `system-optimize.sh` | 按内存配置 Zram、时区和 Chrony | Ubuntu 缺少 Zram 时安装当前 `linux-modules-extra-*` 及对应完整内核元包，确保后续内核继续携带模块；可能额外安装固件与 CPU 微码 |
 | 2 | `system-customize.sh` | 动态 MOTD、中文 Locale、可选 XanMod | 可能修改 Locale、欢迎信息和内核 |
 | 3 | `network-optimize.sh` | BBR、fq、动态 TCP 缓冲区和转发参数 | 自动测速最多约 90 GB；写入独立 sysctl 配置 |
 | 4 | `zsh-setup.sh` | Zsh、Oh My Zsh、Powerlevel10k 和插件 | 备份后重写 root 的 `.zshrc`，可修改默认 Shell |

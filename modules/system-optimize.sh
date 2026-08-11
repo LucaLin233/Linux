@@ -209,15 +209,76 @@ zram_kernel_module_available() {
     [[ -d /sys/module/zram ]] || modprobe zram >/dev/null 2>&1
 }
 
-ensure_zram_kernel_module() {
-    if zram_kernel_module_available; then
+get_ubuntu_kernel_meta_package() {
+    local version_id=""
+    local kernel_version
+
+    kernel_version=$(uname -r)
+    if [[ -r /etc/os-release ]]; then
+        # shellcheck disable=SC1091
+        . /etc/os-release
+        version_id="${VERSION_ID:-}"
+    fi
+
+    case "$kernel_version" in
+        *-generic)
+            case "$version_id" in
+                22.04)
+                    if [[ "$kernel_version" == 5.15.*-generic ]]; then
+                        echo "linux-image-generic"
+                    else
+                        echo "linux-image-generic-hwe-22.04"
+                    fi
+                    ;;
+                24.04)
+                    echo "linux-image-generic"
+                    ;;
+                *)
+                    return 1
+                    ;;
+            esac
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+ensure_ubuntu_kernel_meta_package() {
+    local meta_package
+
+    meta_package=$(get_ubuntu_kernel_meta_package || true)
+    [[ -n "$meta_package" ]] || return 1
+
+    if dpkg-query -W -f='${db:Status-Status}' "$meta_package" 2>/dev/null |
+        grep -qx "installed"; then
         return 0
     fi
 
+    if ! apt-cache show --no-all-versions "$meta_package" >/dev/null 2>&1; then
+        log "当前软件源没有 Ubuntu 内核元包：$meta_package" "warn"
+        return 1
+    fi
+
+    log "为确保后续内核持续包含 Zram，安装内核元包：$meta_package" "warn"
+    log "该元包可能同时安装 linux-firmware、CPU 微码及其他内核运行依赖" "warn"
+
+    if ! NEEDRESTART_MODE=a DEBIAN_FRONTEND=noninteractive \
+        apt-get install -y "$meta_package"; then
+        log "Ubuntu 内核元包安装失败；当前内核的 Zram 配置仍将继续" "warn"
+        return 1
+    fi
+
+    log "Ubuntu 内核元包已就绪，后续内核升级将自动携带 modules-extra" "info"
+}
+
+ensure_zram_kernel_module() {
     local os_id=""
     local kernel_version
     local extra_package
+    local meta_package=""
     local apt_status=0
+    local -a kernel_packages=()
 
     kernel_version=$(uname -r)
     if [[ -r /etc/os-release ]]; then
@@ -226,12 +287,38 @@ ensure_zram_kernel_module() {
         os_id="${ID:-}"
     fi
 
+    if zram_kernel_module_available; then
+        if [[ "$os_id" == "ubuntu" ]]; then
+            ensure_ubuntu_kernel_meta_package ||
+                log "未能配置 Ubuntu 完整内核元包；未来内核升级后可能需要再次补充 modules-extra" "warn"
+        fi
+        return 0
+    fi
+
     if [[ "$os_id" == "ubuntu" ]]; then
         extra_package="linux-modules-extra-${kernel_version}"
 
-        if apt-cache show --no-all-versions "$extra_package" >/dev/null 2>&1; then
-            log "当前 Ubuntu 内核缺少 Zram 模块，安装：$extra_package" "warn"
-            DEBIAN_FRONTEND=noninteractive apt-get install -y "$extra_package" || apt_status=$?
+        if ! apt-cache show --no-all-versions "$extra_package" >/dev/null 2>&1; then
+            log "当前软件源没有 $extra_package" "warn"
+        else
+            kernel_packages+=("$extra_package")
+
+            # 精简 VPS 常安装 linux-image-virtual，它不会依赖 modules-extra。
+            # 同时安装对应的完整 image 元包，确保后续内核升级自动携带 Zram 模块。
+            meta_package=$(get_ubuntu_kernel_meta_package || true)
+            if [[ -n "$meta_package" ]] &&
+                apt-cache show --no-all-versions "$meta_package" >/dev/null 2>&1; then
+                kernel_packages+=("$meta_package")
+                log "为确保后续内核持续包含 Zram，安装内核元包：$meta_package" "warn"
+                log "该元包可能同时安装 linux-firmware、CPU 微码及其他内核运行依赖" "warn"
+            else
+                meta_package=""
+                log "未找到适用的完整内核元包；仅修复当前内核的 Zram 模块" "warn"
+            fi
+
+            log "当前 Ubuntu 内核缺少 Zram 模块，安装：${kernel_packages[*]}" "warn"
+            NEEDRESTART_MODE=a DEBIAN_FRONTEND=noninteractive \
+                apt-get install -y "${kernel_packages[@]}" || apt_status=$?
             depmod -a "$kernel_version" >/dev/null 2>&1 || true
 
             if zram_kernel_module_available; then
@@ -243,11 +330,12 @@ ensure_zram_kernel_module() {
                     fi
                 fi
 
+                if [[ -n "$meta_package" ]]; then
+                    log "Ubuntu 内核元包已就绪，后续内核升级将自动携带 modules-extra" "info"
+                fi
                 log "Zram 内核模块已就绪" "info"
                 return 0
             fi
-        else
-            log "当前软件源没有 $extra_package" "warn"
         fi
     fi
 
@@ -310,14 +398,15 @@ setup_zram() {
     echo "检测到内存: ${mem_mb}MB"
     echo "目标 Zram: ${zram_size}，swappiness=${swappiness}"
 
+    # 即使现有 Zram 配置已匹配，也要确认 Ubuntu 内核元包持续跟踪 modules-extra。
+    install_zram_generator || return 1
+
     if zram_config_matches "$zram_size" "$swappiness"; then
         current_size=$(get_zram_size)
         echo "Zram: ${current_size:-已启用}（配置无需变更）"
         show_swap_status
         return 0
     fi
-
-    install_zram_generator || return 1
 
     used_bytes=$(get_zram_used_bytes)
     used_bytes="${used_bytes:-0}"
