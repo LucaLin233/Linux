@@ -478,7 +478,7 @@ detect_memory_mb() {
 
 calculate_memory_cap() {
     local ram_mb="$1"
-    local cap=$((ram_mb * 32768)) # RAM / 32
+    local cap=$((ram_mb * 65536)) # RAM / 16
     local minimum=$((8 * 1024 * 1024))
     local maximum=$((256 * 1024 * 1024))
 
@@ -1224,7 +1224,7 @@ buffer_limit_reason() {
     if (( desired < minimum )); then
         echo "8 MiB floor"
     elif (( desired > memory_cap )); then
-        echo "RAM / 32 cap"
+        echo "RAM / 16 cap"
     else
         echo "2 x BDP"
     fi
@@ -1513,6 +1513,8 @@ append_adaptive_capacity_settings() {
     local target_file="$1"
     local current_conntrack
     local target_conntrack
+    local cpu_count=1
+    local netdev_budget=300
     local peak_bandwidth=0
 
     if [[ -n "${DETECTED_DOWNLOAD_MBPS:-}" ]] && (( DETECTED_DOWNLOAD_MBPS > peak_bandwidth )); then
@@ -1522,11 +1524,17 @@ append_adaptive_capacity_settings() {
         peak_bandwidth="$DETECTED_UPLOAD_MBPS"
     fi
 
-    if (( peak_bandwidth >= 2500 )) && [[ -e /proc/sys/net/core/netdev_budget ]]; then
-        cat >> "$target_file" <<'EOF'
+    cpu_count=$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)
+    [[ "$cpu_count" =~ ^[0-9]+$ ]] && (( cpu_count > 0 )) || cpu_count=1
 
-# 高带宽链路增加单轮 NAPI 数据包预算
-net.core.netdev_budget = 600
+    if [[ -e /proc/sys/net/core/netdev_budget ]]; then
+        if (( peak_bandwidth >= 2500 && cpu_count >= 2 )); then
+            netdev_budget=600
+        fi
+        cat >> "$target_file" <<EOF
+
+# NAPI 数据包预算：高速多核提高吞吐，单核保留默认值避免挤压代理进程
+net.core.netdev_budget = $netdev_budget
 EOF
     fi
 
@@ -1584,20 +1592,25 @@ net.core.default_qdisc = fq
 net.ipv4.tcp_fastopen = 3
 
 # 5. 连接与接收队列
-net.core.somaxconn = 32768
-net.ipv4.tcp_max_syn_backlog = 8192
+net.core.somaxconn = 65535
+net.ipv4.tcp_max_syn_backlog = 16384
 net.core.netdev_max_backlog = 16384
 
 # 6. 临时端口
 net.ipv4.ip_local_port_range = 1024 65535
 
 # 7. TCP/UDP 缓冲区
+net.core.rmem_default = 262144
+net.core.wmem_default = 262144
 net.core.rmem_max = $RMEM_MAX_BYTES
 net.core.wmem_max = $WMEM_MAX_BYTES
 net.ipv4.tcp_rmem = 4096 131072 $RMEM_MAX_BYTES
 net.ipv4.tcp_wmem = 4096 65536 $WMEM_MAX_BYTES
+net.ipv4.udp_rmem_min = 8192
+net.ipv4.udp_wmem_min = 8192
 
-# 8. 长连接与复杂路径
+# 8. 长连接、连接回收与复杂路径
+net.ipv4.tcp_fin_timeout = 30
 net.ipv4.tcp_slow_start_after_idle = 0
 net.ipv4.tcp_mtu_probing = 1
 EOF
@@ -1931,12 +1944,18 @@ show_status() {
     local syn_backlog
     local backlog
     local port_range
+    local rmem_default
+    local wmem_default
     local rmem_max
     local wmem_max
     local tcp_rmem
     local tcp_wmem
+    local udp_rmem_min
+    local udp_wmem_min
+    local fin_timeout
     local slow_start_after_idle
     local mtu_probing
+    local netdev_budget
 
     available_cc=$(cat /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null || echo "未知")
     current_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "未知")
@@ -1949,12 +1968,18 @@ show_status() {
     syn_backlog=$(sysctl -n net.ipv4.tcp_max_syn_backlog 2>/dev/null || echo "未知")
     backlog=$(sysctl -n net.core.netdev_max_backlog 2>/dev/null || echo "未知")
     port_range=$(sysctl -n net.ipv4.ip_local_port_range 2>/dev/null || echo "未知")
+    rmem_default=$(sysctl -n net.core.rmem_default 2>/dev/null || echo "未知")
+    wmem_default=$(sysctl -n net.core.wmem_default 2>/dev/null || echo "未知")
     rmem_max=$(sysctl -n net.core.rmem_max 2>/dev/null || echo "未知")
     wmem_max=$(sysctl -n net.core.wmem_max 2>/dev/null || echo "未知")
     tcp_rmem=$(sysctl -n net.ipv4.tcp_rmem 2>/dev/null || echo "未知")
     tcp_wmem=$(sysctl -n net.ipv4.tcp_wmem 2>/dev/null || echo "未知")
+    udp_rmem_min=$(sysctl -n net.ipv4.udp_rmem_min 2>/dev/null || echo "未知")
+    udp_wmem_min=$(sysctl -n net.ipv4.udp_wmem_min 2>/dev/null || echo "未知")
+    fin_timeout=$(sysctl -n net.ipv4.tcp_fin_timeout 2>/dev/null || echo "未知")
     slow_start_after_idle=$(sysctl -n net.ipv4.tcp_slow_start_after_idle 2>/dev/null || echo "未知")
     mtu_probing=$(sysctl -n net.ipv4.tcp_mtu_probing 2>/dev/null || echo "未知")
+    netdev_budget=$(sysctl -n net.core.netdev_budget 2>/dev/null || echo "不可用")
 
     echo "========== 网络优化状态 =========="
     echo "配置文件: $NETWORK_CONF"
@@ -1989,17 +2014,23 @@ show_status() {
     echo "  somaxconn: $somaxconn"
     echo "  tcp_max_syn_backlog: $syn_backlog"
     echo "  netdev_max_backlog: $backlog"
+    echo "  netdev_budget: $netdev_budget"
     echo "  临时端口范围: $port_range"
 
     echo
     echo "缓冲区:"
+    echo "  rmem_default: $rmem_default"
+    echo "  wmem_default: $wmem_default"
     echo "  rmem_max: $rmem_max"
     echo "  wmem_max: $wmem_max"
     echo "  tcp_rmem: $tcp_rmem"
     echo "  tcp_wmem: $tcp_wmem"
+    echo "  udp_rmem_min: $udp_rmem_min"
+    echo "  udp_wmem_min: $udp_wmem_min"
 
     echo
     echo "TCP 行为:"
+    echo "  fin_timeout: $fin_timeout"
     echo "  slow_start_after_idle: $slow_start_after_idle"
     echo "  mtu_probing: $mtu_probing"
 
@@ -2048,7 +2079,7 @@ install/plan 选项：
   - 自动测量中国大陆与全球 RTT，BDP 计算使用 150 ms 下限并保留观测值
   - 首选附近公共 iperf3 节点进行多流双向测速，Cloudflare 作为并行回退
   - 自动测速在约 90 GB 时停止，保留余量确保总量不超过 100 GB
-  - 根据 2 × BDP 动态设置缓冲区，上限为 RAM / 32 且不超过 256 MiB
+  - 根据 2 × BDP 动态设置缓冲区，上限为 RAM / 16 且不超过 256 MiB
   - 探测失败时按内存使用保守配置
   - 只在本次运行计算和应用，不创建定时任务
 EOF
@@ -2072,7 +2103,7 @@ main() {
     case "$COMMAND" in
         install)
             require_root
-            for required_command in sysctl mv cp find modprobe ip flock getent install dirname; do
+            for required_command in sysctl mv cp find modprobe ip flock getent install dirname getconf; do
                 if ! command -v "$required_command" >/dev/null 2>&1; then
                     error "缺少必要命令: $required_command"
                     exit 1

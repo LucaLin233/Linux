@@ -76,7 +76,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/linux_
 | ---: | --- | --- | --- |
 | 1 | `system-optimize.sh` | Zram、系统 sysctl、journald、THP、时区和 Chrony | 为 headless VPS 设置 Panic 恢复、日志上限和低干扰 THP 策略；Ubuntu 可能安装内核模块、固件与 CPU 微码 |
 | 2 | `system-customize.sh` | 动态 MOTD、中文 Locale、可选 XanMod | 可能修改 Locale、欢迎信息和内核 |
-| 3 | `network-optimize.sh` | BBR、fq、动态 TCP 缓冲区、IPv4/IPv6 转发 | 仅在上联网卡使用 `accept_ra=2` 保留云平台 IPv6 RA；自动测速最多约 90 GB |
+| 3 | `network-optimize.sh` | BBR、fq、动态 TCP/UDP 缓冲区、IPv4/IPv6 转发 | 仅在上联网卡使用 `accept_ra=2` 保留云平台 IPv6 RA；自动测速最多约 90 GB |
 | 4 | `zsh-setup.sh` | Zsh、Oh My Zsh、Powerlevel10k 和插件 | 备份后重写 root 的 `.zshrc`，可修改默认 Shell |
 | 5 | `mise-setup.sh` | Mise、Python、Node.js 和依赖迁移 | 配置 Shell 集成及每周 Mise 自动更新 |
 | 6 | `tools-setup.sh` | NextTrace、Speedtest、htop、jq、tree 等 | 可能添加 NextTrace 第三方 APT 源 |
@@ -199,6 +199,12 @@ sudo bash <(curl -fsSL "$RAW_BASE/network-optimize.sh") restore
 sudo bash <(curl -fsSL "$RAW_BASE/network-optimize.sh") restore initial
 bash <(curl -fsSL "$RAW_BASE/network-optimize.sh") help
 ```
+
+网络模块默认面向同时承载 TCP、UDP 与 Docker 流量的代理节点：连接队列使用
+`somaxconn=65535`、`tcp_max_syn_backlog=16384`，默认 socket 缓冲区为 256 KiB，UDP 最小
+缓冲区为 8 KiB，`tcp_fin_timeout=30`。动态最大缓冲区按 `2 × BDP` 计算，限制在
+`RAM / 16` 且不超过 256 MiB；`--static` 仍保持固定 32 MiB。`netdev_budget` 在带宽达到
+2.5 Gbps 且至少 2 个在线 CPU 时使用 600，其他环境明确使用内核默认值 300。
 
 > `RAW_BASE` 只在当前 Shell 会话有效。上述进程替换语法需要 Bash 或 Zsh；不要改成
 > `curl ... | sudo bash`，否则交互模块可能无法正常读取终端输入。SSH、自动更新、内核和网络
