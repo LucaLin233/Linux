@@ -10,15 +10,15 @@
 set -uo pipefail
 umask 022
 
-readonly VERSION="1.0.6"
-readonly INSTALL_PATH="/usr/local/sbin/tcshape"
+readonly VERSION="1.0.7"
+readonly INSTALL_PATH="${TCSHAPE_INSTALL_PATH:-/usr/local/sbin/tcshape}"
 readonly UPDATE_REPO="LucaLin233/Linux"
 readonly UPDATE_BRANCH="main"
 readonly UPDATE_SCRIPT_PATH="tools/traffic-shape.sh"
-readonly STATE_DIR="/var/lib/tcshape"
-readonly CONFIG_FILE="/etc/tcshape.conf"
-readonly SERVICE_FILE="/etc/systemd/system/tcshape.service"
-readonly LOCK_FILE="/run/lock/tcshape.lock"
+readonly STATE_DIR="${TCSHAPE_STATE_DIR:-/var/lib/tcshape}"
+readonly CONFIG_FILE="${TCSHAPE_CONFIG_FILE:-/etc/tcshape.conf}"
+readonly SERVICE_FILE="${TCSHAPE_SERVICE_FILE:-/etc/systemd/system/tcshape.service}"
+readonly LOCK_FILE="${TCSHAPE_LOCK_FILE:-/run/lock/tcshape.lock}"
 readonly PID_FILE="/run/tcshape-$$.iperf.pid"
 
 # 与 modules/network-optimize.sh 保持一致。
@@ -28,7 +28,7 @@ readonly TRAFFIC_DIRECTION_LIMIT_BYTES=45000000000
 readonly PORT_POOL="5201 5202 5203 5204 5205 5206 5207 5208 5209 5210 5200"
 readonly PROBE_PORTS="5201 5202 5203 5200"
 readonly LOSS_THRESHOLD="0.1"
-readonly SCAN_CAP_MBIT=100000
+readonly DEFAULT_SCAN_CAP_MBIT=10000
 readonly SWEEP_MAX_AGE_SECONDS=86400
 
 OS_ID=""
@@ -91,7 +91,8 @@ tcshape - 出口限速器扫描与流量整形
 
 完整命令：
   tcshape scan [HOST] [--port N] [--nominal N] [--from N --to N]
-                       [--step N] [--dur N] [--margin N] [--yes] [-4|-6]
+                       [--step N] [--dur N] [--margin N] [--cap N]
+                       [--loss-threshold PCT] [--yes] [-4|-6]
   tcshape apply [--force]
   tcshape set RATE
   tcshape status
@@ -105,6 +106,15 @@ require_root() {
         error "需要 root 权限"
         exit 1
     fi
+}
+
+validate_scan_cap() {
+    is_positive_integer "$1" 100 100000
+}
+
+is_loss_threshold() {
+    local value="$1"
+    awk -v value="$value" 'BEGIN {exit !(value ~ /^[0-9]+([.][0-9]+)?$/ && value >= 0.0001 && value <= 10)}'
 }
 
 is_positive_integer() {
@@ -467,11 +477,79 @@ root_qdisc_kind() {
         head -n 1
 }
 
+qdisc_options_are_custom() {
+    local kind="$1"
+    local options="$2"
+    local known_count
+    local total_count
+    [[ -n "$options" && "$options" != "{}" ]] || return 1
+
+    total_count=$(jq 'keys | length' <<< "$options" 2>/dev/null) || return 0
+    case "$kind" in
+        fq)
+            known_count=$(jq '[keys[] | select(. == "limit" or . == "flow_limit" or . == "quantum" or . == "initial_quantum" or . == "maxrate" or . == "buckets" or . == "orphan_mask" or . == "horizon_drop")] | length' <<< "$options")
+            (( total_count == known_count )) || return 0
+            jq -e '
+                (has("limit") and .limit != 10000) or
+                (has("flow_limit") and .flow_limit != 100) or
+                (has("quantum") and .quantum != 3028) or
+                (has("initial_quantum") and .initial_quantum != 15140) or
+                (has("maxrate") and .maxrate != 0) or
+                (has("buckets") and .buckets != 1024) or
+                (has("orphan_mask") and .orphan_mask != 1023) or
+                (has("horizon_drop") and .horizon_drop != false)
+            ' <<< "$options" >/dev/null 2>&1
+            ;;
+        fq_codel)
+            known_count=$(jq '[keys[] | select(. == "limit" or . == "flows" or . == "quantum" or . == "target" or . == "interval" or . == "ecn")] | length' <<< "$options")
+            (( total_count == known_count )) || return 0
+            jq -e '
+                (has("limit") and .limit != 10240) or
+                (has("flows") and .flows != 1024) or
+                (has("quantum") and .quantum != 1514) or
+                (has("target") and .target != 5000) or
+                (has("interval") and .interval != 100000) or
+                (has("ecn") and .ecn != true)
+            ' <<< "$options" >/dev/null 2>&1
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+qdisc_has_custom_parameters() {
+    local iface="$1"
+    local kind="$2"
+    local json
+    local options
+
+    json=$(tc -j -d qdisc show dev "$iface" 2>/dev/null) || {
+        error "无法读取 $iface 的详细 qdisc 参数，拒绝覆盖"
+        return 0
+    }
+    options=$(jq -cer --arg kind "$kind" \
+        '[.[] | select(.root == true and .kind == $kind) | .options // {}][0]' \
+        <<< "$json" 2>/dev/null) || {
+        error "无法解析 $iface 的 $kind qdisc 参数，拒绝覆盖"
+        return 0
+    }
+    qdisc_options_are_custom "$kind" "$options"
+}
+
 read_config_value() {
     local key="$1"
     local file="${2:-$CONFIG_FILE}"
     [[ -f "$file" ]] || return 1
     awk -F= -v key="$key" '$1 == key {print substr($0, index($0, "=") + 1); exit}' "$file"
+}
+
+is_tcshape_qdisc() {
+    local iface="$1"
+    tc qdisc show dev "$iface" 2>/dev/null |
+        awk '$1 == "qdisc" && $2 == "htb" && $3 == "1:" && $4 == "root" {found=1} END {exit !found}' || return 1
+    tc class show dev "$iface" 2>/dev/null |
+        grep -Eq '^class htb 1:10([[:space:]]|$)'
 }
 
 is_own_shaper() {
@@ -481,10 +559,7 @@ is_own_shaper() {
     grep -Fq 'tcshape-managed' "$SERVICE_FILE" 2>/dev/null || return 1
     configured_iface=$(read_config_value INTERFACE || true)
     [[ "$configured_iface" == "$iface" ]] || return 1
-    tc qdisc show dev "$iface" 2>/dev/null |
-        awk '$1 == "qdisc" && $2 == "htb" && $3 == "1:" && $4 == "root" {found=1} END {exit !found}' || return 1
-    tc class show dev "$iface" 2>/dev/null |
-        grep -Eq '^class htb 1:10([[:space:]]|$)'
+    is_tcshape_qdisc "$iface"
 }
 
 check_external_conflicts() {
@@ -511,6 +586,11 @@ check_external_conflicts() {
             return 1
             ;;
     esac
+
+    if [[ "$kind" =~ ^(fq|fq_codel)$ ]] && qdisc_has_custom_parameters "$iface" "$kind"; then
+        error "当前 $kind 根 qdisc 包含自定义参数，无法保证原样恢复，拒绝覆盖"
+        return 1
+    fi
 
     if ! is_own_shaper "$iface"; then
         local class_output
@@ -669,30 +749,65 @@ qdisc_restore() {
     QSAVE_OWNED=false
 }
 
-save_baseline() {
+save_baseline_to() {
     local iface="$1"
+    local baseline="$2"
+    local json_prefix="$3"
     local kind
-    mkdir -p "$STATE_DIR"
-    chmod 700 "$STATE_DIR"
 
-    [[ -f "$STATE_DIR/qdisc-baseline" ]] && return 0
     kind=$(root_qdisc_kind "$iface")
-
     case "$kind" in
         ""|noqueue|mq|pfifo_fast|fq|fq_codel) ;;
         *) error "无法保存可自动恢复的 qdisc 基线：$kind"; return 1 ;;
     esac
+    if [[ "$kind" =~ ^(fq|fq_codel)$ ]] && qdisc_has_custom_parameters "$iface" "$kind"; then
+        error "当前 $kind 根 qdisc 包含自定义参数，无法保存可自动恢复的基线"
+        return 1
+    fi
 
     {
         printf 'INTERFACE=%s\n' "$iface"
         printf 'KIND=%s\n' "$kind"
-    } > "$STATE_DIR/qdisc-baseline"
-    chmod 600 "$STATE_DIR/qdisc-baseline"
+    } > "$baseline" || return 1
+    chmod 600 "$baseline"
 
-    tc -j qdisc show dev "$iface" > "$STATE_DIR/qdisc-before.json" 2>/dev/null || true
-    tc -j class show dev "$iface" > "$STATE_DIR/class-before.json" 2>/dev/null || true
-    tc -j filter show dev "$iface" > "$STATE_DIR/filter-before.json" 2>/dev/null || true
-    chmod 600 "$STATE_DIR"/*.json 2>/dev/null || true
+    tc -j qdisc show dev "$iface" > "${json_prefix}-qdisc.json" 2>/dev/null || true
+    tc -j class show dev "$iface" > "${json_prefix}-class.json" 2>/dev/null || true
+    tc -j filter show dev "$iface" > "${json_prefix}-filter.json" 2>/dev/null || true
+    chmod 600 "${json_prefix}-"*.json 2>/dev/null || true
+}
+
+save_baseline() {
+    local iface="$1"
+    mkdir -p "$STATE_DIR"
+    chmod 700 "$STATE_DIR"
+    [[ -f "$STATE_DIR/qdisc-baseline" ]] && return 0
+    save_baseline_to "$iface" "$STATE_DIR/qdisc-baseline" "$STATE_DIR/before"
+}
+
+save_baseline_for_interface() {
+    local iface="$1"
+    mkdir -p "$STATE_DIR"
+    rm -f "$STATE_DIR/qdisc-baseline.next" "$STATE_DIR/next-"*.json
+    save_baseline_to "$iface" "$STATE_DIR/qdisc-baseline.next" "$STATE_DIR/next"
+}
+
+remove_interface_baseline() {
+    rm -f "$STATE_DIR/qdisc-baseline.next" "$STATE_DIR/next-"*.json
+}
+
+promote_interface_baseline() {
+    local iface="$1"
+    [[ "$(read_config_value INTERFACE "$STATE_DIR/qdisc-baseline.next" || true)" == "$iface" ]] || return 1
+    mv -f "$STATE_DIR/qdisc-baseline.next" "$STATE_DIR/qdisc-baseline" || return 1
+    local category
+    for category in qdisc class filter; do
+        if [[ -f "$STATE_DIR/next-${category}.json" ]]; then
+            mv -f "$STATE_DIR/next-${category}.json" "$STATE_DIR/${category}-before.json" || return 1
+        else
+            rm -f "$STATE_DIR/${category}-before.json"
+        fi
+    done
 }
 
 restore_baseline() {
@@ -703,17 +818,67 @@ restore_baseline() {
 
     iface=$(read_config_value INTERFACE "$baseline") || return 1
     kind=$(read_config_value KIND "$baseline" || true)
-    restore_simple_qdisc "$iface" "$kind"
+    restore_simple_qdisc "$iface" "$kind" || return 1
+    [[ "$(root_qdisc_kind "$iface")" == "$kind" ]] || {
+        error "基线恢复验证失败：$iface 期望 ${kind:-none}"
+        return 1
+    }
+}
+
+remove_owned_qdisc() {
+    local iface="$1"
+    [[ -n "$iface" && -d "/sys/class/net/$iface" ]] || return 1
+    is_tcshape_qdisc "$iface" || return 1
+    tc qdisc del dev "$iface" root 2>/dev/null || return 1
+    ! is_tcshape_qdisc "$iface"
+}
+
+restore_qdisc_from_file() {
+    local baseline="$1"
+    local iface kind
+    [[ -f "$baseline" ]] || return 1
+    iface=$(read_config_value INTERFACE "$baseline") || return 1
+    kind=$(read_config_value KIND "$baseline" || true)
+    restore_simple_qdisc "$iface" "$kind" || return 1
+    [[ "$(root_qdisc_kind "$iface")" == "$kind" ]]
+}
+
+restore_previous_persistent_state() {
+    local previous_config="$1"
+    local previous_iface="$2"
+    local failed_iface="${3:-}"
+
+    if [[ -n "$failed_iface" && "$failed_iface" != "$previous_iface" ]] && is_own_shaper "$failed_iface"; then
+        tc qdisc del dev "$failed_iface" root 2>/dev/null || return 1
+    fi
+
+    if [[ -n "$previous_config" && -f "$previous_config" ]]; then
+        cp -a "$previous_config" "$CONFIG_FILE" || return 1
+        systemctl restart tcshape.service >/dev/null 2>&1 || return 1
+        apply_saved_config || return 1
+        systemctl is-enabled --quiet tcshape.service 2>/dev/null || return 1
+        systemctl is-active --quiet tcshape.service 2>/dev/null || return 1
+        is_own_shaper "$previous_iface"
+        return $?
+    fi
+
+    systemctl disable --now tcshape.service >/dev/null 2>&1 || true
+    rm -f "$CONFIG_FILE" "$SERVICE_FILE"
+    systemctl daemon-reload >/dev/null 2>&1 || return 1
+    restore_baseline
 }
 
 write_service_files() {
     local rate="$1"
     local iface="$2"
+    local service_exec="$INSTALL_PATH"
     local temp_config
     local temp_service
 
-    temp_config=$(mktemp /etc/.tcshape.conf.XXXXXX) || return 1
-    temp_service=$(mktemp /etc/systemd/system/.tcshape.service.XXXXXX) || {
+    [[ "${TCSHAPE_TEST_MODE:-0}" == "1" ]] && service_exec="$BASH_SOURCE"
+
+    temp_config=$(mktemp "$(dirname "$CONFIG_FILE")/.tcshape.conf.XXXXXX") || return 1
+    temp_service=$(mktemp "$(dirname "$SERVICE_FILE")/.tcshape.service.XXXXXX") || {
         rm -f "$temp_config"
         return 1
     }
@@ -734,7 +899,7 @@ After=network-online.target
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=$INSTALL_PATH _apply
+ExecStart=$service_exec _apply
 
 [Install]
 WantedBy=multi-user.target
@@ -751,6 +916,9 @@ cmd_set() {
     local requested_iface="${2:-}"
     local iface
     local previous_config=""
+    local previous_iface=""
+    local baseline_iface=""
+    local switched_iface=false
 
     is_positive_integer "$rate" 1 100000 || {
         error "速率必须是 1-100000 的整数（Mbit）"
@@ -767,37 +935,67 @@ cmd_set() {
     else
         iface=$(detect_iface) || { error "无法确定默认出口接口"; return 1; }
     fi
-    check_external_conflicts "$iface" || return 1
 
     if [[ -f "$CONFIG_FILE" ]]; then
-        previous_config=$(mktemp)
-        cp -a "$CONFIG_FILE" "$previous_config"
+        previous_iface=$(read_config_value INTERFACE || true)
+        [[ -n "$previous_iface" && -d "/sys/class/net/$previous_iface" ]] || {
+            error "现有配置中的接口不存在，拒绝覆盖无法恢复的状态"
+            return 1
+        }
+        previous_config=$(mktemp) || return 1
+        cp -a "$CONFIG_FILE" "$previous_config" || { rm -f "$previous_config"; return 1; }
+        [[ "$previous_iface" != "$iface" ]] && switched_iface=true
     else
         save_baseline "$iface" || return 1
     fi
 
-    write_service_files "$rate" "$iface" || return 1
-    systemctl enable tcshape.service >/dev/null 2>&1 || true
+    check_external_conflicts "$iface" || { rm -f "$previous_config"; return 1; }
 
-    if systemctl restart tcshape.service && verify_qdisc_rate "$iface" "$rate"; then
-        rm -f "$previous_config"
-        ok "已启用：${rate} Mbit（HTB + fq）"
-        return 0
+    if [[ "$switched_iface" == "true" ]]; then
+        baseline_iface=$(read_config_value INTERFACE "$STATE_DIR/qdisc-baseline" || true)
+        if [[ "$baseline_iface" != "$previous_iface" ]]; then
+            rm -f "$previous_config"
+            error "qdisc 基线接口与当前配置不一致，拒绝跨接口迁移"
+            return 1
+        fi
+        save_baseline_for_interface "$iface" || { rm -f "$previous_config"; return 1; }
     fi
 
-    error "整形应用失败，正在恢复"
-    if [[ -n "$previous_config" && -f "$previous_config" ]]; then
-        cp -a "$previous_config" "$CONFIG_FILE"
+    if ! write_service_files "$rate" "$iface" ||
+        ! systemctl enable tcshape.service >/dev/null 2>&1 ||
+        ! systemctl restart tcshape.service >/dev/null 2>&1 ||
+        ! verify_qdisc_rate "$iface" "$rate" ||
+        ! systemctl is-enabled --quiet tcshape.service 2>/dev/null ||
+        ! systemctl is-active --quiet tcshape.service 2>/dev/null; then
+        error "整形或持久服务应用失败，正在恢复"
+        if ! restore_previous_persistent_state "$previous_config" "$previous_iface" "$iface"; then
+            error "自动回滚失败；请执行：tcshape st，并检查 $CONFIG_FILE 与 qdisc"
+        fi
         rm -f "$previous_config"
-        systemctl restart tcshape.service >/dev/null 2>&1 || true
-    else
-        systemctl disable --now tcshape.service >/dev/null 2>&1 || true
-        rm -f "$CONFIG_FILE" "$SERVICE_FILE"
-        systemctl daemon-reload
-        restore_baseline || true
+        [[ "$switched_iface" == "true" ]] && remove_interface_baseline "$iface"
+        return 1
     fi
-    return 1
+
+    if [[ "$switched_iface" == "true" ]]; then
+        if ! remove_owned_qdisc "$previous_iface" ||
+            ! restore_qdisc_from_file "$STATE_DIR/qdisc-baseline" ||
+            ! promote_interface_baseline "$iface"; then
+            error "新接口已应用，但旧接口清理或基线迁移失败，正在回滚"
+            remove_owned_qdisc "$iface" >/dev/null 2>&1 || true
+            restore_qdisc_from_file "$STATE_DIR/qdisc-baseline.next" >/dev/null 2>&1 || true
+            if ! restore_previous_persistent_state "$previous_config" "$previous_iface" "$iface"; then
+                error "自动回滚失败；旧接口可能仍需人工检查：$previous_iface"
+            fi
+            remove_interface_baseline "$iface"
+            rm -f "$previous_config"
+            return 1
+        fi
+    fi
+
+    rm -f "$previous_config"
+    ok "已启用：${rate} Mbit（HTB + fq，接口 $iface）"
 }
+
 
 cmd_off() {
     local iface
@@ -824,9 +1022,16 @@ cmd_off() {
         return 1
     fi
 
+    if systemctl is-enabled --quiet tcshape.service 2>/dev/null ||
+        systemctl is-active --quiet tcshape.service 2>/dev/null ||
+        is_own_shaper "$iface"; then
+        error "关闭后状态验证失败，保留配置文件供人工检查"
+        return 1
+    fi
+
     rm -f "$CONFIG_FILE" "$SERVICE_FILE"
     systemctl daemon-reload
-    rm -f "$STATE_DIR/qdisc-baseline"
+    rm -f "$STATE_DIR/qdisc-baseline" "$STATE_DIR"/*-before.json
     ok "已移除整形并恢复原 qdisc"
 }
 
@@ -1193,6 +1398,8 @@ cmd_scan() {
     local peer=""
     local lo="" hi="" step="" margin="" nominal=""
     local duration="" gap=3 assume_yes=false user_range=false
+    local scan_cap="$DEFAULT_SCAN_CAP_MBIT"
+    local loss_threshold="$LOSS_THRESHOLD"
     local iface picked result rc gp retrans port receiver goodput loss estimated_gp=""
     local last_ok="" broke_at="" base_loss="" peer_slow=0
 
@@ -1206,6 +1413,8 @@ cmd_scan() {
             --step) step="${2:-}"; shift 2 ;;
             --dur) duration="${2:-}"; shift 2 ;;
             --margin) margin="${2:-}"; shift 2 ;;
+            --cap) scan_cap="${2:-}"; shift 2 ;;
+            --loss-threshold) loss_threshold="${2:-}"; shift 2 ;;
             --yes|-y) assume_yes=true; shift ;;
             -4|-6) IP_FAMILY="$1"; shift ;;
             --*) error "未知参数：$1"; return 1 ;;
@@ -1226,6 +1435,13 @@ cmd_scan() {
 
     [[ -z "$duration" ]] || (( duration <= 120 )) || { error "--dur 最大 120 秒"; return 1; }
     is_positive_integer "$PEER_PORT" 1 65535 || { error "端口无效"; return 1; }
+
+    validate_scan_cap "$scan_cap" || { error "--cap 必须是 100-100000 的整数"; return 1; }
+    scan_cap=$((10#$scan_cap))
+    if ! is_loss_threshold "$loss_threshold"; then
+        error "--loss-threshold 必须是 0.0001-10 之间的百分比"
+        return 1
+    fi
 
     if [[ -n "$lo" || -n "$hi" ]]; then
         [[ -n "$lo" && -n "$hi" ]] || { error "--from 和 --to 必须同时提供"; return 1; }
@@ -1291,16 +1507,23 @@ cmd_scan() {
         printf '不限速：发送 %s Mbit / 接收 %s Mbit / 重传 %s / 丢包 %s%%\n' \
             "$gp" "$goodput" "$retrans" "$loss"
 
-        if ! awk -v loss="$loss" -v threshold="$LOSS_THRESHOLD" 'BEGIN {exit !(loss > threshold)}'; then
+        if ! awk -v loss="$loss" -v threshold="$loss_threshold" 'BEGIN {exit !(loss > threshold)}'; then
             warn "未检测到限速器，不建议执行流量整形"
             save_sweep_result "NO_POLICER" "UNSHAPED_MBIT=$goodput" "UNSHAPED_SENDER_MBIT=$gp" "PEER=$peer"
             traffic_report
             return 0
         fi
 
+        if awk -v g="$goodput" -v cap="$scan_cap" 'BEGIN {exit !(g > cap)}'; then
+            warn "不限速送达 ${goodput} Mbps，超过自动扫描上限 ${scan_cap} Mbit"
+            save_sweep_result "ABOVE_CAP" "UNSHAPED_MBIT=$goodput" "CAP_MBIT=$scan_cap" "PEER=$peer"
+            traffic_report
+            return 0
+        fi
+
         lo=$(awk -v g="$goodput" 'BEGIN {printf "%d", g*0.95}')
         (( lo < 1 )) && lo=1
-        hi=$(awk -v g="$goodput" -v loss="$loss" -v cap="$SCAN_CAP_MBIT" 'BEGIN {
+        hi=$(awk -v g="$goodput" -v loss="$loss" -v cap="$scan_cap" 'BEGIN {
             factor=1.25+loss/100*2; if(factor>2.5)factor=2.5
             value=g*factor; if(value>cap)value=cap
             printf "%d", value
@@ -1353,7 +1576,7 @@ cmd_scan() {
         loss=$(loss_pct "$retrans" "$gp" "$duration")
         [[ -n "$base_loss" ]] || base_loss="$loss"
         hits=0
-        if awk -v l="$loss" -v t="$LOSS_THRESHOLD" -v b="$base_loss" 'BEGIN {exit !((l>t) && (b<=0 || l>=b*10))}'; then
+        if awk -v l="$loss" -v t="$loss_threshold" -v b="$base_loss" 'BEGIN {exit !((l>t) && (b<=0 || l>=b*10))}'; then
             hits=1
             for retry in 2 3; do
                 sleep "$gap"
@@ -1363,7 +1586,7 @@ cmd_scan() {
                 (( rc == 0 )) || continue
                 read -r test_gp test_rt test_port test_recv <<< "$test_result"
                 test_loss=$(loss_pct "$test_rt" "$test_gp" "$duration")
-                awk -v l="$test_loss" -v t="$LOSS_THRESHOLD" -v b="$base_loss" 'BEGIN {exit !((l>t) && (b<=0 || l>=b*10))}' && ((hits++))
+                awk -v l="$test_loss" -v t="$loss_threshold" -v b="$base_loss" 'BEGIN {exit !((l>t) && (b<=0 || l>=b*10))}' && ((hits++))
             done
         fi
 
@@ -1373,7 +1596,7 @@ cmd_scan() {
             break
         fi
 
-        if awk -v g="$goodput" -v r="$rate" -v loss="$loss" -v threshold="$LOSS_THRESHOLD" \
+        if awk -v g="$goodput" -v r="$rate" -v loss="$loss" -v threshold="$loss_threshold" \
             'BEGIN {exit !(g < r*0.7 && loss <= threshold)}'; then
             ((peer_slow++))
             printf '%-10s %-12s %-10s %-10s %s\n' "$rate" "$gp" "$retrans" "$loss" "节点偏慢"
@@ -1421,7 +1644,7 @@ cmd_scan() {
             loss=$(loss_pct "$retrans" "$gp" "$duration")
             hits=0
 
-            if awk -v l="$loss" -v t="$LOSS_THRESHOLD" -v b="$base_loss" 'BEGIN {exit !((l>t) && (b<=0 || l>=b*10))}'; then
+            if awk -v l="$loss" -v t="$loss_threshold" -v b="$base_loss" 'BEGIN {exit !((l>t) && (b<=0 || l>=b*10))}'; then
                 hits=1
                 for retry in 2 3; do
                     sleep "$gap"
@@ -1430,7 +1653,7 @@ cmd_scan() {
                     (( rc == 0 )) || continue
                     read -r test_gp test_rt test_port test_recv <<< "$test_result"
                     test_loss=$(loss_pct "$test_rt" "$test_gp" "$duration")
-                    awk -v l="$test_loss" -v t="$LOSS_THRESHOLD" -v b="$base_loss" 'BEGIN {exit !((l>t) && (b<=0 || l>=b*10))}' && ((hits++))
+                    awk -v l="$test_loss" -v t="$loss_threshold" -v b="$base_loss" 'BEGIN {exit !((l>t) && (b<=0 || l>=b*10))}' && ((hits++))
                 done
             fi
 
@@ -1520,6 +1743,7 @@ cmd_apply() {
         case "$status" in
             NO_POLICER) warn "未检测到限速器，不建议整形" ;;
             NO_KNEE) warn "未找到限速拐点，不建议整形" ;;
+            ABOVE_CAP) warn "不限速吞吐超过扫描上限，不建议自动整形" ;;
             *) warn "最近一次测量结果不可靠，不建议整形" ;;
         esac
         return 1
@@ -1564,19 +1788,25 @@ cmd_apply() {
 }
 
 cmd_status() {
-    local iface kind rate service_state result_status
-    iface=$(detect_iface || true)
-    [[ -n "$iface" ]] || { error "无法确定默认出口接口"; return 1; }
+    local default_iface configured_iface iface kind rate service_enabled service_active result_status baseline_iface
+    default_iface=$(detect_iface || true)
+    configured_iface=$(read_config_value INTERFACE || true)
+    iface="${configured_iface:-$default_iface}"
+    [[ -n "$iface" ]] || { error "无法确定受管或默认出口接口"; return 1; }
     kind=$(root_qdisc_kind "$iface")
     rate=$(tc class show dev "$iface" 2>/dev/null |
         awk '/class htb 1:10/ {for(i=1;i<NF;i++) if($i=="rate") {print $(i+1); exit}}')
-    service_state=$(systemctl is-enabled tcshape.service 2>/dev/null || echo "未启用")
+    service_enabled=$(systemctl is-enabled tcshape.service 2>/dev/null || echo "未启用")
+    service_active=$(systemctl is-active tcshape.service 2>/dev/null || echo "未运行")
     result_status=$(read_config_value STATUS "$STATE_DIR/sweep.result" 2>/dev/null || echo "无")
+    baseline_iface=$(read_config_value INTERFACE "$STATE_DIR/qdisc-baseline" 2>/dev/null || echo "无")
 
-    echo "接口: $iface"
+    echo "默认出口接口: ${default_iface:-unknown}"
+    echo "受管接口: ${configured_iface:-未启用}"
     echo "根 qdisc: ${kind:-unknown}"
     echo "整形速率: ${rate:-未启用}"
-    echo "持久服务: $service_state"
+    echo "持久服务: $service_enabled / $service_active"
+    echo "恢复基线接口: $baseline_iface"
     echo "Sweep 结果: $result_status"
 }
 

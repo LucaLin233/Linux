@@ -71,7 +71,8 @@ sudo tcshape st       # 查看状态
 
 ```bash
 sudo tcshape scan [HOST] [--port N] [--nominal N] [--from N --to N]
-                  [--step N] [--dur N] [--margin N] [--yes] [-4|-6]
+                  [--step N] [--dur N] [--margin N] [--cap N]
+                  [--loss-threshold PCT] [--yes] [-4|-6]
 sudo tcshape apply [--force]
 sudo tcshape set RATE
 sudo tcshape status
@@ -80,6 +81,9 @@ sudo tcshape off
 
 默认 IPv4；使用 `-6` 才启用 IPv6。省略 `HOST` 时，工具参考 tcpfit 的节点池，根据 RTT、
 端口可达性和 iperf3 实际结果自动选择公共服务器，并轮换 `5201–5210` 和 `5200`。
+自动扫描上限默认 10,000 Mbit；不限速送达量高于该值时记录 `ABOVE_CAP` 并停止。确需扫描
+更高带宽可显式使用 `--cap 100000`。默认重传率阈值为 `0.1%`，特殊线路可通过
+`--loss-threshold` 在 `0.0001%–10%` 范围内覆盖。
 
 ## 更新短命令
 
@@ -168,8 +172,10 @@ HTB root：控制所有连接的总出口速率
 /var/lib/tcshape/qdisc-baseline
 ```
 
-`tcshape off` 仅移除本工具创建的 HTB，恢复首次启用前记录的简单 qdisc；不会删除或修改
-`/etc/sysctl.d/99-network-optimize.conf`。`tcshape apply` 会使用 Sweep 结果中记录的接口，避免
+`tcshape off` 仅移除本工具创建的 HTB，恢复当前受管接口首次启用前记录的简单 qdisc；不会删除或修改
+`/etc/sysctl.d/99-network-optimize.conf`。重新设置时若出口接口发生变化，工具会先记录新接口基线，
+验证新整形和持久服务后移除旧接口 HTB，再把新接口基线提升为正式基线；任一步失败都会尝试回滚。
+`tcshape apply` 会使用 Sweep 结果中记录的接口，避免
 IPv4 与 IPv6 使用不同出口时把推荐值应用到另一张网卡。
 
 `tcshape a`/`tcshape apply` 默认只应用 24 小时内的 `KNEE_FOUND` 结果，并显示测试时间、结果
@@ -198,9 +204,11 @@ fq、fq_codel、pfifo_fast、mq、noqueue
 CAKE、TBF、NETEM、TAPRIO、非本工具 HTB、根队列或 mq 子队列的自定义 class/filter
 ```
 
-带自定义参数的 `fq`/`fq_codel` 无法逐项原样恢复，不应交给 tcshape 接管；当前自动恢复仅保证
-恢复 qdisc 类型及其默认参数。`mq` 自动生成的 `class mq`、标准 fq/fq_codel 子队列，以及独立的
-clsact/ingress filter 不视为冲突：替换根 qdisc 时 clsact/ingress 会继续保留，关闭后由内核恢复 mq 拓扑。已经由 tcshape
+仅允许使用内核默认参数的 `fq`/`fq_codel`；检测到非默认 `limit`、`flow_limit`、`quantum`、
+`target`、`interval` 等参数时直接拒绝接管，因为无法保证逐项原样恢复。JSON 快照只用于人工核查，
+自动恢复仅重建已验证为默认参数的 qdisc 类型。`mq` 自动生成的 `class mq`、标准
+fq/fq_codel 子队列，以及独立的 clsact/ingress filter 不视为冲突：替换根 qdisc 时
+clsact/ingress 会继续保留，关闭后由内核恢复 mq 拓扑。已经由 tcshape
 管理的 `HTB + fq` 也允许再次 Sweep；测试结束后会重新应用原固定速率。检测到
 `tcpfit-qdisc.service` 时也会拒绝运行。Sweep 遇到退出、错误、`Ctrl-C`、`TERM` 或流量超限
 时都会执行恢复流程。

@@ -55,19 +55,19 @@ assert_eq "6" "$(calc_validation_rate 15)" "validation rate for 15 Mbit"
 assert_eq "1" "$(calc_auto_step 17 31)" "auto step for narrow range"
 assert_eq "20" "$(calc_auto_step 100 300)" "auto step for wide range"
 
-assert_eq "1.0.6" "$(script_version "$ROOT_DIR/tools/traffic-shape.sh")" \
+assert_eq "1.0.7" "$(script_version "$ROOT_DIR/tools/traffic-shape.sh")" \
     "extract update version"
 assert_ok "validate install source" validate_install_file \
     "$ROOT_DIR/tools/traffic-shape.sh"
 assert_ok "validate managed update file" validate_update_file \
-    "$ROOT_DIR/tools/traffic-shape.sh" "1.0.6"
+    "$ROOT_DIR/tools/traffic-shape.sh" "1.0.7"
 
 temp_dir=$(mktemp -d)
 trap 'rm -rf "$temp_dir"' EXIT
 invalid_update="$temp_dir/invalid-update.sh"
 sed 's#readonly UPDATE_REPO="LucaLin233/Linux"#readonly UPDATE_REPO="other/repo"#' \
     "$ROOT_DIR/tools/traffic-shape.sh" > "$invalid_update"
-assert_fail "reject update from another repository" validate_update_file "$invalid_update" "1.0.6"
+assert_fail "reject update from another repository" validate_update_file "$invalid_update" "1.0.7"
 
 empty_install="$temp_dir/empty-tcshape"
 unknown_install="$temp_dir/unknown-tcshape"
@@ -128,6 +128,26 @@ assert_eq "1小时1分钟" "$(format_age 3660)" "format Sweep result age"
 assert_fail "reject future Sweep timestamp" sweep_result_age 5000 1000
 assert_ok "accept Sweep result at 24-hour boundary" sweep_result_is_fresh 86400
 assert_fail "reject Sweep result older than 24 hours" sweep_result_is_fresh 86401
+assert_ok "accept minimum loss threshold" is_loss_threshold 0.0001
+assert_ok "accept decimal loss threshold" is_loss_threshold 0.25
+assert_fail "reject zero loss threshold" is_loss_threshold 0
+assert_fail "reject excessive loss threshold" is_loss_threshold 10.1
+assert_fail "reject malformed loss threshold" is_loss_threshold 0.1x
+assert_ok "accept minimum scan cap" validate_scan_cap 100
+assert_ok "accept maximum scan cap" validate_scan_cap 100000
+assert_fail "reject low scan cap" validate_scan_cap 99
+assert_fail "reject excessive scan cap" validate_scan_cap 100001
+
+assert_fail "allow default fq options" qdisc_options_are_custom fq \
+    '{"limit":10000,"flow_limit":100,"quantum":3028,"initial_quantum":15140,"buckets":1024}'
+assert_ok "reject custom fq flow limit" qdisc_options_are_custom fq \
+    '{"limit":10000,"flow_limit":8192,"quantum":3028}'
+assert_ok "reject unknown fq option" qdisc_options_are_custom fq \
+    '{"limit":10000,"future_option":1}'
+assert_fail "allow default fq_codel options" qdisc_options_are_custom fq_codel \
+    '{"limit":10240,"flows":1024,"quantum":1514,"target":5000,"interval":100000,"ecn":true}'
+assert_ok "reject custom fq_codel target" qdisc_options_are_custom fq_codel \
+    '{"limit":10240,"target":10000}'
 
 fixture="$temp_dir/iperf.json"
 cat > "$fixture" <<'JSON'
