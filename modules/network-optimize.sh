@@ -1601,12 +1601,8 @@ net.core.netdev_budget = $netdev_budget
 EOF
     fi
 
-    if [[ -e /proc/sys/net/core/netdev_budget_usecs ]]; then
-        cat >> "$target_file" <<'EOF'
-net.core.netdev_budget_usecs = 4000
-EOF
-    fi
-
+    # Linux 6.15+ 将最小值收紧为 2 jiffies；不同 HZ 内核可能拒绝固定 4000。
+    # 保留内核当前值，避免在无 softnet time_squeeze 证据时盲目延长 softirq 周期。
     if [[ -e /proc/sys/net/netfilter/nf_conntrack_max ]]; then
         current_conntrack=$(cat /proc/sys/net/netfilter/nf_conntrack_max 2>/dev/null || echo 0)
         target_conntrack=$((RAM_MB * 64))

@@ -211,8 +211,8 @@ bash <(curl -fsSL "$RAW_BASE/network-optimize.sh") help
 计算，限制在 `RAM / 16` 且不超过 256 MiB；全局 `tcp_mem` 预算按 RAM 的 1/16、1/8、1/4
 生成（按系统实际页大小换算），并明确启用 SACK、DSACK 和 TCP 时间戳。`--static` 保持固定
 32 MiB 上限和 4 MiB 默认值。`netdev_budget` 在带宽达到
-2.5 Gbps 且至少 2 个在线 CPU 时使用 600，其他环境使用 300；可用时将
-`netdev_budget_usecs` 设为 4000。
+2.5 Gbps 且至少 2 个在线 CPU 时使用 600，其他环境使用 300。`netdev_budget_usecs` 保留
+内核按 HZ 选择的默认值，避免新内核拒绝低于 `2 jiffies` 的固定值。
 
 > `RAW_BASE` 只在当前 Shell 会话有效。上述进程替换语法需要 Bash 或 Zsh；不要改成
 > `curl ... | sudo bash`，否则交互模块可能无法正常读取终端输入。SSH、自动更新、内核和网络
