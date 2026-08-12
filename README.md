@@ -206,10 +206,12 @@ bash <(curl -fsSL "$RAW_BASE/network-optimize.sh") help
 ```
 
 网络模块默认面向同时承载 TCP、UDP 与 Docker 流量的代理节点：连接队列使用
-`somaxconn=65535`、`tcp_max_syn_backlog=16384`，默认 socket 缓冲区为 256 KiB，UDP 最小
-缓冲区为 8 KiB，`tcp_fin_timeout=30`。动态最大缓冲区按 `2 × BDP` 计算，限制在
-`RAM / 16` 且不超过 256 MiB；`--static` 仍保持固定 32 MiB。`netdev_budget` 在带宽达到
-2.5 Gbps 且至少 2 个在线 CPU 时使用 600，其他环境明确使用内核默认值 300。
+`somaxconn=65535`、`tcp_max_syn_backlog=16384`，TCP/socket 默认缓冲区按半个 BDP 动态取
+2-4 MiB，UDP 最小缓冲区为 8 KiB，`tcp_fin_timeout=30`。动态最大缓冲区按 `2 × BDP`
+计算，限制在 `RAM / 16` 且不超过 256 MiB；全局 `tcp_mem` 预算按 RAM 的 1/16、1/8、1/4
+生成；`--static` 保持固定 32 MiB 上限和 4 MiB 默认值。`netdev_budget` 在带宽达到
+2.5 Gbps 且至少 2 个在线 CPU 时使用 600，其他环境使用 300；可用时将
+`netdev_budget_usecs` 设为 4000。
 
 > `RAW_BASE` 只在当前 Shell 会话有效。上述进程替换语法需要 Bash 或 Zsh；不要改成
 > `curl ... | sudo bash`，否则交互模块可能无法正常读取终端输入。SSH、自动更新、内核和网络

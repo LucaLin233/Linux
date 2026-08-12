@@ -122,6 +122,9 @@ RX_BDP_BYTES=0
 TX_BDP_BYTES=0
 RMEM_MAX_BYTES=33554432
 WMEM_MAX_BYTES=33554432
+RMEM_DEFAULT_BYTES=4194304
+WMEM_DEFAULT_BYTES=4194304
+TCP_MEM_PAGES="4096 8192 16384"
 CALCULATION_REASON="static 32 MiB"
 RMEM_REASON="static 32 MiB"
 WMEM_REASON="static 32 MiB"
@@ -1210,6 +1213,40 @@ calculate_buffer_max() {
     echo "$desired"
 }
 
+calculate_tcp_mem() {
+    local ram_mb="$1"
+    local total_pages=$((ram_mb * 256))
+    local low=$((total_pages / 16))
+    local pressure=$((total_pages / 8))
+    local maximum=$((total_pages / 4))
+
+    (( low < 4096 )) && low=4096
+    (( pressure < 8192 )) && pressure=8192
+    (( maximum < 16384 )) && maximum=16384
+    printf '%s %s %s\n' "$low" "$pressure" "$maximum"
+}
+
+calculate_buffer_default() {
+    local bandwidth_mbps="$1"
+    local rtt_ms="$2"
+    local buffer_max="$3"
+    local minimum=$((2 * 1024 * 1024))
+    local maximum=$((4 * 1024 * 1024))
+    local mib=$((1024 * 1024))
+    local bdp
+    local desired
+
+    # 代理节点使用半个 BDP 作为起点，并限制在 2-4 MiB。
+    # 这比 tcpfit 的 mixed 角色略激进，但不会让每条连接默认占用完整 BDP。
+    bdp=$((bandwidth_mbps * rtt_ms * 125))
+    desired=$(((bdp + 1) / 2))
+    desired=$((((desired + mib - 1) / mib) * mib))
+    (( desired < minimum )) && desired=$minimum
+    (( desired > maximum )) && desired=$maximum
+    (( desired > buffer_max )) && desired=$buffer_max
+    echo "$desired"
+}
+
 buffer_limit_reason() {
     local bandwidth_mbps="$1"
     local rtt_ms="$2"
@@ -1276,10 +1313,13 @@ resolve_tuning_values() {
         return 1
     }
     MEMORY_CAP_BYTES=$(calculate_memory_cap "$RAM_MB")
+    TCP_MEM_PAGES=$(calculate_tcp_mem "$RAM_MB")
 
     if [[ "$TUNING_MODE" == "static" ]]; then
         RMEM_MAX_BYTES=33554432
         WMEM_MAX_BYTES=33554432
+        RMEM_DEFAULT_BYTES=4194304
+        WMEM_DEFAULT_BYTES=4194304
         RMEM_REASON="static 32 MiB"
         WMEM_REASON="static 32 MiB"
         CALCULATION_REASON="rmem: $RMEM_REASON; wmem: $WMEM_REASON"
@@ -1345,12 +1385,16 @@ resolve_tuning_values() {
         TX_BDP_BYTES=$((upload_mbps * rtt_ms * 125))
         RMEM_MAX_BYTES=$(calculate_buffer_max "$download_mbps" "$rtt_ms" "$MEMORY_CAP_BYTES")
         WMEM_MAX_BYTES=$(calculate_buffer_max "$upload_mbps" "$rtt_ms" "$MEMORY_CAP_BYTES")
+        RMEM_DEFAULT_BYTES=$(calculate_buffer_default "$download_mbps" "$rtt_ms" "$RMEM_MAX_BYTES")
+        WMEM_DEFAULT_BYTES=$(calculate_buffer_default "$upload_mbps" "$rtt_ms" "$WMEM_MAX_BYTES")
         RMEM_REASON=$(buffer_limit_reason "$download_mbps" "$rtt_ms" "$MEMORY_CAP_BYTES")
         WMEM_REASON=$(buffer_limit_reason "$upload_mbps" "$rtt_ms" "$MEMORY_CAP_BYTES")
         CALCULATION_REASON="rmem: $RMEM_REASON; wmem: $WMEM_REASON"
     else
         RMEM_MAX_BYTES="$MEMORY_CAP_BYTES"
         WMEM_MAX_BYTES="$MEMORY_CAP_BYTES"
+        RMEM_DEFAULT_BYTES=4194304
+        WMEM_DEFAULT_BYTES=4194304
         RMEM_REASON="RAM fallback"
         WMEM_REASON="RAM fallback"
         CALCULATION_REASON="rmem: $RMEM_REASON; wmem: $WMEM_REASON"
@@ -1379,6 +1423,8 @@ show_tuning_plan() {
     echo "发送 BDP: $((TX_BDP_BYTES / 1024)) KiB"
     echo "rmem_max: $(format_mib "$RMEM_MAX_BYTES") MiB"
     echo "wmem_max: $(format_mib "$WMEM_MAX_BYTES") MiB"
+    echo "rmem_default: $(format_mib "$RMEM_DEFAULT_BYTES") MiB"
+    echo "wmem_default: $(format_mib "$WMEM_DEFAULT_BYTES") MiB"
     echo "计算依据: $CALCULATION_REASON"
 }
 
@@ -1392,8 +1438,11 @@ append_supported_tcp_settings() {
 net.ipv4.tcp_moderate_rcvbuf = 1
 net.ipv4.tcp_window_scaling = 1
 net.ipv4.tcp_syncookies = 1
-net.ipv4.tcp_notsent_lowat = 131072
 EOF
+
+    if [[ -e /proc/sys/net/ipv4/tcp_adv_win_scale ]]; then
+        echo "net.ipv4.tcp_adv_win_scale = 1" >> "$target_file"
+    fi
 
     if [[ -e /proc/sys/net/ipv4/tcp_shrink_window ]]; then
         echo "net.ipv4.tcp_shrink_window = 1" >> "$target_file"
@@ -1538,6 +1587,12 @@ net.core.netdev_budget = $netdev_budget
 EOF
     fi
 
+    if [[ -e /proc/sys/net/core/netdev_budget_usecs ]]; then
+        cat >> "$target_file" <<'EOF'
+net.core.netdev_budget_usecs = 4000
+EOF
+    fi
+
     if [[ -e /proc/sys/net/netfilter/nf_conntrack_max ]]; then
         current_conntrack=$(cat /proc/sys/net/netfilter/nf_conntrack_max 2>/dev/null || echo 0)
         target_conntrack=$((RAM_MB * 64))
@@ -1599,13 +1654,14 @@ net.core.netdev_max_backlog = 16384
 # 6. 临时端口
 net.ipv4.ip_local_port_range = 1024 65535
 
-# 7. TCP/UDP 缓冲区
-net.core.rmem_default = 262144
-net.core.wmem_default = 262144
+# 7. TCP/UDP 缓冲区；默认值按半个 BDP 推导并限制在 2-4 MiB
+net.core.rmem_default = $RMEM_DEFAULT_BYTES
+net.core.wmem_default = $WMEM_DEFAULT_BYTES
 net.core.rmem_max = $RMEM_MAX_BYTES
 net.core.wmem_max = $WMEM_MAX_BYTES
-net.ipv4.tcp_rmem = 4096 131072 $RMEM_MAX_BYTES
-net.ipv4.tcp_wmem = 4096 65536 $WMEM_MAX_BYTES
+net.ipv4.tcp_rmem = 4096 $RMEM_DEFAULT_BYTES $RMEM_MAX_BYTES
+net.ipv4.tcp_wmem = 4096 $WMEM_DEFAULT_BYTES $WMEM_MAX_BYTES
+net.ipv4.tcp_mem = $TCP_MEM_PAGES
 net.ipv4.udp_rmem_min = 8192
 net.ipv4.udp_wmem_min = 8192
 
@@ -2079,7 +2135,8 @@ install/plan 选项：
   - 自动测量中国大陆与全球 RTT，BDP 计算使用 150 ms 下限并保留观测值
   - 首选附近公共 iperf3 节点进行多流双向测速，Cloudflare 作为并行回退
   - 自动测速在约 90 GB 时停止，保留余量确保总量不超过 100 GB
-  - 根据 2 × BDP 动态设置缓冲区，上限为 RAM / 16 且不超过 256 MiB
+  - 根据 2 × BDP 动态设置缓冲区上限，默认值按半个 BDP 取 2-4 MiB
+  - 缓冲区上限为 RAM / 16 且不超过 256 MiB
   - 探测失败时按内存使用保守配置
   - 只在本次运行计算和应用，不创建定时任务
 EOF
@@ -2140,4 +2197,6 @@ main() {
 
 trap 'error "网络优化脚本在第 $LINENO 行执行失败"' ERR
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi
