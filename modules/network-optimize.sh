@@ -1255,7 +1255,6 @@ calculate_buffer_default() {
     local bandwidth_mbps="$1"
     local rtt_ms="$2"
     local buffer_max="$3"
-    local ram_mb="${4:-$RAM_MB}"
     local minimum=$((4 * 1024 * 1024))
     local maximum=$((8 * 1024 * 1024))
     local mib=$((1024 * 1024))
@@ -1263,13 +1262,9 @@ calculate_buffer_default() {
     local desired
 
     # 代理节点使用半个 BDP 作为起点，并限制在 4-8 MiB。
-    # 低于 1 GiB 的机器固定为 4 MiB，避免并发连接挤压系统内存。
     bdp=$((bandwidth_mbps * rtt_ms * 125))
     desired=$(((bdp + 1) / 2))
     desired=$((((desired + mib - 1) / mib) * mib))
-    if (( ram_mb < 1024 )); then
-        desired=$minimum
-    fi
     (( desired < minimum )) && desired=$minimum
     (( desired > maximum )) && desired=$maximum
     (( desired > buffer_max )) && desired=$buffer_max
@@ -1414,21 +1409,16 @@ resolve_tuning_values() {
         TX_BDP_BYTES=$((upload_mbps * rtt_ms * 125))
         RMEM_MAX_BYTES=$(calculate_buffer_max "$download_mbps" "$rtt_ms" "$MEMORY_CAP_BYTES")
         WMEM_MAX_BYTES=$(calculate_buffer_max "$upload_mbps" "$rtt_ms" "$MEMORY_CAP_BYTES")
-        RMEM_DEFAULT_BYTES=$(calculate_buffer_default "$download_mbps" "$rtt_ms" "$RMEM_MAX_BYTES" "$RAM_MB")
-        WMEM_DEFAULT_BYTES=$(calculate_buffer_default "$upload_mbps" "$rtt_ms" "$WMEM_MAX_BYTES" "$RAM_MB")
+        RMEM_DEFAULT_BYTES=$(calculate_buffer_default "$download_mbps" "$rtt_ms" "$RMEM_MAX_BYTES")
+        WMEM_DEFAULT_BYTES=$(calculate_buffer_default "$upload_mbps" "$rtt_ms" "$WMEM_MAX_BYTES")
         RMEM_REASON=$(buffer_limit_reason "$download_mbps" "$rtt_ms" "$MEMORY_CAP_BYTES")
         WMEM_REASON=$(buffer_limit_reason "$upload_mbps" "$rtt_ms" "$MEMORY_CAP_BYTES")
         CALCULATION_REASON="rmem: $RMEM_REASON; wmem: $WMEM_REASON"
     else
         RMEM_MAX_BYTES="$MEMORY_CAP_BYTES"
         WMEM_MAX_BYTES="$MEMORY_CAP_BYTES"
-        if (( RAM_MB < 1024 )); then
-            RMEM_DEFAULT_BYTES=4194304
-            WMEM_DEFAULT_BYTES=4194304
-        else
-            RMEM_DEFAULT_BYTES=8388608
-            WMEM_DEFAULT_BYTES=8388608
-        fi
+        RMEM_DEFAULT_BYTES=4194304
+        WMEM_DEFAULT_BYTES=4194304
         RMEM_REASON="RAM fallback"
         WMEM_REASON="RAM fallback"
         CALCULATION_REASON="rmem: $RMEM_REASON; wmem: $WMEM_REASON"
@@ -2237,7 +2227,7 @@ install/plan 选项：
   - 自动测速在约 90 GB 时停止，保留余量确保总量不超过 100 GB
   - 默认启用 ECN；可用 --disable-ecn 回退
   - 根据 2 × BDP 动态设置缓冲区上限，默认值按半个 BDP 取 4-8 MiB
-  - RAM 小于 1 GiB 时默认缓冲固定 4 MiB
+  - 探测失败且缺少 BDP 数据时，默认缓冲保守回退到 4 MiB
   - RAM 小于 2 GiB 时上限为 RAM / 16、最高 256 MiB；否则为 RAM / 8、最高 512 MiB
   - 探测失败时按内存使用保守配置
   - 只在本次运行计算和应用，不创建定时任务
