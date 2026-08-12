@@ -55,19 +55,19 @@ assert_eq "6" "$(calc_validation_rate 15)" "validation rate for 15 Mbit"
 assert_eq "1" "$(calc_auto_step 17 31)" "auto step for narrow range"
 assert_eq "20" "$(calc_auto_step 100 300)" "auto step for wide range"
 
-assert_eq "1.0.7" "$(script_version "$ROOT_DIR/tools/traffic-shape.sh")" \
+assert_eq "1.0.8" "$(script_version "$ROOT_DIR/tools/traffic-shape.sh")" \
     "extract update version"
 assert_ok "validate install source" validate_install_file \
     "$ROOT_DIR/tools/traffic-shape.sh"
 assert_ok "validate managed update file" validate_update_file \
-    "$ROOT_DIR/tools/traffic-shape.sh" "1.0.7"
+    "$ROOT_DIR/tools/traffic-shape.sh" "1.0.8"
 
 temp_dir=$(mktemp -d)
 trap 'rm -rf "$temp_dir"' EXIT
 invalid_update="$temp_dir/invalid-update.sh"
 sed 's#readonly UPDATE_REPO="LucaLin233/Linux"#readonly UPDATE_REPO="other/repo"#' \
     "$ROOT_DIR/tools/traffic-shape.sh" > "$invalid_update"
-assert_fail "reject update from another repository" validate_update_file "$invalid_update" "1.0.7"
+assert_fail "reject update from another repository" validate_update_file "$invalid_update" "1.0.8"
 
 empty_install="$temp_dir/empty-tcshape"
 unknown_install="$temp_dir/unknown-tcshape"
@@ -137,6 +137,11 @@ assert_ok "accept minimum scan cap" validate_scan_cap 100
 assert_ok "accept maximum scan cap" validate_scan_cap 100000
 assert_fail "reject low scan cap" validate_scan_cap 99
 assert_fail "reject excessive scan cap" validate_scan_cap 100001
+
+fq_json='[{"kind":"fq","root":true,"options":{"priomap ":[1,2],"weights ":[3,2,1],"limit":10000}}]'
+assert_eq '{"priomap":[1,2],"weights":[3,2,1],"limit":10000}' \
+    "$(normalize_qdisc_options "$fq_json" fq)" \
+    "normalize qdisc option keys with trailing spaces"
 
 fixture="$temp_dir/iperf.json"
 cat > "$fixture" <<'JSON'

@@ -10,7 +10,7 @@
 set -uo pipefail
 umask 022
 
-readonly VERSION="1.0.7"
+readonly VERSION="1.0.8"
 readonly INSTALL_PATH="${TCSHAPE_INSTALL_PATH:-/usr/local/sbin/tcshape}"
 readonly UPDATE_REPO="LucaLin233/Linux"
 readonly UPDATE_BRANCH="main"
@@ -42,6 +42,12 @@ QSAVE_IFACE=""
 QSAVE_KIND=""
 QSAVE_OWNED=false
 SWEEP_ACTIVE=false
+SCAN_ID=""
+SCAN_STARTED_AT=""
+SCAN_IFACE=""
+SCAN_PEER=""
+SCAN_CAP=""
+SCAN_LOSS_THRESHOLD=""
 
 readonly PEER_POOL='speedtest.hkg12.hk.leaseweb.net|香港|Leaseweb
 speedtest.sin1.sg.leaseweb.net|新加坡|Leaseweb
@@ -480,22 +486,50 @@ root_qdisc_kind() {
 qdisc_has_custom_parameters() {
     local iface="$1"
     local kind="$2"
-    local json
-    local options
+    local current_json
+    local baseline_json
+    local current_options
+    local baseline_options
+    local probe
 
-    json=$(tc -j qdisc show dev "$iface" 2>/dev/null) || {
+    current_json=$(tc -j qdisc show dev "$iface" 2>/dev/null) || {
         error "无法读取 $iface 的 qdisc 参数，拒绝覆盖"
         return 0
     }
-    options=$(jq -cer --arg kind "$kind" \
-        '[.[] | select(.root == true and .kind == $kind) | .options // {}][0]' \
-        <<< "$json" 2>/dev/null) || {
+    current_options=$(normalize_qdisc_options "$current_json" "$kind") || {
         error "无法解析 $iface 的 $kind qdisc 参数，拒绝覆盖"
         return 0
     }
 
-    # 非详细 JSON 中 options 为空表示未显式配置参数；出现任意 option 都无法保证原样恢复。
-    [[ "$options" != "{}" ]]
+    probe="tcshape-probe-${BASHPID}"
+    if ! ip link add "$probe" type dummy 2>/dev/null; then
+        error "无法创建临时接口读取本机 $kind 默认参数，拒绝覆盖"
+        return 0
+    fi
+    if ! tc qdisc replace dev "$probe" root "$kind" 2>/dev/null; then
+        ip link del "$probe" 2>/dev/null || true
+        error "无法创建默认 $kind qdisc 进行比较，拒绝覆盖"
+        return 0
+    fi
+    baseline_json=$(tc -j qdisc show dev "$probe" 2>/dev/null || true)
+    ip link del "$probe" 2>/dev/null || true
+    baseline_options=$(normalize_qdisc_options "$baseline_json" "$kind") || {
+        error "无法解析本机 $kind 默认参数，拒绝覆盖"
+        return 0
+    }
+
+    [[ "$current_options" != "$baseline_options" ]]
+}
+
+normalize_qdisc_options() {
+    local json="$1"
+    local kind="$2"
+
+    jq -cer --arg kind "$kind" '
+        [.[] | select(.root == true and .kind == $kind) | .options // {}][0]
+        | with_entries(.key |= sub("[[:space:]]+$"; ""))
+        | del(.offload, .refcnt)
+    ' <<< "$json" 2>/dev/null
 }
 
 read_config_value() {
@@ -1308,7 +1342,14 @@ save_sweep_result() {
     chmod 700 "$STATE_DIR"
     {
         echo "STATUS=$status"
+        echo "SCAN_ID=$SCAN_ID"
+        echo "STARTED_AT=$SCAN_STARTED_AT"
         echo "CREATED_AT=$(date +%s)"
+        echo "IP_FAMILY=$IP_FAMILY"
+        echo "INTERFACE=$SCAN_IFACE"
+        echo "PEER=$SCAN_PEER"
+        echo "CAP_MBIT=$SCAN_CAP"
+        echo "LOSS_THRESHOLD=$SCAN_LOSS_THRESHOLD"
         printf '%s\n' "$@"
     } > "$STATE_DIR/sweep.result"
     chmod 600 "$STATE_DIR/sweep.result"
@@ -1353,6 +1394,27 @@ validate_peer_path() {
         return 1
     fi
     return 0
+}
+
+show_current_shaping() {
+    local iface="$1"
+    local rate
+    local enabled
+    local active
+
+    if is_own_shaper "$iface"; then
+        rate=$(read_config_value RATE_MBIT || echo "未知")
+        enabled=$(systemctl is-enabled tcshape.service 2>/dev/null || echo "disabled")
+        active=$(systemctl is-active tcshape.service 2>/dev/null || echo "inactive")
+        echo "当前整形：已启用"
+        echo "接口：$iface"
+        echo "速率：${rate} Mbit"
+        echo "服务：$enabled / $active"
+        echo "扫描期间：临时替换，结束后恢复 ${rate} Mbit"
+    else
+        echo "当前整形：未启用"
+        echo "接口：$iface"
+    fi
 }
 
 cmd_scan() {
@@ -1416,7 +1478,7 @@ cmd_scan() {
     check_external_conflicts "$iface" || return 1
     traffic_mark "$iface" || { error "无法读取网卡流量计数器"; return 1; }
 
-    echo "接口：$iface"
+    show_current_shaping "$iface"
     echo "流量上限：单方向 45 GB / 合计 90 GB"
     echo "Sweep 会临时替换根 qdisc，并产生大量上传流量。"
     if [[ "$assume_yes" != "true" ]]; then
@@ -1424,6 +1486,15 @@ cmd_scan() {
         read -r -p "继续扫描？[y/N]: " answer
         [[ "$answer" =~ ^[Yy]$ ]] || { info "已取消"; return 0; }
     fi
+
+    SCAN_ID="$(date +%s)-${BASHPID}"
+    SCAN_STARTED_AT="$(date +%s)"
+    SCAN_IFACE="$iface"
+    SCAN_CAP="$scan_cap"
+    SCAN_LOSS_THRESHOLD="$loss_threshold"
+    mkdir -p "$STATE_DIR"
+    chmod 700 "$STATE_DIR"
+    rm -f "$STATE_DIR/sweep.result"
 
     if [[ -z "$peer" ]]; then
         picked=$(auto_pick_peer)
@@ -1436,13 +1507,13 @@ cmd_scan() {
         (( rc == 0 )) || return 2
         IFS='|' read -r peer PEER_PORT estimated_gp <<< "$picked"
     fi
+    SCAN_PEER="$peer"
     if [[ -z "$duration" ]]; then
         duration=$(calc_test_duration "${estimated_gp:-0}")
     fi
     info "测速节点：$peer:$PEER_PORT"
     info "单档测试时长：${duration}s"
 
-    rm -f "$STATE_DIR/sweep.result" 2>/dev/null || true
     qdisc_save "$iface"
     SWEEP_ACTIVE=true
     trap cleanup_sweep EXIT
@@ -1635,9 +1706,7 @@ cmd_scan() {
     save_sweep_result "KNEE_FOUND" \
         "KNEE_MBIT=$last_ok" \
         "BROKE_AT_MBIT=$broke_at" \
-        "RECOMMEND_MBIT=$recommend" \
-        "PEER=$peer" \
-        "INTERFACE=$iface"
+        "RECOMMEND_MBIT=$recommend"
 
     ok "找到拐点：${last_ok} Mbit；建议：${recommend} Mbit"
     echo "未自动应用。确认后执行：tcshape a"
@@ -1687,7 +1756,7 @@ recommendation_is_active() {
 
 cmd_apply() {
     local result_file="$STATE_DIR/sweep.result"
-    local status recommend result_iface created_at age created_text
+    local status recommend result_iface created_at age created_text scan_id started_at peer cap threshold family knee broke_at
     local force=false
 
     while (( $# > 0 )); do
@@ -1699,6 +1768,14 @@ cmd_apply() {
 
     [[ -f "$result_file" ]] || { error "没有 Sweep 结果，请先执行：tcshape s"; return 1; }
     status=$(read_config_value STATUS "$result_file" || true)
+    scan_id=$(read_config_value SCAN_ID "$result_file" || true)
+    started_at=$(read_config_value STARTED_AT "$result_file" || true)
+
+    if [[ ! "$scan_id" =~ ^[0-9]+-[0-9]+$ || ! "$started_at" =~ ^[0-9]+$ ]]; then
+        error "Sweep 结果缺少本轮扫描标识，拒绝应用"
+        error "请重新执行：tcshape s"
+        return 1
+    fi
 
     if [[ "$status" != "KNEE_FOUND" ]]; then
         case "$status" in
@@ -1717,8 +1794,22 @@ cmd_apply() {
     }
     recommend=$((10#$recommend))
     result_iface=$(read_config_value INTERFACE "$result_file" || true)
+    family=$(read_config_value IP_FAMILY "$result_file" || true)
+    peer=$(read_config_value PEER "$result_file" || true)
+    cap=$(read_config_value CAP_MBIT "$result_file" || true)
+    threshold=$(read_config_value LOSS_THRESHOLD "$result_file" || true)
+    knee=$(read_config_value KNEE_MBIT "$result_file" || true)
+    broke_at=$(read_config_value BROKE_AT_MBIT "$result_file" || true)
+    [[ -n "$result_iface" && "$family" =~ ^-[46]$ && -n "$peer" ]] || {
+        error "Sweep 结果元数据不完整，拒绝应用"
+        return 1
+    }
 
-    if [[ -n "$result_iface" ]] && recommendation_is_active "$result_iface" "$recommend"; then
+    echo "Sweep 摘要：接口 $result_iface / $family / 节点 $peer"
+    echo "扫描：拐点 ${knee:-未知} Mbit / 失效点 ${broke_at:-未知} Mbit / 推荐 ${recommend} Mbit"
+    echo "阈值：丢包 ${threshold:-未知}% / 上限 ${cap:-未知} Mbit"
+
+    if recommendation_is_active "$result_iface" "$recommend"; then
         ok "推荐整形已启用：${recommend} Mbit（接口 $result_iface），无需重复应用"
         return 0
     fi

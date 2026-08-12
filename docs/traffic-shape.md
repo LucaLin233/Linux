@@ -114,7 +114,7 @@ sudo tcshape --version
 
 ## Sweep 行为
 
-1. 检查当前 qdisc 与其他整形服务冲突；
+1. 检查当前 qdisc 与其他整形服务冲突，并显示当前整形、接口、速率和持久服务状态；
 2. 记录网卡流量计数和原根 qdisc；
 3. 自动选择附近且可用的公共 iperf3 节点；
 4. 不限速单流同时读取发送端重传与接收端实际吞吐，判断是否存在 policer；
@@ -137,6 +137,10 @@ sudo tcshape --version
 ```text
 /var/lib/tcshape/sweep.result
 ```
+
+用户确认扫描后，旧结果立即失效。每轮结果包含唯一 `SCAN_ID`、开始和完成时间、接口、地址族、
+节点、丢包阈值及扫描上限；只有本轮完整完成并得到 `KNEE_FOUND` 时才允许应用。执行
+`tcshape a` 前会先显示本轮结果摘要。
 
 ## 流量限制
 
@@ -192,7 +196,7 @@ Sweep 状态、推荐值、接口和 qdisc 所有权检查。
 
 ## qdisc 安全边界
 
-允许自动接管并按该 qdisc 类型的默认参数恢复：
+允许自动接管并按该 qdisc 类型的本机内核默认参数恢复：
 
 ```text
 fq、fq_codel、pfifo_fast、mq、noqueue

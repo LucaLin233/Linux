@@ -22,6 +22,7 @@
 #   --rtt-ms N                   手动指定 RTT
 #   --target HOST                自定义 RTT 目标，可重复指定
 #   --no-probe                   不发起网络探测；缺失数据时按内存保守配置
+#   --disable-ecn                禁用 ECN，回退到传统丢包信号
 
 set -euo pipefail
 
@@ -97,6 +98,7 @@ COMMAND="install"
 RESTORE_SCOPE="previous"
 TUNING_MODE="auto"
 NO_PROBE="false"
+ECN_ENABLED="true"
 MANUAL_BANDWIDTH_MBPS=""
 MANUAL_DOWNLOAD_MBPS=""
 MANUAL_UPLOAD_MBPS=""
@@ -411,6 +413,10 @@ parse_arguments() {
                 NO_PROBE="true"
                 shift
                 ;;
+            --disable-ecn)
+                ECN_ENABLED="false"
+                shift
+                ;;
             initial)
                 if [[ "$COMMAND" != "restore" ]]; then
                     error "initial 只能用于 restore"
@@ -481,9 +487,17 @@ detect_memory_mb() {
 
 calculate_memory_cap() {
     local ram_mb="$1"
-    local cap=$((ram_mb * 65536)) # RAM / 16
+    local cap
     local minimum=$((8 * 1024 * 1024))
-    local maximum=$((256 * 1024 * 1024))
+    local maximum
+
+    if (( ram_mb >= 2048 )); then
+        cap=$((ram_mb * 131072)) # RAM / 8
+        maximum=$((512 * 1024 * 1024))
+    else
+        cap=$((ram_mb * 65536)) # RAM / 16
+        maximum=$((256 * 1024 * 1024))
+    fi
 
     (( cap < minimum )) && cap=$minimum
     (( cap > maximum )) && cap=$maximum
@@ -1241,17 +1255,21 @@ calculate_buffer_default() {
     local bandwidth_mbps="$1"
     local rtt_ms="$2"
     local buffer_max="$3"
-    local minimum=$((2 * 1024 * 1024))
-    local maximum=$((4 * 1024 * 1024))
+    local ram_mb="${4:-$RAM_MB}"
+    local minimum=$((4 * 1024 * 1024))
+    local maximum=$((8 * 1024 * 1024))
     local mib=$((1024 * 1024))
     local bdp
     local desired
 
-    # 代理节点使用半个 BDP 作为起点，并限制在 2-4 MiB。
-    # 这比 tcpfit 的 mixed 角色略激进，但不会让每条连接默认占用完整 BDP。
+    # 代理节点使用半个 BDP 作为起点，并限制在 4-8 MiB。
+    # 低于 1 GiB 的机器固定为 4 MiB，避免并发连接挤压系统内存。
     bdp=$((bandwidth_mbps * rtt_ms * 125))
     desired=$(((bdp + 1) / 2))
     desired=$((((desired + mib - 1) / mib) * mib))
+    if (( ram_mb < 1024 )); then
+        desired=$minimum
+    fi
     (( desired < minimum )) && desired=$minimum
     (( desired > maximum )) && desired=$maximum
     (( desired > buffer_max )) && desired=$buffer_max
@@ -1396,16 +1414,21 @@ resolve_tuning_values() {
         TX_BDP_BYTES=$((upload_mbps * rtt_ms * 125))
         RMEM_MAX_BYTES=$(calculate_buffer_max "$download_mbps" "$rtt_ms" "$MEMORY_CAP_BYTES")
         WMEM_MAX_BYTES=$(calculate_buffer_max "$upload_mbps" "$rtt_ms" "$MEMORY_CAP_BYTES")
-        RMEM_DEFAULT_BYTES=$(calculate_buffer_default "$download_mbps" "$rtt_ms" "$RMEM_MAX_BYTES")
-        WMEM_DEFAULT_BYTES=$(calculate_buffer_default "$upload_mbps" "$rtt_ms" "$WMEM_MAX_BYTES")
+        RMEM_DEFAULT_BYTES=$(calculate_buffer_default "$download_mbps" "$rtt_ms" "$RMEM_MAX_BYTES" "$RAM_MB")
+        WMEM_DEFAULT_BYTES=$(calculate_buffer_default "$upload_mbps" "$rtt_ms" "$WMEM_MAX_BYTES" "$RAM_MB")
         RMEM_REASON=$(buffer_limit_reason "$download_mbps" "$rtt_ms" "$MEMORY_CAP_BYTES")
         WMEM_REASON=$(buffer_limit_reason "$upload_mbps" "$rtt_ms" "$MEMORY_CAP_BYTES")
         CALCULATION_REASON="rmem: $RMEM_REASON; wmem: $WMEM_REASON"
     else
         RMEM_MAX_BYTES="$MEMORY_CAP_BYTES"
         WMEM_MAX_BYTES="$MEMORY_CAP_BYTES"
-        RMEM_DEFAULT_BYTES=4194304
-        WMEM_DEFAULT_BYTES=4194304
+        if (( RAM_MB < 1024 )); then
+            RMEM_DEFAULT_BYTES=4194304
+            WMEM_DEFAULT_BYTES=4194304
+        else
+            RMEM_DEFAULT_BYTES=8388608
+            WMEM_DEFAULT_BYTES=8388608
+        fi
         RMEM_REASON="RAM fallback"
         WMEM_REASON="RAM fallback"
         CALCULATION_REASON="rmem: $RMEM_REASON; wmem: $WMEM_REASON"
@@ -1437,6 +1460,71 @@ show_tuning_plan() {
     echo "rmem_default: $(format_mib "$RMEM_DEFAULT_BYTES") MiB"
     echo "wmem_default: $(format_mib "$WMEM_DEFAULT_BYTES") MiB"
     echo "计算依据: $CALCULATION_REASON"
+    echo "ECN: $([[ "$ECN_ENABLED" == "true" ]] && echo 启用 || echo 禁用)"
+}
+
+network_health_snapshot() {
+    local iface="${1:-}"
+    local dropped=0
+    local squeezed=0
+    local rx_errors=0
+    local tx_errors=0
+    local retrans=0
+    local limited=0
+    local line drop_hex squeeze_hex
+
+    if [[ -r /proc/net/softnet_stat ]]; then
+        while read -r line; do
+            read -r _ drop_hex squeeze_hex _ <<< "$line"
+            dropped=$((dropped + 16#${drop_hex:-0}))
+            squeezed=$((squeezed + 16#${squeeze_hex:-0}))
+        done < /proc/net/softnet_stat
+    fi
+    if [[ -n "$iface" ]]; then
+        rx_errors=$(cat "/sys/class/net/$iface/statistics/rx_errors" 2>/dev/null || echo 0)
+        tx_errors=$(cat "/sys/class/net/$iface/statistics/tx_errors" 2>/dev/null || echo 0)
+    fi
+    retrans=$(awk '/^Tcp:/ {if (++seen == 2) print $13}' /proc/net/snmp 2>/dev/null || echo 0)
+    if command -v ss >/dev/null 2>&1; then
+        limited=$(ss -tinmH 2>/dev/null |
+            awk '/(sndbuf_limited|rwnd_limited)/ {count++} END {print count+0}')
+    fi
+
+    printf '%s %s %s %s %s %s\n' \
+        "$dropped" "$squeezed" "${rx_errors:-0}" "${tx_errors:-0}" \
+        "${retrans:-0}" "$limited"
+}
+
+show_install_summary() {
+    local before="$1"
+    local bbr_enabled="$2"
+    local after
+    local b_drop b_squeeze b_rx b_tx b_retrans _
+    local a_drop a_squeeze a_rx a_tx a_retrans a_limited
+    local health="softnet 无新增丢包，网卡无新增错误"
+    local algorithm="当前拥塞控制"
+
+    after=$(network_health_snapshot "$PROBE_IFACE")
+    read -r b_drop b_squeeze b_rx b_tx b_retrans _ <<< "$before"
+    read -r a_drop a_squeeze a_rx a_tx a_retrans a_limited <<< "$after"
+    if (( a_drop > b_drop || a_squeeze > b_squeeze || a_rx > b_rx || a_tx > b_tx )); then
+        health="softnet 或网卡错误计数有新增，请运行 status 复查"
+    fi
+    [[ "$bbr_enabled" == "true" ]] && algorithm="BBR"
+
+    printf '环境：%s CPU / %.1f GiB / %s\n' \
+        "$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 未知)" \
+        "$(awk -v mb="$RAM_MB" 'BEGIN {print mb / 1024}')" \
+        "${PROBE_IFACE:-unknown}"
+    printf '测量：%s↓ %s↑ Mbps / RTT %s ms\n' \
+        "${DETECTED_DOWNLOAD_MBPS:-未知}" "${DETECTED_UPLOAD_MBPS:-未知}" \
+        "${OBSERVED_RTT_MS:-${DETECTED_RTT_MS:-未知}}"
+    printf '缓冲：默认 %s MiB / 最大 %s MiB\n' \
+        "$(format_mib "$WMEM_DEFAULT_BYTES")" "$(format_mib "$WMEM_MAX_BYTES")"
+    printf '网络健康：%s；TCP 重传新增 %s；受限 socket %s\n' \
+        "$health" "$((a_retrans - b_retrans))" "$a_limited"
+    printf '应用：%s + fq + ECN %s，配置成功\n' \
+        "$algorithm" "$([[ "$ECN_ENABLED" == "true" ]] && echo 开启 || echo 关闭)"
 }
 
 # === 新版网络配置 ===
@@ -1664,7 +1752,7 @@ net.core.netdev_max_backlog = 16384
 # 6. 临时端口
 net.ipv4.ip_local_port_range = 1024 65535
 
-# 7. TCP/UDP 缓冲区；默认值按半个 BDP 推导并限制在 2-4 MiB
+# 7. TCP/UDP 缓冲区；默认值按半个 BDP 推导并限制在 4-8 MiB
 net.core.rmem_default = $RMEM_DEFAULT_BYTES
 net.core.wmem_default = $WMEM_DEFAULT_BYTES
 net.core.rmem_max = $RMEM_MAX_BYTES
@@ -1679,6 +1767,7 @@ net.ipv4.udp_wmem_min = 8192
 net.ipv4.tcp_fin_timeout = 30
 net.ipv4.tcp_slow_start_after_idle = 0
 net.ipv4.tcp_mtu_probing = 1
+net.ipv4.tcp_ecn = $([[ "$ECN_ENABLED" == "true" ]] && echo 1 || echo 0)
 EOF
 
     append_supported_tcp_settings "$target_file"
@@ -1837,6 +1926,7 @@ install_optimization() {
     local temp_config
     local runtime_backup
     local bbr_enabled="false"
+    local health_before
 
     info "开始配置网络优化..."
 
@@ -1848,8 +1938,12 @@ install_optimization() {
         install_probe_dependencies || true
     fi
 
+    PROBE_IFACE=$(detect_default_iface || true)
+    health_before=$(network_health_snapshot "$PROBE_IFACE")
     resolve_tuning_values || return 1
-    show_tuning_plan
+    if [[ "${DEBUG:-}" == "1" ]]; then
+        show_tuning_plan
+    fi
 
     migrate_legacy_kernel_config || return 1
     migrate_legacy_sysctl_conf || return 1
@@ -1931,15 +2025,7 @@ install_optimization() {
         warn "BBR 未启用；其余网络与转发参数已正常应用"
     fi
 
-    echo
-    echo "说明："
-    echo "  - 无参数安装会自动探测一次并应用，不创建定时任务。"
-    echo "  - IPv4 转发已启用，兼容 NAT、透明代理、网关与端口转发场景。"
-    echo "  - IPv6 转发已启用，并使用 accept_ra=2 保留云平台 RA。"
-    echo "  - 未启用 route_localnet 或 MPTCP。"
-    echo "  - 新版不再管理 limits.conf、nproc 与 memlock。"
-    echo "  - 已恢复旧脚本修改过的资源限制配置（若检测到对应备份）。"
-    echo "  - 已移除的旧 sysctl 参数在重启前可能仍保留运行时值；重启后将完全按新版配置生效。"
+    show_install_summary "$health_before" "$bbr_enabled"
 }
 
 restore_optimization() {
@@ -2046,6 +2132,7 @@ show_status() {
     slow_start_after_idle=$(sysctl -n net.ipv4.tcp_slow_start_after_idle 2>/dev/null || echo "未知")
     mtu_probing=$(sysctl -n net.ipv4.tcp_mtu_probing 2>/dev/null || echo "未知")
     netdev_budget=$(sysctl -n net.core.netdev_budget 2>/dev/null || echo "不可用")
+    tcp_ecn=$(sysctl -n net.ipv4.tcp_ecn 2>/dev/null || echo "不可用")
 
     echo "========== 网络优化状态 =========="
     echo "配置文件: $NETWORK_CONF"
@@ -2099,6 +2186,8 @@ show_status() {
     echo "  fin_timeout: $fin_timeout"
     echo "  slow_start_after_idle: $slow_start_after_idle"
     echo "  mtu_probing: $mtu_probing"
+    echo "  ECN: $tcp_ecn"
+    echo "  健康快照: $(network_health_snapshot "$(detect_default_iface || true)")"
 
     echo
     echo "兼容迁移:"
@@ -2131,6 +2220,7 @@ install/plan 选项：
   --rtt-ms N              指定 RTT，单位 ms
   --target HOST           自定义 RTT 目标，可重复指定
   --no-probe              禁止外部探测，缺失数据时按内存保守配置
+  --disable-ecn           禁用 ECN，兼容存在 ECN 黑洞的旧链路
 
 示例：
   network-optimize.sh
@@ -2145,8 +2235,10 @@ install/plan 选项：
   - 自动测量中国大陆与全球 RTT，BDP 计算使用 150 ms 下限并保留观测值
   - 首选附近公共 iperf3 节点进行多流双向测速，Cloudflare 作为并行回退
   - 自动测速在约 90 GB 时停止，保留余量确保总量不超过 100 GB
-  - 根据 2 × BDP 动态设置缓冲区上限，默认值按半个 BDP 取 2-4 MiB
-  - 缓冲区上限为 RAM / 16 且不超过 256 MiB
+  - 默认启用 ECN；可用 --disable-ecn 回退
+  - 根据 2 × BDP 动态设置缓冲区上限，默认值按半个 BDP 取 4-8 MiB
+  - RAM 小于 1 GiB 时默认缓冲固定 4 MiB
+  - RAM 小于 2 GiB 时上限为 RAM / 16、最高 256 MiB；否则为 RAM / 8、最高 512 MiB
   - 探测失败时按内存使用保守配置
   - 只在本次运行计算和应用，不创建定时任务
 EOF

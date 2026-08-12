@@ -76,7 +76,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/linux_
 | ---: | --- | --- | --- |
 | 1 | `system-optimize.sh` | Zram、系统 sysctl、journald、THP、时区和 Chrony | 为 headless VPS 设置 Panic 恢复、日志上限和低干扰 THP 策略；Ubuntu 可能安装内核模块、固件与 CPU 微码 |
 | 2 | `system-customize.sh` | 动态 MOTD、中文 Locale、可选 XanMod | 可能修改 Locale、欢迎信息和内核 |
-| 3 | `network-optimize.sh` | BBR、fq、动态 TCP/UDP 缓冲区、IPv4/IPv6 转发 | 仅在上联网卡使用 `accept_ra=2` 保留云平台 IPv6 RA；自动测速最多约 90 GB |
+| 3 | `network-optimize.sh` | BBR、fq、ECN、动态 TCP/UDP 缓冲区、IPv4/IPv6 转发 | 仅在上联网卡使用 `accept_ra=2` 保留云平台 IPv6 RA；自动测速最多约 90 GB |
 | 4 | `zsh-setup.sh` | Zsh、Oh My Zsh、Powerlevel10k 和插件 | 备份后重写 root 的 `.zshrc`，可修改默认 Shell |
 | 5 | `mise-setup.sh` | Mise、Python、Node.js 和依赖迁移 | 配置 Shell 集成及每周 Mise 自动更新 |
 | 6 | `tools-setup.sh` | NextTrace、Speedtest、htop、jq、tree 等 | 可能添加 NextTrace 第三方 APT 源 |
