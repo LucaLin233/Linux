@@ -1215,10 +1215,21 @@ calculate_buffer_max() {
 
 calculate_tcp_mem() {
     local ram_mb="$1"
-    local total_pages=$((ram_mb * 256))
-    local low=$((total_pages / 16))
-    local pressure=$((total_pages / 8))
-    local maximum=$((total_pages / 4))
+    local page_size="${2:-}"
+    local total_pages
+    local low
+    local pressure
+    local maximum
+
+    if [[ -z "$page_size" ]]; then
+        page_size=$(getconf PAGESIZE 2>/dev/null || true)
+    fi
+    [[ "$page_size" =~ ^[0-9]+$ ]] && (( page_size > 0 )) || return 1
+
+    total_pages=$((ram_mb * 1024 * 1024 / page_size))
+    low=$((total_pages / 16))
+    pressure=$((total_pages / 8))
+    maximum=$((total_pages / 4))
 
     (( low < 4096 )) && low=4096
     (( pressure < 8192 )) && pressure=8192
@@ -1438,6 +1449,9 @@ append_supported_tcp_settings() {
 net.ipv4.tcp_moderate_rcvbuf = 1
 net.ipv4.tcp_window_scaling = 1
 net.ipv4.tcp_syncookies = 1
+net.ipv4.tcp_sack = 1
+net.ipv4.tcp_dsack = 1
+net.ipv4.tcp_timestamps = 1
 EOF
 
     if [[ -e /proc/sys/net/ipv4/tcp_adv_win_scale ]]; then

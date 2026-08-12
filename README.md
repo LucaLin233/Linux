@@ -209,7 +209,8 @@ bash <(curl -fsSL "$RAW_BASE/network-optimize.sh") help
 `somaxconn=65535`、`tcp_max_syn_backlog=16384`，TCP/socket 默认缓冲区按半个 BDP 动态取
 2-4 MiB，UDP 最小缓冲区为 8 KiB，`tcp_fin_timeout=30`。动态最大缓冲区按 `2 × BDP`
 计算，限制在 `RAM / 16` 且不超过 256 MiB；全局 `tcp_mem` 预算按 RAM 的 1/16、1/8、1/4
-生成；`--static` 保持固定 32 MiB 上限和 4 MiB 默认值。`netdev_budget` 在带宽达到
+生成（按系统实际页大小换算），并明确启用 SACK、DSACK 和 TCP 时间戳。`--static` 保持固定
+32 MiB 上限和 4 MiB 默认值。`netdev_budget` 在带宽达到
 2.5 Gbps 且至少 2 个在线 CPU 时使用 600，其他环境使用 300；可用时将
 `netdev_budget_usecs` 设为 4000。
 

@@ -28,9 +28,11 @@ assert_eq "3145728" "$(calculate_buffer_default 300 150 16777216)" \
     "buffer default rounds half BDP"
 assert_eq "4194304" "$(calculate_buffer_default 1000 150 37748736)" \
     "buffer default keeps 4 MiB ceiling"
-assert_eq "16384 32768 65536" "$(calculate_tcp_mem 1024)" \
-    "tcp memory budget follows RAM"
-assert_eq "4096 8192 16384" "$(calculate_tcp_mem 128)" \
+assert_eq "16384 32768 65536" "$(calculate_tcp_mem 1024 4096)" \
+    "tcp memory budget follows RAM with 4 KiB pages"
+assert_eq "4096 8192 16384" "$(calculate_tcp_mem 1024 65536)" \
+    "tcp memory budget follows RAM with 64 KiB pages"
+assert_eq "4096 8192 16384" "$(calculate_tcp_mem 128 4096)" \
     "tcp memory budget keeps minimums"
 
 printf 'All network-optimize tests passed.\n'
