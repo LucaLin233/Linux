@@ -43,6 +43,7 @@ readonly RUNTIME_INITIAL_BACKUP="/var/lib/linux-setup/network-optimize.initial-r
 readonly RUNTIME_INITIAL_UNKNOWN="/var/lib/linux-setup/network-optimize.initial-runtime-unknown"
 readonly RUNTIME_PREVIOUS_BACKUP="/var/lib/linux-setup/network-optimize.previous-runtime"
 readonly LOCK_FILE="/run/lock/network-optimize.lock"
+readonly NETWORK_DETAIL_LOG="${NETWORK_OPTIMIZE_LOG:-/var/log/linux-setup.log}"
 
 # 首选附近公共 iperf3 节点进行多流双向测速；Cloudflare 用于并行交叉验证和回退。
 readonly SPEED_DOWNLOAD_URL="https://speed.cloudflare.com/__down"
@@ -182,6 +183,15 @@ error() {
 
 success() {
     log "$1" "success"
+}
+detail() {
+    local message="$1"
+
+    if [[ "${DEBUG:-}" == "1" ]]; then
+        info "$message"
+    elif [[ -w "$NETWORK_DETAIL_LOG" || ( ! -e "$NETWORK_DETAIL_LOG" && -w "$(dirname "$NETWORK_DETAIL_LOG")" ) ]]; then
+        printf '%s network-optimize: %s\n' "$(date '+%F %T')" "$message" >> "$NETWORK_DETAIL_LOG"
+    fi
 }
 
 
@@ -975,8 +985,8 @@ probe_iperf_bandwidth() {
             download_cpu=$(format_cpu_percent "$download_cpu")
 
             PREFERRED_IPERF_PORT="$port"
-            info "iperf3 成功节点：$location/$provider $host [$peer_ip]:$port（IPv4 RTT ${rtt} ms）"
-            info "节点结果：下载 ${download:-失败} Mbps（CPU ${download_cpu:-?}% / 重传率 ${download_retransmit_percent:-?}% [${download_retransmits:-?} 次]），上传 ${upload:-失败} Mbps（CPU ${upload_cpu:-?}% / 重传率 ${upload_retransmit_percent:-?}% [${upload_retransmits:-?} 次]）"
+            detail "iperf3 成功节点：$location/$provider $host [$peer_ip]:$port（IPv4 RTT ${rtt} ms）"
+            detail "节点结果：下载 ${download:-失败} Mbps（CPU ${download_cpu:-?}% / 重传率 ${download_retransmit_percent:-?}% [${download_retransmits:-?} 次]），上传 ${upload:-失败} Mbps（CPU ${upload_cpu:-?}% / 重传率 ${upload_retransmit_percent:-?}% [${upload_retransmits:-?} 次]）"
 
             [[ -n "$upload" ]] && (( upload > best_upload )) && best_upload=$upload
             [[ -n "$download" ]] && (( download > best_download )) && best_download=$download
@@ -1105,13 +1115,13 @@ probe_cloudflare_bandwidth() {
     local crosscheck=""
 
     command -v curl >/dev/null 2>&1 || return 1
-    info "使用 8 流 Cloudflare 交叉验证；iperf3 不可用时同时作为回退..."
+    detail "使用 8 流 Cloudflare 交叉验证；iperf3 不可用时同时作为回退..."
 
     download=$(probe_cloudflare_direction download || true)
     upload=$(probe_cloudflare_direction upload || true)
 
     if [[ -n "$download" || -n "$upload" ]]; then
-        info "Cloudflare 结果：下载$(format_bandwidth_result "$download")，上传$(format_bandwidth_result "$upload")"
+        detail "Cloudflare 结果：下载$(format_bandwidth_result "$download")，上传$(format_bandwidth_result "$upload")"
     else
         warn "Cloudflare 交叉验证失败：两个方向均未获得足够有效流量"
     fi
@@ -1168,8 +1178,8 @@ show_probe_environment() {
     default_qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo unknown)
     root_qdisc=$(tc qdisc show dev "$PROBE_IFACE" 2>/dev/null | awk 'NR == 1 {print $2}')
 
-    info "测速环境：接口 $PROBE_IFACE / 驱动 $driver / RX-TX 队列 ${rx_queues}-${tx_queues}"
-    info "测速前网络栈：CC $current_cc / default_qdisc $default_qdisc / root_qdisc ${root_qdisc:-unknown}"
+    detail "测速环境：接口 $PROBE_IFACE / 驱动 $driver / RX-TX 队列 ${rx_queues}-${tx_queues}"
+    detail "测速前网络栈：CC $current_cc / default_qdisc $default_qdisc / root_qdisc ${root_qdisc:-unknown}"
 }
 
 probe_bandwidth() {
@@ -1206,9 +1216,9 @@ probe_bandwidth() {
     DETECTED_UPLOAD_MBPS=$(round_bandwidth "$DETECTED_UPLOAD_MBPS")
     total_used=$(traffic_used_bytes total || echo 0)
 
-    info "原始测速：下载 ${raw_download:-缺失} Mbps，上传 ${raw_upload:-缺失} Mbps"
-    info "计算带宽：下载 $DETECTED_DOWNLOAD_MBPS Mbps，上传 $DETECTED_UPLOAD_MBPS Mbps"
-    info "测速流量：$(awk -v bytes="$total_used" 'BEGIN {printf "%.2f GB", bytes / 1000000000}')"
+    detail "原始测速：下载 ${raw_download:-缺失} Mbps，上传 ${raw_upload:-缺失} Mbps"
+    detail "计算带宽：下载 $DETECTED_DOWNLOAD_MBPS Mbps，上传 $DETECTED_UPLOAD_MBPS Mbps"
+    detail "测速流量：$(awk -v bytes="$total_used" 'BEGIN {printf "%.2f GB", bytes / 1000000000}')"
 }
 
 calculate_buffer_max() {
@@ -1882,7 +1892,18 @@ restore_runtime_values() {
 
 apply_network_config() {
     local config_file="$1"
-    sysctl -p "$config_file"
+    local output
+
+    if [[ "${DEBUG:-}" == "1" ]]; then
+        sysctl -p "$config_file"
+        return
+    fi
+
+    if ! output=$(sysctl -p "$config_file" 2>&1); then
+        printf '%s\n' "$output" >&2
+        return 1
+    fi
+    [[ -z "$output" ]] || while IFS= read -r line; do detail "$line"; done <<< "$output"
 }
 
 normalize_sysctl_value() {

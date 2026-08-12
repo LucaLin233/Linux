@@ -196,7 +196,10 @@ Sweep 状态、推荐值、接口和 qdisc 所有权检查。
 
 ## qdisc 安全边界
 
-允许自动接管并按该 qdisc 类型的本机内核默认参数恢复：
+允许自动接管并按 qdisc 类型恢复为内核默认参数：
+
+`fq`/`fq_codel` 的普通 `tc -j` 输出会展开内核参数。脚本创建名称不超过 Linux `IFNAMSIZ`
+限制的临时 dummy 接口，在本机生成同类默认 qdisc 并结构化比较；测试后立即删除。
 
 ```text
 fq、fq_codel、pfifo_fast、mq、noqueue
@@ -208,9 +211,8 @@ fq、fq_codel、pfifo_fast、mq、noqueue
 CAKE、TBF、NETEM、TAPRIO、非本工具 HTB、根队列或 mq 子队列的自定义 class/filter
 ```
 
-仅允许使用内核默认参数的 `fq`/`fq_codel`；检测到非默认 `limit`、`flow_limit`、`quantum`、
-`target`、`interval` 等参数时直接拒绝接管，因为无法保证逐项原样恢复。JSON 快照只用于人工核查，
-自动恢复仅重建已验证为默认参数的 qdisc 类型。`mq` 自动生成的 `class mq`、标准
+只有当前参数与本机临时 qdisc 的默认参数一致时才允许接管；恢复时重建相同类型的默认 qdisc。
+JSON 快照只用于人工核查。`mq` 自动生成的 `class mq`、标准
 fq/fq_codel 子队列，以及独立的 clsact/ingress filter 不视为冲突：替换根 qdisc 时
 clsact/ingress 会继续保留，关闭后由内核恢复 mq 拓扑。已经由 tcshape
 管理的 `HTB + fq` 也允许再次 Sweep；测试结束后会重新应用原固定速率。检测到

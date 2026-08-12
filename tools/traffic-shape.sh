@@ -10,7 +10,7 @@
 set -uo pipefail
 umask 022
 
-readonly VERSION="1.0.8"
+readonly VERSION="1.0.9"
 readonly INSTALL_PATH="${TCSHAPE_INSTALL_PATH:-/usr/local/sbin/tcshape}"
 readonly UPDATE_REPO="LucaLin233/Linux"
 readonly UPDATE_BRANCH="main"
@@ -501,7 +501,8 @@ qdisc_has_custom_parameters() {
         return 0
     }
 
-    probe="tcshape-probe-${BASHPID}"
+    # Linux IFNAMSIZ 限制为 15 字节；接口名必须保持短小。
+    probe="tcs${BASHPID}"
     if ! ip link add "$probe" type dummy 2>/dev/null; then
         error "无法创建临时接口读取本机 $kind 默认参数，拒绝覆盖"
         return 0
