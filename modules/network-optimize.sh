@@ -1469,6 +1469,8 @@ network_health_snapshot() {
     local squeezed=0
     local rx_errors=0
     local tx_errors=0
+    local rx_dropped=0
+    local tx_dropped=0
     local retrans=0
     local limited=0
     local line drop_hex squeeze_hex
@@ -1483,6 +1485,8 @@ network_health_snapshot() {
     if [[ -n "$iface" ]]; then
         rx_errors=$(cat "/sys/class/net/$iface/statistics/rx_errors" 2>/dev/null || echo 0)
         tx_errors=$(cat "/sys/class/net/$iface/statistics/tx_errors" 2>/dev/null || echo 0)
+        rx_dropped=$(cat "/sys/class/net/$iface/statistics/rx_dropped" 2>/dev/null || echo 0)
+        tx_dropped=$(cat "/sys/class/net/$iface/statistics/tx_dropped" 2>/dev/null || echo 0)
     fi
     retrans=$(awk '/^Tcp:/ {if (++seen == 2) print $13}' /proc/net/snmp 2>/dev/null || echo 0)
     if command -v ss >/dev/null 2>&1; then
@@ -1490,25 +1494,38 @@ network_health_snapshot() {
             awk '/(sndbuf_limited|rwnd_limited)/ {count++} END {print count+0}')
     fi
 
-    printf '%s %s %s %s %s %s\n' \
+    printf '%s %s %s %s %s %s %s %s\n' \
         "$dropped" "$squeezed" "${rx_errors:-0}" "${tx_errors:-0}" \
-        "${retrans:-0}" "$limited"
+        "${rx_dropped:-0}" "${tx_dropped:-0}" "${retrans:-0}" "$limited"
 }
 
 show_install_summary() {
     local before="$1"
     local bbr_enabled="$2"
     local after
-    local b_drop b_squeeze b_rx b_tx b_retrans _
-    local a_drop a_squeeze a_rx a_tx a_retrans a_limited
-    local health="softnet 无新增丢包，网卡无新增错误"
+    local b_drop b_squeeze b_rxerr b_txerr b_rxdrop b_txdrop b_retrans _
+    local a_drop a_squeeze a_rxerr a_txerr a_rxdrop a_txdrop a_retrans a_limited
+    local delta_drop delta_squeeze delta_rxerr delta_txerr delta_rxdrop delta_txdrop
+    local health
     local algorithm="当前拥塞控制"
 
     after=$(network_health_snapshot "$PROBE_IFACE")
-    read -r b_drop b_squeeze b_rx b_tx b_retrans _ <<< "$before"
-    read -r a_drop a_squeeze a_rx a_tx a_retrans a_limited <<< "$after"
-    if (( a_drop > b_drop || a_squeeze > b_squeeze || a_rx > b_rx || a_tx > b_tx )); then
-        health="softnet 或网卡错误计数有新增，请运行 status 复查"
+    read -r b_drop b_squeeze b_rxerr b_txerr b_rxdrop b_txdrop b_retrans _ <<< "$before"
+    read -r a_drop a_squeeze a_rxerr a_txerr a_rxdrop a_txdrop a_retrans a_limited <<< "$after"
+    delta_drop=$((a_drop - b_drop))
+    delta_squeeze=$((a_squeeze - b_squeeze))
+    delta_rxerr=$((a_rxerr - b_rxerr))
+    delta_txerr=$((a_txerr - b_txerr))
+    delta_rxdrop=$((a_rxdrop - b_rxdrop))
+    delta_txdrop=$((a_txdrop - b_txdrop))
+
+    if (( delta_drop > 0 || delta_rxerr > 0 || delta_txerr > 0 ||
+          delta_rxdrop > 0 || delta_txdrop > 0 )); then
+        health="异常：softnet 丢包 +${delta_drop}，网卡丢包 +$((delta_rxdrop + delta_txdrop))，网卡错误 +$((delta_rxerr + delta_txerr))"
+    elif (( delta_squeeze > 0 )); then
+        health="注意：softnet budget pressure +${delta_squeeze}，无新增丢包或网卡错误"
+    else
+        health="正常：softnet 和网卡无新增丢包或错误"
     fi
     [[ "$bbr_enabled" == "true" ]] && algorithm="BBR"
 
@@ -2198,7 +2215,8 @@ show_status() {
     echo "  slow_start_after_idle: $slow_start_after_idle"
     echo "  mtu_probing: $mtu_probing"
     echo "  ECN: $tcp_ecn"
-    echo "  健康快照: $(network_health_snapshot "$(detect_default_iface || true)")"
+    echo "  健康快照字段: softnet_dropped time_squeeze rx_errors tx_errors rx_dropped tx_dropped tcp_retrans limited_sockets"
+    echo "  健康快照累计值: $(network_health_snapshot "$(detect_default_iface || true)")"
 
     echo
     echo "兼容迁移:"
