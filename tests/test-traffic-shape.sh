@@ -138,17 +138,6 @@ assert_ok "accept maximum scan cap" validate_scan_cap 100000
 assert_fail "reject low scan cap" validate_scan_cap 99
 assert_fail "reject excessive scan cap" validate_scan_cap 100001
 
-assert_fail "allow default fq options" qdisc_options_are_custom fq \
-    '{"limit":10000,"flow_limit":100,"quantum":3028,"initial_quantum":15140,"buckets":1024}'
-assert_ok "reject custom fq flow limit" qdisc_options_are_custom fq \
-    '{"limit":10000,"flow_limit":8192,"quantum":3028}'
-assert_ok "reject unknown fq option" qdisc_options_are_custom fq \
-    '{"limit":10000,"future_option":1}'
-assert_fail "allow default fq_codel options" qdisc_options_are_custom fq_codel \
-    '{"limit":10240,"flows":1024,"quantum":1514,"target":5000,"interval":100000,"ecn":true}'
-assert_ok "reject custom fq_codel target" qdisc_options_are_custom fq_codel \
-    '{"limit":10240,"target":10000}'
-
 fixture="$temp_dir/iperf.json"
 cat > "$fixture" <<'JSON'
 {

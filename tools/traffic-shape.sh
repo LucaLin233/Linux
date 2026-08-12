@@ -477,55 +477,14 @@ root_qdisc_kind() {
         head -n 1
 }
 
-qdisc_options_are_custom() {
-    local kind="$1"
-    local options="$2"
-    local known_count
-    local total_count
-    [[ -n "$options" && "$options" != "{}" ]] || return 1
-
-    total_count=$(jq 'keys | length' <<< "$options" 2>/dev/null) || return 0
-    case "$kind" in
-        fq)
-            known_count=$(jq '[keys[] | select(. == "limit" or . == "flow_limit" or . == "quantum" or . == "initial_quantum" or . == "maxrate" or . == "buckets" or . == "orphan_mask" or . == "horizon_drop")] | length' <<< "$options")
-            (( total_count == known_count )) || return 0
-            jq -e '
-                (has("limit") and .limit != 10000) or
-                (has("flow_limit") and .flow_limit != 100) or
-                (has("quantum") and .quantum != 3028) or
-                (has("initial_quantum") and .initial_quantum != 15140) or
-                (has("maxrate") and .maxrate != 0) or
-                (has("buckets") and .buckets != 1024) or
-                (has("orphan_mask") and .orphan_mask != 1023) or
-                (has("horizon_drop") and .horizon_drop != false)
-            ' <<< "$options" >/dev/null 2>&1
-            ;;
-        fq_codel)
-            known_count=$(jq '[keys[] | select(. == "limit" or . == "flows" or . == "quantum" or . == "target" or . == "interval" or . == "ecn")] | length' <<< "$options")
-            (( total_count == known_count )) || return 0
-            jq -e '
-                (has("limit") and .limit != 10240) or
-                (has("flows") and .flows != 1024) or
-                (has("quantum") and .quantum != 1514) or
-                (has("target") and .target != 5000) or
-                (has("interval") and .interval != 100000) or
-                (has("ecn") and .ecn != true)
-            ' <<< "$options" >/dev/null 2>&1
-            ;;
-        *)
-            return 1
-            ;;
-    esac
-}
-
 qdisc_has_custom_parameters() {
     local iface="$1"
     local kind="$2"
     local json
     local options
 
-    json=$(tc -j -d qdisc show dev "$iface" 2>/dev/null) || {
-        error "无法读取 $iface 的详细 qdisc 参数，拒绝覆盖"
+    json=$(tc -j qdisc show dev "$iface" 2>/dev/null) || {
+        error "无法读取 $iface 的 qdisc 参数，拒绝覆盖"
         return 0
     }
     options=$(jq -cer --arg kind "$kind" \
@@ -534,7 +493,9 @@ qdisc_has_custom_parameters() {
         error "无法解析 $iface 的 $kind qdisc 参数，拒绝覆盖"
         return 0
     }
-    qdisc_options_are_custom "$kind" "$options"
+
+    # 非详细 JSON 中 options 为空表示未显式配置参数；出现任意 option 都无法保证原样恢复。
+    [[ "$options" != "{}" ]]
 }
 
 read_config_value() {
