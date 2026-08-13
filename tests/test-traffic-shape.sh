@@ -54,20 +54,71 @@ assert_eq "5" "$(calc_margin 80)" "margin for 80 Mbit"
 assert_eq "6" "$(calc_validation_rate 15)" "validation rate for 15 Mbit"
 assert_eq "1" "$(calc_auto_step 17 31)" "auto step for narrow range"
 assert_eq "20" "$(calc_auto_step 100 300)" "auto step for wide range"
+assert_eq "32768" "$(calc_burst 20)" "burst keeps 32 KiB floor"
+assert_eq "1000000" "$(calc_burst 2000)" "burst follows four milliseconds at line rate"
 
-assert_eq "1.0.9" "$(script_version "$ROOT_DIR/tools/traffic-shape.sh")" \
+tc() {
+    cat <<'EOF'
+qdisc mq 0: root
+qdisc fq 0: parent :1 limit 10000p flow_limit 100p buckets 1024 orphan_mask 1023
+qdisc fq 0: parent :2 limit 10000p flow_limit 100p buckets 1024 orphan_mask 1023
+EOF
+}
+assert_eq "fq" "$(mq_leaf_kind eth0)" "detect mq handle-zero leaf qdisc"
+unset -f tc
+
+MQ_ROOT="mq"
+MQ_HANDLE="0:"
+MQ_LEAF_KIND="fq_codel"
+MQ_CALL_LOG=$(mktemp)
+root_qdisc_kind() { printf '%s\n' "$MQ_ROOT"; }
+tc() {
+    printf '%s\n' "$*" >> "$MQ_CALL_LOG"
+    case "$*" in
+        "qdisc show dev eth0")
+            printf 'qdisc mq %s root\n' "$MQ_HANDLE"
+            printf 'qdisc %s 0: parent %s1\n' "$MQ_LEAF_KIND" "${MQ_HANDLE%:}:"
+            printf 'qdisc %s 0: parent %s2\n' "$MQ_LEAF_KIND" "${MQ_HANDLE%:}:"
+            ;;
+        "qdisc del dev eth0 root")
+            [[ "$MQ_HANDLE" != "0:" ]] || return 2
+            MQ_ROOT=""
+            return 0
+            ;;
+        "qdisc replace dev eth0 root handle 1: mq") MQ_ROOT="mq"; MQ_HANDLE="1:" ;;
+        "qdisc add dev eth0 root mq") MQ_ROOT="mq"; MQ_HANDLE="1:" ;;
+        "qdisc replace dev eth0 parent 1:1 fq_codel"|\
+        "qdisc replace dev eth0 parent 1:2 fq_codel") return 0 ;;
+        *) return 1 ;;
+    esac
+}
+assert_ok "replace mq handle zero before safe root deletion" qdisc_remove_root eth0
+grep -Fqx "qdisc replace dev eth0 root handle 1: mq" "$MQ_CALL_LOG" ||
+    fail "safe mq deletion did not replace handle zero"
+printf 'PASS: safe mq deletion replaces handle zero\n'
+MQ_ROOT="mq"
+MQ_HANDLE="1:"
+: > "$MQ_CALL_LOG"
+assert_ok "restore mq leaf qdisc kind" restore_simple_qdisc eth0 mq fq_codel
+grep -Fqx "qdisc replace dev eth0 parent 1:1 fq_codel" "$MQ_CALL_LOG" &&
+    grep -Fqx "qdisc replace dev eth0 parent 1:2 fq_codel" "$MQ_CALL_LOG" ||
+    fail "mq leaf restore did not replace every leaf"
+printf 'PASS: mq leaf restore replaces every leaf\n'
+unset -f tc root_qdisc_kind
+
+assert_eq "1.0.10" "$(script_version "$ROOT_DIR/tools/traffic-shape.sh")" \
     "extract update version"
 assert_ok "validate install source" validate_install_file \
     "$ROOT_DIR/tools/traffic-shape.sh"
 assert_ok "validate managed update file" validate_update_file \
-    "$ROOT_DIR/tools/traffic-shape.sh" "1.0.9"
+    "$ROOT_DIR/tools/traffic-shape.sh" "1.0.10"
 
 temp_dir=$(mktemp -d)
 trap 'rm -rf "$temp_dir"' EXIT
 invalid_update="$temp_dir/invalid-update.sh"
 sed 's#readonly UPDATE_REPO="LucaLin233/Linux"#readonly UPDATE_REPO="other/repo"#' \
     "$ROOT_DIR/tools/traffic-shape.sh" > "$invalid_update"
-assert_fail "reject update from another repository" validate_update_file "$invalid_update" "1.0.9"
+assert_fail "reject update from another repository" validate_update_file "$invalid_update" "1.0.10"
 
 empty_install="$temp_dir/empty-tcshape"
 unknown_install="$temp_dir/unknown-tcshape"

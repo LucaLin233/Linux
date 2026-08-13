@@ -3,14 +3,14 @@
 # 出口限速器拐点扫描与 HTB + fq 流量整形工具
 #
 # Sweep/shape portions adapted from Kylin010/tcpfit.
-# Upstream version: v0.5.4
-# Upstream commit: 65885816bb77be38d041218f1bf62fe4ebe5c300
+# Upstream version: v0.5.5
+# Upstream commit: a8ad4280e876bca066970ff97458003df30c7eae
 # Licensed under the MIT License. See THIRD_PARTY_NOTICES.md.
 
 set -uo pipefail
 umask 022
 
-readonly VERSION="1.0.9"
+readonly VERSION="1.0.10"
 readonly INSTALL_PATH="${TCSHAPE_INSTALL_PATH:-/usr/local/sbin/tcshape}"
 readonly UPDATE_REPO="LucaLin233/Linux"
 readonly UPDATE_BRANCH="main"
@@ -40,6 +40,7 @@ TRAFFIC_RX_START=0
 TRAFFIC_TX_START=0
 QSAVE_IFACE=""
 QSAVE_KIND=""
+QSAVE_LEAF_KIND=""
 QSAVE_OWNED=false
 SWEEP_ACTIVE=false
 SCAN_ID=""
@@ -483,6 +484,86 @@ root_qdisc_kind() {
         head -n 1
 }
 
+qdisc_remove_root() {
+    local iface="$1"
+
+    tc qdisc del dev "$iface" root 2>/dev/null && return 0
+    [[ "$(root_qdisc_kind "$iface")" == "mq" ]] || return 1
+    tc qdisc replace dev "$iface" root handle 1: mq 2>/dev/null || return 1
+    tc qdisc del dev "$iface" root 2>/dev/null
+}
+
+mq_leaf_kind() {
+    local iface="$1"
+    local output handle major
+
+    output=$(tc qdisc show dev "$iface" 2>/dev/null) || return 1
+    handle=$(awk '$1 == "qdisc" && $2 == "mq" {
+        for (i=1; i<=NF; i++) if ($i == "root") {print $3; exit}
+    }' <<< "$output")
+    major=${handle%:}
+    [[ -n "$major" ]] || return 1
+    awk -v major="$major" '$1 == "qdisc" && $0 ~ / parent / {
+        for (i=1; i<=NF; i++) if ($i == "parent") {
+            parent=$(i+1)
+            if ((major == "0" && (parent ~ /^:/ || index(parent, "0:") == 1)) ||
+                (major != "0" && index(parent, major ":") == 1)) {print $2; exit}
+        }
+    }' <<< "$output"
+}
+
+qdisc_set_mq_leaves() {
+    local iface="$1" kind="$2" output handle major parents parent
+
+    output=$(tc qdisc show dev "$iface" 2>/dev/null) || return 1
+    handle=$(awk '$1 == "qdisc" && $2 == "mq" {
+        for (i=1; i<=NF; i++) if ($i == "root") {print $3; exit}
+    }' <<< "$output")
+    major=${handle%:}
+    if [[ -z "$major" || "$major" == "0" ]]; then
+        tc qdisc replace dev "$iface" root handle 1: mq 2>/dev/null || return 1
+        output=$(tc qdisc show dev "$iface" 2>/dev/null) || return 1
+        handle=$(awk '$1 == "qdisc" && $2 == "mq" {
+            for (i=1; i<=NF; i++) if ($i == "root") {print $3; exit}
+        }' <<< "$output")
+        major=${handle%:}
+    fi
+    [[ -n "$major" ]] || return 1
+    parents=$(awk -v major="$major" '$1 == "qdisc" && $0 ~ / parent / {
+        for (i=1; i<=NF; i++) if ($i == "parent") {
+            parent=$(i+1); if (index(parent, major ":") == 1) print parent; break
+        }
+    }' <<< "$output")
+    [[ -n "$parents" ]] || return 1
+    for parent in $parents; do
+        tc qdisc replace dev "$iface" parent "$parent" "$kind" 2>/dev/null || return 1
+    done
+}
+
+qdisc_set_fq() {
+    local iface="$1" kind
+
+    kind=$(root_qdisc_kind "$iface")
+    case "$kind" in
+        mq) qdisc_set_mq_leaves "$iface" fq ;;
+        fq) return 0 ;;
+        ""|noqueue) tc qdisc add dev "$iface" root fq 2>/dev/null ;;
+        *)
+            qdisc_remove_root "$iface" || return 1
+            kind=$(root_qdisc_kind "$iface")
+            case "$kind" in
+                mq) qdisc_set_mq_leaves "$iface" fq ;;
+                fq) return 0 ;;
+                *) tc qdisc replace dev "$iface" root fq 2>/dev/null ;;
+            esac
+            ;;
+    esac
+}
+
+calc_burst() {
+    awk -v rate="$1" 'BEGIN {burst=rate*500; if (burst<32768) burst=32768; printf "%d", burst}'
+}
+
 qdisc_has_custom_parameters() {
     local iface="$1"
     local kind="$2"
@@ -640,12 +721,14 @@ check_external_conflicts() {
 apply_qdisc() {
     local iface="$1"
     local rate="$2"
+    local burst
 
-    tc qdisc del dev "$iface" root 2>/dev/null || true
+    burst=$(calc_burst "$rate")
+    qdisc_remove_root "$iface" || return 1
     tc qdisc add dev "$iface" root handle 1: htb default 10 || return 1
     tc class add dev "$iface" parent 1: classid 1:10 htb \
         rate "${rate}mbit" ceil "${rate}mbit" \
-        burst 32k cburst 32k quantum 1514 || return 1
+        burst "$burst" cburst "$burst" quantum 1514 || return 1
     tc qdisc add dev "$iface" parent 1:10 handle 10: fq \
         limit 40960 flow_limit 8192 maxrate "${rate}mbit" || return 1
 }
@@ -687,6 +770,8 @@ qdisc_save() {
     local iface="$1"
     QSAVE_IFACE="$iface"
     QSAVE_KIND=$(root_qdisc_kind "$iface")
+    QSAVE_LEAF_KIND=""
+    [[ "$QSAVE_KIND" == "mq" ]] && QSAVE_LEAF_KIND=$(mq_leaf_kind "$iface" || true)
     QSAVE_OWNED=false
     is_own_shaper "$iface" && QSAVE_OWNED=true
 }
@@ -694,15 +779,23 @@ qdisc_save() {
 restore_simple_qdisc() {
     local iface="$1"
     local kind="$2"
+    local leaf_kind="${3:-}"
 
-    tc qdisc del dev "$iface" root 2>/dev/null || true
+    qdisc_remove_root "$iface" 2>/dev/null || true
     case "$kind" in
         "")
             return 0
             ;;
-        noqueue|mq)
+        noqueue)
             sleep 1
             [[ "$(root_qdisc_kind "$iface")" == "$kind" ]] || return 1
+            ;;
+        mq)
+            sleep 1
+            [[ "$(root_qdisc_kind "$iface")" == "mq" ]] ||
+                tc qdisc add dev "$iface" root mq 2>/dev/null || return 1
+            [[ -z "$leaf_kind" ]] || qdisc_set_mq_leaves "$iface" "$leaf_kind" || return 1
+            [[ "$(root_qdisc_kind "$iface")" == "mq" ]] || return 1
             ;;
         pfifo_fast|fq|fq_codel)
             tc qdisc add dev "$iface" root "$kind" 2>/dev/null || return 1
@@ -734,7 +827,7 @@ qdisc_restore() {
             return 1
         fi
     else
-        if ! restore_simple_qdisc "$QSAVE_IFACE" "$QSAVE_KIND"; then
+        if ! restore_simple_qdisc "$QSAVE_IFACE" "$QSAVE_KIND" "$QSAVE_LEAF_KIND"; then
             error "无法自动恢复原 qdisc：${QSAVE_KIND:-unknown}"
             return 1
         fi
@@ -742,6 +835,7 @@ qdisc_restore() {
 
     QSAVE_IFACE=""
     QSAVE_KIND=""
+    QSAVE_LEAF_KIND=""
     QSAVE_OWNED=false
 }
 
@@ -749,9 +843,10 @@ save_baseline_to() {
     local iface="$1"
     local baseline="$2"
     local json_prefix="$3"
-    local kind
+    local kind leaf_kind=""
 
     kind=$(root_qdisc_kind "$iface")
+    [[ "$kind" == "mq" ]] && leaf_kind=$(mq_leaf_kind "$iface" || true)
     case "$kind" in
         ""|noqueue|mq|pfifo_fast|fq|fq_codel) ;;
         *) error "无法保存可自动恢复的 qdisc 基线：$kind"; return 1 ;;
@@ -764,6 +859,7 @@ save_baseline_to() {
     {
         printf 'INTERFACE=%s\n' "$iface"
         printf 'KIND=%s\n' "$kind"
+        printf 'LEAF_KIND=%s\n' "$leaf_kind"
     } > "$baseline" || return 1
     chmod 600 "$baseline"
 
@@ -810,11 +906,13 @@ restore_baseline() {
     local baseline="$STATE_DIR/qdisc-baseline"
     local iface
     local kind
+    local leaf_kind
     [[ -f "$baseline" ]] || { error "未找到 qdisc 基线，拒绝猜测恢复"; return 1; }
 
     iface=$(read_config_value INTERFACE "$baseline") || return 1
     kind=$(read_config_value KIND "$baseline" || true)
-    restore_simple_qdisc "$iface" "$kind" || return 1
+    leaf_kind=$(read_config_value LEAF_KIND "$baseline" || true)
+    restore_simple_qdisc "$iface" "$kind" "$leaf_kind" || return 1
     [[ "$(root_qdisc_kind "$iface")" == "$kind" ]] || {
         error "基线恢复验证失败：$iface 期望 ${kind:-none}"
         return 1
@@ -831,11 +929,12 @@ remove_owned_qdisc() {
 
 restore_qdisc_from_file() {
     local baseline="$1"
-    local iface kind
+    local iface kind leaf_kind
     [[ -f "$baseline" ]] || return 1
     iface=$(read_config_value INTERFACE "$baseline") || return 1
     kind=$(read_config_value KIND "$baseline" || true)
-    restore_simple_qdisc "$iface" "$kind" || return 1
+    leaf_kind=$(read_config_value LEAF_KIND "$baseline" || true)
+    restore_simple_qdisc "$iface" "$kind" "$leaf_kind" || return 1
     [[ "$(root_qdisc_kind "$iface")" == "$kind" ]]
 }
 
@@ -1421,11 +1520,11 @@ show_current_shaping() {
 cmd_scan() {
     local peer=""
     local lo="" hi="" step="" margin="" nominal=""
-    local duration="" gap=3 assume_yes=false user_range=false
+    local duration="" gap=3 pre_scan_gap=15 baseline_cap=0.5 assume_yes=false user_range=false
     local scan_cap="$DEFAULT_SCAN_CAP_MBIT"
     local loss_threshold="$LOSS_THRESHOLD"
     local iface picked result rc gp retrans port receiver goodput loss estimated_gp=""
-    local last_ok="" broke_at="" base_loss="" peer_slow=0
+    local last_ok="" broke_at="" base_loss="" spike_min_loss="" baseline_inconclusive=false peer_slow=0
 
     while (( $# > 0 )); do
         case "$1" in
@@ -1522,8 +1621,7 @@ cmd_scan() {
 
     if [[ "$user_range" == "false" ]]; then
         info "不限速探测（${duration}s，单流）..."
-        tc qdisc del dev "$iface" root 2>/dev/null || true
-        tc qdisc add dev "$iface" root fq || { error "无法应用临时 fq"; return 1; }
+        qdisc_set_fq "$iface" || { error "无法应用临时 fq"; return 1; }
 
         result=$(run_iperf "$peer" "$duration" 1)
         rc=$?
@@ -1537,6 +1635,24 @@ cmd_scan() {
         read -r gp retrans port receiver <<< "$result"
         goodput="${receiver:-$gp}"
         loss=$(loss_pct "$retrans" "$gp" "$duration")
+        if [[ -n "$nominal" ]] && (( nominal > scan_cap )) &&
+            awk -v g="$goodput" -v cap="$scan_cap" -v l="$loss" -v t="$loss_threshold" 'BEGIN {exit !(g <= cap && l > t)}'; then
+            local aggregate_result aggregate_gp aggregate_rt aggregate_receiver aggregate_goodput
+            info "单流结果不足以判断，补测 8 流聚合..."
+            aggregate_result=$(run_iperf "$peer" "$duration" 8)
+            rc=$?
+            (( rc == 75 )) && { save_sweep_result "BUDGET_EXCEEDED" "PEER=$peer"; return 2; }
+            if (( rc == 0 )); then
+                read -r aggregate_gp aggregate_rt port aggregate_receiver <<< "$aggregate_result"
+                aggregate_goodput="${aggregate_receiver:-$aggregate_gp}"
+                if awk -v g="$aggregate_goodput" -v cap="$scan_cap" 'BEGIN {exit !(g > cap)}'; then
+                    goodput="$aggregate_goodput"
+                    gp="$aggregate_gp"
+                    retrans="$aggregate_rt"
+                    loss=$(loss_pct "$retrans" "$gp" "$duration")
+                fi
+            fi
+        fi
         printf '不限速：发送 %s Mbit / 接收 %s Mbit / 重传 %s / 丢包 %s%%\n' \
             "$gp" "$goodput" "$retrans" "$loss"
 
@@ -1566,6 +1682,11 @@ cmd_scan() {
         (( hi <= lo )) && hi=$((lo + step))
     fi
 
+    if [[ "$user_range" == "false" ]]; then
+        info "扫描首档前冷却 ${pre_scan_gap}s..."
+        sleep "$pre_scan_gap"
+    fi
+
     info "验证节点路径..."
     validate_peer_path "$peer" "$nominal" "$iface" "$duration"
     rc=$?
@@ -1585,6 +1706,15 @@ cmd_scan() {
     printf '%-10s %-12s %-10s %-10s %s\n' "Rate" "Goodput" "Retrans" "Loss%" "Result"
 
     local rate retry hits test_result test_gp test_rt test_port test_recv test_loss
+
+    is_loss_spike() {
+        awk -v loss="$1" -v threshold="$loss_threshold" -v baseline="${base_loss:-0}" 'BEGIN {
+            required=threshold
+            if (baseline>0 && baseline*5>required) required=baseline*5
+            if (required>1) required=1
+            exit !(loss>required)
+        }'
+    }
     local points=()
     for ((rate=lo; rate<=hi; rate+=step)); do points+=("$rate"); done
     [[ " ${points[*]} " == *" $hi "* ]] || points+=("$hi")
@@ -1607,9 +1737,11 @@ cmd_scan() {
         read -r gp retrans port receiver <<< "$result"
         goodput="${receiver:-$gp}"
         loss=$(loss_pct "$retrans" "$gp" "$duration")
-        [[ -n "$base_loss" ]] || base_loss="$loss"
+        if [[ -z "$base_loss" ]] && awk -v l="$loss" -v t="$loss_threshold" 'BEGIN {exit !(l<=t)}'; then
+            base_loss="$loss"
+        fi
         hits=0
-        if awk -v l="$loss" -v t="$loss_threshold" -v b="$base_loss" 'BEGIN {exit !((l>t) && (b<=0 || l>=b*10))}'; then
+        if is_loss_spike "$loss"; then
             hits=1
             for retry in 2 3; do
                 sleep "$gap"
@@ -1619,11 +1751,12 @@ cmd_scan() {
                 (( rc == 0 )) || continue
                 read -r test_gp test_rt test_port test_recv <<< "$test_result"
                 test_loss=$(loss_pct "$test_rt" "$test_gp" "$duration")
-                awk -v l="$test_loss" -v t="$loss_threshold" -v b="$base_loss" 'BEGIN {exit !((l>t) && (b<=0 || l>=b*10))}' && ((hits++))
+                is_loss_spike "$test_loss" && ((hits++))
             done
         fi
 
         if (( hits >= 2 )); then
+            spike_min_loss="$loss"
             printf '%-10s %-12s %-10s %-10s %s\n' "$rate" "$gp" "$retrans" "$loss" "拐点"
             broke_at="$rate"
             break
@@ -1646,6 +1779,50 @@ cmd_scan() {
         last_ok="$rate"
         sleep "$gap"
     done
+
+    if [[ "$user_range" == "false" && -z "$last_ok" && -n "$broke_at" ]]; then
+        local known_broke="$broke_at" known_loss="$spike_min_loss"
+        local control control_loss attempts=0
+        while (( attempts < 3 )) && [[ -z "$last_ok" ]]; do
+            ((attempts++))
+            control=$((known_broke * 3 / 4))
+            (( control < 1 )) && control=1
+            (( control < known_broke )) || break
+            info "首档有损，向下检查控制点 ${control} Mbit"
+            apply_test_shaper "$iface" "$control" || return 1
+            result=$(run_iperf "$peer" "$duration" 1); rc=$?
+            (( rc == 75 )) && { save_sweep_result "BUDGET_EXCEEDED" "PEER=$peer"; return 2; }
+            (( rc == 0 )) || break
+            read -r gp retrans port receiver <<< "$result"
+            control_loss=$(loss_pct "$retrans" "$gp" "$duration")
+            if awk -v l="$control_loss" -v t="$loss_threshold" 'BEGIN {exit !(l<=t)}'; then
+                last_ok="$control"
+                broke_at="$known_broke"
+                base_loss="$control_loss"
+                break
+            fi
+            if awk -v a="$control_loss" -v b="$known_loss" -v cap="$baseline_cap" 'BEGIN {
+                diff=a-b; if (diff<0) diff=-diff
+                exit !(a<=cap && b<=cap && diff<=0.1)
+            }'; then
+                base_loss=$(awk -v a="$control_loss" -v b="$known_loss" 'BEGIN {print (a<b?a:b)}')
+                last_ok="$control"
+                broke_at=""
+                baseline_inconclusive=true
+                info "确认稳定路径底噪 ${base_loss}%，继续原扫描区间"
+                break
+            fi
+            known_broke="$control"
+            known_loss="$control_loss"
+        done
+    fi
+
+    if [[ "$baseline_inconclusive" == "true" ]]; then
+        save_sweep_result "INCONCLUSIVE" "PEER=$peer"
+        warn "已确认存在稳定路径底噪，但本轮未重新定位限速拐点，不生成整形推荐"
+        traffic_report
+        return 2
+    fi
 
     if [[ -z "$last_ok" ]]; then
         save_sweep_result "INCONCLUSIVE" "PEER=$peer"
@@ -1677,7 +1854,7 @@ cmd_scan() {
             loss=$(loss_pct "$retrans" "$gp" "$duration")
             hits=0
 
-            if awk -v l="$loss" -v t="$loss_threshold" -v b="$base_loss" 'BEGIN {exit !((l>t) && (b<=0 || l>=b*10))}'; then
+            if is_loss_spike "$loss"; then
                 hits=1
                 for retry in 2 3; do
                     sleep "$gap"
@@ -1686,7 +1863,7 @@ cmd_scan() {
                     (( rc == 0 )) || continue
                     read -r test_gp test_rt test_port test_recv <<< "$test_result"
                     test_loss=$(loss_pct "$test_rt" "$test_gp" "$duration")
-                    awk -v l="$test_loss" -v t="$loss_threshold" -v b="$base_loss" 'BEGIN {exit !((l>t) && (b<=0 || l>=b*10))}' && ((hits++))
+                    is_loss_spike "$test_loss" && ((hits++))
                 done
             fi
 

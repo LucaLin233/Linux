@@ -2,6 +2,9 @@
 set -euo pipefail
 
 readonly ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+readonly TEMP_DIR=$(mktemp -d)
+trap 'rm -rf "$TEMP_DIR"' EXIT
+export NETWORK_OPTIMIZE_STATE_DIR="$TEMP_DIR/state"
 # shellcheck source=../modules/network-optimize.sh
 source "$ROOT_DIR/modules/network-optimize.sh"
 
@@ -20,8 +23,8 @@ assert_eq() {
 
 assert_eq "8388608" "$(calculate_buffer_max 100 150 268435456)" \
     "buffer max keeps 8 MiB floor"
-assert_eq "37748736" "$(calculate_buffer_max 1000 150 268435456)" \
-    "buffer max rounds 2x BDP to MiB"
+assert_eq "39845888" "$(calculate_buffer_max 1000 150 268435456)" \
+    "buffer max includes 2 MiB headroom"
 assert_eq "4194304" "$(calculate_buffer_default 100 150 8388608)" \
     "buffer default keeps 4 MiB floor"
 assert_eq "7340032" "$(calculate_buffer_default 700 150 37748736)" \
@@ -38,5 +41,65 @@ assert_eq "4096 8192 16384" "$(calculate_tcp_mem 1024 65536)" \
     "tcp memory budget follows RAM with 64 KiB pages"
 assert_eq "4096 8192 16384" "$(calculate_tcp_mem 128 4096)" \
     "tcp memory budget keeps minimums"
+
+assert_eq "default via 192.0.2.1 dev eth0 proto dhcp metric 100" \
+    "$(strip_route_window_fields 'default via 192.0.2.1 dev eth0 proto dhcp metric 100 initcwnd 32 initrwnd 32')" \
+    "strip route window fields without losing route attributes"
+
+CURRENT_ROUTE="default via 192.0.2.1 dev eth0 proto dhcp src 192.0.2.10 metric 100 onlink"
+LAST_ROUTE_ARGS=""
+IP_FAIL=false
+
+default_ipv4_route() { printf '%s\n' "$CURRENT_ROUTE"; }
+ip() {
+    [[ "$1 $2 $3" == "-4 route replace" ]] || return 1
+    shift 3
+    LAST_ROUTE_ARGS="$*"
+    [[ "$IP_FAIL" == "false" ]] || return 1
+    CURRENT_ROUTE="$*"
+}
+
+mkdir -p "$NETWORK_OPTIMIZE_STATE_DIR"
+backup_default_route
+apply_initcwnd >/dev/null
+assert_eq "default via 192.0.2.1 dev eth0 proto dhcp src 192.0.2.10 metric 100 onlink initcwnd 32 initrwnd 32" \
+    "$LAST_ROUTE_ARGS" "apply initcwnd while preserving route attributes"
+[[ -e "$ROUTE_OWNED_MARKER" ]] || fail "apply initcwnd records ownership"
+printf 'PASS: apply initcwnd records ownership\n'
+
+backup_default_route
+[[ -e "$ROUTE_PREVIOUS_OWNED" ]] || fail "rerun records previous route ownership"
+printf 'PASS: rerun records previous route ownership\n'
+INITCWND_ENABLED=false
+apply_initcwnd >/dev/null
+assert_eq "default via 192.0.2.1 dev eth0 proto dhcp src 192.0.2.10 metric 100 onlink" \
+    "$CURRENT_ROUTE" "disable initcwnd removes owned route windows"
+[[ ! -e "$ROUTE_OWNED_MARKER" ]] || fail "disable initcwnd clears ownership"
+printf 'PASS: disable initcwnd clears ownership\n'
+
+CURRENT_ROUTE="default via 198.51.100.1 dev eth1 proto dhcp metric 200"
+restore_default_route "$ROUTE_PREVIOUS_BACKUP" "$ROUTE_PREVIOUS_OWNED"
+assert_eq "default via 192.0.2.1 dev eth0 proto dhcp src 192.0.2.10 metric 100 onlink initcwnd 32 initrwnd 32" \
+    "$CURRENT_ROUTE" "restore previous route snapshot"
+[[ -e "$ROUTE_OWNED_MARKER" ]] || fail "restore previous owned route restores ownership"
+printf 'PASS: restore previous owned route restores ownership\n'
+
+CURRENT_ROUTE="default via 203.0.113.1 dev eth2 initcwnd 32 initrwnd 32 metric 300"
+rm -f "$TEMP_DIR/missing-route"
+restore_default_route "$TEMP_DIR/missing-route"
+assert_eq "default via 203.0.113.1 dev eth2 metric 300" "$CURRENT_ROUTE" \
+    "missing backup strips owned route windows from current route"
+
+CURRENT_ROUTE="default via 192.0.2.1 dev eth0 proto dhcp metric 100"
+INITCWND_ENABLED=true
+IP_FAIL=true
+if apply_initcwnd >/dev/null 2>&1; then
+    fail "failed route replacement unexpectedly succeeded"
+fi
+IP_FAIL=false
+assert_eq "default via 192.0.2.1 dev eth0 proto dhcp metric 100" "$CURRENT_ROUTE" \
+    "failed initcwnd application leaves route unchanged"
+[[ ! -e "$ROUTE_OWNED_MARKER" ]] || fail "failed initcwnd application does not claim ownership"
+printf 'PASS: failed initcwnd application does not claim ownership\n'
 
 printf 'All network-optimize tests passed.\n'

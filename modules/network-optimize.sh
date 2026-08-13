@@ -23,6 +23,7 @@
 #   --target HOST                自定义 RTT 目标，可重复指定
 #   --no-probe                   不发起网络探测；缺失数据时按内存保守配置
 #   --disable-ecn                禁用 ECN，回退到传统丢包信号
+#   --disable-initcwnd           保留内核默认初始拥塞窗口
 
 set -euo pipefail
 
@@ -42,6 +43,13 @@ readonly BBR_MODULES_PREVIOUS_ABSENT="${BBR_MODULES_FILE}.previous-absent"
 readonly RUNTIME_INITIAL_BACKUP="/var/lib/linux-setup/network-optimize.initial-runtime"
 readonly RUNTIME_INITIAL_UNKNOWN="/var/lib/linux-setup/network-optimize.initial-runtime-unknown"
 readonly RUNTIME_PREVIOUS_BACKUP="/var/lib/linux-setup/network-optimize.previous-runtime"
+readonly NETWORK_OPTIMIZE_STATE_DIR="${NETWORK_OPTIMIZE_STATE_DIR:-/var/lib/linux-setup}"
+readonly ROUTE_INITIAL_BACKUP="${NETWORK_OPTIMIZE_STATE_DIR}/network-optimize.initial-route"
+readonly ROUTE_PREVIOUS_BACKUP="${NETWORK_OPTIMIZE_STATE_DIR}/network-optimize.previous-route"
+readonly ROUTE_INITIAL_UNKNOWN="${NETWORK_OPTIMIZE_STATE_DIR}/network-optimize.initial-route-unknown"
+readonly ROUTE_INITIAL_OWNED="${ROUTE_INITIAL_BACKUP}.owned"
+readonly ROUTE_PREVIOUS_OWNED="${ROUTE_PREVIOUS_BACKUP}.owned"
+readonly ROUTE_OWNED_MARKER="${NETWORK_OPTIMIZE_STATE_DIR}/network-optimize.initcwnd-owned"
 readonly LOCK_FILE="/run/lock/network-optimize.lock"
 readonly NETWORK_DETAIL_LOG="${NETWORK_OPTIMIZE_LOG:-/var/log/linux-setup.log}"
 
@@ -100,6 +108,7 @@ RESTORE_SCOPE="previous"
 TUNING_MODE="auto"
 NO_PROBE="false"
 ECN_ENABLED="true"
+INITCWND_ENABLED="true"
 MANUAL_BANDWIDTH_MBPS=""
 MANUAL_DOWNLOAD_MBPS=""
 MANUAL_UPLOAD_MBPS=""
@@ -427,6 +436,10 @@ parse_arguments() {
                 ECN_ENABLED="false"
                 shift
                 ;;
+            --disable-initcwnd)
+                INITCWND_ENABLED="false"
+                shift
+                ;;
             initial)
                 if [[ "$COMMAND" != "restore" ]]; then
                     error "initial 只能用于 restore"
@@ -728,6 +741,100 @@ detect_default_iface() {
 
     [[ -n "$iface" && -d "/sys/class/net/$iface" ]] || return 1
     echo "$iface"
+}
+
+default_ipv4_route() {
+    ip -4 route show default 2>/dev/null | head -n 1
+}
+
+strip_route_window_fields() {
+    local route="$1"
+    local skip=false token
+    local -a fields=() clean=()
+
+    read -r -a fields <<< "$route"
+    for token in "${fields[@]}"; do
+        if [[ "$skip" == "true" ]]; then
+            skip=false
+            continue
+        fi
+        case "$token" in
+            initcwnd|initrwnd) skip=true ;;
+            *) clean+=("$token") ;;
+        esac
+    done
+    printf '%s\n' "${clean[*]}"
+}
+
+backup_default_route() {
+    local route
+
+    route=$(default_ipv4_route)
+    rm -f "$ROUTE_PREVIOUS_BACKUP" "$ROUTE_PREVIOUS_OWNED"
+    [[ -n "$route" ]] || return 0
+    install -d -m 0755 "$NETWORK_OPTIMIZE_STATE_DIR"
+    printf '%s\n' "$route" > "$ROUTE_PREVIOUS_BACKUP"
+    chmod 600 "$ROUTE_PREVIOUS_BACKUP"
+    [[ ! -e "$ROUTE_OWNED_MARKER" ]] || install -m 0600 /dev/null "$ROUTE_PREVIOUS_OWNED"
+    if [[ ! -e "$ROUTE_INITIAL_BACKUP" && ! -e "$ROUTE_INITIAL_UNKNOWN" ]]; then
+        printf '%s\n' "$route" > "$ROUTE_INITIAL_BACKUP"
+        chmod 600 "$ROUTE_INITIAL_BACKUP"
+        [[ ! -e "$ROUTE_OWNED_MARKER" ]] || install -m 0600 /dev/null "$ROUTE_INITIAL_OWNED"
+    fi
+}
+
+apply_initcwnd() {
+    local route clean
+    local -a route_args=()
+
+    if [[ "$INITCWND_ENABLED" != "true" ]]; then
+        [[ -e "$ROUTE_OWNED_MARKER" ]] || return 0
+        route=$(default_ipv4_route)
+        [[ -n "$route" ]] || return 0
+        clean=$(strip_route_window_fields "$route")
+        read -r -a route_args <<< "$clean"
+        ip -4 route replace "${route_args[@]}" || return 1
+        rm -f "$ROUTE_OWNED_MARKER"
+        success "已移除本脚本设置的 initcwnd/initrwnd，恢复内核默认值"
+        return 0
+    fi
+    route=$(default_ipv4_route)
+    [[ -n "$route" ]] || {
+        warn "未找到 IPv4 默认路由，跳过 initcwnd/initrwnd"
+        return 0
+    }
+    clean=$(strip_route_window_fields "$route")
+    read -r -a route_args <<< "$clean"
+    if ip -4 route replace "${route_args[@]}" initcwnd 32 initrwnd 32; then
+        install -D -m 0600 /dev/null "$ROUTE_OWNED_MARKER"
+        success "默认路由已设置 initcwnd/initrwnd = 32（可能增加有浅层 policer 链路的首秒突发）"
+    else
+        error "默认路由不支持 initcwnd/initrwnd，网络 sysctl 已应用但路由优化失败"
+        return 1
+    fi
+}
+
+restore_default_route() {
+    local route_file="$1"
+    local owned_file="${2:-}"
+    local route=""
+    local -a route_args=()
+
+    [[ -f "$route_file" ]] || {
+        [[ -e "$ROUTE_OWNED_MARKER" ]] || return 0
+        route=$(default_ipv4_route)
+        [[ -n "$route" ]] || return 0
+        route=$(strip_route_window_fields "$route")
+    }
+    [[ -n "$route" ]] || route=$(<"$route_file")
+    read -r -a route_args <<< "$route"
+    (( ${#route_args[@]} > 0 )) || return 1
+    ip -4 route replace "${route_args[@]}" || return 1
+    if [[ -n "$owned_file" && -e "$owned_file" ]]; then
+        install -D -m 0600 /dev/null "$ROUTE_OWNED_MARKER"
+    else
+        rm -f "$ROUTE_OWNED_MARKER"
+    fi
 }
 
 read_iface_counter() {
@@ -1229,8 +1336,8 @@ calculate_buffer_max() {
     local mib=$((1024 * 1024))
     local desired
 
-    # 2 × BDP = Mbps × RTT(ms) × 250 bytes。
-    desired=$((bandwidth_mbps * rtt_ms * 250))
+    # 2 × BDP + 2 MiB，为 socket 记账和通告窗口保留余量。
+    desired=$((bandwidth_mbps * rtt_ms * 250 + 2 * 1024 * 1024))
     desired=$((((desired + mib - 1) / mib) * mib))
     (( desired < minimum )) && desired=$minimum
     (( desired > memory_cap )) && desired=$memory_cap
@@ -1289,7 +1396,7 @@ buffer_limit_reason() {
     local mib=$((1024 * 1024))
     local desired
 
-    desired=$((bandwidth_mbps * rtt_ms * 250))
+    desired=$((bandwidth_mbps * rtt_ms * 250 + 2 * 1024 * 1024))
     desired=$((((desired + mib - 1) / mib) * mib))
 
     if (( desired < minimum )); then
@@ -1297,7 +1404,7 @@ buffer_limit_reason() {
     elif (( desired > memory_cap )); then
         echo "RAM / 16 cap"
     else
-        echo "2 x BDP"
+        echo "2 x BDP + 2 MiB headroom"
     fi
 }
 
@@ -1460,6 +1567,7 @@ show_tuning_plan() {
     echo "rmem_default: $(format_mib "$RMEM_DEFAULT_BYTES") MiB"
     echo "wmem_default: $(format_mib "$WMEM_DEFAULT_BYTES") MiB"
     echo "计算依据: $CALCULATION_REASON"
+    echo "initcwnd/initrwnd: $([[ "$INITCWND_ENABLED" == "true" ]] && echo "32（默认启用；浅层 policer 可能增加首秒突发）" || echo "内核默认")"
     echo "ECN: $([[ "$ECN_ENABLED" == "true" ]] && echo 启用 || echo 禁用)"
 }
 
@@ -1765,6 +1873,7 @@ net.ipv4.tcp_fastopen = 3
 net.core.somaxconn = 65535
 net.ipv4.tcp_max_syn_backlog = 16384
 net.core.netdev_max_backlog = 16384
+net.core.optmem_max = 65536
 
 # 6. 临时端口
 net.ipv4.ip_local_port_range = 1024 65535
@@ -1783,6 +1892,7 @@ net.ipv4.udp_wmem_min = 8192
 # 8. 长连接、连接回收与复杂路径
 net.ipv4.tcp_fin_timeout = 30
 net.ipv4.tcp_slow_start_after_idle = 0
+net.ipv4.tcp_keepalive_time = 600
 net.ipv4.tcp_mtu_probing = 1
 net.ipv4.tcp_ecn = $([[ "$ECN_ENABLED" == "true" ]] && echo 1 || echo 0)
 EOF
@@ -1819,6 +1929,9 @@ prepare_legacy_backup_state() {
         fi
         if [[ ! -e "$RUNTIME_INITIAL_BACKUP" && ! -e "$RUNTIME_INITIAL_UNKNOWN" ]]; then
             install -D -m 0600 /dev/null "$RUNTIME_INITIAL_UNKNOWN"
+        fi
+        if [[ ! -e "$ROUTE_INITIAL_BACKUP" && ! -e "$ROUTE_INITIAL_UNKNOWN" ]]; then
+            install -D -m 0600 /dev/null "$ROUTE_INITIAL_UNKNOWN"
         fi
     fi
 
@@ -2015,6 +2128,10 @@ install_optimization() {
         rm -f "$temp_config" "$runtime_backup"
         return 1
     }
+    backup_default_route || {
+        rm -f "$temp_config" "$runtime_backup"
+        return 1
+    }
 
     # 应用前已保存全部涉及参数的运行值，失败时逐项回滚。
     if ! apply_network_config "$temp_config"; then
@@ -2036,6 +2153,17 @@ install_optimization() {
     if ! mv "$temp_config" "$NETWORK_CONF"; then
         error "写入网络配置文件失败"
         restore_runtime_values "$runtime_backup"
+        rm -f "$temp_config" "$runtime_backup"
+        return 1
+    fi
+
+    if ! apply_initcwnd; then
+        restore_default_route "$ROUTE_PREVIOUS_BACKUP" "$ROUTE_PREVIOUS_OWNED" || true
+        restore_runtime_values "$RUNTIME_PREVIOUS_BACKUP"
+        if ! restore_managed_file \
+            "$NETWORK_CONF" "$NETWORK_PREVIOUS_BACKUP" "$NETWORK_PREVIOUS_ABSENT"; then
+            warn "路由优化失败后无法恢复上次持久网络配置"
+        fi
         rm -f "$temp_config" "$runtime_backup"
         return 1
     fi
@@ -2063,6 +2191,8 @@ restore_optimization() {
     local modules_backup
     local modules_absent
     local runtime_backup
+    local route_backup
+    local route_owned
 
     case "$scope" in
         previous)
@@ -2071,6 +2201,8 @@ restore_optimization() {
             modules_backup="$BBR_MODULES_PREVIOUS_BACKUP"
             modules_absent="$BBR_MODULES_PREVIOUS_ABSENT"
             runtime_backup="$RUNTIME_PREVIOUS_BACKUP"
+            route_backup="$ROUTE_PREVIOUS_BACKUP"
+            route_owned="$ROUTE_PREVIOUS_OWNED"
             ;;
         initial)
             config_backup="$NETWORK_INITIAL_BACKUP"
@@ -2078,6 +2210,8 @@ restore_optimization() {
             modules_backup="$BBR_MODULES_INITIAL_BACKUP"
             modules_absent="$BBR_MODULES_INITIAL_ABSENT"
             runtime_backup="$RUNTIME_INITIAL_BACKUP"
+            route_backup="$ROUTE_INITIAL_BACKUP"
+            route_owned="$ROUTE_INITIAL_OWNED"
             ;;
         *)
             error "恢复范围必须是 previous 或 initial"
@@ -2109,6 +2243,12 @@ restore_optimization() {
         warn "没有 $scope 运行值快照；已恢复持久配置，部分已移除参数可能需重启后还原"
     fi
 
+    if [[ "$scope" == "initial" && -e "$ROUTE_INITIAL_UNKNOWN" ]]; then
+        warn "初始默认路由状态由旧版脚本留下且不可知，保留当前路由"
+    elif ! restore_default_route "$route_backup" "$route_owned"; then
+        warn "无法恢复 $scope 默认路由属性；请检查 IPv4 默认路由"
+    fi
+
     success "网络配置已恢复到 $scope 状态"
 }
 
@@ -2136,6 +2276,9 @@ show_status() {
     local slow_start_after_idle
     local mtu_probing
     local netdev_budget
+    local optmem_max
+    local keepalive_time
+    local initcwnd_state
 
     available_cc=$(cat /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null || echo "未知")
     current_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "未知")
@@ -2160,6 +2303,9 @@ show_status() {
     slow_start_after_idle=$(sysctl -n net.ipv4.tcp_slow_start_after_idle 2>/dev/null || echo "未知")
     mtu_probing=$(sysctl -n net.ipv4.tcp_mtu_probing 2>/dev/null || echo "未知")
     netdev_budget=$(sysctl -n net.core.netdev_budget 2>/dev/null || echo "不可用")
+    optmem_max=$(sysctl -n net.core.optmem_max 2>/dev/null || echo "不可用")
+    keepalive_time=$(sysctl -n net.ipv4.tcp_keepalive_time 2>/dev/null || echo "不可用")
+    initcwnd_state=$(default_ipv4_route | grep -oE 'initcwnd [0-9]+( initrwnd [0-9]+)?' || echo "内核默认")
     tcp_ecn=$(sysctl -n net.ipv4.tcp_ecn 2>/dev/null || echo "不可用")
 
     echo "========== 网络优化状态 =========="
@@ -2196,6 +2342,7 @@ show_status() {
     echo "  tcp_max_syn_backlog: $syn_backlog"
     echo "  netdev_max_backlog: $backlog"
     echo "  netdev_budget: $netdev_budget"
+    echo "  optmem_max: $optmem_max"
     echo "  临时端口范围: $port_range"
 
     echo
@@ -2214,6 +2361,8 @@ show_status() {
     echo "  fin_timeout: $fin_timeout"
     echo "  slow_start_after_idle: $slow_start_after_idle"
     echo "  mtu_probing: $mtu_probing"
+    echo "  keepalive_time: $keepalive_time"
+    echo "  默认路由窗口: $initcwnd_state"
     echo "  ECN: $tcp_ecn"
     echo "  健康快照字段: softnet_dropped time_squeeze rx_errors tx_errors rx_dropped tx_dropped tcp_retrans limited_sockets"
     echo "  健康快照累计值: $(network_health_snapshot "$(detect_default_iface || true)")"
@@ -2250,6 +2399,7 @@ install/plan 选项：
   --target HOST           自定义 RTT 目标，可重复指定
   --no-probe              禁止外部探测，缺失数据时按内存保守配置
   --disable-ecn           禁用 ECN，兼容存在 ECN 黑洞的旧链路
+  --disable-initcwnd      保留内核默认初始拥塞窗口（默认设置为 32）
 
 示例：
   network-optimize.sh
@@ -2265,7 +2415,9 @@ install/plan 选项：
   - 首选附近公共 iperf3 节点进行多流双向测速，Cloudflare 作为并行回退
   - 自动测速在约 90 GB 时停止，保留余量确保总量不超过 100 GB
   - 默认启用 ECN；可用 --disable-ecn 回退
-  - 根据 2 × BDP 动态设置缓冲区上限，默认值按半个 BDP 取 4-8 MiB
+  - 默认把 IPv4 默认路由的 initcwnd/initrwnd 设为 32；浅层 policer 可能增加首秒突发
+  - 可用 --disable-initcwnd 保留内核默认初始拥塞窗口
+  - 根据 2 × BDP + 2 MiB 余量动态设置缓冲区上限，默认值按半个 BDP 取 4-8 MiB
   - 探测失败且缺少 BDP 数据时，默认缓冲保守回退到 4 MiB
   - RAM 小于 2 GiB 时上限为 RAM / 16、最高 256 MiB；否则为 RAM / 8、最高 512 MiB
   - 探测失败时按内存使用保守配置
