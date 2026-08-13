@@ -724,8 +724,8 @@ apply_qdisc() {
     local burst
 
     burst=$(calc_burst "$rate")
-    qdisc_remove_root "$iface" || return 1
-    # 删除临时 HTB 后，多队列网卡可能立即自动重建 mq；replace 可原子覆盖该根 qdisc。
+    # fq 0:、mq 0: 或驱动自动重建的根 qdisc 可能无法删除；replace 才是最终应用动作。
+    qdisc_remove_root "$iface" >/dev/null 2>&1 || true
     tc qdisc replace dev "$iface" root handle 1: htb default 10 || return 1
     tc class replace dev "$iface" parent 1: classid 1:10 htb \
         rate "${rate}mbit" ceil "${rate}mbit" \
