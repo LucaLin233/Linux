@@ -1579,6 +1579,8 @@ network_health_snapshot() {
     local tx_errors=0
     local rx_dropped=0
     local tx_dropped=0
+    local rx_packets=0
+    local tx_packets=0
     local retrans=0
     local limited=0
     local line drop_hex squeeze_hex
@@ -1595,6 +1597,8 @@ network_health_snapshot() {
         tx_errors=$(cat "/sys/class/net/$iface/statistics/tx_errors" 2>/dev/null || echo 0)
         rx_dropped=$(cat "/sys/class/net/$iface/statistics/rx_dropped" 2>/dev/null || echo 0)
         tx_dropped=$(cat "/sys/class/net/$iface/statistics/tx_dropped" 2>/dev/null || echo 0)
+        rx_packets=$(cat "/sys/class/net/$iface/statistics/rx_packets" 2>/dev/null || echo 0)
+        tx_packets=$(cat "/sys/class/net/$iface/statistics/tx_packets" 2>/dev/null || echo 0)
     fi
     retrans=$(awk '/^Tcp:/ {if (++seen == 2) print $13}' /proc/net/snmp 2>/dev/null || echo 0)
     if command -v ss >/dev/null 2>&1; then
@@ -1602,39 +1606,58 @@ network_health_snapshot() {
             awk '/(sndbuf_limited|rwnd_limited)/ {count++} END {print count+0}')
     fi
 
-    printf '%s %s %s %s %s %s %s %s\n' \
+    printf '%s %s %s %s %s %s %s %s %s %s\n' \
         "$dropped" "$squeezed" "${rx_errors:-0}" "${tx_errors:-0}" \
-        "${rx_dropped:-0}" "${tx_dropped:-0}" "${retrans:-0}" "$limited"
+        "${rx_dropped:-0}" "${tx_dropped:-0}" "${retrans:-0}" "$limited" \
+        "${rx_packets:-0}" "${tx_packets:-0}"
+}
+
+classify_network_health() {
+    local softnet_drop="$1" squeezed="$2" errors="$3" nic_drop="$4" packets="$5"
+    local drop_ppm=0
+
+    (( packets > 0 )) && drop_ppm=$((nic_drop * 1000000 / packets))
+
+    if (( softnet_drop > 0 || errors > 0 ||
+          (nic_drop >= 100 && packets > 0 && drop_ppm >= 1000) )); then
+        printf '异常：测速期间 softnet 丢包 +%s，网卡丢包 +%s（%s ppm），网卡错误 +%s' \
+            "$softnet_drop" "$nic_drop" "$drop_ppm" "$errors"
+    elif (( nic_drop > 10 || drop_ppm > 100 || squeezed > 0 ||
+             (nic_drop > 0 && packets == 0) )); then
+        printf '注意：测速期间 softnet budget pressure +%s，网卡丢包 +%s（%s ppm），无新增 softnet 丢包或网卡错误' \
+            "$squeezed" "$nic_drop" "$drop_ppm"
+    elif (( nic_drop > 0 )); then
+        printf '正常：测速期间仅有轻微网卡丢包波动 +%s（%s ppm），无 softnet 丢包或网卡错误' \
+            "$nic_drop" "$drop_ppm"
+    else
+        printf '正常：测速期间 softnet 和网卡无新增丢包或错误'
+    fi
 }
 
 show_install_summary() {
     local before="$1"
     local bbr_enabled="$2"
     local after
-    local b_drop b_squeeze b_rxerr b_txerr b_rxdrop b_txdrop b_retrans _
-    local a_drop a_squeeze a_rxerr a_txerr a_rxdrop a_txdrop a_retrans a_limited
+    local b_drop b_squeeze b_rxerr b_txerr b_rxdrop b_txdrop b_retrans _ b_rxpkt b_txpkt
+    local a_drop a_squeeze a_rxerr a_txerr a_rxdrop a_txdrop a_retrans a_limited a_rxpkt a_txpkt
     local delta_drop delta_squeeze delta_rxerr delta_txerr delta_rxdrop delta_txdrop
-    local health
+    local delta_packets health
     local algorithm="当前拥塞控制"
 
     after=$(network_health_snapshot "$PROBE_IFACE")
-    read -r b_drop b_squeeze b_rxerr b_txerr b_rxdrop b_txdrop b_retrans _ <<< "$before"
-    read -r a_drop a_squeeze a_rxerr a_txerr a_rxdrop a_txdrop a_retrans a_limited <<< "$after"
+    read -r b_drop b_squeeze b_rxerr b_txerr b_rxdrop b_txdrop b_retrans _ b_rxpkt b_txpkt <<< "$before"
+    read -r a_drop a_squeeze a_rxerr a_txerr a_rxdrop a_txdrop a_retrans a_limited a_rxpkt a_txpkt <<< "$after"
     delta_drop=$((a_drop - b_drop))
     delta_squeeze=$((a_squeeze - b_squeeze))
     delta_rxerr=$((a_rxerr - b_rxerr))
     delta_txerr=$((a_txerr - b_txerr))
     delta_rxdrop=$((a_rxdrop - b_rxdrop))
     delta_txdrop=$((a_txdrop - b_txdrop))
-
-    if (( delta_drop > 0 || delta_rxerr > 0 || delta_txerr > 0 ||
-          delta_rxdrop > 0 || delta_txdrop > 0 )); then
-        health="异常：softnet 丢包 +${delta_drop}，网卡丢包 +$((delta_rxdrop + delta_txdrop))，网卡错误 +$((delta_rxerr + delta_txerr))"
-    elif (( delta_squeeze > 0 )); then
-        health="注意：softnet budget pressure +${delta_squeeze}，无新增丢包或网卡错误"
-    else
-        health="正常：softnet 和网卡无新增丢包或错误"
-    fi
+    delta_packets=$((a_rxpkt - b_rxpkt + a_txpkt - b_txpkt))
+    (( delta_packets < 0 )) && delta_packets=0
+    health=$(classify_network_health \
+        "$delta_drop" "$delta_squeeze" "$((delta_rxerr + delta_txerr))" \
+        "$((delta_rxdrop + delta_txdrop))" "$delta_packets")
     [[ "$bbr_enabled" == "true" ]] && algorithm="BBR"
 
     printf '环境：%s CPU / %.1f GiB / %s\n' \
@@ -2364,7 +2387,7 @@ show_status() {
     echo "  keepalive_time: $keepalive_time"
     echo "  默认路由窗口: $initcwnd_state"
     echo "  ECN: $tcp_ecn"
-    echo "  健康快照字段: softnet_dropped time_squeeze rx_errors tx_errors rx_dropped tx_dropped tcp_retrans limited_sockets"
+    echo "  健康快照字段: softnet_dropped time_squeeze rx_errors tx_errors rx_dropped tx_dropped tcp_retrans limited_sockets rx_packets tx_packets"
     echo "  健康快照累计值: $(network_health_snapshot "$(detect_default_iface || true)")"
 
     echo

@@ -46,6 +46,31 @@ assert_eq "default via 192.0.2.1 dev eth0 proto dhcp metric 100" \
     "$(strip_route_window_fields 'default via 192.0.2.1 dev eth0 proto dhcp metric 100 initcwnd 32 initrwnd 32')" \
     "strip route window fields without losing route attributes"
 
+assert_eq "正常：测速期间 softnet 和网卡无新增丢包或错误" \
+    "$(classify_network_health 0 0 0 0 1000000)" \
+    "classify clean health snapshot"
+assert_eq "正常：测速期间仅有轻微网卡丢包波动 +1（1 ppm），无 softnet 丢包或网卡错误" \
+    "$(classify_network_health 0 0 0 1 1000000)" \
+    "classify isolated NIC drop as normal fluctuation"
+assert_eq "注意：测速期间 softnet budget pressure +105，网卡丢包 +0（0 ppm），无新增 softnet 丢包或网卡错误" \
+    "$(classify_network_health 0 105 0 0 1000000)" \
+    "classify softnet budget pressure as notice"
+assert_eq "注意：测速期间 softnet budget pressure +0，网卡丢包 +1983（39 ppm），无新增 softnet 丢包或网卡错误" \
+    "$(classify_network_health 0 0 0 1983 50000000)" \
+    "classify low-ratio NIC drops during high-volume test as notice"
+assert_eq "注意：测速期间 softnet budget pressure +0，网卡丢包 +2000（0 ppm），无新增 softnet 丢包或网卡错误" \
+    "$(classify_network_health 0 0 0 2000 0)" \
+    "classify NIC drops without packet denominator as notice"
+assert_eq "异常：测速期间 softnet 丢包 +1，网卡丢包 +0（0 ppm），网卡错误 +0" \
+    "$(classify_network_health 1 0 0 0 1000000)" \
+    "classify softnet drops as abnormal"
+assert_eq "异常：测速期间 softnet 丢包 +0，网卡丢包 +2000（2000 ppm），网卡错误 +0" \
+    "$(classify_network_health 0 0 0 2000 1000000)" \
+    "classify material NIC drop ratio as abnormal"
+assert_eq "异常：测速期间 softnet 丢包 +0，网卡丢包 +0（0 ppm），网卡错误 +1" \
+    "$(classify_network_health 0 0 1 0 1000000)" \
+    "classify NIC errors as abnormal"
+
 CURRENT_ROUTE="default via 192.0.2.1 dev eth0 proto dhcp src 192.0.2.10 metric 100 onlink"
 LAST_ROUTE_ARGS=""
 IP_FAIL=false
