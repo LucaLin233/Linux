@@ -412,6 +412,7 @@ alias dc='docker compose'
 alias dcd='docker compose down'
 alias dcu='docker compose up -d'
 alias dcr='docker compose restart'
+alias dcpu='docker compose pull && docker compose up -d'
 alias dcre='docker compose pull && docker compose up -d --force-recreate'
 alias dcreup='docker compose down && docker compose pull && docker compose up -d --remove-orphans'
 
