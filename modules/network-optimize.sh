@@ -2480,6 +2480,6 @@ main() {
 
 trap 'error "网络优化脚本在第 $LINENO 行执行失败"' ERR
 
-if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+if [[ "${BASH_SOURCE[0]:-$0}" == "$0" ]]; then
     main "$@"
 fi
