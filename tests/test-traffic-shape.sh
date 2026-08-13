@@ -121,19 +121,19 @@ grep -Fqx "qdisc replace dev eth0 parent 1:1 fq_codel" "$MQ_CALL_LOG" &&
 printf 'PASS: mq leaf restore replaces every leaf\n'
 unset -f tc root_qdisc_kind
 
-assert_eq "1.0.10" "$(script_version "$ROOT_DIR/tools/traffic-shape.sh")" \
+assert_eq "1.0.11" "$(script_version "$ROOT_DIR/tools/traffic-shape.sh")" \
     "extract update version"
 assert_ok "validate install source" validate_install_file \
     "$ROOT_DIR/tools/traffic-shape.sh"
 assert_ok "validate managed update file" validate_update_file \
-    "$ROOT_DIR/tools/traffic-shape.sh" "1.0.10"
+    "$ROOT_DIR/tools/traffic-shape.sh" "1.0.11"
 
 temp_dir=$(mktemp -d)
 trap 'rm -rf "$temp_dir"' EXIT
 invalid_update="$temp_dir/invalid-update.sh"
 sed 's#readonly UPDATE_REPO="LucaLin233/Linux"#readonly UPDATE_REPO="other/repo"#' \
     "$ROOT_DIR/tools/traffic-shape.sh" > "$invalid_update"
-assert_fail "reject update from another repository" validate_update_file "$invalid_update" "1.0.10"
+assert_fail "reject update from another repository" validate_update_file "$invalid_update" "1.0.11"
 
 empty_install="$temp_dir/empty-tcshape"
 unknown_install="$temp_dir/unknown-tcshape"

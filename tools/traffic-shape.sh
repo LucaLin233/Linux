@@ -10,7 +10,7 @@
 set -uo pipefail
 umask 022
 
-readonly VERSION="1.0.10"
+readonly VERSION="1.0.11"
 readonly INSTALL_PATH="${TCSHAPE_INSTALL_PATH:-/usr/local/sbin/tcshape}"
 readonly UPDATE_REPO="LucaLin233/Linux"
 readonly UPDATE_BRANCH="main"
