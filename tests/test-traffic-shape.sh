@@ -48,6 +48,21 @@ tc() {
 assert_ok "verify integer-Gbit shaping rate" verify_qdisc_rate test0 1000
 unset -f tc
 
+TC_APPLY_LOG=$(mktemp)
+qdisc_remove_root() { return 0; }
+tc() { printf '%s\n' "$*" >> "$TC_APPLY_LOG"; }
+assert_ok "apply shaping with replace semantics" apply_qdisc eth0 1117
+grep -Fqx "qdisc replace dev eth0 root handle 1: htb default 10" "$TC_APPLY_LOG" ||
+    fail "HTB root was not applied with replace"
+grep -Fq "class replace dev eth0 parent 1: classid 1:10 htb" "$TC_APPLY_LOG" ||
+    fail "HTB class was not applied with replace"
+grep -Fq "qdisc replace dev eth0 parent 1:10 handle 10: fq" "$TC_APPLY_LOG" ||
+    fail "fq leaf was not applied with replace"
+printf 'PASS: shaping restore tolerates auto-recreated root qdisc\n'
+unset -f tc
+# 恢复脚本原始函数，供后续 mq 删除测试使用。
+eval "$(sed -n '/^qdisc_remove_root() {/,/^}/p' "$ROOT_DIR/tools/traffic-shape.sh")"
+
 assert_eq "1" "$(calc_margin 15)" "margin for 15 Mbit"
 assert_eq "2" "$(calc_margin 45)" "margin for 45 Mbit"
 assert_eq "5" "$(calc_margin 80)" "margin for 80 Mbit"

@@ -725,11 +725,12 @@ apply_qdisc() {
 
     burst=$(calc_burst "$rate")
     qdisc_remove_root "$iface" || return 1
-    tc qdisc add dev "$iface" root handle 1: htb default 10 || return 1
-    tc class add dev "$iface" parent 1: classid 1:10 htb \
+    # 删除临时 HTB 后，多队列网卡可能立即自动重建 mq；replace 可原子覆盖该根 qdisc。
+    tc qdisc replace dev "$iface" root handle 1: htb default 10 || return 1
+    tc class replace dev "$iface" parent 1: classid 1:10 htb \
         rate "${rate}mbit" ceil "${rate}mbit" \
         burst "$burst" cburst "$burst" quantum 1514 || return 1
-    tc qdisc add dev "$iface" parent 1:10 handle 10: fq \
+    tc qdisc replace dev "$iface" parent 1:10 handle 10: fq \
         limit 40960 flow_limit 8192 maxrate "${rate}mbit" || return 1
 }
 
