@@ -1758,6 +1758,18 @@ classify_network_health() {
     fi
 }
 
+format_rtt_selection_summary() {
+    if [[ "$TUNING_MODE" == "static" ]]; then
+        printf '%s\n' 'RTT：未使用（静态 32 MiB 缓冲区）'
+        return
+    fi
+
+    printf 'RTT：观测 %s / 最终采用 %s ms（来源 %s；策略 %s）\n' \
+        "${OBSERVED_RTT_MS:+${OBSERVED_RTT_MS} ms}" \
+        "${DETECTED_RTT_MS:-未知}" "${RTT_SOURCE:-unknown}" "${RTT_POLICY:-unknown}" |
+        sed 's/RTT：观测  /RTT：观测 未获得 /'
+}
+
 show_install_summary() {
     local before="$1"
     local bbr_enabled="$2"
@@ -1788,9 +1800,9 @@ show_install_summary() {
         "$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 未知)" \
         "$(awk -v mb="$RAM_MB" 'BEGIN {print mb / 1024}')" \
         "${PROBE_IFACE:-unknown}"
-    printf '测量：%s↓ %s↑ Mbps / RTT %s ms\n' \
-        "${DETECTED_DOWNLOAD_MBPS:-未知}" "${DETECTED_UPLOAD_MBPS:-未知}" \
-        "${OBSERVED_RTT_MS:-${DETECTED_RTT_MS:-未知}}"
+    printf '测量：%s↓ %s↑ Mbps\n' \
+        "${DETECTED_DOWNLOAD_MBPS:-未知}" "${DETECTED_UPLOAD_MBPS:-未知}"
+    format_rtt_selection_summary
     printf '缓冲：默认 %s MiB / 最大 %s MiB\n' \
         "$(format_mib "$WMEM_DEFAULT_BYTES")" "$(format_mib "$WMEM_MAX_BYTES")"
     printf '网络健康：%s；TCP 重传新增 %s；受限 socket %s\n' \
@@ -2248,23 +2260,29 @@ apply_removed_sysctl_migration() {
 resolve_port_range_restore_value() {
     local current_config="$1"
     local initial_runtime="$2"
-    local initial_config="$3"
+    local runtime_unknown="$3"
+    local initial_config="$4"
+    local config_unknown="$5"
     local value
 
     managed_unsafe_port_range_present "$current_config" || return 1
 
-    value=$(read_saved_sysctl_value "$initial_runtime" net.ipv4.ip_local_port_range || true)
-    value=$(normalize_port_range "$value" 2>/dev/null || true)
-    if [[ -n "$value" ]]; then
-        printf '%s\n' "$value"
-        return 0
+    if [[ ! -e "$runtime_unknown" ]]; then
+        value=$(read_saved_sysctl_value "$initial_runtime" net.ipv4.ip_local_port_range || true)
+        value=$(normalize_port_range "$value" 2>/dev/null || true)
+        if [[ -n "$value" && "$value" != "1024 65535" ]]; then
+            printf '%s\n' "$value"
+            return 0
+        fi
     fi
 
-    value=$(read_saved_sysctl_value "$initial_config" net.ipv4.ip_local_port_range || true)
-    value=$(normalize_port_range "$value" 2>/dev/null || true)
-    if [[ -n "$value" ]]; then
-        printf '%s\n' "$value"
-        return 0
+    if [[ ! -e "$config_unknown" ]]; then
+        value=$(read_saved_sysctl_value "$initial_config" net.ipv4.ip_local_port_range || true)
+        value=$(normalize_port_range "$value" 2>/dev/null || true)
+        if [[ -n "$value" && "$value" != "1024 65535" ]]; then
+            printf '%s\n' "$value"
+            return 0
+        fi
     fi
 
     printf '%s\n' "32768 60999"
@@ -2455,7 +2473,8 @@ install_optimization() {
     prepare_legacy_backup_state
 
     if port_range_restore=$(resolve_port_range_restore_value \
-        "$NETWORK_CONF" "$RUNTIME_INITIAL_BACKUP" "$NETWORK_INITIAL_BACKUP"); then
+        "$NETWORK_CONF" "$RUNTIME_INITIAL_BACKUP" "$RUNTIME_INITIAL_UNKNOWN" \
+        "$NETWORK_INITIAL_BACKUP" "$NETWORK_INITIAL_UNKNOWN"); then
         if ! capture_port_range_for_rollback "$runtime_backup"; then
             error "无法保存当前临时端口范围，拒绝执行迁移"
             rm -f "$temp_config" "$runtime_backup"

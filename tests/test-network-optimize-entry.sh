@@ -207,28 +207,47 @@ assert_eq '0' "$(read_saved_sysctl_value "$generated_config" net.ipv4.tcp_ecn)" 
 
 managed_config="$TEMP_DIR/managed.conf"
 initial_runtime="$TEMP_DIR/initial-runtime"
+runtime_unknown="$TEMP_DIR/initial-runtime-unknown"
 initial_config="$TEMP_DIR/initial-config"
+config_unknown="$TEMP_DIR/initial-config-unknown"
 printf '%s\n' 'net.ipv4.ip_local_port_range = 1024 65535' > "$managed_config"
 printf '%s\n' 'net.ipv4.ip_local_port_range=40000 65000' > "$initial_runtime"
 printf '%s\n' 'net.ipv4.ip_local_port_range = 32768 62000' > "$initial_config"
 assert_ok "detect legacy managed unsafe port range" managed_unsafe_port_range_present "$managed_config"
 assert_eq '40000 65000' \
-    "$(resolve_port_range_restore_value "$managed_config" "$initial_runtime" "$initial_config")" \
+    "$(resolve_port_range_restore_value "$managed_config" "$initial_runtime" "$runtime_unknown" \
+        "$initial_config" "$config_unknown")" \
     "prefer initial runtime port range"
 
 rm -f "$initial_runtime"
 assert_eq '32768 62000' \
-    "$(resolve_port_range_restore_value "$managed_config" "$initial_runtime" "$initial_config")" \
+    "$(resolve_port_range_restore_value "$managed_config" "$initial_runtime" "$runtime_unknown" \
+        "$initial_config" "$config_unknown")" \
     "fall back to initial config port range"
 
 rm -f "$initial_config"
 assert_eq '32768 60999' \
-    "$(resolve_port_range_restore_value "$managed_config" "$initial_runtime" "$initial_config")" \
+    "$(resolve_port_range_restore_value "$managed_config" "$initial_runtime" "$runtime_unknown" \
+        "$initial_config" "$config_unknown")" \
     "fall back to Debian default port range"
 
 printf '%s\n' 'net.ipv4.ip_local_port_range = 32768 60999' > "$managed_config"
 assert_fail "ignore non-legacy port range" resolve_port_range_restore_value \
-    "$managed_config" "$initial_runtime" "$initial_config"
+    "$managed_config" "$initial_runtime" "$runtime_unknown" "$initial_config" "$config_unknown"
+
+printf '%s\n' 'net.ipv4.ip_local_port_range=1024 65535' > "$initial_runtime"
+printf '%s\n' 'net.ipv4.ip_local_port_range = 1024 65535' > "$initial_config"
+printf '%s\n' 'net.ipv4.ip_local_port_range = 1024 65535' > "$managed_config"
+assert_eq '32768 60999' \
+    "$(resolve_port_range_restore_value "$managed_config" "$initial_runtime" "$runtime_unknown" \
+        "$initial_config" "$config_unknown")" \
+    "reject contaminated unsafe initial port range"
+touch "$runtime_unknown"
+printf '%s\n' 'net.ipv4.ip_local_port_range = 32768 62000' > "$initial_config"
+assert_eq '32768 62000' \
+    "$(resolve_port_range_restore_value "$managed_config" "$initial_runtime" "$runtime_unknown" \
+        "$initial_config" "$config_unknown")" \
+    "ignore runtime backup marked unknown"
 assert_fail "reject malformed port range" normalize_port_range '1024 invalid'
 
 removed_managed_config="$TEMP_DIR/removed-managed.conf"

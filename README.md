@@ -211,7 +211,7 @@ sudo bash <(curl -fsSL "$RAW_BASE/network-optimize.sh") restore initial
 bash <(curl -fsSL "$RAW_BASE/network-optimize.sh") help
 ```
 
-主脚本交互运行到网络模块时会显示相同的三项选择；选择多个模块也不会跳过该确认。无 TTY 且未传模式参数时自动使用静态 32 MiB 缓冲区，不安装 `iperf3`/`jq`，也不产生测速流量。明确传入 `--auto`、`--probe`、`--static` 或线路参数时跳过交互；手填带宽缺少 RTT 时按 150 ms 计算且不测速；主动探测成功时使用观测 RTT，探测失败时回退到 150 ms。`--target` 必须配合 `--probe`。旧版受管配置中的 `ip_local_port_range = 1024 65535` 会恢复首次运行前的值；备份不可用时恢复 Debian 默认 `32768 60999`，新版不再管理该参数。默认不写入 `net.ipv4.tcp_ecn`；只有显式传入 `--disable-ecn` 时才持久写入 `0`。升级旧版受管配置时，ECN 和 `nf_conntrack_max` 有可信首次运行备份便恢复原值；初始值未知则不猜测，仅停止持久管理并保留当前运行值到重启。
+主脚本交互运行到网络模块时会显示相同的三项选择；选择多个模块也不会跳过该确认。无 TTY 且未传模式参数时自动使用静态 32 MiB 缓冲区，不安装 `iperf3`/`jq`，也不产生测速流量。明确传入 `--auto`、`--probe`、`--static` 或线路参数时跳过交互；手填带宽缺少 RTT 时按 150 ms 计算且不测速；主动探测成功时使用观测 RTT，探测失败时回退到 150 ms；安装摘要会同时显示观测值、最终采用值、来源和策略。`--target` 必须配合 `--probe`。旧版受管配置中的 `ip_local_port_range = 1024 65535` 会恢复首次运行前的值；备份不可用时恢复 Debian 默认 `32768 60999`，新版不再管理该参数。默认不写入 `net.ipv4.tcp_ecn`；只有显式传入 `--disable-ecn` 时才持久写入 `0`。升级旧版受管配置时，ECN 和 `nf_conntrack_max` 有可信首次运行备份便恢复原值；初始值未知则不猜测，仅停止持久管理并保留当前运行值到重启。
 
 网络模块默认面向同时承载 TCP、UDP 与 Docker 流量的代理节点：连接队列使用
 `somaxconn=65535`、`tcp_max_syn_backlog=16384`，TCP/socket 默认缓冲区按半个 BDP 动态取

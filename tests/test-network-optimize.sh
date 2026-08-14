@@ -43,6 +43,22 @@ assert_eq "4096 8192 16384" "$(calculate_tcp_mem 128 4096)" \
     "tcp memory budget keeps minimums"
 assert_eq "RAM-based cap" "$(buffer_limit_reason 10000 150 67108864)" \
     "buffer reason reports the memory-derived cap"
+TUNING_MODE=auto
+OBSERVED_RTT_MS=69
+DETECTED_RTT_MS=69
+RTT_SOURCE='max(CN, global)'
+RTT_POLICY='observed RTT'
+assert_eq 'RTT：观测 69 ms / 最终采用 69 ms（来源 max(CN, global)；策略 observed RTT）' \
+    "$(format_rtt_selection_summary)" "summary shows the selected observed RTT"
+OBSERVED_RTT_MS=''
+DETECTED_RTT_MS=150
+RTT_SOURCE='default after failed active probe'
+RTT_POLICY='150 ms fallback'
+assert_eq 'RTT：观测 未获得 / 最终采用 150 ms（来源 default after failed active probe；策略 150 ms fallback）' \
+    "$(format_rtt_selection_summary)" "summary shows the selected fallback RTT"
+TUNING_MODE=static
+assert_eq 'RTT：未使用（静态 32 MiB 缓冲区）' \
+    "$(format_rtt_selection_summary)" "summary explains static RTT handling"
 
 assert_eq "default via 192.0.2.1 dev eth0 proto dhcp metric 100" \
     "$(strip_route_window_fields 'default via 192.0.2.1 dev eth0 proto dhcp metric 100 initcwnd 32 initrwnd 32')" \
