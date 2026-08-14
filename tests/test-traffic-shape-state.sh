@@ -38,8 +38,8 @@ SYSTEMD_FAIL_ENABLE=false
 SYSTEMD_FAIL_RESTART=false
 SYSTEMD_FAIL_DAEMON_RELOAD_ONCE=false
 CURRENT_SERVICE_IFACE=""
-declare -A QDISC_KIND=([eth0]=fq [eth1]=fq)
-declare -A QDISC_RATE=([eth0]="" [eth1]="")
+declare -A QDISC_KIND=([eth0]=fq [lo]=fq)
+declare -A QDISC_RATE=([eth0]="" [lo]="")
 
 root_qdisc_kind() { printf '%s\n' "${QDISC_KIND[$1]:-}"; }
 check_external_conflicts() { return 0; }
@@ -138,16 +138,16 @@ assert_eq htb "${QDISC_KIND[eth0]}" "first enable applies eth0"
 assert_file_value "$CONFIG_FILE" INTERFACE eth0 "first enable stores eth0"
 assert_eq true "$SYSTEMD_ENABLED" "first enable persists service"
 
-# Migrate to eth1: old HTB must be removed and the new baseline promoted.
-cmd_set 800 eth1 >/dev/null
+# Migrate to lo: old HTB must be removed and the new baseline promoted.
+cmd_set 800 lo >/dev/null
 assert_eq fq "${QDISC_KIND[eth0]}" "migration removes old eth0 HTB"
-assert_eq htb "${QDISC_KIND[eth1]}" "migration applies eth1 HTB"
-assert_file_value "$CONFIG_FILE" INTERFACE eth1 "migration stores eth1"
-assert_file_value "$STATE_DIR/qdisc-baseline" INTERFACE eth1 "migration promotes eth1 baseline"
+assert_eq htb "${QDISC_KIND[lo]}" "migration applies lo HTB"
+assert_file_value "$CONFIG_FILE" INTERFACE lo "migration stores lo"
+assert_file_value "$STATE_DIR/qdisc-baseline" INTERFACE lo "migration promotes lo baseline"
 
 # off restores the currently managed interface and leaves no orphan HTB.
 cmd_off >/dev/null
-assert_eq fq "${QDISC_KIND[eth1]}" "off restores eth1 baseline"
+assert_eq fq "${QDISC_KIND[lo]}" "off restores lo baseline"
 assert_eq fq "${QDISC_KIND[eth0]}" "off leaves eth0 clean"
 [[ ! -e "$CONFIG_FILE" && ! -e "$SERVICE_FILE" ]] || fail "off removes managed files"
 printf 'PASS: off removes managed files\n'
