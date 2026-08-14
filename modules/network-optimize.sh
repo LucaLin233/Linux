@@ -989,6 +989,25 @@ traffic_used_bytes() {
     esac
 }
 
+format_bytes() {
+    awk -v bytes="$1" 'BEGIN {
+        if (bytes >= 1000000000) printf "%.2f GB", bytes / 1000000000
+        else printf "%.0f MB", bytes / 1000000
+    }'
+}
+
+traffic_report() {
+    local rx
+    local tx
+    local total
+
+    [[ -n "$PROBE_IFACE" ]] || return 0
+    rx=$(traffic_used_bytes download || echo 0)
+    tx=$(traffic_used_bytes upload || echo 0)
+    total=$((rx + tx))
+    echo "流量：上传 $(format_bytes "$tx") / 下载 $(format_bytes "$rx") / 合计 $(format_bytes "$total")"
+}
+
 traffic_budget_reached() {
     local direction="$1"
     local total
@@ -1413,7 +1432,6 @@ show_probe_environment() {
 probe_bandwidth() {
     local raw_download
     local raw_upload
-    local total_used
 
     command -v ip >/dev/null 2>&1 || return 1
     traffic_mark || {
@@ -1427,6 +1445,7 @@ probe_bandwidth() {
     # 公共 iperf3 节点可能忙碌或单向限速；只要预算允许，再用并行 Cloudflare
     # 交叉验证，并对每个方向保留较高结果。
     probe_cloudflare_bandwidth || true
+    traffic_report
 
     [[ -n "$DETECTED_DOWNLOAD_MBPS$DETECTED_UPLOAD_MBPS" ]] || return 1
     raw_download="$DETECTED_DOWNLOAD_MBPS"
@@ -1442,11 +1461,9 @@ probe_bandwidth() {
 
     DETECTED_DOWNLOAD_MBPS=$(round_bandwidth "$DETECTED_DOWNLOAD_MBPS")
     DETECTED_UPLOAD_MBPS=$(round_bandwidth "$DETECTED_UPLOAD_MBPS")
-    total_used=$(traffic_used_bytes total || echo 0)
 
     detail "原始测速：下载 ${raw_download:-缺失} Mbps，上传 ${raw_upload:-缺失} Mbps"
     detail "计算带宽：下载 $DETECTED_DOWNLOAD_MBPS Mbps，上传 $DETECTED_UPLOAD_MBPS Mbps"
-    detail "测速流量：$(awk -v bytes="$total_used" 'BEGIN {printf "%.2f GB", bytes / 1000000000}')"
 }
 
 calculate_buffer_max() {
