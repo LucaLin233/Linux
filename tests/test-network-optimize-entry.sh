@@ -169,6 +169,26 @@ assert_eq 'default after failed active probe' "$RTT_SOURCE" \
 assert_eq '150 ms fallback' "$RTT_POLICY" "failed active probe records fallback policy"
 assert_eq 39845888 "$RMEM_MAX_BYTES" "failed active probe uses fallback RTT in calculation"
 
+NETWORK_TEST_TOTAL=84999999999
+NETWORK_TEST_UPLOAD=39999999999
+traffic_used_bytes() {
+    case "$1" in
+        total) printf '%s\n' "$NETWORK_TEST_TOTAL" ;;
+        upload) printf '%s\n' "$NETWORK_TEST_UPLOAD" ;;
+        download) printf '%s\n' 0 ;;
+        *) return 1 ;;
+    esac
+}
+assert_fail "active probe budget stays open below reserved threshold" \
+    traffic_budget_reached upload
+NETWORK_TEST_UPLOAD=40000000000
+assert_ok "active probe budget stops at reserved direction threshold" \
+    traffic_budget_reached upload
+NETWORK_TEST_UPLOAD=0
+NETWORK_TEST_TOTAL=85000000000
+assert_ok "active probe budget stops at reserved total threshold" \
+    traffic_budget_reached upload
+
 generated_config="$TEMP_DIR/generated.conf"
 ECN_DISABLED=false
 create_network_config "$generated_config" false
