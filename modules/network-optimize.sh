@@ -100,7 +100,7 @@ readonly -a CHINA_TCP_TARGETS=(www.baidu.com www.qq.com www.163.com)
 readonly -a GLOBAL_TCP_TARGETS=(www.cloudflare.com www.google.com www.wikipedia.org)
 readonly AUTO_RTT_MIN_MS=10
 readonly AUTO_RTT_MAX_MS=300
-readonly AUTO_RTT_CALC_FLOOR_MS=150
+readonly DEFAULT_RTT_MS=150
 
 # 参数与计算结果。命令行参数优先于自动探测。
 COMMAND="install"
@@ -115,6 +115,7 @@ MANUAL_BANDWIDTH_MBPS=""
 MANUAL_DOWNLOAD_MBPS=""
 MANUAL_UPLOAD_MBPS=""
 MANUAL_RTT_MS=""
+MANUAL_RTT_DEFAULTED="false"
 declare -a CUSTOM_RTT_TARGETS=()
 
 DETECTED_DOWNLOAD_MBPS=""
@@ -520,7 +521,10 @@ parse_arguments() {
     if [[ -n "$MANUAL_BANDWIDTH_MBPS$MANUAL_DOWNLOAD_MBPS$MANUAL_UPLOAD_MBPS" ]] &&
         [[ "$ACTIVE_PROBE_REQUESTED" != "true" ]]; then
         NO_PROBE="true"
-        [[ -n "$MANUAL_RTT_MS" ]] || MANUAL_RTT_MS="$AUTO_RTT_CALC_FLOOR_MS"
+        if [[ -z "$MANUAL_RTT_MS" ]]; then
+            MANUAL_RTT_MS="$DEFAULT_RTT_MS"
+            MANUAL_RTT_DEFAULTED="true"
+        fi
     elif [[ -n "$MANUAL_RTT_MS" && "$ACTIVE_PROBE_REQUESTED" != "true" ]]; then
         error "仅指定 RTT 无法计算缓冲区；请同时指定带宽，或使用 --probe"
         return 1
@@ -579,7 +583,10 @@ select_tuning_mode() {
                 return 1
             }
             read -r -p "计算 RTT ms（默认 150）: " rtt_ms || return 1
-            rtt_ms="${rtt_ms:-$AUTO_RTT_CALC_FLOOR_MS}"
+            if [[ -z "$rtt_ms" ]]; then
+                rtt_ms="$DEFAULT_RTT_MS"
+                MANUAL_RTT_DEFAULTED="true"
+            fi
             is_positive_integer "$rtt_ms" 1 5000 || {
                 error "RTT 必须是 1–5000 的整数"
                 return 1
@@ -1508,7 +1515,7 @@ buffer_limit_reason() {
     if (( desired < minimum )); then
         echo "8 MiB floor"
     elif (( desired > memory_cap )); then
-        echo "RAM / 16 cap"
+        echo "RAM-based cap"
     else
         echo "2 x BDP + 2 MiB headroom"
     fi
@@ -1585,21 +1592,24 @@ resolve_tuning_values() {
 
     if [[ -n "$MANUAL_RTT_MS" ]]; then
         rtt_ms="$MANUAL_RTT_MS"
-        RTT_SOURCE="command line"
-        RTT_POLICY="manual override"
+        if [[ "$MANUAL_RTT_DEFAULTED" == "true" ]]; then
+            RTT_SOURCE="default"
+            RTT_POLICY="150 ms fallback for manual bandwidth"
+        else
+            RTT_SOURCE="command line"
+            RTT_POLICY="manual override"
+        fi
     elif [[ "$NO_PROBE" != "true" ]]; then
         info "自动探测中国大陆与全球 RTT..."
         if detect_rtt; then
             OBSERVED_RTT_MS="$DETECTED_RTT_MS"
             rtt_ms="$OBSERVED_RTT_MS"
-            if (( rtt_ms < AUTO_RTT_CALC_FLOOR_MS )); then
-                rtt_ms=$AUTO_RTT_CALC_FLOOR_MS
-                RTT_POLICY="150 ms coverage floor"
-            else
-                RTT_POLICY="observed RTT"
-            fi
+            RTT_POLICY="observed RTT"
         else
-            warn "RTT 探测失败，将使用内存保守配置"
+            warn "RTT 探测失败，将按默认 150 ms 计算"
+            rtt_ms="$DEFAULT_RTT_MS"
+            RTT_SOURCE="default after failed active probe"
+            RTT_POLICY="150 ms fallback"
         fi
     fi
 
@@ -2770,7 +2780,7 @@ install/plan 选项：
 默认行为：
   - 交互终端无参数运行时选择静态、手填或自动探测；默认静态 32 MiB
   - 非交互终端无参数运行时自动使用静态模式，不安装探测依赖、不产生测速流量
-  - 明确传入模式或线路参数时跳过交互；手填带宽缺少 RTT 时按 150 ms 计算且不测速
+  - 手填带宽缺少 RTT 时按 150 ms 计算；主动探测成功使用观测值，失败回退到 150 ms
   - 只有 --auto、--probe 或交互确认后才主动探测并安装缺失依赖
   - 自动探测测量中国大陆与全球 RTT，并使用公共 iperf3 与 Cloudflare
   - 自动测速在约 90 GB 时停止，保留余量确保总量不超过 100 GB
@@ -2778,9 +2788,8 @@ install/plan 选项：
   - 默认把 IPv4 默认路由的 initcwnd/initrwnd 设为 32；浅层 policer 可能增加首秒突发
   - 可用 --disable-initcwnd 保留内核默认初始拥塞窗口
   - 根据 2 × BDP + 2 MiB 余量动态设置缓冲区上限，默认值按半个 BDP 取 4-8 MiB
-  - 探测失败且缺少 BDP 数据时，默认缓冲保守回退到 4 MiB
+  - RTT 探测失败回退到 150 ms；带宽探测失败时默认缓冲回退到 4 MiB，最大值按内存限制
   - RAM 小于 2 GiB 时上限为 RAM / 16、最高 256 MiB；否则为 RAM / 8、最高 512 MiB
-  - 探测失败时按内存使用保守配置
   - 只在本次运行计算和应用，不创建定时任务
 EOF
 }

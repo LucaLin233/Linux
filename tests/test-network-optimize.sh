@@ -41,6 +41,8 @@ assert_eq "4096 8192 16384" "$(calculate_tcp_mem 1024 65536)" \
     "tcp memory budget follows RAM with 64 KiB pages"
 assert_eq "4096 8192 16384" "$(calculate_tcp_mem 128 4096)" \
     "tcp memory budget keeps minimums"
+assert_eq "RAM-based cap" "$(buffer_limit_reason 10000 150 67108864)" \
+    "buffer reason reports the memory-derived cap"
 
 assert_eq "default via 192.0.2.1 dev eth0 proto dhcp metric 100" \
     "$(strip_route_window_fields 'default via 192.0.2.1 dev eth0 proto dhcp metric 100 initcwnd 32 initrwnd 32')" \

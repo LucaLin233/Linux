@@ -48,6 +48,7 @@ reset_selection() {
     MANUAL_DOWNLOAD_MBPS=""
     MANUAL_UPLOAD_MBPS=""
     MANUAL_RTT_MS=""
+    MANUAL_RTT_DEFAULTED=false
     CUSTOM_RTT_TARGETS=()
 }
 
@@ -121,9 +122,52 @@ reset_selection
 parse_arguments install --download-mbps 1000
 assert_eq true "$NO_PROBE" "manual bandwidth never triggers active probing"
 assert_eq 150 "$MANUAL_RTT_MS" "manual bandwidth defaults missing RTT to 150 ms"
+assert_eq true "$MANUAL_RTT_DEFAULTED" "manual bandwidth records default RTT source"
 assert_fail "custom target requires explicit probe consent" parse_arguments plan --target example.com
 reset_selection
 assert_ok "custom target accepts explicit probe consent" parse_arguments plan --probe --target example.com
+
+prepare_dynamic_case() {
+    TUNING_MODE=auto
+    NO_PROBE=false
+    MANUAL_BANDWIDTH_MBPS=""
+    MANUAL_DOWNLOAD_MBPS=""
+    MANUAL_UPLOAD_MBPS=""
+    MANUAL_RTT_MS=""
+    MANUAL_RTT_DEFAULTED=false
+    DETECTED_DOWNLOAD_MBPS=""
+    DETECTED_UPLOAD_MBPS=""
+    DETECTED_RTT_MS=""
+    OBSERVED_RTT_MS=""
+    RTT_SOURCE=unknown
+    RTT_POLICY=unknown
+    BANDWIDTH_SOURCE=unknown
+}
+
+detect_memory_mb() { printf '%s\n' 8192; }
+probe_bandwidth() {
+    DETECTED_DOWNLOAD_MBPS=1000
+    DETECTED_UPLOAD_MBPS=500
+}
+detect_rtt() {
+    DETECTED_RTT_MS=40
+    RTT_SOURCE="test active probe"
+}
+prepare_dynamic_case
+resolve_tuning_values >/dev/null
+assert_eq 40 "$OBSERVED_RTT_MS" "active probe records RTT below 150 ms"
+assert_eq 40 "$DETECTED_RTT_MS" "active probe calculates with observed RTT"
+assert_eq 'observed RTT' "$RTT_POLICY" "active probe records observed RTT policy"
+assert_eq 12582912 "$RMEM_MAX_BYTES" "active probe uses lower RTT in buffer calculation"
+
+detect_rtt() { return 1; }
+prepare_dynamic_case
+resolve_tuning_values >/dev/null
+assert_eq 150 "$DETECTED_RTT_MS" "failed active probe falls back to 150 ms"
+assert_eq 'default after failed active probe' "$RTT_SOURCE" \
+    "failed active probe records fallback source"
+assert_eq '150 ms fallback' "$RTT_POLICY" "failed active probe records fallback policy"
+assert_eq 39845888 "$RMEM_MAX_BYTES" "failed active probe uses fallback RTT in calculation"
 
 generated_config="$TEMP_DIR/generated.conf"
 ECN_DISABLED=false
