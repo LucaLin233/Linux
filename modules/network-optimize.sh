@@ -2282,22 +2282,61 @@ apply_port_range_migration() {
     [[ "$actual" == "$expected" ]]
 }
 
-capture_runtime_values() {
-    local config_file="$1"
-    local output_file="$2"
+capture_runtime_values_from_files() {
+    local output_file="$1"
+    local input_file
     local key
+    shift
 
     : > "$output_file"
-    while IFS='=' read -r key _; do
-        key="${key//[[:space:]]/}"
-        [[ -z "$key" || "$key" == \#* ]] && continue
-        if sysctl -n "$key" >/dev/null 2>&1; then
-            printf '%s=%s\n' "$key" "$(sysctl -n "$key")" >> "$output_file"
-        else
-            error "当前内核不存在 sysctl 参数: $key"
-            return 1
+    for input_file in "$@"; do
+        [[ -f "$input_file" ]] || continue
+        while IFS='=' read -r key _; do
+            key="${key//[[:space:]]/}"
+            [[ -z "$key" || "$key" == \#* ]] && continue
+            grep -Fq "${key}=" "$output_file" && continue
+            if sysctl -n "$key" >/dev/null 2>&1; then
+                printf '%s=%s\n' "$key" "$(sysctl -n "$key")" >> "$output_file"
+            else
+                warn "当前内核不存在运行时参数，跳过快照: $key"
+            fi
+        done < "$input_file"
+    done
+}
+
+capture_runtime_values() {
+    capture_runtime_values_from_files "$2" "$1"
+}
+
+apply_runtime_values_strict() {
+    local values_file="$1"
+    local key
+    local value
+    local expected
+    local actual
+    local failed=false
+
+    [[ -f "$values_file" ]] || return 0
+    while IFS='=' read -r key value; do
+        [[ -n "$key" ]] || continue
+        if ! sysctl -n "$key" >/dev/null 2>&1; then
+            warn "当前内核不存在待恢复参数，跳过: $key"
+            continue
         fi
-    done < "$config_file"
+        if ! sysctl -w "$key=$value" >/dev/null 2>&1; then
+            error "运行时参数恢复失败: $key"
+            failed=true
+            continue
+        fi
+        expected=$(printf '%s\n' "$value" | normalize_sysctl_value)
+        actual=$(sysctl -n "$key" 2>/dev/null | normalize_sysctl_value || true)
+        if [[ "$actual" != "$expected" ]]; then
+            error "运行时参数恢复验证失败: $key"
+            failed=true
+        fi
+    done < "$values_file"
+
+    [[ "$failed" == "false" ]]
 }
 
 restore_runtime_values() {
@@ -2382,10 +2421,6 @@ install_optimization() {
     if [[ "${DEBUG:-}" == "1" ]]; then
         show_tuning_plan
     fi
-
-    migrate_legacy_kernel_config || return 1
-    migrate_legacy_sysctl_conf || return 1
-    restore_legacy_limits
 
     if ensure_bbr_available; then
         bbr_enabled="true"
@@ -2526,6 +2561,12 @@ install_optimization() {
         return 1
     fi
 
+    if ! migrate_legacy_kernel_config; then
+        warn "新版网络配置已生效，但旧配置归档失败；请检查 $LEGACY_KERNEL_CONF"
+    fi
+    migrate_legacy_sysctl_conf || true
+    restore_legacy_limits
+
     rm -f "$runtime_backup"
     success "网络优化配置已写入：$NETWORK_CONF"
 
@@ -2542,6 +2583,33 @@ install_optimization() {
     show_install_summary "$health_before" "$bbr_enabled"
 }
 
+snapshot_managed_file_state() {
+    local target="$1"
+    local backup="$2"
+    local absent="$3"
+
+    rm -f "$backup" "$absent"
+    if [[ -e "$target" || -L "$target" ]]; then
+        cp -a "$target" "$backup"
+    else
+        : > "$absent"
+    fi
+}
+
+rollback_restore_transaction() {
+    local config_backup="$1"
+    local config_absent="$2"
+    local modules_backup="$3"
+    local modules_absent="$4"
+    local runtime_backup="$5"
+
+    restore_managed_file "$NETWORK_CONF" "$config_backup" "$config_absent" ||
+        warn "恢复失败后无法还原原网络配置文件"
+    restore_managed_file "$BBR_MODULES_FILE" "$modules_backup" "$modules_absent" ||
+        warn "恢复失败后无法还原原 BBR 模块配置"
+    restore_runtime_values "$runtime_backup"
+}
+
 restore_optimization() {
     local scope="${1:-previous}"
     local config_backup
@@ -2551,6 +2619,9 @@ restore_optimization() {
     local runtime_backup
     local route_backup
     local route_owned
+    local transaction_dir
+    local current_runtime
+    local restore_modules=false
 
     case "$scope" in
         previous)
@@ -2577,28 +2648,63 @@ restore_optimization() {
             ;;
     esac
 
-    info "开始恢复网络优化配置（$scope）..."
-
-    if ! restore_managed_file "$NETWORK_CONF" "$config_backup" "$config_absent"; then
+    if [[ ! -e "$config_backup" && ! -e "$config_absent" ]]; then
         error "未找到可信的 $scope 网络配置状态，拒绝推测"
         return 1
     fi
-
-    if ! restore_managed_file "$BBR_MODULES_FILE" "$modules_backup" "$modules_absent"; then
-        warn "未找到可信的 $scope BBR 模块配置状态，保留当前文件"
+    if [[ -e "$modules_backup" || -e "$modules_absent" ]]; then
+        restore_modules=true
     fi
 
-    if [[ -f "$NETWORK_CONF" ]]; then
-        apply_network_config "$NETWORK_CONF" || {
-            error "恢复网络配置后应用失败"
-            return 1
-        }
-    fi
+    transaction_dir=$(mktemp -d) || return 1
+    current_runtime="$transaction_dir/current-runtime"
+    snapshot_managed_file_state "$NETWORK_CONF" \
+        "$transaction_dir/current-config" "$transaction_dir/current-config-absent" || {
+        rm -rf "$transaction_dir"
+        return 1
+    }
+    snapshot_managed_file_state "$BBR_MODULES_FILE" \
+        "$transaction_dir/current-modules" "$transaction_dir/current-modules-absent" || {
+        rm -rf "$transaction_dir"
+        return 1
+    }
+    capture_runtime_values_from_files "$current_runtime" "$config_backup" "$runtime_backup" || {
+        rm -rf "$transaction_dir"
+        return 1
+    }
 
+    info "开始恢复网络优化配置（$scope）..."
+
+    if [[ -e "$config_backup" ]] && ! apply_network_config "$config_backup"; then
+        error "目标网络配置应用失败，正在恢复原运行值"
+        restore_runtime_values "$current_runtime"
+        rm -rf "$transaction_dir"
+        return 1
+    fi
     if [[ -f "$runtime_backup" ]]; then
-        restore_runtime_values "$runtime_backup"
+        if ! apply_runtime_values_strict "$runtime_backup"; then
+            error "目标运行值恢复失败，正在回滚"
+            restore_runtime_values "$current_runtime"
+            rm -rf "$transaction_dir"
+            return 1
+        fi
     else
-        warn "没有 $scope 运行值快照；已恢复持久配置，部分已移除参数可能需重启后还原"
+        warn "没有 $scope 运行值快照；部分已移除参数可能需重启后还原"
+    fi
+
+    if ! restore_managed_file "$NETWORK_CONF" "$config_backup" "$config_absent" ||
+        { [[ "$restore_modules" == "true" ]] &&
+          ! restore_managed_file "$BBR_MODULES_FILE" "$modules_backup" "$modules_absent"; }; then
+        error "提交恢复后的持久配置失败，正在回滚"
+        rollback_restore_transaction \
+            "$transaction_dir/current-config" "$transaction_dir/current-config-absent" \
+            "$transaction_dir/current-modules" "$transaction_dir/current-modules-absent" \
+            "$current_runtime"
+        rm -rf "$transaction_dir"
+        return 1
+    fi
+    if [[ "$restore_modules" != "true" ]]; then
+        warn "未找到可信的 $scope BBR 模块配置状态，保留当前文件"
     fi
 
     if [[ "$scope" == "initial" && -e "$ROUTE_INITIAL_UNKNOWN" ]]; then
@@ -2607,6 +2713,7 @@ restore_optimization() {
         warn "无法恢复 $scope 默认路由属性；请检查 IPv4 默认路由"
     fi
 
+    rm -rf "$transaction_dir"
     success "网络配置已恢复到 $scope 状态"
 }
 
