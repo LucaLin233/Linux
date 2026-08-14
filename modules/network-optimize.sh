@@ -4,8 +4,8 @@
 # linux-setup:depends=
 # linux-setup:enabled=true
 # 网络优化模块
-# 功能：自动探测带宽、RTT 与内存，动态配置 BBR、fq、TCP 缓冲区及 RA 安全的双栈转发。
-# 无参数运行等同于 install：自动探测一次、立即应用，不创建定时任务。
+# 功能：配置 BBR、fq、TCP 缓冲区及 RA 安全的双栈转发；主动探测必须明确选择。
+# 无参数交互运行会选择静态、手填或自动探测；非交互运行默认使用静态缓冲区。
 #
 # 用法：
 #   bash network-optimize.sh [install] [选项]  # 自动计算并应用
@@ -14,13 +14,13 @@
 #   bash network-optimize.sh status            # 查看当前状态
 #
 # install/plan 可选参数：
-#   --auto                       自动探测（默认）
+#   --auto, --probe              明确执行自动探测
 #   --static                     使用原有固定 32 MiB 缓冲区
 #   --bandwidth-mbps N           手动指定对称带宽
 #   --download-mbps N            手动指定下载带宽
 #   --upload-mbps N              手动指定上传带宽
 #   --rtt-ms N                   手动指定 RTT
-#   --target HOST                自定义 RTT 目标，可重复指定
+#   --target HOST                自定义 RTT 目标，可重复指定；需配合 --probe
 #   --no-probe                   不发起网络探测；缺失数据时按内存保守配置
 #   --disable-ecn                禁用 ECN，回退到传统丢包信号
 #   --disable-initcwnd           保留内核默认初始拥塞窗口
@@ -107,6 +107,8 @@ COMMAND="install"
 RESTORE_SCOPE="previous"
 TUNING_MODE="auto"
 NO_PROBE="false"
+TUNING_SELECTION_EXPLICIT="false"
+ACTIVE_PROBE_REQUESTED="false"
 ECN_ENABLED="true"
 INITCWND_ENABLED="true"
 MANUAL_BANDWIDTH_MBPS=""
@@ -406,12 +408,17 @@ parse_arguments() {
 
     while (( $# > 0 )); do
         case "$1" in
-            --auto)
+            --auto|--probe)
                 TUNING_MODE="auto"
+                NO_PROBE="false"
+                TUNING_SELECTION_EXPLICIT="true"
+                ACTIVE_PROBE_REQUESTED="true"
                 shift
                 ;;
             --static)
                 TUNING_MODE="static"
+                NO_PROBE="true"
+                TUNING_SELECTION_EXPLICIT="true"
                 shift
                 ;;
             --bandwidth-mbps|--download-mbps|--upload-mbps|--rtt-ms|--target)
@@ -419,6 +426,7 @@ parse_arguments() {
                     error "参数 $1 缺少值"
                     return 1
                 fi
+                TUNING_SELECTION_EXPLICIT="true"
                 case "$1" in
                     --bandwidth-mbps) MANUAL_BANDWIDTH_MBPS="$2" ;;
                     --download-mbps) MANUAL_DOWNLOAD_MBPS="$2" ;;
@@ -430,6 +438,7 @@ parse_arguments() {
                 ;;
             --no-probe)
                 NO_PROBE="true"
+                TUNING_SELECTION_EXPLICIT="true"
                 shift
                 ;;
             --disable-ecn)
@@ -502,6 +511,103 @@ parse_arguments() {
         error "--static 不能与动态带宽、RTT 或目标参数同时使用"
         return 1
     fi
+
+    if (( ${#CUSTOM_RTT_TARGETS[@]} > 0 )) && [[ "$ACTIVE_PROBE_REQUESTED" != "true" ]]; then
+        error "--target 必须与 --probe 或 --auto 一起使用"
+        return 1
+    fi
+
+    if [[ -n "$MANUAL_BANDWIDTH_MBPS$MANUAL_DOWNLOAD_MBPS$MANUAL_UPLOAD_MBPS" ]] &&
+        [[ "$ACTIVE_PROBE_REQUESTED" != "true" ]]; then
+        NO_PROBE="true"
+        [[ -n "$MANUAL_RTT_MS" ]] || MANUAL_RTT_MS="$AUTO_RTT_CALC_FLOOR_MS"
+    elif [[ -n "$MANUAL_RTT_MS" && "$ACTIVE_PROBE_REQUESTED" != "true" ]]; then
+        error "仅指定 RTT 无法计算缓冲区；请同时指定带宽，或使用 --probe"
+        return 1
+    fi
+}
+
+is_interactive_terminal() {
+    [[ -t 0 ]]
+}
+
+show_active_probe_warning() {
+    warn "主动探测会安装缺失的 curl、ping、iperf3、jq 等工具"
+    warn "典型流量约等于 32 秒线速传输：1 Gbps 约 4 GB，2.5 Gbps 约 10 GB，10 Gbps 约 40 GB"
+    warn "硬停止阈值为单方向 45 GB、合计 90 GB"
+}
+
+select_tuning_mode() {
+    local choice
+    local download_mbps
+    local upload_mbps
+    local rtt_ms
+    local answer
+
+    [[ "$COMMAND" == "install" || "$COMMAND" == "plan" ]] || return 0
+    [[ "$TUNING_SELECTION_EXPLICIT" == "false" ]] || return 0
+
+    if ! is_interactive_terminal; then
+        TUNING_MODE="static"
+        NO_PROBE="true"
+        info "未检测到交互终端，使用静态 32 MiB 缓冲区；不执行主动探测"
+        return 0
+    fi
+
+    echo "网络优化参数来源："
+    echo "  1) 静态配置（默认；零测速，固定 32 MiB 缓冲区）"
+    echo "  2) 手填线路参数（零测速；按 2 × BDP + 2 MiB 计算）"
+    echo "  3) 自动探测（安装探测依赖并产生大量流量）"
+    read -r -p "选择 [1-3]（默认 1）: " choice || return 1
+    choice="${choice:-1}"
+
+    case "$choice" in
+        1)
+            TUNING_MODE="static"
+            NO_PROBE="true"
+            ;;
+        2)
+            read -r -p "下载带宽 Mbps: " download_mbps || return 1
+            is_positive_integer "$download_mbps" 1 100000 || {
+                error "下载带宽必须是 1–100000 的整数"
+                return 1
+            }
+            read -r -p "上传带宽 Mbps（默认与下载相同）: " upload_mbps || return 1
+            upload_mbps="${upload_mbps:-$download_mbps}"
+            is_positive_integer "$upload_mbps" 1 100000 || {
+                error "上传带宽必须是 1–100000 的整数"
+                return 1
+            }
+            read -r -p "计算 RTT ms（默认 150）: " rtt_ms || return 1
+            rtt_ms="${rtt_ms:-$AUTO_RTT_CALC_FLOOR_MS}"
+            is_positive_integer "$rtt_ms" 1 5000 || {
+                error "RTT 必须是 1–5000 的整数"
+                return 1
+            }
+            TUNING_MODE="auto"
+            NO_PROBE="true"
+            MANUAL_DOWNLOAD_MBPS="$download_mbps"
+            MANUAL_UPLOAD_MBPS="$upload_mbps"
+            MANUAL_RTT_MS="$rtt_ms"
+            ;;
+        3)
+            show_active_probe_warning
+            read -r -p "确认执行主动探测？[y/N]: " answer || return 1
+            if [[ ! "$answer" =~ ^[Yy]$ ]]; then
+                info "已取消网络优化"
+                return 2
+            fi
+            TUNING_MODE="auto"
+            NO_PROBE="false"
+            ACTIVE_PROBE_REQUESTED="true"
+            ;;
+        *)
+            error "无效选择: $choice"
+            return 1
+            ;;
+    esac
+
+    TUNING_SELECTION_EXPLICIT="true"
 }
 
 detect_memory_mb() {
@@ -1898,10 +2004,7 @@ net.ipv4.tcp_max_syn_backlog = 16384
 net.core.netdev_max_backlog = 16384
 net.core.optmem_max = 65536
 
-# 6. 临时端口
-net.ipv4.ip_local_port_range = 1024 65535
-
-# 7. TCP/UDP 缓冲区；默认值按半个 BDP 推导并限制在 4-8 MiB
+# 6. TCP/UDP 缓冲区；默认值按半个 BDP 推导并限制在 4-8 MiB
 net.core.rmem_default = $RMEM_DEFAULT_BYTES
 net.core.wmem_default = $WMEM_DEFAULT_BYTES
 net.core.rmem_max = $RMEM_MAX_BYTES
@@ -1912,7 +2015,7 @@ net.ipv4.tcp_mem = $TCP_MEM_PAGES
 net.ipv4.udp_rmem_min = 8192
 net.ipv4.udp_wmem_min = 8192
 
-# 8. 长连接、连接回收与复杂路径
+# 7. 长连接、连接回收与复杂路径
 net.ipv4.tcp_fin_timeout = 30
 net.ipv4.tcp_slow_start_after_idle = 0
 net.ipv4.tcp_keepalive_time = 600
@@ -2013,6 +2116,89 @@ backup_network_state() {
         "$BBR_MODULES_PREVIOUS_ABSENT"
 }
 
+read_saved_sysctl_value() {
+    local file="$1"
+    local wanted_key="$2"
+
+    [[ -f "$file" ]] || return 1
+    awk -F= -v wanted="$wanted_key" '
+        {
+            key=$1
+            gsub(/[[:space:]]/, "", key)
+            if (key == wanted) {
+                value=substr($0, index($0, "=") + 1)
+                gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
+                print value
+                exit
+            }
+        }
+    ' "$file"
+}
+
+normalize_port_range() {
+    awk '
+        NF == 2 && $1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ &&
+        $1 >= 1 && $2 <= 65535 && $1 < $2 {
+            printf "%d %d\n", $1, $2
+            found=1
+        }
+        END {exit !found}
+    ' <<< "$1"
+}
+
+managed_unsafe_port_range_present() {
+    local config_file="$1"
+    local value
+
+    value=$(read_saved_sysctl_value "$config_file" net.ipv4.ip_local_port_range || true)
+    [[ "$(normalize_port_range "$value" 2>/dev/null || true)" == "1024 65535" ]]
+}
+
+resolve_port_range_restore_value() {
+    local current_config="$1"
+    local initial_runtime="$2"
+    local initial_config="$3"
+    local value
+
+    managed_unsafe_port_range_present "$current_config" || return 1
+
+    value=$(read_saved_sysctl_value "$initial_runtime" net.ipv4.ip_local_port_range || true)
+    value=$(normalize_port_range "$value" 2>/dev/null || true)
+    if [[ -n "$value" ]]; then
+        printf '%s\n' "$value"
+        return 0
+    fi
+
+    value=$(read_saved_sysctl_value "$initial_config" net.ipv4.ip_local_port_range || true)
+    value=$(normalize_port_range "$value" 2>/dev/null || true)
+    if [[ -n "$value" ]]; then
+        printf '%s\n' "$value"
+        return 0
+    fi
+
+    printf '%s\n' "32768 60999"
+}
+
+capture_port_range_for_rollback() {
+    local output_file="$1"
+    local value
+
+    value=$(sysctl -n net.ipv4.ip_local_port_range 2>/dev/null) || return 1
+    value=$(normalize_port_range "$value") || return 1
+    grep -Fq 'net.ipv4.ip_local_port_range=' "$output_file" ||
+        printf 'net.ipv4.ip_local_port_range=%s\n' "$value" >> "$output_file"
+}
+
+apply_port_range_migration() {
+    local expected="$1"
+    local actual
+
+    sysctl -w "net.ipv4.ip_local_port_range=$expected" >/dev/null 2>&1 || return 1
+    actual=$(sysctl -n net.ipv4.ip_local_port_range 2>/dev/null) || return 1
+    actual=$(normalize_port_range "$actual") || return 1
+    [[ "$actual" == "$expected" ]]
+}
+
 capture_runtime_values() {
     local config_file="$1"
     local output_file="$2"
@@ -2091,6 +2277,7 @@ install_optimization() {
     local runtime_backup
     local bbr_enabled="false"
     local health_before
+    local port_range_restore=""
 
     info "开始配置网络优化..."
 
@@ -2136,6 +2323,15 @@ install_optimization() {
     fi
     capture_virtual_ipv6_ra_values "$runtime_backup"
 
+    if port_range_restore=$(resolve_port_range_restore_value \
+        "$NETWORK_CONF" "$RUNTIME_INITIAL_BACKUP" "$NETWORK_INITIAL_BACKUP"); then
+        if ! capture_port_range_for_rollback "$runtime_backup"; then
+            error "无法保存当前临时端口范围，拒绝执行迁移"
+            rm -f "$temp_config" "$runtime_backup"
+            return 1
+        fi
+    fi
+
     install -d -m 0755 /var/lib/linux-setup
     prepare_legacy_backup_state
     merge_initial_runtime_values "$runtime_backup" || {
@@ -2161,6 +2357,15 @@ install_optimization() {
         restore_runtime_values "$runtime_backup"
         rm -f "$temp_config" "$runtime_backup"
         return 1
+    fi
+    if [[ -n "$port_range_restore" ]]; then
+        if ! apply_port_range_migration "$port_range_restore"; then
+            error "无法恢复安全的临时端口范围，正在回滚"
+            restore_runtime_values "$runtime_backup"
+            rm -f "$temp_config" "$runtime_backup"
+            return 1
+        fi
+        info "已移除旧版临时端口覆盖并恢复为：$port_range_restore"
     fi
     if ! normalize_virtual_ipv6_ra "$runtime_backup"; then
         restore_runtime_values "$runtime_backup"
@@ -2413,29 +2618,32 @@ show_help() {
   network-optimize.sh help              显示帮助
 
 install/plan 选项：
-  --auto                  自动探测（默认）
+  --auto, --probe         明确执行自动探测
   --static                使用原有固定 32 MiB 缓冲区
   --bandwidth-mbps N      指定对称带宽，单位 Mbps
   --download-mbps N       指定下载带宽，单位 Mbps
   --upload-mbps N         指定上传带宽，单位 Mbps
   --rtt-ms N              指定 RTT，单位 ms
-  --target HOST           自定义 RTT 目标，可重复指定
+  --target HOST           自定义 RTT 目标，可重复指定；需配合 --probe
   --no-probe              禁止外部探测，缺失数据时按内存保守配置
   --disable-ecn           禁用 ECN，兼容存在 ECN 黑洞的旧链路
   --disable-initcwnd      保留内核默认初始拥塞窗口（默认设置为 32）
 
 示例：
-  network-optimize.sh
-  network-optimize.sh plan
+  network-optimize.sh                 # 交互选择参数来源
+  network-optimize.sh plan            # 交互选择参数来源
+  network-optimize.sh install --probe # 明确执行主动探测
   network-optimize.sh install --bandwidth-mbps 1000 --rtt-ms 180
   network-optimize.sh install --download-mbps 1000 --upload-mbps 500 --rtt-ms 180
-  network-optimize.sh plan --target example.com --target 203.0.113.10
+  network-optimize.sh plan --probe --target example.com --target 203.0.113.10
   network-optimize.sh install --static
 
 默认行为：
-  - 自动安装缺少的最小探测依赖
-  - 自动测量中国大陆与全球 RTT，BDP 计算使用 150 ms 下限并保留观测值
-  - 首选附近公共 iperf3 节点进行多流双向测速，Cloudflare 作为并行回退
+  - 交互终端无参数运行时选择静态、手填或自动探测；默认静态 32 MiB
+  - 非交互终端无参数运行时自动使用静态模式，不安装探测依赖、不产生测速流量
+  - 明确传入模式或线路参数时跳过交互；手填带宽缺少 RTT 时按 150 ms 计算且不测速
+  - 只有 --auto、--probe 或交互确认后才主动探测并安装缺失依赖
+  - 自动探测测量中国大陆与全球 RTT，并使用公共 iperf3 与 Cloudflare
   - 自动测速在约 90 GB 时停止，保留余量确保总量不超过 100 GB
   - 默认启用 ECN；可用 --disable-ecn 回退
   - 默认把 IPv4 默认路由的 initcwnd/initrwnd 设为 32；浅层 policer 可能增加首秒突发
@@ -2450,11 +2658,19 @@ EOF
 
 main() {
     local required_command
+    local selection_rc=0
 
     if ! parse_arguments "$@"; then
         show_help
         exit 1
     fi
+
+    select_tuning_mode || selection_rc=$?
+    case "$selection_rc" in
+        0) ;;
+        2) exit 2 ;;
+        *) exit 1 ;;
+    esac
 
     for required_command in awk grep sort mktemp; do
         if ! command -v "$required_command" >/dev/null 2>&1; then
