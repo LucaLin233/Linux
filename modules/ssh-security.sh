@@ -5,7 +5,7 @@
 # linux-setup:enabled=true
 # SSH 安全配置模块
 # 功能：配置 SSH 端口、Root 登录策略与认证方式。
-# 策略：完整替换主配置，保留并加载 sshd_config.d 扩展配置。
+# 策略：完整替换主配置，保留现有监听地址，并在末尾加载扩展配置。
 
 set -euo pipefail
 
@@ -106,6 +106,39 @@ get_effective_ports() {
     sshd -T 2>/dev/null |
         awk '$1 == "port" {print $2}' |
         sort -n -u
+}
+
+get_effective_listen_addresses_from_config() {
+    local config_file="${1:-}"
+    local addresses
+    local -a sshd_args=(-T)
+
+    [[ -n "$config_file" ]] && sshd_args+=(-f "$config_file")
+    addresses=$(sshd "${sshd_args[@]}" 2>/dev/null | awk '$1 == "listenaddress" {
+        value=$2
+        if (value ~ /^\[.*\]:[0-9]+$/) {
+            sub(/^\[/, "", value)
+            sub(/\]:[0-9]+$/, "", value)
+        } else if (value ~ /^[^:]+:[0-9]+$/) {
+            sub(/:[0-9]+$/, "", value)
+        }
+        print value
+    }' | sort -u)
+    [[ -n "$addresses" ]] || return 1
+    printf '%s\n' "$addresses"
+}
+
+get_effective_listen_addresses() {
+    get_effective_listen_addresses_from_config
+}
+
+render_listen_addresses() {
+    local addresses="$1"
+    local address
+
+    while IFS= read -r address; do
+        [[ -n "$address" ]] && printf 'ListenAddress %s\n' "$address"
+    done <<< "$addresses"
 }
 
 port_is_in_list() {
@@ -289,6 +322,7 @@ create_temp_ssh_config() {
     local ports="$1"
     local password_auth="$2"
     local root_login="$3"
+    local listen_addresses="$4"
     local temp_config
 
     if ! temp_config=$(mktemp /etc/ssh/sshd_config.new.XXXXXX); then
@@ -304,8 +338,7 @@ create_temp_ssh_config() {
 # 网络
 $(while IFS= read -r port; do [[ -n "$port" ]] && echo "Port $port"; done <<< "$ports")
 AddressFamily any
-ListenAddress 0.0.0.0
-ListenAddress ::
+$(render_listen_addresses "$listen_addresses")
 
 # 认证
 PermitRootLogin $root_login
@@ -383,8 +416,10 @@ verify_effective_settings() {
     local expected_ports="$2"
     local expected_password_auth="$3"
     local expected_root_login="$4"
+    local expected_listen_addresses="$5"
     local actual_value
     local ports
+    local listen_addresses
     local key
 
     declare -A expected_values=(
@@ -411,6 +446,56 @@ verify_effective_settings() {
         error "最终 SSH 端口不符合预期：$(tr '\n' ' ' <<< "$ports")"
         return 1
     fi
+
+    listen_addresses=$(get_effective_listen_addresses_from_config "$config_file") || {
+        error "无法读取最终 SSH 监听地址"
+        return 1
+    }
+    if [[ "$listen_addresses" != "$expected_listen_addresses" ]]; then
+        error "最终 SSH 监听地址不符合预期：$(tr '\n' ' ' <<< "$listen_addresses")"
+        error "预期保留：$(tr '\n' ' ' <<< "$expected_listen_addresses")"
+        return 1
+    fi
+}
+
+report_shadowed_dropin_settings() {
+    local files=("$SSH_DROPIN_DIR"/*.conf)
+    local matches
+
+    [[ -e "${files[0]}" ]] || return 0
+    matches=$(awk '
+        BEGIN {
+            split("port addressfamily listenaddress permitrootlogin passwordauthentication kbdinteractiveauthentication permitemptypasswords pubkeyauthentication usepam maxauthtries logingracetime maxsessions clientaliveinterval clientalivecountmax allowagentforwarding allowtcpforwarding x11forwarding permittunnel usedns printmotd banner subsystem", names)
+            for (i in names) managed[names[i]]=1
+        }
+        /^[[:space:]]*(#|$)/ {next}
+        {
+            key=tolower($1)
+            if (managed[key]) printf "  %s:%d: %s\n", FILENAME, FNR, $1
+        }
+    ' "${files[@]}")
+    [[ -n "$matches" ]] || return 0
+
+    warn "以下 drop-in 关键字可能被主配置优先值遮蔽或与累加项冲突："
+    printf '%s\n' "$matches"
+}
+
+confirm_ssh_changes() {
+    local ports="$1"
+    local listen_addresses="$2"
+    local password_auth="$3"
+    local root_login="$4"
+    local answer
+
+    echo
+    info "即将应用的 SSH 生效策略："
+    echo "  端口: $(tr '\n' ' ' <<< "$ports")"
+    echo "  监听地址: $(tr '\n' ' ' <<< "$listen_addresses")"
+    echo "  Root 登录: $(format_root_login_display "$root_login")"
+    echo "  密码认证: $password_auth"
+    report_shadowed_dropin_settings
+    read -r -p "确认写入并重载 SSH？[y/N]: " answer
+    [[ "$answer" =~ ^[Yy]$ ]]
 }
 
 backup_ssh_config() {
@@ -507,11 +592,13 @@ apply_ssh_config() {
 show_summary() {
     local service_name="$1"
     local ports
+    local listen_addresses
     local root_login
     local password_auth
     local keyboard_auth
 
     ports=$(get_effective_ports)
+    listen_addresses=$(get_effective_listen_addresses || echo "未知")
     root_login=$(get_effective_value "permitrootlogin")
     password_auth=$(get_effective_value "passwordauthentication")
     keyboard_auth=$(get_effective_value "kbdinteractiveauthentication")
@@ -520,6 +607,7 @@ show_summary() {
     info "🎯 SSH 安全配置摘要："
     echo "  SSH 服务: $service_name（运行中）"
     echo "  监听端口: $(tr '\n' ' ' <<< "$ports")"
+    echo "  监听地址: $(tr '\n' ' ' <<< "$listen_addresses")"
     echo "  Root 登录: $(format_root_login_display "$root_login")"
     echo "  密码认证: $password_auth"
     echo "  交互式认证: $keyboard_auth"
@@ -570,7 +658,14 @@ main() {
 
     mkdir -p "$SSH_DROPIN_DIR"
 
+    local listen_addresses
+    if ! listen_addresses=$(get_effective_listen_addresses); then
+        error "无法读取当前 SSH 监听地址，拒绝改为通配监听"
+        exit 1
+    fi
+
     info "🔐 配置 SSH 安全策略..."
+    echo "当前 SSH 监听地址: $(tr '\n' ' ' <<< "$listen_addresses")"
 
     echo
     local selected_ports
@@ -591,7 +686,8 @@ main() {
     if ! temp_config=$(create_temp_ssh_config \
         "$selected_ports" \
         "$password_auth" \
-        "$root_login"); then
+        "$root_login" \
+        "$listen_addresses"); then
         exit 1
     fi
 
@@ -604,9 +700,20 @@ main() {
         "$temp_config" \
         "$selected_ports" \
         "$password_auth" \
-        "$root_login"; then
+        "$root_login" \
+        "$listen_addresses"; then
         rm -f "$temp_config"
         exit 1
+    fi
+
+    if ! confirm_ssh_changes \
+        "$selected_ports" \
+        "$listen_addresses" \
+        "$password_auth" \
+        "$root_login"; then
+        rm -f "$temp_config"
+        info "已取消 SSH 配置"
+        exit 0
     fi
 
     if ! apply_ssh_config "$temp_config" "$ssh_service" "$selected_ports"; then
@@ -620,6 +727,7 @@ main() {
     success "SSH 安全配置完成"
 }
 
-trap 'error "SSH 配置脚本在第 $LINENO 行执行失败"' ERR
-
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    trap 'error "SSH 配置脚本在第 $LINENO 行执行失败"' ERR
+    main "$@"
+fi

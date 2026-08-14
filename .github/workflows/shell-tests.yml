@@ -1,0 +1,32 @@
+name: Shell tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install test dependencies
+        run: sudo apt-get update && sudo apt-get install -y shellcheck jq iproute2
+
+      - name: Check Bash syntax
+        run: find . -type f -name '*.sh' -print0 | xargs -0 -n1 bash -n
+
+      - name: Run ShellCheck
+        run: shellcheck -x --severity=error linux_setup.sh modules/*.sh tools/*.sh tests/*.sh
+
+      - name: Run tests
+        run: |
+          bash tests/test-network-optimize.sh
+          bash tests/test-traffic-shape.sh
+          bash tests/test-traffic-shape-state.sh
+          bash tests/test-traffic-shape-sweep.sh
+          bash tests/test-ssh-security.sh

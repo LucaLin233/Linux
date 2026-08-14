@@ -6,10 +6,10 @@
 [Kylin010/tcpfit](https://github.com/Kylin010/tcpfit) 移植和修改的 Sweep、Shape、
 公共 iperf3 节点选择及 qdisc 管理逻辑。
 
-当前移植基线为 tcpfit `v0.5.4`：
+当前移植基线为 tcpfit `v0.5.6`：
 
 ```text
-65885816bb77be38d041218f1bf62fe4ebe5c300
+67c0bdfb35dd98e86982600298237b6ecc08ebe4
 ```
 
 本项目只移植适合独立 `tcshape` 工具的 Sweep、Shape 和 qdisc 管理逻辑，不追求与 tcpfit
