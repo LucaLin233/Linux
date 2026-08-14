@@ -66,6 +66,7 @@ readonly CLOUDFLARE_DOWNLOAD_BYTES=50000000
 readonly CLOUDFLARE_UPLOAD_BYTES=250000000
 readonly TRAFFIC_TOTAL_LIMIT_BYTES=90000000000
 readonly TRAFFIC_DIRECTION_LIMIT_BYTES=45000000000
+readonly TRAFFIC_STOP_RESERVE_BYTES=5000000000
 
 # 公共节点参考 tcpfit，覆盖常见 VPS 机房区域。端口范围为 5201–5210，并兼容 5200。
 readonly IPERF_PEER_POOL='speedtest.hkg12.hk.leaseweb.net|香港|Leaseweb
@@ -538,7 +539,7 @@ is_interactive_terminal() {
 show_active_probe_warning() {
     warn "主动探测会安装缺失的 curl、ping、iperf3、jq 等工具"
     warn "典型流量约等于 32 秒线速传输：1 Gbps 约 4 GB，2.5 Gbps 约 10 GB，10 Gbps 约 40 GB"
-    warn "硬停止阈值为单方向 45 GB、合计 90 GB"
+    warn "安全上限为单方向 45 GB、合计 90 GB；达到 40/85 GB 时提前终止测速"
 }
 
 select_tuning_mode() {
@@ -992,11 +993,12 @@ traffic_budget_reached() {
     local direction="$1"
     local total
     local directional
+    local total_stop=$((TRAFFIC_TOTAL_LIMIT_BYTES - TRAFFIC_STOP_RESERVE_BYTES))
+    local direction_stop=$((TRAFFIC_DIRECTION_LIMIT_BYTES - TRAFFIC_STOP_RESERVE_BYTES))
 
     total=$(traffic_used_bytes total) || return 0
     directional=$(traffic_used_bytes "$direction") || return 0
-    (( total >= TRAFFIC_TOTAL_LIMIT_BYTES ||
-        directional >= TRAFFIC_DIRECTION_LIMIT_BYTES ))
+    (( total >= total_stop || directional >= direction_stop ))
 }
 
 kill_process_tree() {
@@ -1004,6 +1006,12 @@ kill_process_tree() {
     pkill -TERM -P "$pid" 2>/dev/null || true
     kill -TERM "$pid" 2>/dev/null || true
     sleep 0.2
+    pkill -KILL -P "$pid" 2>/dev/null || true
+    kill -KILL "$pid" 2>/dev/null || true
+}
+
+kill_process_tree_now() {
+    local pid="$1"
     pkill -KILL -P "$pid" 2>/dev/null || true
     kill -KILL "$pid" 2>/dev/null || true
 }
@@ -1100,7 +1108,7 @@ run_iperf_test() {
     while kill -0 "$pid" 2>/dev/null; do
         if traffic_budget_reached "$direction"; then
             limited="true"
-            kill_process_tree "$pid"
+            kill_process_tree_now "$pid"
             break
         fi
         sleep 0.05
@@ -1295,7 +1303,7 @@ probe_cloudflare_direction() {
 
         if traffic_budget_reached "$direction"; then
             for pid in "${pids[@]}"; do
-                kill_process_tree "$pid"
+                kill_process_tree_now "$pid"
             done
             break
         fi
@@ -1414,7 +1422,7 @@ probe_bandwidth() {
     }
 
     show_probe_environment
-    info "自动测量公网带宽（90 GB 停止阈值，保留余量确保不超过 100 GB）..."
+    info "自动测量公网带宽（40/85 GB 提前停止，安全上限 45/90 GB）..."
     probe_iperf_bandwidth || true
     # 公共 iperf3 节点可能忙碌或单向限速；只要预算允许，再用并行 Cloudflare
     # 交叉验证，并对每个方向保留较高结果。
@@ -2890,7 +2898,7 @@ install/plan 选项：
   - 手填带宽缺少 RTT 时按 150 ms 计算；主动探测成功使用观测值，失败回退到 150 ms
   - 只有 --auto、--probe 或交互确认后才主动探测并安装缺失依赖
   - 自动探测测量中国大陆与全球 RTT，并使用公共 iperf3 与 Cloudflare
-  - 自动测速在约 90 GB 时停止，保留余量确保总量不超过 100 GB
+  - 自动测速在单方向 40 GB 或合计 85 GB 时提前停止，保留 5 GB 终止余量
   - 默认不持久管理 ECN；只在传入 --disable-ecn 时写入 tcp_ecn=0
   - 默认把 IPv4 默认路由的 initcwnd/initrwnd 设为 32；浅层 policer 可能增加首秒突发
   - 可用 --disable-initcwnd 保留内核默认初始拥塞窗口
