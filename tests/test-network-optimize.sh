@@ -60,6 +60,19 @@ TUNING_MODE=static
 assert_eq 'RTT：未使用（静态 32 MiB 缓冲区）' \
     "$(format_rtt_selection_summary)" "summary explains static RTT handling"
 
+PROBE_IFACE=eth0
+TRAFFIC_RX_START=100000000
+TRAFFIC_TX_START=200000000
+read_iface_counter() {
+    case "$1" in
+        rx) echo 1600000000 ;;
+        tx) echo 2450000000 ;;
+        *) return 1 ;;
+    esac
+}
+assert_eq '流量：上传 2.25 GB / 下载 1.50 GB / 合计 3.75 GB' \
+    "$(traffic_report)" "traffic report shows upload, download, and total usage"
+
 assert_eq "default via 192.0.2.1 dev eth0 proto dhcp metric 100" \
     "$(strip_route_window_fields 'default via 192.0.2.1 dev eth0 proto dhcp metric 100 initcwnd 32 initrwnd 32')" \
     "strip route window fields without losing route attributes"
