@@ -262,6 +262,7 @@ runtime_backup="$TEMP_DIR/runtime-backup"
 SYSCTL_PORT_RANGE='1024 65535'
 SYSCTL_TCP_ECN='1'
 SYSCTL_CONNTRACK_MAX='262144'
+SYSCTL_WRITE_FAIL_KEY=''
 sysctl() {
     case "$1" in
         -n)
@@ -273,6 +274,7 @@ sysctl() {
             esac
             ;;
         -w)
+            [[ "${2%%=*}" != "$SYSCTL_WRITE_FAIL_KEY" ]] || return 1
             case "$2" in
                 net.ipv4.ip_local_port_range=*) SYSCTL_PORT_RANGE="${2#*=}" ;;
                 net.ipv4.tcp_ecn=*) SYSCTL_TCP_ECN="${2#*=}" ;;
@@ -283,6 +285,25 @@ sysctl() {
         *) return 1 ;;
     esac
 }
+transaction_target="$TEMP_DIR/transaction-target"
+transaction_current="$TEMP_DIR/transaction-current"
+printf '%s\n' \
+    'net.ipv4.tcp_ecn=2' \
+    'net.netfilter.nf_conntrack_max=131072' > "$transaction_target"
+assert_ok "capture runtime values across restore inputs" capture_runtime_values_from_files \
+    "$transaction_current" "$transaction_target" "$transaction_target"
+assert_eq 2 "$(wc -l < "$transaction_current" | tr -d ' ')" \
+    "runtime transaction snapshot deduplicates keys"
+SYSCTL_WRITE_FAIL_KEY=net.netfilter.nf_conntrack_max
+assert_fail "strict runtime restore reports partial failure" apply_runtime_values_strict \
+    "$transaction_target"
+assert_eq 2 "$SYSCTL_TCP_ECN" "strict restore exposes the partial write for rollback"
+SYSCTL_WRITE_FAIL_KEY=''
+restore_runtime_values "$transaction_current"
+assert_eq 1 "$SYSCTL_TCP_ECN" "transaction rollback restores ECN after partial failure"
+assert_eq 262144 "$SYSCTL_CONNTRACK_MAX" \
+    "transaction rollback preserves Conntrack max after partial failure"
+
 assert_ok "capture current port range for rollback" capture_port_range_for_rollback "$runtime_backup"
 assert_eq 'net.ipv4.ip_local_port_range=1024 65535' "$(cat "$runtime_backup")" \
     "rollback snapshot includes previous port range"
