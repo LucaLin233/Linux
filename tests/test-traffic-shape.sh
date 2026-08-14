@@ -240,9 +240,14 @@ cat > "$fixture" <<'JSON'
   }
 }
 
+
 JSON
-assert_eq $'18300000\t12\t14600000\t18300000\t1380\t8' "$(parse_iperf_json "$fixture")" \
-    "parse sender, receiver, bytes, MSS and duration"
+parsed_iperf=$(parse_iperf_json "$fixture")
+assert_eq "$(printf '18300000\t12\t14600000\t18300000\t1380')" \
+    "$(cut -f1-5 <<< "$parsed_iperf")" \
+    "parse sender, receiver, bytes and MSS"
+assert_ok "parse iperf duration across jq number formats" \
+    awk -F'\t' '$6 == 8 {found=1} END {exit !found}' <<< "$parsed_iperf"
 
 assert_eq "0.1000" "$(retrans_pct 1 1448000 1448 8 0)" \
     "calculate retransmission rate for standard MSS"
