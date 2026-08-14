@@ -1,7 +1,7 @@
 # tcshape：出口限速器扫描与流量整形
 
 `tools/traffic-shape.sh` 以 [Kylin010/tcpfit](https://github.com/Kylin010/tcpfit)
-`v0.5.4`（提交 `65885816bb77be38d041218f1bf62fe4ebe5c300`）为当前移植基线，选择性移植
+`v0.5.6`（提交 `67c0bdfb35dd98e86982600298237b6ecc08ebe4`）为当前移植基线，选择性移植
 Sweep 与 Shape 核心逻辑，用于检测 VPS 出口 policer 的限速拐点，并在用户确认后应用
 `HTB + fq` 出口整形。tcshape 是独立、安全边界更严格的工具，不追求完整复制 tcpfit 的命令、
 交互流程或 TCP/sysctl 调优功能。
@@ -40,7 +40,8 @@ sudo apt-get update
 
 ## 安装与短命令
 
-首次运行会静默安装缺失依赖，并把自身安装为 `/usr/local/sbin/tcshape`。Termius 等终端推荐
+首次运行管理菜单、扫描或整形命令时会静默安装缺失依赖，并把自身安装为 `/usr/local/sbin/tcshape`。
+显式执行 `tcshape st`/`status` 只读当前状态，不自安装、不下载，也不调用 APT。Termius 等终端推荐
 先下载到普通文件再执行：
 
 ```bash
@@ -78,6 +79,8 @@ sudo tcshape set RATE
 sudo tcshape status
 sudo tcshape off
 ```
+
+重传率优先按 iperf3 的实际发送字节数和 TCP MSS 计算，字段缺失时才回退为吞吐与时长估算。
 
 默认 IPv4；使用 `-6` 才启用 IPv6。省略 `HOST` 时，工具参考 tcpfit 的节点池，根据 RTT、
 端口可达性和 iperf3 实际结果自动选择公共服务器，并轮换 `5201–5210` 和 `5200`。
@@ -117,7 +120,7 @@ sudo tcshape --version
 1. 检查当前 qdisc 与其他整形服务冲突，并显示当前整形、接口、速率和持久服务状态；
 2. 记录网卡流量计数和原根 qdisc；
 3. 自动选择附近且可用的公共 iperf3 节点；
-4. 不限速单流同时读取发送端重传与接收端实际吞吐，判断是否存在 policer；
+4. 不限速单流同时读取发送端重传与接收端实际吞吐；低于参考带宽 70% 时在同一节点补测两次并选取最高的完整样本；
 5. 根据接收端吞吐推导扫描区间；小带宽和窄区间会自动使用更细步长；
 6. 在 `HTB + fq` 下进行粗扫、异常复测和细扫；
 7. 恢复原 qdisc；
@@ -139,7 +142,7 @@ sudo tcshape --version
 ```
 
 用户确认扫描后，旧结果立即失效。每轮结果包含唯一 `SCAN_ID`、开始和完成时间、接口、地址族、
-节点、丢包阈值及扫描上限；只有本轮完整完成并得到 `KNEE_FOUND` 时才允许应用。执行
+节点、TCP 重传率阈值及扫描上限；只有本轮完整完成并得到 `KNEE_FOUND` 时才允许应用。执行
 `tcshape a` 前会先显示本轮结果摘要。
 
 ## 流量限制

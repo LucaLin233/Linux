@@ -36,6 +36,7 @@ SYSTEMD_ENABLED=false
 SYSTEMD_ACTIVE=false
 SYSTEMD_FAIL_ENABLE=false
 SYSTEMD_FAIL_RESTART=false
+SYSTEMD_FAIL_DAEMON_RELOAD_ONCE=false
 CURRENT_SERVICE_IFACE=""
 declare -A QDISC_KIND=([eth0]=fq [eth1]=fq)
 declare -A QDISC_RATE=([eth0]="" [eth1]="")
@@ -92,7 +93,13 @@ systemctl() {
     local command="${1:-}"
     shift || true
     case "$command" in
-        daemon-reload) return 0 ;;
+        daemon-reload)
+            if [[ "$SYSTEMD_FAIL_DAEMON_RELOAD_ONCE" == true ]]; then
+                SYSTEMD_FAIL_DAEMON_RELOAD_ONCE=false
+                return 1
+            fi
+            return 0
+            ;;
         enable)
             [[ "$SYSTEMD_FAIL_ENABLE" == false ]] || return 1
             SYSTEMD_ENABLED=true
@@ -114,6 +121,15 @@ systemctl() {
         is-active) [[ "$SYSTEMD_ACTIVE" == true ]] ;;
         *) return 1 ;;
     esac
+}
+
+MOVE_FAIL_SERVICE=false
+move_managed_file() {
+    local source="$1" destination="$2"
+    if [[ "$MOVE_FAIL_SERVICE" == true && "$destination" == "$SERVICE_FILE" ]]; then
+        return 1
+    fi
+    mv -f "$source" "$destination"
 }
 
 # First enable on eth0.
@@ -145,5 +161,24 @@ SYSTEMD_FAIL_ENABLE=false
 assert_eq fq "${QDISC_KIND[eth0]}" "enable failure restores baseline"
 [[ ! -e "$CONFIG_FILE" && ! -e "$SERVICE_FILE" ]] || fail "enable failure removes managed files"
 printf 'PASS: enable failure removes managed files\n'
+
+# A partial persistent-file write must report failure and roll back the config move.
+MOVE_FAIL_SERVICE=true
+if cmd_set 700 eth0 >/dev/null 2>&1; then
+    fail "service file move failure unexpectedly succeeded"
+fi
+MOVE_FAIL_SERVICE=false
+assert_eq fq "${QDISC_KIND[eth0]}" "service move failure restores baseline"
+[[ ! -e "$CONFIG_FILE" && ! -e "$SERVICE_FILE" ]] || fail "service move failure removes partial files"
+printf 'PASS: service move failure removes partial files\n'
+
+# daemon-reload failure must also roll back the already moved managed files.
+SYSTEMD_FAIL_DAEMON_RELOAD_ONCE=true
+if cmd_set 700 eth0 >/dev/null 2>&1; then
+    fail "daemon-reload failure unexpectedly succeeded"
+fi
+assert_eq fq "${QDISC_KIND[eth0]}" "daemon-reload failure restores baseline"
+[[ ! -e "$CONFIG_FILE" && ! -e "$SERVICE_FILE" ]] || fail "daemon-reload failure removes managed files"
+printf 'PASS: daemon-reload failure removes managed files\n'
 
 printf 'All tcshape state tests passed.\n'

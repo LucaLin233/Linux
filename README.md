@@ -82,7 +82,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/linux_
 | 6 | `tools-setup.sh` | NextTrace、Speedtest、htop、jq、tree 等 | 可能添加 NextTrace 第三方 APT 源 |
 | 7 | `docker-setup.sh` | Docker Engine、Compose、Buildx、日志轮转 | 添加 Docker 官方 APT 源并管理 Docker 服务 |
 | 8 | `auto-update-setup.sh` | 定时完整升级系统和内核 | 更新后需要重启时会等待 30 秒自动重启 |
-| 9 | `ssh-security.sh` | SSH 端口、Root 登录与认证策略 | 完整管理 `sshd_config`，操作不当可能失去远程连接 |
+| 9 | `ssh-security.sh` | SSH 端口、Root 登录与认证策略 | 保留当前 `ListenAddress`，完整管理其余主配置；写入前显示 drop-in 冲突并再次确认 |
 
 当前只有 `mise-setup` 声明 `zsh-setup` 为强依赖；其他模块可以单独执行。
 SSH 模块要求系统已安装并运行 `openssh-server`；精简镜像请先执行 `sudo apt install -y openssh-server`。
@@ -258,7 +258,7 @@ Token 属于敏感凭据，不要写入日志、README 或提交到 Git。
 
 ### 出口流量整形 tcshape
 
-基于 tcpfit `v0.5.4` 选择性移植限速器拐点 Sweep 与 `HTB + fq` Shape。它不会修改基础
+基于 tcpfit `v0.5.6` 选择性移植限速器拐点 Sweep 与 `HTB + fq` Shape。它不会修改基础
 sysctl，适用于存在出口 policer 的特定 VPS，不是通用必选优化。
 
 首次运行：
@@ -278,7 +278,7 @@ sudo tcshape s        # 自动选公共节点并扫描
 sudo tcshape a        # 应用 24 小时内的最近推荐值
 sudo tcshape on 480   # 手动限制为 480 Mbit
 sudo tcshape off      # 关闭并恢复原 qdisc
-sudo tcshape st       # 查看状态
+sudo tcshape st       # 只读查看状态，不自安装或安装依赖
 sudo tcshape u        # 从 LucaLin233/Linux main 检查更新
 sudo tcshape apply --force  # 明确强制使用超过 24 小时的旧推荐值
 ```
@@ -293,6 +293,8 @@ Sweep 可能消耗大量上传流量，并会临时替换默认出口接口的�
 自动扫描上限默认 10 Gbit，可用 `tcshape scan --cap N` 明确调整；可用
 `--loss-threshold PCT` 覆盖默认 `0.1%` 重传率阈值。跨出口接口重新设置时会验证新整形后清理
 旧接口 HTB 并迁移恢复基线，失败则回滚；带自定义参数的 `fq`/`fq_codel` 会被拒绝接管。
+不限速单流低于自动选点或 `--nominal` 参考带宽的 70% 时，会按 tcpfit `v0.5.6` 在同一节点
+补测两次，并按接收带宽选取最高的完整样本。重传率优先使用 iperf3 实际字节数与 MSS 计算。
 
 `tcshape u`/`tcshape update` 会读取 `LucaLin233/Linux` 的 `main` 最新提交，按固定 Commit 下载并
 校验受管标记、版本号和 Bash 语法，再原子替换短命令。上一版本保存在

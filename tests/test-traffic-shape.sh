@@ -80,6 +80,15 @@ qdisc fq 0: parent :2 limit 10000p flow_limit 100p buckets 1024 orphan_mask 1023
 EOF
 }
 assert_eq "fq" "$(mq_leaf_kind eth0)" "detect mq handle-zero leaf qdisc"
+assert_ok "verify every mq leaf uses fq" mq_leaves_are_kind eth0 fq
+tc() {
+    cat <<'EOF'
+qdisc mq 1: root
+qdisc fq 0: parent 1:1
+qdisc fq_codel 0: parent 1:2
+EOF
+}
+assert_fail "reject mixed mq leaf qdiscs" mq_leaves_are_kind eth0 fq
 unset -f tc
 
 MQ_ROOT="mq"
@@ -121,19 +130,19 @@ grep -Fqx "qdisc replace dev eth0 parent 1:1 fq_codel" "$MQ_CALL_LOG" &&
 printf 'PASS: mq leaf restore replaces every leaf\n'
 unset -f tc root_qdisc_kind
 
-assert_eq "1.0.11" "$(script_version "$ROOT_DIR/tools/traffic-shape.sh")" \
+assert_eq "1.0.12" "$(script_version "$ROOT_DIR/tools/traffic-shape.sh")" \
     "extract update version"
 assert_ok "validate install source" validate_install_file \
     "$ROOT_DIR/tools/traffic-shape.sh"
 assert_ok "validate managed update file" validate_update_file \
-    "$ROOT_DIR/tools/traffic-shape.sh" "1.0.11"
+    "$ROOT_DIR/tools/traffic-shape.sh" "1.0.12"
 
 temp_dir=$(mktemp -d)
 trap 'rm -rf "$temp_dir"' EXIT
 invalid_update="$temp_dir/invalid-update.sh"
 sed 's#readonly UPDATE_REPO="LucaLin233/Linux"#readonly UPDATE_REPO="other/repo"#' \
     "$ROOT_DIR/tools/traffic-shape.sh" > "$invalid_update"
-assert_fail "reject update from another repository" validate_update_file "$invalid_update" "1.0.11"
+assert_fail "reject update from another repository" validate_update_file "$invalid_update" "1.0.12"
 
 empty_install="$temp_dir/empty-tcshape"
 unknown_install="$temp_dir/unknown-tcshape"
@@ -215,18 +224,70 @@ printf 'PASS: temporary qdisc probe name fits IFNAMSIZ\n'
 fixture="$temp_dir/iperf.json"
 cat > "$fixture" <<'JSON'
 {
+  "start": {
+    "tcp_mss_default": 1380
+  },
   "end": {
     "sum_sent": {
       "bits_per_second": 18300000,
-      "retransmits": 12
+      "retransmits": 12,
+      "bytes": 18300000,
+      "seconds": 8.0
     },
     "sum_received": {
       "bits_per_second": 14600000
     }
   }
 }
+
 JSON
-assert_eq $'18300000\t12\t14600000' "$(parse_iperf_json "$fixture")" \
-    "parse sender and receiver throughput"
+assert_eq $'18300000\t12\t14600000\t18300000\t1380\t8' "$(parse_iperf_json "$fixture")" \
+    "parse sender, receiver, bytes, MSS and duration"
+
+assert_eq "0.1000" "$(retrans_pct 1 1448000 1448 8 0)" \
+    "calculate retransmission rate for standard MSS"
+assert_eq "0.1000" "$(retrans_pct 1 1380000 1380 8 0)" \
+    "calculate retransmission rate for tunnel MSS"
+assert_eq "0.1000" "$(retrans_pct 1 8948000 8948 8 0)" \
+    "calculate retransmission rate for jumbo MSS"
+assert_eq "0.1000" "$(retrans_pct 1 0 1448 1 11584000)" \
+    "fallback to exact sender bps when bytes are unavailable"
+assert_fail "threshold equality is not a spike" is_loss_spike 0.1 0.1 0
+assert_ok "loss above fixed threshold is a spike" is_loss_spike 0.1001 0.1 0
+assert_fail "adaptive baseline suppresses path noise" is_loss_spike 0.2 0.1 0.05
+assert_ok "adaptive baseline accepts material spike" is_loss_spike 0.3 0.1 0.05
+assert_fail "adaptive threshold is capped at one percent" is_loss_spike 1.0 0.1 0.5
+assert_ok "loss above capped adaptive threshold is a spike" is_loss_spike 1.1 0.1 0.5
+
+result_queue="$temp_dir/iperf-results"
+printf '%s\n' \
+    '37 0 5201 37 16280000 1448 3 37400000 37400000' \
+    '36 2 5201 36 15600000 1448 3 37000000 37000000' > "$result_queue"
+run_iperf() {
+    local result
+    result=$(sed -n '1p' "$result_queue")
+    sed '1d' "$result_queue" > "$result_queue.next"
+    mv -f "$result_queue.next" "$result_queue"
+    printf '%s\n' "$result"
+}
+low_result='13 5000 5201 13 5600000 1448 3 13000000 13000000'
+assert_eq '37 0 5201 37 16280000 1448 3 37400000 37400000' \
+    "$(stabilize_unshaped_result peer.example 3 40 "$low_result")" \
+    "retry low unshaped sample and keep the best complete result"
+run_iperf() { return 75; }
+if stabilize_unshaped_result peer.example 3 40 "$low_result" >/dev/null; then
+    fail "traffic budget result was not propagated"
+else
+    assert_eq "75" "$?" "propagate traffic budget from low-sample retry"
+fi
+eval "$(sed -n '/^run_iperf() {/,/^}/p' "$ROOT_DIR/tools/traffic-shape.sh")"
+
+STATUS_CALLED=false
+install_self() { fail "status invoked install_self"; }
+ensure_dependencies() { fail "status invoked ensure_dependencies"; }
+check_status_dependencies() { return 0; }
+cmd_status() { STATUS_CALLED=true; }
+main status
+assert_eq "true" "$STATUS_CALLED" "status bypasses self-install and dependency installation"
 
 printf 'All tcshape tests passed.\n'
