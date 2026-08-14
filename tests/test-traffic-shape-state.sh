@@ -160,6 +160,7 @@ fi
 SYSTEMD_FAIL_ENABLE=false
 assert_eq fq "${QDISC_KIND[eth0]}" "enable failure restores baseline"
 [[ ! -e "$CONFIG_FILE" && ! -e "$SERVICE_FILE" ]] || fail "enable failure removes managed files"
+[[ ! -e "$STATE_DIR/qdisc-baseline" ]] || fail "enable failure removes stale baseline"
 printf 'PASS: enable failure removes managed files\n'
 
 # A partial persistent-file write must report failure and roll back the config move.
@@ -170,6 +171,7 @@ fi
 MOVE_FAIL_SERVICE=false
 assert_eq fq "${QDISC_KIND[eth0]}" "service move failure restores baseline"
 [[ ! -e "$CONFIG_FILE" && ! -e "$SERVICE_FILE" ]] || fail "service move failure removes partial files"
+[[ ! -e "$STATE_DIR/qdisc-baseline" ]] || fail "service move failure removes stale baseline"
 printf 'PASS: service move failure removes partial files\n'
 
 # daemon-reload failure must also roll back the already moved managed files.
@@ -179,6 +181,12 @@ if cmd_set 700 eth0 >/dev/null 2>&1; then
 fi
 assert_eq fq "${QDISC_KIND[eth0]}" "daemon-reload failure restores baseline"
 [[ ! -e "$CONFIG_FILE" && ! -e "$SERVICE_FILE" ]] || fail "daemon-reload failure removes managed files"
+[[ ! -e "$STATE_DIR/qdisc-baseline" ]] || fail "daemon-reload failure removes stale baseline"
 printf 'PASS: daemon-reload failure removes managed files\n'
+
+cmd_set 650 lo >/dev/null
+cmd_off >/dev/null
+assert_eq fq "${QDISC_KIND[lo]}" "retry on another interface restores its own baseline"
+printf 'PASS: failed first setup does not leak a cross-interface baseline\n'
 
 printf 'All tcshape state tests passed.\n'
