@@ -71,6 +71,23 @@ assert_eq "1" "$(calc_auto_step 17 31)" "auto step for narrow range"
 assert_eq "20" "$(calc_auto_step 100 300)" "auto step for wide range"
 assert_eq "32768" "$(calc_burst 20)" "burst keeps 32 KiB floor"
 assert_eq "1000000" "$(calc_burst 2000)" "burst follows four milliseconds at line rate"
+SCAN_CAP=10000
+assert_eq "1000000000" "$(traffic_reserve_bytes)" "default scan cap keeps 1 GB reserve"
+SCAN_CAP=100000
+assert_eq "5000000000" "$(traffic_reserve_bytes)" "maximum scan cap keeps 5 GB reserve"
+USED_TOTAL=0
+USED_UPLOAD=0
+traffic_used_bytes() {
+    case "$1" in total) printf '%s\n' "$USED_TOTAL" ;; upload) printf '%s\n' "$USED_UPLOAD" ;; *) return 1 ;; esac
+}
+SCAN_CAP=10000
+USED_TOTAL=88999999999
+USED_UPLOAD=43999999999
+assert_fail "traffic budget stays open below reserved threshold" traffic_budget_reached
+USED_UPLOAD=44000000000
+assert_ok "traffic budget stops at reserved direction threshold" traffic_budget_reached
+eval "$(sed -n '/^traffic_used_bytes() {/,/^}/p' "$ROOT_DIR/tools/traffic-shape.sh")"
+SCAN_CAP=""
 
 tc() {
     cat <<'EOF'
@@ -89,7 +106,23 @@ qdisc fq_codel 0: parent 1:2
 EOF
 }
 assert_fail "reject mixed mq leaf qdiscs" mq_leaves_are_kind eth0 fq
+assert_fail "reject mixed mq restore profile" mq_restore_leaf_kind eth0
 unset -f tc
+
+default_leaf_options='{"limit":10000,"flow_limit":100}'
+default_mq_json='[{"kind":"fq","parent":"1:1","options":{"limit":10000,"flow_limit":100}},{"kind":"fq","parent":"1:2","options":{"limit":10000,"flow_limit":100}}]'
+custom_mq_json='[{"kind":"fq","parent":"1:1","options":{"limit":20000,"flow_limit":100}},{"kind":"fq","parent":"1:2","options":{"limit":10000,"flow_limit":100}}]'
+assert_ok "accept default mq leaf options" mq_leaf_options_are_default \
+    "$default_mq_json" 1 fq "$default_leaf_options"
+assert_fail "reject custom mq leaf options" mq_leaf_options_are_default \
+    "$custom_mq_json" 1 fq "$default_leaf_options"
+
+tc() { return 1; }
+systemctl() { return 1; }
+is_own_shaper() { return 1; }
+assert_fail "reject unreadable root qdisc" check_external_conflicts eth0
+assert_fail "reject unreadable Sweep qdisc snapshot" qdisc_save eth0
+unset -f tc systemctl is_own_shaper
 
 MQ_ROOT="mq"
 MQ_HANDLE="0:"
@@ -130,19 +163,19 @@ grep -Fqx "qdisc replace dev eth0 parent 1:1 fq_codel" "$MQ_CALL_LOG" &&
 printf 'PASS: mq leaf restore replaces every leaf\n'
 unset -f tc root_qdisc_kind
 
-assert_eq "1.0.12" "$(script_version "$ROOT_DIR/tools/traffic-shape.sh")" \
+assert_eq "1.0.13" "$(script_version "$ROOT_DIR/tools/traffic-shape.sh")" \
     "extract update version"
 assert_ok "validate install source" validate_install_file \
     "$ROOT_DIR/tools/traffic-shape.sh"
 assert_ok "validate managed update file" validate_update_file \
-    "$ROOT_DIR/tools/traffic-shape.sh" "1.0.12"
+    "$ROOT_DIR/tools/traffic-shape.sh" "1.0.13"
 
 temp_dir=$(mktemp -d)
 trap 'rm -rf "$temp_dir"' EXIT
 invalid_update="$temp_dir/invalid-update.sh"
 sed 's#readonly UPDATE_REPO="LucaLin233/Linux"#readonly UPDATE_REPO="other/repo"#' \
     "$ROOT_DIR/tools/traffic-shape.sh" > "$invalid_update"
-assert_fail "reject update from another repository" validate_update_file "$invalid_update" "1.0.12"
+assert_fail "reject update from another repository" validate_update_file "$invalid_update" "1.0.13"
 
 empty_install="$temp_dir/empty-tcshape"
 unknown_install="$temp_dir/unknown-tcshape"

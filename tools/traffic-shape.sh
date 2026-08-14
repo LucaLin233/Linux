@@ -10,7 +10,7 @@
 set -uo pipefail
 umask 022
 
-readonly VERSION="1.0.12"
+readonly VERSION="1.0.13"
 readonly INSTALL_PATH="${TCSHAPE_INSTALL_PATH:-/usr/local/sbin/tcshape}"
 readonly UPDATE_REPO="LucaLin233/Linux"
 readonly UPDATE_BRANCH="main"
@@ -24,6 +24,9 @@ readonly PID_FILE="/run/tcshape-$$.iperf.pid"
 # 与 modules/network-optimize.sh 保持一致。
 readonly TRAFFIC_TOTAL_LIMIT_BYTES=90000000000
 readonly TRAFFIC_DIRECTION_LIMIT_BYTES=45000000000
+readonly TRAFFIC_MIN_RESERVE_BYTES=1000000000
+readonly TRAFFIC_MAX_RESERVE_BYTES=5000000000
+readonly TRAFFIC_POLL_INTERVAL_SECONDS=0.1
 
 readonly PORT_POOL="5201 5202 5203 5204 5205 5206 5207 5208 5209 5210 5200"
 readonly PROBE_PORTS="5201 5202 5203 5200"
@@ -493,16 +496,23 @@ detect_iface() {
 }
 
 root_qdisc_kind() {
-    tc qdisc show dev "$1" 2>/dev/null |
-        awk '$1 == "qdisc" && $4 == "root" {print $2; found=1; exit} NR == 1 {fallback=$2} END {if (!found && fallback) print fallback}' |
-        head -n 1
+    local output
+    local kind
+
+    output=$(tc qdisc show dev "$1" 2>/dev/null) || return 1
+    kind=$(awk '$1 == "qdisc" && $4 == "root" {print $2; exit}' <<< "$output")
+    [[ -n "$kind" ]] || return 1
+    printf '%s\n' "$kind"
 }
 
 qdisc_remove_root() {
     local iface="$1"
 
+    local kind
+
     tc qdisc del dev "$iface" root 2>/dev/null && return 0
-    [[ "$(root_qdisc_kind "$iface")" == "mq" ]] || return 1
+    kind=$(root_qdisc_kind "$iface") || return 1
+    [[ "$kind" == "mq" ]] || return 1
     tc qdisc replace dev "$iface" root handle 1: mq 2>/dev/null || return 1
     tc qdisc del dev "$iface" root 2>/dev/null
 }
@@ -583,14 +593,14 @@ qdisc_set_mq_leaves() {
 qdisc_set_fq() {
     local iface="$1" kind
 
-    kind=$(root_qdisc_kind "$iface")
+    kind=$(root_qdisc_kind "$iface") || return 1
     case "$kind" in
         mq) qdisc_set_mq_leaves "$iface" fq || return 1 ;;
         fq) : ;;
         ""|noqueue) tc qdisc add dev "$iface" root fq 2>/dev/null || return 1 ;;
         *)
             qdisc_remove_root "$iface" || return 1
-            kind=$(root_qdisc_kind "$iface")
+            kind=$(root_qdisc_kind "$iface") || return 1
             case "$kind" in
                 mq) qdisc_set_mq_leaves "$iface" fq || return 1 ;;
                 fq) : ;;
@@ -599,7 +609,7 @@ qdisc_set_fq() {
             ;;
     esac
 
-    kind=$(root_qdisc_kind "$iface")
+    kind=$(root_qdisc_kind "$iface") || return 1
     [[ "$kind" == "fq" ]] && return 0
     [[ "$kind" == "mq" ]] && mq_leaves_are_kind "$iface" fq
 }
@@ -608,14 +618,38 @@ calc_burst() {
     awk -v rate="$1" 'BEGIN {burst=rate*500; if (burst<32768) burst=32768; printf "%d", burst}'
 }
 
+default_qdisc_options() {
+    local kind="$1"
+    local baseline_json
+    local baseline_options
+    local probe
+
+    # Linux IFNAMSIZ 限制为 15 字节；接口名必须保持短小。
+    probe="tcs${BASHPID}"
+    if ! ip link add "$probe" type dummy 2>/dev/null; then
+        error "无法创建临时接口读取本机 $kind 默认参数"
+        return 1
+    fi
+    if ! tc qdisc replace dev "$probe" root "$kind" 2>/dev/null; then
+        ip link del "$probe" 2>/dev/null || true
+        error "无法创建默认 $kind qdisc 进行比较"
+        return 1
+    fi
+    baseline_json=$(tc -j qdisc show dev "$probe" 2>/dev/null || true)
+    ip link del "$probe" 2>/dev/null || true
+    baseline_options=$(normalize_qdisc_options "$baseline_json" "$kind") || {
+        error "无法解析本机 $kind 默认参数"
+        return 1
+    }
+    printf '%s\n' "$baseline_options"
+}
+
 qdisc_has_custom_parameters() {
     local iface="$1"
     local kind="$2"
     local current_json
-    local baseline_json
     local current_options
     local baseline_options
-    local probe
 
     current_json=$(tc -j qdisc show dev "$iface" 2>/dev/null) || {
         error "无法读取 $iface 的 qdisc 参数，拒绝覆盖"
@@ -625,26 +659,71 @@ qdisc_has_custom_parameters() {
         error "无法解析 $iface 的 $kind qdisc 参数，拒绝覆盖"
         return 0
     }
-
-    # Linux IFNAMSIZ 限制为 15 字节；接口名必须保持短小。
-    probe="tcs${BASHPID}"
-    if ! ip link add "$probe" type dummy 2>/dev/null; then
-        error "无法创建临时接口读取本机 $kind 默认参数，拒绝覆盖"
-        return 0
-    fi
-    if ! tc qdisc replace dev "$probe" root "$kind" 2>/dev/null; then
-        ip link del "$probe" 2>/dev/null || true
-        error "无法创建默认 $kind qdisc 进行比较，拒绝覆盖"
-        return 0
-    fi
-    baseline_json=$(tc -j qdisc show dev "$probe" 2>/dev/null || true)
-    ip link del "$probe" 2>/dev/null || true
-    baseline_options=$(normalize_qdisc_options "$baseline_json" "$kind") || {
-        error "无法解析本机 $kind 默认参数，拒绝覆盖"
-        return 0
-    }
-
+    baseline_options=$(default_qdisc_options "$kind") || return 0
     [[ "$current_options" != "$baseline_options" ]]
+}
+
+mq_leaf_options_are_default() {
+    local current_json="$1"
+    local major="$2"
+    local kind="$3"
+    local baseline_options="$4"
+
+    jq -e --arg major "$major" --arg kind "$kind" --argjson baseline "$baseline_options" '
+        def clean_options:
+            (.options // {})
+            | with_entries(.key |= sub("[[:space:]]+$"; ""))
+            | del(.offload, .refcnt);
+        [.[]
+          | select(.kind == $kind)
+          | select((.parent // "") as $parent
+              | if $major == "0" then ($parent | test("^(:|0:)"))
+                else ($parent | startswith($major + ":")) end)
+          | clean_options] as $leaves
+        | ($leaves | length) > 0 and all($leaves[]; . == $baseline)
+    ' <<< "$current_json" >/dev/null 2>&1
+}
+
+mq_leaves_have_custom_parameters() {
+    local iface="$1"
+    local kind="$2"
+    local output
+    local current_json
+    local baseline_options
+    local handle
+    local major
+
+    output=$(tc qdisc show dev "$iface" 2>/dev/null) || return 0
+    handle=$(awk '$1 == "qdisc" && $2 == "mq" && $4 == "root" {print $3; exit}' <<< "$output")
+    major=${handle%:}
+    [[ -n "$major" ]] || return 0
+    current_json=$(tc -j qdisc show dev "$iface" 2>/dev/null) || return 0
+    baseline_options=$(default_qdisc_options "$kind") || return 0
+    mq_leaf_options_are_default "$current_json" "$major" "$kind" "$baseline_options" && return 1
+    return 0
+}
+
+mq_restore_leaf_kind() {
+    local iface="$1"
+    local leaf_kind
+
+    leaf_kind=$(mq_leaf_kind "$iface") || {
+        error "无法读取 mq 子队列类型，拒绝覆盖"
+        return 1
+    }
+    case "$leaf_kind" in fq|fq_codel|pfifo_fast|noqueue) ;;
+        *) error "当前 mq 使用不可恢复的子 qdisc：$leaf_kind"; return 1 ;;
+    esac
+    if ! mq_leaves_are_kind "$iface" "$leaf_kind"; then
+        error "当前 mq 子队列类型不一致，无法保证原样恢复"
+        return 1
+    fi
+    if [[ "$leaf_kind" =~ ^(fq|fq_codel)$ ]] &&
+        mq_leaves_have_custom_parameters "$iface" "$leaf_kind"; then
+        error "当前 mq 的 $leaf_kind 子队列包含自定义参数，拒绝覆盖"
+        return 1
+    fi
+    printf '%s\n' "$leaf_kind"
 }
 
 normalize_qdisc_options() {
@@ -693,7 +772,10 @@ check_external_conflicts() {
         return 1
     fi
 
-    kind=$(root_qdisc_kind "$iface")
+    if ! kind=$(root_qdisc_kind "$iface"); then
+        error "无法读取 $iface 的根 qdisc，拒绝覆盖"
+        return 1
+    fi
     if [[ "$kind" == "htb" ]] && ! is_own_shaper "$iface"; then
         error "检测到非本工具管理的 HTB，拒绝覆盖"
         return 1
@@ -724,6 +806,7 @@ check_external_conflicts() {
         # mq 会为每个硬件发送队列生成固有的 class mq；它不是用户自定义规则。
         # clsact/ingress filter 不属于根 qdisc，替换 root 时会原样保留。
         if [[ "$kind" == "mq" ]]; then
+            mq_restore_leaf_kind "$iface" >/dev/null || return 1
             if printf '%s\n' "$class_output" |
                 awk 'NF && !($1 == "class" && $2 == "mq") {found=1} END {exit !found}'; then
                 error "当前 mq 根队列下存在非 mq class，拒绝覆盖"
@@ -813,12 +896,23 @@ verify_qdisc_rate() {
 
 qdisc_save() {
     local iface="$1"
+    local kind
+    local leaf_kind=""
+    local owned=false
+
+    if ! kind=$(root_qdisc_kind "$iface"); then
+        error "无法保存 $iface 的根 qdisc，拒绝扫描"
+        return 1
+    fi
+    if [[ "$kind" == "mq" ]]; then
+        leaf_kind=$(mq_restore_leaf_kind "$iface") || return 1
+    fi
+    is_own_shaper "$iface" && owned=true
+
     QSAVE_IFACE="$iface"
-    QSAVE_KIND=$(root_qdisc_kind "$iface")
-    QSAVE_LEAF_KIND=""
-    [[ "$QSAVE_KIND" == "mq" ]] && QSAVE_LEAF_KIND=$(mq_leaf_kind "$iface" || true)
-    QSAVE_OWNED=false
-    is_own_shaper "$iface" && QSAVE_OWNED=true
+    QSAVE_KIND="$kind"
+    QSAVE_LEAF_KIND="$leaf_kind"
+    QSAVE_OWNED="$owned"
 }
 
 restore_simple_qdisc() {
@@ -890,8 +984,13 @@ save_baseline_to() {
     local json_prefix="$3"
     local kind leaf_kind=""
 
-    kind=$(root_qdisc_kind "$iface")
-    [[ "$kind" == "mq" ]] && leaf_kind=$(mq_leaf_kind "$iface" || true)
+    if ! kind=$(root_qdisc_kind "$iface"); then
+        error "无法读取 $iface 的根 qdisc，拒绝保存基线"
+        return 1
+    fi
+    if [[ "$kind" == "mq" ]]; then
+        leaf_kind=$(mq_restore_leaf_kind "$iface") || return 1
+    fi
     case "$kind" in
         ""|noqueue|mq|pfifo_fast|fq|fq_codel) ;;
         *) error "无法保存可自动恢复的 qdisc 基线：$kind"; return 1 ;;
@@ -914,11 +1013,23 @@ save_baseline_to() {
     chmod 600 "${json_prefix}-"*.json 2>/dev/null || true
 }
 
+remove_baseline() {
+    rm -f "$STATE_DIR/qdisc-baseline" "$STATE_DIR"/*-before.json
+}
+
 save_baseline() {
     local iface="$1"
+    local existing_iface
     mkdir -p "$STATE_DIR"
     chmod 700 "$STATE_DIR"
-    [[ -f "$STATE_DIR/qdisc-baseline" ]] && return 0
+    if [[ -f "$STATE_DIR/qdisc-baseline" ]]; then
+        existing_iface=$(read_config_value INTERFACE "$STATE_DIR/qdisc-baseline" || true)
+        if [[ "$existing_iface" != "$iface" ]]; then
+            error "残留 qdisc 基线属于 $existing_iface，拒绝用于 $iface"
+            return 1
+        fi
+        return 0
+    fi
     save_baseline_to "$iface" "$STATE_DIR/qdisc-baseline" "$STATE_DIR/before"
 }
 
@@ -1005,7 +1116,8 @@ restore_previous_persistent_state() {
     systemctl disable --now tcshape.service >/dev/null 2>&1 || true
     rm -f "$CONFIG_FILE" "$SERVICE_FILE"
     systemctl daemon-reload >/dev/null 2>&1 || return 1
-    restore_baseline
+    restore_baseline || return 1
+    remove_baseline
 }
 
 move_managed_file() {
@@ -1095,6 +1207,8 @@ cmd_set() {
         iface=$(detect_iface) || { error "无法确定默认出口接口"; return 1; }
     fi
 
+    check_external_conflicts "$iface" || return 1
+
     if [[ -f "$CONFIG_FILE" ]]; then
         previous_iface=$(read_config_value INTERFACE || true)
         [[ -n "$previous_iface" && -d "/sys/class/net/$previous_iface" ]] || {
@@ -1107,8 +1221,6 @@ cmd_set() {
     else
         save_baseline "$iface" || return 1
     fi
-
-    check_external_conflicts "$iface" || { rm -f "$previous_config"; return 1; }
 
     if [[ "$switched_iface" == "true" ]]; then
         baseline_iface=$(read_config_value INTERFACE "$STATE_DIR/qdisc-baseline" || true)
@@ -1190,7 +1302,7 @@ cmd_off() {
 
     rm -f "$CONFIG_FILE" "$SERVICE_FILE"
     systemctl daemon-reload
-    rm -f "$STATE_DIR/qdisc-baseline" "$STATE_DIR"/*-before.json
+    remove_baseline
     ok "已移除整形并恢复原 qdisc"
 }
 
@@ -1223,11 +1335,26 @@ traffic_used_bytes() {
     esac
 }
 
+traffic_reserve_bytes() {
+    local cap_mbit="${SCAN_CAP:-$DEFAULT_SCAN_CAP_MBIT}"
+    local reserve
+
+    [[ "$cap_mbit" =~ ^[0-9]+$ ]] || cap_mbit="$DEFAULT_SCAN_CAP_MBIT"
+    # 预留约 0.5 秒扫描上限流量，并限制在 1-5 GB。
+    reserve=$((cap_mbit * 62500))
+    (( reserve < TRAFFIC_MIN_RESERVE_BYTES )) && reserve=$TRAFFIC_MIN_RESERVE_BYTES
+    (( reserve > TRAFFIC_MAX_RESERVE_BYTES )) && reserve=$TRAFFIC_MAX_RESERVE_BYTES
+    printf '%s\n' "$reserve"
+}
+
 traffic_budget_reached() {
-    local total upload
+    local total upload reserve total_stop direction_stop
     total=$(traffic_used_bytes total) || return 0
     upload=$(traffic_used_bytes upload) || return 0
-    (( total >= TRAFFIC_TOTAL_LIMIT_BYTES || upload >= TRAFFIC_DIRECTION_LIMIT_BYTES ))
+    reserve=$(traffic_reserve_bytes)
+    total_stop=$((TRAFFIC_TOTAL_LIMIT_BYTES - reserve))
+    direction_stop=$((TRAFFIC_DIRECTION_LIMIT_BYTES - reserve))
+    (( total >= total_stop || upload >= direction_stop ))
 }
 
 format_bytes() {
@@ -1252,6 +1379,12 @@ kill_process_tree() {
     pkill -TERM -P "$pid" 2>/dev/null || true
     kill -TERM "$pid" 2>/dev/null || true
     sleep 1
+    pkill -KILL -P "$pid" 2>/dev/null || true
+    kill -KILL "$pid" 2>/dev/null || true
+}
+
+kill_process_tree_now() {
+    local pid="$1"
     pkill -KILL -P "$pid" 2>/dev/null || true
     kill -KILL "$pid" 2>/dev/null || true
 }
@@ -1332,7 +1465,7 @@ run_iperf() {
 
         while kill -0 "$pid" 2>/dev/null; do
             if traffic_budget_reached; then
-                kill_process_tree "$pid"
+                kill_process_tree_now "$pid"
                 wait "$pid" 2>/dev/null || true
                 rm -f "$PID_FILE" "$tmp"
                 return 75
@@ -1341,7 +1474,7 @@ run_iperf() {
                 kill_process_tree "$pid"
                 break
             fi
-            sleep 0.2
+            sleep "$TRAFFIC_POLL_INTERVAL_SECONDS"
         done
 
         wait "$pid" 2>/dev/null
@@ -1708,9 +1841,10 @@ cmd_scan() {
     iface=$(detect_iface) || { error "无法确定默认出口接口"; return 1; }
     check_external_conflicts "$iface" || return 1
     traffic_mark "$iface" || { error "无法读取网卡流量计数器"; return 1; }
+    SCAN_CAP="$scan_cap"
 
     show_current_shaping "$iface"
-    echo "流量上限：单方向 45 GB / 合计 90 GB"
+    echo "流量上限：单方向 45 GB / 合计 90 GB（按扫描上限预留 $(format_bytes "$(traffic_reserve_bytes)")）"
     echo "Sweep 会临时替换根 qdisc，并产生大量上传流量。"
     if [[ "$assume_yes" != "true" ]]; then
         local answer
@@ -1721,7 +1855,6 @@ cmd_scan() {
     SCAN_ID="$(date +%s)-${BASHPID}"
     SCAN_STARTED_AT="$(date +%s)"
     SCAN_IFACE="$iface"
-    SCAN_CAP="$scan_cap"
     SCAN_LOSS_THRESHOLD="$loss_threshold"
     mkdir -p "$STATE_DIR"
     chmod 700 "$STATE_DIR"
@@ -1745,7 +1878,7 @@ cmd_scan() {
     info "测速节点：$peer:$PEER_PORT"
     info "单档测试时长：${duration}s"
 
-    qdisc_save "$iface"
+    qdisc_save "$iface" || return 1
     SWEEP_ACTIVE=true
     trap cleanup_sweep EXIT
     trap 'exit 130' INT TERM HUP
