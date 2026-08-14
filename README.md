@@ -76,7 +76,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/linux_
 | ---: | --- | --- | --- |
 | 1 | `system-optimize.sh` | Zram、系统 sysctl、journald、THP、时区和 Chrony | 为 headless VPS 设置 Panic 恢复、日志上限和低干扰 THP 策略；Ubuntu 可能安装内核模块、固件与 CPU 微码 |
 | 2 | `system-customize.sh` | 动态 MOTD、中文 Locale、可选 XanMod | 可能修改 Locale、欢迎信息和内核 |
-| 3 | `network-optimize.sh` | BBR、fq、ECN、动态 TCP/UDP 缓冲区、IPv4/IPv6 转发 | 仅在上联网卡使用 `accept_ra=2` 保留云平台 IPv6 RA；自动测速最多约 90 GB |
+| 3 | `network-optimize.sh` | BBR、fq、ECN、动态 TCP/UDP 缓冲区、IPv4/IPv6 转发 | 默认静态零测速；主动测速需明确选择，最多约 90 GB；保留云平台 IPv6 RA |
 | 4 | `zsh-setup.sh` | Zsh、Oh My Zsh、Powerlevel10k 和插件 | 备份后重写 root 的 `.zshrc`，可修改默认 Shell |
 | 5 | `mise-setup.sh` | Mise、Python、Node.js 和依赖迁移 | 配置 Shell 集成及每周 Mise 自动更新 |
 | 6 | `tools-setup.sh` | NextTrace、Speedtest、htop、jq、tree 等 | 可能添加 NextTrace 第三方 APT 源 |
@@ -192,8 +192,14 @@ sudo bash <(curl -fsSL "$RAW_BASE/system-customize.sh") help
 
 ```bash
 RAW_BASE="https://raw.githubusercontent.com/LucaLin233/Linux/main/modules"
-# 不执行外部测速，只显示保守配置计划
-bash <(curl -fsSL "$RAW_BASE/network-optimize.sh") plan --no-probe
+# 交互终端无参数运行：选择静态、手填或主动探测
+sudo bash <(curl -fsSL "$RAW_BASE/network-optimize.sh")
+
+# 非交互默认静态；也可明确指定静态模式
+bash <(curl -fsSL "$RAW_BASE/network-optimize.sh") plan --static
+
+# 明确允许主动探测
+sudo bash <(curl -fsSL "$RAW_BASE/network-optimize.sh") install --probe
 
 # 使用明确的带宽和 RTT，避免自动测速
 sudo bash <(curl -fsSL "$RAW_BASE/network-optimize.sh") \
@@ -204,6 +210,8 @@ sudo bash <(curl -fsSL "$RAW_BASE/network-optimize.sh") restore
 sudo bash <(curl -fsSL "$RAW_BASE/network-optimize.sh") restore initial
 bash <(curl -fsSL "$RAW_BASE/network-optimize.sh") help
 ```
+
+主脚本交互运行到网络模块时会显示相同的三项选择；选择多个模块也不会跳过该确认。无 TTY 且未传模式参数时自动使用静态 32 MiB 缓冲区，不安装 `iperf3`/`jq`，也不产生测速流量。明确传入 `--auto`、`--probe`、`--static` 或线路参数时跳过交互；手填带宽缺少 RTT 时按 150 ms 计算且不测速，`--target` 必须配合 `--probe`。旧版受管配置中的 `ip_local_port_range = 1024 65535` 会恢复首次运行前的值；备份不可用时恢复 Debian 默认 `32768 60999`，新版不再管理该参数。
 
 网络模块默认面向同时承载 TCP、UDP 与 Docker 流量的代理节点：连接队列使用
 `somaxconn=65535`、`tcp_max_syn_backlog=16384`，TCP/socket 默认缓冲区按半个 BDP 动态取

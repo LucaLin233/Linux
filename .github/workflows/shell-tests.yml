@@ -26,6 +26,7 @@ jobs:
       - name: Run tests
         run: |
           bash tests/test-network-optimize.sh
+          bash tests/test-network-optimize-entry.sh
           bash tests/test-traffic-shape.sh
           bash tests/test-traffic-shape-state.sh
           bash tests/test-traffic-shape-sweep.sh
