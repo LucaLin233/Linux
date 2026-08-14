@@ -288,6 +288,7 @@ fi
 eval "$(sed -n '/^run_iperf() {/,/^}/p' "$ROOT_DIR/tools/traffic-shape.sh")"
 
 STATUS_CALLED=false
+require_root() { return 0; }
 install_self() { fail "status invoked install_self"; }
 ensure_dependencies() { fail "status invoked ensure_dependencies"; }
 check_status_dependencies() { return 0; }
