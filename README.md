@@ -76,7 +76,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/linux_
 | ---: | --- | --- | --- |
 | 1 | `system-optimize.sh` | Zram、系统 sysctl、journald、THP、时区和 Chrony | 为 headless VPS 设置 Panic 恢复、日志上限和低干扰 THP 策略；Ubuntu 可能安装内核模块、固件与 CPU 微码 |
 | 2 | `system-customize.sh` | 动态 MOTD、中文 Locale、可选 XanMod | 可能修改 Locale、欢迎信息和内核 |
-| 3 | `network-optimize.sh` | BBR、fq、ECN、动态 TCP/UDP 缓冲区、IPv4/IPv6 转发 | 默认静态零测速；主动测速需明确选择，最多约 90 GB；保留云平台 IPv6 RA |
+| 3 | `network-optimize.sh` | BBR、fq、按需禁用 ECN、动态 TCP/UDP 缓冲区、IPv4/IPv6 转发 | 默认静态零测速；主动测速需明确选择，最多约 90 GB；保留云平台 IPv6 RA |
 | 4 | `zsh-setup.sh` | Zsh、Oh My Zsh、Powerlevel10k 和插件 | 备份后重写 root 的 `.zshrc`，可修改默认 Shell |
 | 5 | `mise-setup.sh` | Mise、Python、Node.js 和依赖迁移 | 配置 Shell 集成及每周 Mise 自动更新 |
 | 6 | `tools-setup.sh` | NextTrace、Speedtest、htop、jq、tree 等 | 可能添加 NextTrace 第三方 APT 源 |
@@ -211,7 +211,7 @@ sudo bash <(curl -fsSL "$RAW_BASE/network-optimize.sh") restore initial
 bash <(curl -fsSL "$RAW_BASE/network-optimize.sh") help
 ```
 
-主脚本交互运行到网络模块时会显示相同的三项选择；选择多个模块也不会跳过该确认。无 TTY 且未传模式参数时自动使用静态 32 MiB 缓冲区，不安装 `iperf3`/`jq`，也不产生测速流量。明确传入 `--auto`、`--probe`、`--static` 或线路参数时跳过交互；手填带宽缺少 RTT 时按 150 ms 计算且不测速，`--target` 必须配合 `--probe`。旧版受管配置中的 `ip_local_port_range = 1024 65535` 会恢复首次运行前的值；备份不可用时恢复 Debian 默认 `32768 60999`，新版不再管理该参数。
+主脚本交互运行到网络模块时会显示相同的三项选择；选择多个模块也不会跳过该确认。无 TTY 且未传模式参数时自动使用静态 32 MiB 缓冲区，不安装 `iperf3`/`jq`，也不产生测速流量。明确传入 `--auto`、`--probe`、`--static` 或线路参数时跳过交互；手填带宽缺少 RTT 时按 150 ms 计算且不测速，`--target` 必须配合 `--probe`。旧版受管配置中的 `ip_local_port_range = 1024 65535` 会恢复首次运行前的值；备份不可用时恢复 Debian 默认 `32768 60999`，新版不再管理该参数。默认不写入 `net.ipv4.tcp_ecn`；只有显式传入 `--disable-ecn` 时才持久写入 `0`。升级旧版受管配置时，ECN 和 `nf_conntrack_max` 有可信首次运行备份便恢复原值；初始值未知则不猜测，仅停止持久管理并保留当前运行值到重启。
 
 网络模块默认面向同时承载 TCP、UDP 与 Docker 流量的代理节点：连接队列使用
 `somaxconn=65535`、`tcp_max_syn_backlog=16384`，TCP/socket 默认缓冲区按半个 BDP 动态取
@@ -220,7 +220,9 @@ bash <(curl -fsSL "$RAW_BASE/network-optimize.sh") help
 生成（按系统实际页大小换算），并明确启用 SACK、DSACK 和 TCP 时间戳。`--static` 保持固定
 32 MiB 上限和 4 MiB 默认值。`netdev_budget` 在带宽达到
 2.5 Gbps 且至少 2 个在线 CPU 时使用 600，其他环境使用 300。`netdev_budget_usecs` 保留
-内核按 HZ 选择的默认值，避免新内核拒绝低于 `2 jiffies` 的固定值。
+内核按 HZ 选择的默认值，避免新内核拒绝低于 `2 jiffies` 的固定值。模块不再按 RAM 放大
+`nf_conntrack_max`，避免在 buckets 不变时增加哈希链查找成本；`status` 仍显示 Conntrack 的
+`count / max` 和 buckets，供确有容量压力时判断。
 
 > `RAW_BASE` 只在当前 Shell 会话有效。上述进程替换语法需要 Bash 或 Zsh；不要改成
 > `curl ... | sudo bash`，否则交互模块可能无法正常读取终端输入。SSH、自动更新、内核和网络
@@ -396,7 +398,7 @@ sudo bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/t
 | 仅安装 XanMod | `xanmod-install.sh` | 同时让多个脚本反复管理内核源 |
 
 `network-optimize.sh` 与 `traffic-shape.sh` 职责不同，可以配合：前者管理 BBR、缓冲区和默认
-`fq`、仅上联网卡接收 RA 的 IPv6 转发和按能力启用的 TCP/Conntrack 参数；现有 Docker、veth、CNI 与隧道接口的 RA 会在运行时设为 `0` 并纳入回滚快照。后者在确实检测到 policer 后才使用 HTB 控制聚合出口速率，并保留 fq 叶子 pacing。
+`fq`、仅上联网卡接收 RA 的 IPv6 转发和按内核能力启用的 TCP 参数；现有 Docker、veth、CNI 与隧道接口的 RA 会在运行时设为 `0` 并纳入回滚快照。后者在确实检测到 policer 后才使用 HTB 控制聚合出口速率，并保留 fq 叶子 pacing。
 
 ## 高风险提醒
 

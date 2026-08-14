@@ -109,7 +109,7 @@ TUNING_MODE="auto"
 NO_PROBE="false"
 TUNING_SELECTION_EXPLICIT="false"
 ACTIVE_PROBE_REQUESTED="false"
-ECN_ENABLED="true"
+ECN_DISABLED="false"
 INITCWND_ENABLED="true"
 MANUAL_BANDWIDTH_MBPS=""
 MANUAL_DOWNLOAD_MBPS=""
@@ -442,7 +442,7 @@ parse_arguments() {
                 shift
                 ;;
             --disable-ecn)
-                ECN_ENABLED="false"
+                ECN_DISABLED="true"
                 shift
                 ;;
             --disable-initcwnd)
@@ -1674,7 +1674,7 @@ show_tuning_plan() {
     echo "wmem_default: $(format_mib "$WMEM_DEFAULT_BYTES") MiB"
     echo "计算依据: $CALCULATION_REASON"
     echo "initcwnd/initrwnd: $([[ "$INITCWND_ENABLED" == "true" ]] && echo "32（默认启用；浅层 policer 可能增加首秒突发）" || echo "内核默认")"
-    echo "ECN: $([[ "$ECN_ENABLED" == "true" ]] && echo 启用 || echo 禁用)"
+    echo "ECN: $([[ "$ECN_DISABLED" == "true" ]] && echo "显式禁用" || echo "保留当前设置（不持久接管）")"
 }
 
 network_health_snapshot() {
@@ -1778,7 +1778,7 @@ show_install_summary() {
     printf '网络健康：%s；TCP 重传新增 %s；受限 socket %s\n' \
         "$health" "$((a_retrans - b_retrans))" "$a_limited"
     printf '应用：%s + fq + ECN %s，配置成功\n' \
-        "$algorithm" "$([[ "$ECN_ENABLED" == "true" ]] && echo 开启 || echo 关闭)"
+        "$algorithm" "$([[ "$ECN_DISABLED" == "true" ]] && echo 已禁用 || echo 未接管)"
 }
 
 # === 新版网络配置 ===
@@ -1916,8 +1916,6 @@ EOF
 
 append_adaptive_capacity_settings() {
     local target_file="$1"
-    local current_conntrack
-    local target_conntrack
     local cpu_count=1
     local netdev_budget=300
     local peak_bandwidth=0
@@ -1945,24 +1943,6 @@ EOF
 
     # Linux 6.15+ 将最小值收紧为 2 jiffies；不同 HZ 内核可能拒绝固定 4000。
     # 保留内核当前值，避免在无 softnet time_squeeze 证据时盲目延长 softirq 周期。
-    if [[ -e /proc/sys/net/netfilter/nf_conntrack_max ]]; then
-        current_conntrack=$(cat /proc/sys/net/netfilter/nf_conntrack_max 2>/dev/null || echo 0)
-        target_conntrack=$((RAM_MB * 64))
-        (( target_conntrack < 65536 )) && target_conntrack=65536
-        (( target_conntrack > 1048576 )) && target_conntrack=1048576
-
-        # 每次都写入最终值，保证重复运行后配置仍可跨重启持久化。
-        # 当前值更高时沿用当前值，绝不降低管理员已有配置。
-        if [[ "$current_conntrack" =~ ^[0-9]+$ ]] && (( current_conntrack > target_conntrack )); then
-            target_conntrack="$current_conntrack"
-        fi
-
-        cat >> "$target_file" <<EOF
-
-# 按内存保守设置 Conntrack 上限，不降低现有配置
-net.netfilter.nf_conntrack_max = $target_conntrack
-EOF
-    fi
 }
 
 create_network_config() {
@@ -2020,8 +2000,15 @@ net.ipv4.tcp_fin_timeout = 30
 net.ipv4.tcp_slow_start_after_idle = 0
 net.ipv4.tcp_keepalive_time = 600
 net.ipv4.tcp_mtu_probing = 1
-net.ipv4.tcp_ecn = $([[ "$ECN_ENABLED" == "true" ]] && echo 1 || echo 0)
 EOF
+
+    if [[ "$ECN_DISABLED" == "true" ]]; then
+        cat >> "$target_file" <<'EOF'
+
+# 仅在显式请求时禁用 ECN；默认保留系统或管理员设置
+net.ipv4.tcp_ecn = 0
+EOF
+    fi
 
     append_supported_tcp_settings "$target_file"
     append_ipv6_forwarding_config "$target_file"
@@ -2154,6 +2141,92 @@ managed_unsafe_port_range_present() {
     [[ "$(normalize_port_range "$value" 2>/dev/null || true)" == "1024 65535" ]]
 }
 
+managed_removed_sysctl_present() {
+    local config_file="$1"
+    local key="$2"
+    local value
+
+    [[ -f "$config_file" ]] || return 1
+    grep -Fq '# 由 network-optimize.sh 自动生成。' "$config_file" || return 1
+    value=$(read_saved_sysctl_value "$config_file" "$key" || true)
+    [[ -n "$value" ]]
+}
+
+normalize_removed_sysctl_value() {
+    local key="$1"
+    local value="$2"
+
+    case "$key" in
+        net.ipv4.tcp_ecn)
+            awk 'NF == 1 && $1 ~ /^[0-2]$/ {print $1; found=1} END {exit !found}' <<< "$value"
+            ;;
+        net.netfilter.nf_conntrack_max)
+            awk 'NF == 1 && $1 ~ /^[0-9]+$/ && $1 > 0 {print $1; found=1} END {exit !found}' <<< "$value"
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+resolve_removed_sysctl_restore_value() {
+    local initial_runtime="$1"
+    local runtime_unknown="$2"
+    local initial_config="$3"
+    local config_unknown="$4"
+    local key="$5"
+    local source_file
+    local unknown_marker
+    local value
+
+    while IFS= read -r source_file && IFS= read -r unknown_marker; do
+        [[ ! -e "$unknown_marker" ]] || continue
+        value=$(read_saved_sysctl_value "$source_file" "$key" || true)
+        value=$(normalize_removed_sysctl_value "$key" "$value" 2>/dev/null || true)
+        if [[ -n "$value" ]]; then
+            printf '%s\n' "$value"
+            return 0
+        fi
+    done <<EOF
+$initial_runtime
+$runtime_unknown
+$initial_config
+$config_unknown
+EOF
+
+    return 1
+}
+
+removed_sysctl_display_name() {
+    case "$1" in
+        net.ipv4.tcp_ecn) printf '%s\n' 'ECN' ;;
+        net.netfilter.nf_conntrack_max) printf '%s\n' 'nf_conntrack_max' ;;
+        *) printf '%s\n' "$1" ;;
+    esac
+}
+
+capture_runtime_value_for_rollback() {
+    local output_file="$1"
+    local key="$2"
+    local value
+
+    grep -Fq "${key}=" "$output_file" && return 0
+    value=$(sysctl -n "$key" 2>/dev/null) || return 1
+    value=$(normalize_removed_sysctl_value "$key" "$value") || return 1
+    printf '%s=%s\n' "$key" "$value" >> "$output_file"
+}
+
+apply_removed_sysctl_migration() {
+    local key="$1"
+    local expected="$2"
+    local actual
+
+    sysctl -w "$key=$expected" >/dev/null 2>&1 || return 1
+    actual=$(sysctl -n "$key" 2>/dev/null) || return 1
+    actual=$(normalize_removed_sysctl_value "$key" "$actual") || return 1
+    [[ "$actual" == "$expected" ]]
+}
+
 resolve_port_range_restore_value() {
     local current_config="$1"
     local initial_runtime="$2"
@@ -2278,6 +2351,10 @@ install_optimization() {
     local bbr_enabled="false"
     local health_before
     local port_range_restore=""
+    local restore_value
+    local migration_index
+    local -a removed_sysctl_keys=()
+    local -a removed_sysctl_values=()
 
     info "开始配置网络优化..."
 
@@ -2322,6 +2399,7 @@ install_optimization() {
         return 1
     fi
     capture_virtual_ipv6_ra_values "$runtime_backup"
+    prepare_legacy_backup_state
 
     if port_range_restore=$(resolve_port_range_restore_value \
         "$NETWORK_CONF" "$RUNTIME_INITIAL_BACKUP" "$NETWORK_INITIAL_BACKUP"); then
@@ -2332,12 +2410,43 @@ install_optimization() {
         fi
     fi
 
+    if [[ "$ECN_DISABLED" != "true" ]] &&
+        managed_removed_sysctl_present "$NETWORK_CONF" net.ipv4.tcp_ecn; then
+        if restore_value=$(resolve_removed_sysctl_restore_value \
+            "$RUNTIME_INITIAL_BACKUP" "$RUNTIME_INITIAL_UNKNOWN" \
+            "$NETWORK_INITIAL_BACKUP" "$NETWORK_INITIAL_UNKNOWN" net.ipv4.tcp_ecn); then
+            removed_sysctl_keys+=(net.ipv4.tcp_ecn)
+            removed_sysctl_values+=("$restore_value")
+        else
+            warn "旧版受管 ECN 初始值未知；停止持久管理并保留当前运行值到重启"
+        fi
+    fi
+
+    if managed_removed_sysctl_present "$NETWORK_CONF" net.netfilter.nf_conntrack_max; then
+        if restore_value=$(resolve_removed_sysctl_restore_value \
+            "$RUNTIME_INITIAL_BACKUP" "$RUNTIME_INITIAL_UNKNOWN" \
+            "$NETWORK_INITIAL_BACKUP" "$NETWORK_INITIAL_UNKNOWN" \
+            net.netfilter.nf_conntrack_max); then
+            removed_sysctl_keys+=(net.netfilter.nf_conntrack_max)
+            removed_sysctl_values+=("$restore_value")
+        else
+            warn "旧版受管 nf_conntrack_max 初始值未知；停止持久管理并保留当前运行值到重启"
+        fi
+    fi
+
     install -d -m 0755 /var/lib/linux-setup
-    prepare_legacy_backup_state
     merge_initial_runtime_values "$runtime_backup" || {
         rm -f "$temp_config" "$runtime_backup"
         return 1
     }
+    for migration_index in "${!removed_sysctl_keys[@]}"; do
+        if ! capture_runtime_value_for_rollback \
+            "$runtime_backup" "${removed_sysctl_keys[$migration_index]}"; then
+            error "无法保存待移除参数的当前值：${removed_sysctl_keys[$migration_index]}"
+            rm -f "$temp_config" "$runtime_backup"
+            return 1
+        fi
+    done
     install -m 0600 "$runtime_backup" "$RUNTIME_PREVIOUS_BACKUP" || {
         rm -f "$temp_config" "$runtime_backup"
         return 1
@@ -2367,6 +2476,17 @@ install_optimization() {
         fi
         info "已移除旧版临时端口覆盖并恢复为：$port_range_restore"
     fi
+    for migration_index in "${!removed_sysctl_keys[@]}"; do
+        if ! apply_removed_sysctl_migration \
+            "${removed_sysctl_keys[$migration_index]}" \
+            "${removed_sysctl_values[$migration_index]}"; then
+            error "无法恢复待移除参数：${removed_sysctl_keys[$migration_index]}，正在回滚"
+            restore_runtime_values "$runtime_backup"
+            rm -f "$temp_config" "$runtime_backup"
+            return 1
+        fi
+        info "已停止管理 $(removed_sysctl_display_name "${removed_sysctl_keys[$migration_index]}") 并恢复首次运行值：${removed_sysctl_values[$migration_index]}"
+    done
     if ! normalize_virtual_ipv6_ra "$runtime_backup"; then
         restore_runtime_values "$runtime_backup"
         rm -f "$temp_config" "$runtime_backup"
@@ -2507,6 +2627,10 @@ show_status() {
     local optmem_max
     local keepalive_time
     local initcwnd_state
+    local tcp_ecn
+    local conntrack_count
+    local conntrack_max
+    local conntrack_buckets
 
     available_cc=$(cat /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null || echo "未知")
     current_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "未知")
@@ -2533,6 +2657,9 @@ show_status() {
     netdev_budget=$(sysctl -n net.core.netdev_budget 2>/dev/null || echo "不可用")
     optmem_max=$(sysctl -n net.core.optmem_max 2>/dev/null || echo "不可用")
     keepalive_time=$(sysctl -n net.ipv4.tcp_keepalive_time 2>/dev/null || echo "不可用")
+    conntrack_count=$(sysctl -n net.netfilter.nf_conntrack_count 2>/dev/null || echo "不可用")
+    conntrack_max=$(sysctl -n net.netfilter.nf_conntrack_max 2>/dev/null || echo "不可用")
+    conntrack_buckets=$(sysctl -n net.netfilter.nf_conntrack_buckets 2>/dev/null || echo "不可用")
     initcwnd_state=$(default_ipv4_route | grep -oE 'initcwnd [0-9]+( initrwnd [0-9]+)?' || echo "内核默认")
     tcp_ecn=$(sysctl -n net.ipv4.tcp_ecn 2>/dev/null || echo "不可用")
 
@@ -2572,6 +2699,8 @@ show_status() {
     echo "  netdev_budget: $netdev_budget"
     echo "  optmem_max: $optmem_max"
     echo "  临时端口范围: $port_range"
+    echo "  Conntrack 使用量: $conntrack_count / $conntrack_max"
+    echo "  Conntrack buckets: $conntrack_buckets"
 
     echo
     echo "缓冲区:"
@@ -2645,7 +2774,7 @@ install/plan 选项：
   - 只有 --auto、--probe 或交互确认后才主动探测并安装缺失依赖
   - 自动探测测量中国大陆与全球 RTT，并使用公共 iperf3 与 Cloudflare
   - 自动测速在约 90 GB 时停止，保留余量确保总量不超过 100 GB
-  - 默认启用 ECN；可用 --disable-ecn 回退
+  - 默认不持久管理 ECN；只在传入 --disable-ecn 时写入 tcp_ecn=0
   - 默认把 IPv4 默认路由的 initcwnd/initrwnd 设为 32；浅层 policer 可能增加首秒突发
   - 可用 --disable-initcwnd 保留内核默认初始拥塞窗口
   - 根据 2 × BDP + 2 MiB 余量动态设置缓冲区上限，默认值按半个 BDP 取 4-8 MiB
