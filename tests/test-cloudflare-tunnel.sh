@@ -9,6 +9,7 @@ export CLOUDFLARED_KEYRING="$TEST_DIR/keyring.gpg"
 export CLOUDFLARED_SOURCE_FILE="$TEST_DIR/cloudflared.list"
 export CLOUDFLARED_STATE_DIR="$TEST_DIR/state"
 export CLOUDFLARED_LEGACY_BIN="$TEST_DIR/cloudflared"
+export CLOUDFLARED_APT_BIN="$TEST_DIR/usr-bin-cloudflared"
 export CLOUDFLARED_LEGACY_UPDATER="$TEST_DIR/cloudflared-update"
 export CLOUDFLARED_LEGACY_SERVICE="$TEST_DIR/cloudflared-updater.service"
 export CLOUDFLARED_LEGACY_TIMER="$TEST_DIR/cloudflared-updater.timer"
@@ -23,7 +24,15 @@ source "$ROOT_DIR/tools/cloudflare_tunnel.sh"
 
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 pass() { printf 'PASS: %s\n' "$*"; }
-systemctl() { return 0; }
+SYSTEMCTL_TIMER_ENABLED=true
+systemctl() {
+    local unit="${!#}"
+    if [[ "${1:-}" =~ ^(is-enabled|is-active)$ && "$unit" == *.timer ]]; then
+        [[ "$SYSTEMCTL_TIMER_ENABLED" == true ]]
+        return
+    fi
+    return 0
+}
 curl() {
     local output=""
     while (( $# > 0 )); do
@@ -54,7 +63,7 @@ EOF
 chmod 0755 "$LEGACY_BIN"
 migrate_legacy_binary
 [[ ! -e "$LEGACY_BIN" ]] || fail "recognized legacy binary was not removed automatically"
-grep -Fq 'ExecStart=/usr/bin/cloudflared --no-autoupdate --token-file /etc/cloudflared/token' "$SERVICE_FILE" ||
+grep -Fq "ExecStart=$APT_BIN --no-autoupdate --token-file /etc/cloudflared/token" "$SERVICE_FILE" ||
     fail "legacy service executable path was not migrated safely"
 find "$STATE_DIR" -type f -name cloudflared.service -print -quit | grep -q . ||
     fail "legacy service unit was not backed up"
@@ -68,6 +77,23 @@ fi
 [[ -f "$LEGACY_BIN" ]] || fail "unrecognized legacy binary was deleted"
 rm -f "$LEGACY_BIN"
 pass "preserve legacy binary without ownership evidence"
+
+cat > "$APT_BIN" <<'EOF'
+#!/usr/bin/env bash
+echo 'cloudflared version 2026.8.2'
+EOF
+chmod 0755 "$APT_BIN"
+dpkg-query() {
+    if [[ "${1:-}" == -S && "${2:-}" == "$APT_BIN" ]]; then
+        return 0
+    fi
+    command dpkg-query "$@"
+}
+ln -s "$APT_BIN" "$LEGACY_BIN"
+migrate_legacy_binary
+[[ ! -e "$LEGACY_BIN" && ! -L "$LEGACY_BIN" ]] || fail "APT compatibility symlink was not removed"
+pass "complete partially migrated APT symlink layout"
+rm -f "$APT_BIN"
 
 write_auto_update_files
 bash -n "$AUTO_UPDATE_SCRIPT"
@@ -99,7 +125,13 @@ cat > "$LEGACY_TIMER" <<'EOF'
 Description=Cloudflared Auto Updater Timer
 EOF
 legacy_auto_update_present || fail "legacy auto-update intent was not detected"
-pass "detect legacy auto-update intent"
+pass "detect enabled legacy auto-update intent"
+SYSTEMCTL_TIMER_ENABLED=false
+if legacy_auto_update_present; then
+    fail "disabled legacy timer unexpectedly enabled new auto-update"
+fi
+pass "do not preserve disabled legacy timer"
+SYSTEMCTL_TIMER_ENABLED=true
 cleanup_legacy_updater
 [[ ! -e "$LEGACY_UPDATER" && ! -e "$LEGACY_SERVICE" && ! -e "$LEGACY_TIMER" ]] ||
     fail "managed legacy updater was not removed"

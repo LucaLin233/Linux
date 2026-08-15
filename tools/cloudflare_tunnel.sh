@@ -10,6 +10,7 @@ readonly STATE_DIR="${CLOUDFLARED_STATE_DIR:-/var/lib/cloudflared-wrapper}"
 readonly KEY_URL="https://pkg.cloudflare.com/cloudflare-main.gpg"
 readonly REPOSITORY="https://pkg.cloudflare.com/cloudflared"
 readonly LEGACY_BIN="${CLOUDFLARED_LEGACY_BIN:-/usr/local/bin/cloudflared}"
+readonly APT_BIN="${CLOUDFLARED_APT_BIN:-/usr/bin/cloudflared}"
 readonly LEGACY_UPDATER="${CLOUDFLARED_LEGACY_UPDATER:-/usr/local/bin/cloudflared-update}"
 readonly LEGACY_SERVICE="${CLOUDFLARED_LEGACY_SERVICE:-/etc/systemd/system/cloudflared-updater.service}"
 readonly LEGACY_TIMER="${CLOUDFLARED_LEGACY_TIMER:-/etc/systemd/system/cloudflared-updater.timer}"
@@ -167,10 +168,14 @@ cleanup_binary_updater() {
 }
 
 legacy_auto_update_present() {
-    if [[ -f "$LEGACY_TIMER" ]] && legacy_updater_is_managed "$LEGACY_TIMER"; then
+    if [[ -f "$LEGACY_TIMER" ]] && legacy_updater_is_managed "$LEGACY_TIMER" &&
+        { systemctl is-enabled --quiet cloudflared-updater.timer 2>/dev/null ||
+          systemctl is-active --quiet cloudflared-updater.timer 2>/dev/null; }; then
         return 0
     fi
-    if [[ -f "$BINARY_UPDATE_TIMER" ]] && binary_updater_is_managed "$BINARY_UPDATE_TIMER"; then
+    if [[ -f "$BINARY_UPDATE_TIMER" ]] && binary_updater_is_managed "$BINARY_UPDATE_TIMER" &&
+        { systemctl is-enabled --quiet cloudflared-update.timer 2>/dev/null ||
+          systemctl is-active --quiet cloudflared-update.timer 2>/dev/null; }; then
         return 0
     fi
     return 1
@@ -178,6 +183,14 @@ legacy_auto_update_present() {
 
 legacy_binary_is_safe_to_migrate() {
     [[ -x "$LEGACY_BIN" && -f "$SERVICE_FILE" ]] || return 1
+
+    if [[ -L "$LEGACY_BIN" ]] &&
+        [[ "$(readlink -f "$LEGACY_BIN")" == "$APT_BIN" ]] &&
+        dpkg-query -S "$APT_BIN" >/dev/null 2>&1 &&
+        grep -Fq "ExecStart=$APT_BIN " "$SERVICE_FILE"; then
+        return 0
+    fi
+
     grep -Fq "ExecStart=$LEGACY_BIN " "$SERVICE_FILE" || return 1
     "$LEGACY_BIN" version 2>/dev/null | grep -Eiq '^cloudflared version[[:space:]]'
 }
@@ -190,8 +203,8 @@ migrate_legacy_service_path() {
     backup_dir="$STATE_DIR/legacy-service-$(date +%Y%m%d_%H%M%S)"
     backup_path "$SERVICE_FILE" "$backup_dir"
     service_temp=$(mktemp)
-    sed "s#^ExecStart=$LEGACY_BIN #ExecStart=/usr/bin/cloudflared #" "$SERVICE_FILE" > "$service_temp"
-    grep -Fq 'ExecStart=/usr/bin/cloudflared ' "$service_temp" || {
+    sed "s#^ExecStart=$LEGACY_BIN #ExecStart=$APT_BIN #" "$SERVICE_FILE" > "$service_temp"
+    grep -Fq "ExecStart=$APT_BIN " "$service_temp" || {
         rm -f "$service_temp"
         error "旧服务路径迁移验证失败"
         return 1
@@ -209,7 +222,7 @@ migrate_legacy_service_path() {
             return 1
         fi
     fi
-    info "cloudflared.service 已迁移到 /usr/bin/cloudflared；原 unit 已备份。"
+    info "cloudflared.service 已迁移到 $APT_BIN；原 unit 已备份。"
 }
 
 migrate_legacy_binary() {
@@ -413,8 +426,8 @@ install_package() {
         info "检测到旧版每日更新配置，已自动迁移为 APT timer。"
     fi
 
-    [[ -x /usr/bin/cloudflared ]] || { error "APT cloudflared 安装后不可用"; return 1; }
-    /usr/bin/cloudflared version
+    [[ -x "$APT_BIN" ]] || { error "APT cloudflared 安装后不可用"; return 1; }
+    "$APT_BIN" version
 }
 
 install_service() {
@@ -482,13 +495,13 @@ upgrade_cloudflared() {
             return 1
         }
     fi
-    /usr/bin/cloudflared version
+    "$APT_BIN" version
 }
 
 show_status() {
     if dpkg-query -W -f='${db:Status-Status}' cloudflared 2>/dev/null | grep -qx installed; then
         echo "APT 包: 已安装"
-        /usr/bin/cloudflared version 2>/dev/null || true
+        "$APT_BIN" version 2>/dev/null || true
     else
         echo "APT 包: 未安装"
     fi

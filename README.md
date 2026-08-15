@@ -285,7 +285,9 @@ cloudflared 时再启用。`upgrade` 可用于立即手动检查、升级并重�
 受管安装后，脚本会全自动安装 APT 包，把 `cloudflared.service` 从
 `/usr/local/bin/cloudflared` 事务式迁移到 `/usr/bin/cloudflared`，原样保留 Token/config 参数，
 验证服务后再备份并移除旧二进制，无需重新输入 Token。任一验证失败都会恢复旧 unit 和运行状态；
-归属证据不足则保留文件并停止，不盲删。`migrate-legacy` 可单独执行相同迁移流程。
+归属证据不足则保留文件并停止，不盲删。若上一次迁移已完成 APT 安装和 unit 切换，只留下
+`/usr/local/bin/cloudflared -> /usr/bin/cloudflared` 兼容链接，重新运行也会自动识别、备份并收尾。
+`migrate-legacy` 可单独执行相同迁移流程。
 
 脚本使用 `service install --no-update-service`，并识别、备份和清理旧版裸二进制更新单元，避免
 APT 包与 `cloudflared update` 混用。若旧环境已有每日自动更新 timer，迁移时会自动换成新的
