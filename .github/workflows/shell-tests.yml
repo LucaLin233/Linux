@@ -9,13 +9,15 @@ permissions:
   contents: read
 
 jobs:
-  test:
+  ubuntu:
+    name: Ubuntu 24.04 lint and tests
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
       - name: Install test dependencies
-        run: sudo apt-get update && sudo apt-get install -y shellcheck jq iproute2
+        run: sudo apt-get update && sudo apt-get install -y shellcheck jq iproute2 rsync openssh-client
 
       - name: Check Bash syntax
         run: find . -type f -name '*.sh' -print0 | xargs -0 -n1 bash -n
@@ -24,10 +26,24 @@ jobs:
         run: shellcheck -x --severity=error linux_setup.sh modules/*.sh tools/*.sh tests/*.sh
 
       - name: Run tests
+        run: bash tests/run.sh
+
+  debian-13:
+    name: Debian 13 tests
+    runs-on: ubuntu-24.04
+    container: debian:13-slim
+    timeout-minutes: 15
+    steps:
+      - name: Install test dependencies
         run: |
-          bash tests/test-network-optimize.sh
-          bash tests/test-network-optimize-entry.sh
-          bash tests/test-traffic-shape.sh
-          bash tests/test-traffic-shape-state.sh
-          bash tests/test-traffic-shape-sweep.sh
-          bash tests/test-ssh-security.sh
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            bash ca-certificates coreutils git iproute2 jq openssh-client rsync util-linux
+
+      - uses: actions/checkout@v4
+
+      - name: Check Bash syntax
+        run: find . -type f -name '*.sh' -print0 | xargs -0 -n1 bash -n
+
+      - name: Run tests
+        run: bash tests/run.sh

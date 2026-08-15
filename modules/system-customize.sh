@@ -152,7 +152,8 @@ backup_managed_file() {
     local initial_unknown="${backup_prefix}.initial-unknown"
 
     if [[ ! -e "$initial_backup" && ! -e "$initial_absent" && ! -e "$initial_unknown" ]]; then
-        if [[ -f "$file" ]] && grep -Fq '由 system-customize.sh 自动生成' "$file"; then
+        if [[ -f "$file" ]] &&
+            grep -Eq '# linux-setup:managed-motd|由 (system-customize|setup-motd)\.sh 自动生成' "$file"; then
             install -D -m 0600 /dev/null "$initial_unknown" || return 1
         elif [[ -e "$file" || -L "$file" ]]; then
             cp -a "$file" "$initial_backup" || return 1
@@ -268,8 +269,11 @@ configure_motd() {
 
     install -m 0755 /dev/stdin "$MOTD_SCRIPT" <<'SCRIPT'
 #!/usr/bin/env bash
-# 由 system-customize.sh 自动生成。
+# linux-setup:managed-motd
+# 由 Linux Scripts Collection 自动生成。
 # 欢迎横幅与系统状态面板。
+
+export LC_ALL=C
 
 hostname_value=$(hostname)
 kernel=$(uname -r)
@@ -318,28 +322,6 @@ pick_color() {
     fi
 }
 
-read -r _ user1 nice1 system1 idle1 iowait1 irq1 softirq1 steal1 _ < <(grep '^cpu ' /proc/stat)
-total1=$((user1 + nice1 + system1 + idle1 + iowait1 + irq1 + softirq1 + steal1))
-busy1=$((user1 + nice1 + system1 + irq1 + softirq1 + steal1))
-
-sleep 0.5
-
-read -r _ user2 nice2 system2 idle2 iowait2 irq2 softirq2 steal2 _ < <(grep '^cpu ' /proc/stat)
-total2=$((user2 + nice2 + system2 + idle2 + iowait2 + irq2 + softirq2 + steal2))
-busy2=$((user2 + nice2 + system2 + irq2 + softirq2 + steal2))
-
-total_delta=$((total2 - total1))
-busy_delta=$((busy2 - busy1))
-
-if (( total_delta > 0 )); then
-    cpu_percent=$(awk -v busy="$busy_delta" -v total="$total_delta" \
-        'BEGIN {printf "%.1f", busy / total * 100}')
-    cpu_color=$(pick_color "$cpu_percent" "cpu")
-else
-    cpu_percent="N/A"
-    cpu_color="$VALUE"
-fi
-
 load_average=$(awk '{printf "%.2f %.2f %.2f", $1, $2, $3}' /proc/loadavg)
 
 memory_raw=$(awk '
@@ -358,8 +340,8 @@ memory_total="${memory_rest%%|*}G"
 memory_percent="${memory_raw##*|}"
 memory_color=$(pick_color "$memory_percent" "memory")
 
-disk_percent=$(df / | awk 'NR == 2 {gsub(/%/, "", $5); print $5}')
-disk_usage=$(df -h / | awk 'NR == 2 {printf "%s / %s", $3, $2}')
+disk_percent=$(df -P / | awk 'NR == 2 {gsub(/%/, "", $5); print $5}')
+disk_usage=$(df -Ph / | awk 'NR == 2 {printf "%s / %s", $3, $2}')
 disk_color=$(pick_color "$disk_percent" "disk")
 
 printf "\n${BLUE_BG} 已连接 %s 服务器 ${RESET}\n" "$hostname_value"
@@ -367,8 +349,7 @@ printf "${ITALIC_DIM} 今天想要做些什么？${RESET}\n\n"
 
 printf "  ${LABEL}内核${RESET}      ${VALUE}%s${RESET}\n" "$kernel"
 printf "  ${LABEL}运行时间${RESET}  ${VALUE}%s${RESET}\n" "$uptime_value"
-printf "  ${LABEL}CPU负载${RESET}   ${VALUE}%s  (${cpu_color}%s%%${VALUE})${RESET}\n" \
-    "$load_average" "$cpu_percent"
+printf "  ${LABEL}CPU负载${RESET}   ${VALUE}%s${RESET}\n" "$load_average"
 printf "  ${LABEL}内存${RESET}      ${VALUE}%s / %s  (${memory_color}%s%%${VALUE})${RESET}\n" \
     "$memory_used" "$memory_total" "$memory_percent"
 printf "  ${LABEL}磁盘${RESET}      ${VALUE}%s  (${disk_color}%s%%${VALUE})${RESET}\n" \

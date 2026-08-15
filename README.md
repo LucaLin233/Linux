@@ -12,6 +12,8 @@
 - Ubuntu 22.04（Jammy）不在 XanMod 官方 APT 支持范围内，内核步骤会安全跳过；
 - 独立工具：以脚本顶部说明为准；大部分面向 Debian/Ubuntu 系统；
 - `xanmod-install.sh`：主要面向 amd64/x86-64；
+- CI 在 Ubuntu 24.04 和 Debian 13 容器运行全部纯 Shell 测试；systemd 服务切换使用 stub
+  验证事务与回滚，不等同于真实主机 E2E；
 - 需要访问 GitHub、系统 APT 软件源和各工具的上游服务。
 
 ## 快速开始
@@ -255,16 +257,33 @@ bash <(curl -fsSL "$RAW_BASE/network-optimize.sh") help
 
 ### Cloudflare Tunnel
 
-安装、升级或彻底卸载 cloudflared Tunnel；安装流程会配置 systemd 服务和每日自动更新。
+[`tools/cloudflare_tunnel.sh`](tools/cloudflare_tunnel.sh) 是 Cloudflare 官方 APT 安装流程的薄包装器，
+只支持 Debian/Ubuntu 与 systemd。它使用官方 stable 软件源和 `cloudflared service install`，
+不再下载裸二进制。安装完成后会询问是否启用受管的 APT systemd timer，默认不启用；也可稍后
+使用独立命令启用。
 
 ```bash
 sudo bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/tools/cloudflare_tunnel.sh) install
 sudo bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/tools/cloudflare_tunnel.sh) upgrade
+bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/tools/cloudflare_tunnel.sh) status
+sudo bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/tools/cloudflare_tunnel.sh) enable-auto-update
+sudo bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/tools/cloudflare_tunnel.sh) disable-auto-update
+sudo bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/tools/cloudflare_tunnel.sh) migrate-legacy
 sudo bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/tools/cloudflare_tunnel.sh) uninstall
 ```
 
-Token 属于敏感凭据，不要写入日志、README 或提交到 Git。
-`uninstall` 会删除本脚本管理的二进制、服务、自动更新和配置文件。
+安装时 Token 使用隐藏输入，不会写入日志。APT 包会随普通 `apt upgrade` 或 `apt full-upgrade`
+更新，但这些命令本身不会自动运行。`enable-auto-update` 会创建每日 systemd timer：先执行
+`apt-get update`，比较已安装版本与候选版本，只在存在新版时升级 `cloudflared`；服务原本运行时
+才会重启。timer 使用随机延迟、APT 锁等待和独立 flock，日志进入 journal。
+
+启用自动更新意味着升级时单实例 Tunnel 会短暂中断。如果已经使用本仓库
+`auto-update-setup.sh` 每周执行完整系统升级，通常无需重复启用此 timer；只有需要更频繁检测
+cloudflared 时再启用。`upgrade` 可用于立即手动检查、升级并重启服务。
+
+`migrate-legacy` 会识别、备份并清理旧版脚本放在 `/usr/local/bin` 的二进制和自定义 updater；
+无法确认归属的文件会保留。`uninstall` 删除服务、APT 包及本脚本管理的软件源，但保留 Tunnel
+配置和凭据。彻底清理须显式运行 `purge`，并在交互终端输入 `PURGE` 二次确认。
 
 ### 出口流量整形 tcshape
 
@@ -313,23 +332,6 @@ Sweep 可能消耗大量上传流量，并会临时替换默认出口接口的�
 
 详细参数、安全边界和恢复说明见 [`docs/traffic-shape.md`](docs/traffic-shape.md)。
 
-### 旧版网络优化脚本
-
-```bash
-sudo bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/tools/kernel.sh) install -c    # 国内场景
-sudo bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/tools/kernel.sh) install -i    # 国际场景
-sudo bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/tools/kernel.sh) status
-sudo bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/tools/kernel.sh) restore
-
-sudo bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/tools/kernel2.sh) install
-sudo bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/tools/kernel2.sh) status
-sudo bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/tools/kernel2.sh) restore
-```
-
-`kernel.sh`、`kernel2.sh` 和 `modules/network-optimize.sh` 会管理重叠的 sysctl、BBR、资源限制
-或根 qdisc。**不要叠加执行。** 新部署优先使用 `network-optimize.sh`；旧脚本主要用于已有环境的
-兼容和恢复。
-
 ### 多服务器文件推送
 
 [`tools/push.sh`](tools/push.sh) 使用 SSH 和 rsync 并发同步文件，支持密钥或密码认证。
@@ -345,31 +347,42 @@ cd Linux
 ```
 
 默认生成当前目录的 `config.conf`，权限为 `600`，且仓库已通过 `.gitignore` 忽略根目录和
-`tools/` 下的该文件。推荐密钥认证，不要把密码直接写进仓库。
+`tools/` 下的该文件。该文件会作为受信任的 Bash 配置加载，因此拒绝符号链接、非当前用户/root
+所有以及组或其他用户可写的配置。默认使用密钥认证、持久化 `known_hosts`，并支持
+`user@[IPv6]:port` 格式。
 
-> 示例配置默认 `DELETE_EXTRA="true"`，等同于 rsync 删除目标端多余文件。首次使用前必须核对
-> 源路径、目标路径和服务器列表，必要时将它改为 `false`。
+示例配置默认 `DELETE_EXTRA="false"`，不会删除目标端多余文件。启用删除时，交互执行必须输入
+`DELETE`；非交互执行还须显式设置 `ALLOW_DELETE_EXTRA="true"`。将 `known_hosts` 指向
+`/dev/null` 同样需要显式设置 `ALLOW_INSECURE_HOST_KEY_STORAGE="true"`，不推荐这样做。
 
 ### sing-box 安装
 
 ```bash
 sudo bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/tools/sbinstall.sh) install
+bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/tools/sbinstall.sh) status
 sudo bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/tools/sbinstall.sh) uninstall
 ```
 
-安装前需要准备有效的 `/root/proxy/config.json` 以及脚本要求的证书文件权限。脚本会下载
-sing-box、创建目录和 systemd 服务；卸载会停止并移除本脚本管理的服务和程序文件。
+安装前需准备有效的 `/root/proxy/config.json`；证书由该配置引用时还需准备 `cert.crt` 和
+`private.key`。脚本从 SagerNet GitHub Release API 获取目标文件及 SHA-256 digest，在 staging
+目录完成摘要、版本和 `sing-box check` 校验后才替换运行版本。已有二进制和 unit 会保存到
+`/root/proxy/backup`；替换或服务重启失败时自动回滚。卸载仅移除本脚本可确认管理的服务和
+程序文件，保留配置、证书与回滚快照。
 
 ### 独立动态 MOTD
 
 ```bash
-sudo bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/tools/setup-motd.sh)
+sudo bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/tools/setup-motd.sh) install
+sudo bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/tools/setup-motd.sh) status
+sudo bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/tools/setup-motd.sh) restore
+sudo bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/tools/setup-motd.sh) restore initial
 ```
 
-用于只部署动态登录欢迎信息，与 `modules/system-customize.sh` 的 MOTD 功能重叠；已经运行系统
-定制模块时通常无需再次执行。脚本会备份并清空静态登录欢迎文件；其中静态 MOTD 会被替换为
-普通空文件，避免其链接到运行时动态 MOTD 时被 PAM 重复显示。动态 MOTD 脚本的备份保存在
-`/var/lib/linux-setup/motd-backups`，不会留在可执行的 `update-motd.d` 目录中。
+用于只部署动态登录欢迎信息，与 `modules/system-customize.sh` 使用相同 MOTD 模板和
+`previous`/`initial` 两级备份状态。已经运行系统定制模块时通常无需重复安装。静态欢迎文件会
+备份后替换为空的普通文件，避免 PAM 重复显示；动态脚本备份保存在
+`/var/lib/linux-setup/motd-backups`。状态面板直接显示 load average，不再为计算即时 CPU
+百分比而固定延迟每次登录。
 
 ### XanMod 内核
 
@@ -392,7 +405,7 @@ sudo bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/t
 
 | 需求 | 推荐脚本 | 避免同时使用 |
 | --- | --- | --- |
-| 新 Debian/Ubuntu VPS 网络基础调优 | `modules/network-optimize.sh` | `kernel.sh`、`kernel2.sh` |
+| 新 Debian/Ubuntu VPS 网络基础调优 | `modules/network-optimize.sh` | 其他会覆盖 sysctl 或根 qdisc 的调优脚本 |
 | 特定出口 policer 检测与整形 | `tools/traffic-shape.sh` | tcpfit Shape、CAKE、TBF、其他 HTB |
 | 一键系统定制 | `system-customize.sh` | 重复运行 `setup-motd.sh` |
 | 仅安装 XanMod | `xanmod-install.sh` | 同时让多个脚本反复管理内核源 |
@@ -409,7 +422,7 @@ sudo bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/t
 - **网络测速**：`network-optimize` 和 tcshape 都可能产生大量流量；
 - **qdisc**：不要叠加多个整形工具；tcshape 遇到高级或未知 qdisc 会拒绝覆盖；
 - **内核**：安装新内核前确认磁盘空间、架构和可用的旧内核；
-- **rsync**：`DELETE_EXTRA=true` 会删除目标端多余文件；
+- **rsync**：默认不删除远端文件；显式启用 `DELETE_EXTRA=true` 后会要求额外确认；
 - **凭据**：不要提交 Token、密码、私钥、`.env` 或 `config.conf`。
 
 ## 问题排查
