@@ -14,7 +14,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install test dependencies
         run: sudo apt-get update && sudo apt-get install -y shellcheck jq iproute2 rsync openssh-client
@@ -40,7 +40,7 @@ jobs:
           DEBIAN_FRONTEND=noninteractive apt-get install -y \
             bash ca-certificates coreutils git iproute2 jq openssh-client rsync util-linux
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Check Bash syntax
         run: find . -type f -name '*.sh' -print0 | xargs -0 -n1 bash -n
