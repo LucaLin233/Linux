@@ -16,6 +16,11 @@ readonly LEGACY_TIMER="${CLOUDFLARED_LEGACY_TIMER:-/etc/systemd/system/cloudflar
 readonly AUTO_UPDATE_SCRIPT="${CLOUDFLARED_AUTO_UPDATE_SCRIPT:-/usr/local/libexec/cloudflared-apt-update}"
 readonly AUTO_UPDATE_SERVICE="${CLOUDFLARED_AUTO_UPDATE_SERVICE:-/etc/systemd/system/cloudflared-apt-update.service}"
 readonly AUTO_UPDATE_TIMER="${CLOUDFLARED_AUTO_UPDATE_TIMER:-/etc/systemd/system/cloudflared-apt-update.timer}"
+readonly SERVICE_FILE="${CLOUDFLARED_SERVICE_FILE:-/etc/systemd/system/cloudflared.service}"
+readonly BINARY_UPDATE_SERVICE="${CLOUDFLARED_BINARY_UPDATE_SERVICE:-/etc/systemd/system/cloudflared-update.service}"
+readonly BINARY_UPDATE_TIMER="${CLOUDFLARED_BINARY_UPDATE_TIMER:-/etc/systemd/system/cloudflared-update.timer}"
+
+PRESERVE_AUTO_UPDATE=false
 
 info() { printf '[INFO] %s\n' "$*"; }
 warn() { printf '[WARN] %s\n' "$*" >&2; }
@@ -113,10 +118,98 @@ cleanup_legacy_updater() {
     systemctl stop cloudflared-updater.service >/dev/null 2>&1 || true
     for path in "${paths[@]}"; do
         [[ -e "$path" ]] || continue
-        backup_path "$path" "$backup_dir"
-        rm -f "$path"
+        backup_path "$path" "$backup_dir" || return 1
+        rm -f "$path" || return 1
     done
     systemctl daemon-reload
+    for path in "${paths[@]}"; do
+        [[ ! -e "$path" ]] || return 1
+    done
+}
+
+binary_updater_is_managed() {
+    local path="$1"
+    case "$path" in
+        "$BINARY_UPDATE_SERVICE")
+            grep -Fq 'Description=Update cloudflared' "$path" &&
+                grep -Fq ' update; code=$?' "$path"
+            ;;
+        "$BINARY_UPDATE_TIMER")
+            grep -Fq 'Description=Update cloudflared' "$path" &&
+                grep -Fq 'OnCalendar=daily' "$path"
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+cleanup_binary_updater() {
+    local path backup_dir
+    local -a paths=("$BINARY_UPDATE_SERVICE" "$BINARY_UPDATE_TIMER")
+    for path in "${paths[@]}"; do
+        [[ -e "$path" ]] || continue
+        binary_updater_is_managed "$path" || {
+            warn "发现无法确认归属的 cloudflared 二进制更新单元，保留: $path"
+            return 1
+        }
+    done
+    backup_dir="$STATE_DIR/binary-updater-$(date +%Y%m%d_%H%M%S)"
+    systemctl disable --now cloudflared-update.timer >/dev/null 2>&1 || true
+    systemctl stop cloudflared-update.service >/dev/null 2>&1 || true
+    for path in "${paths[@]}"; do
+        [[ -e "$path" ]] || continue
+        backup_path "$path" "$backup_dir" || return 1
+        rm -f "$path" || return 1
+    done
+    systemctl daemon-reload
+    for path in "${paths[@]}"; do
+        [[ ! -e "$path" ]] || return 1
+    done
+}
+
+legacy_auto_update_present() {
+    if [[ -f "$LEGACY_TIMER" ]] && legacy_updater_is_managed "$LEGACY_TIMER"; then
+        return 0
+    fi
+    if [[ -f "$BINARY_UPDATE_TIMER" ]] && binary_updater_is_managed "$BINARY_UPDATE_TIMER"; then
+        return 0
+    fi
+    return 1
+}
+
+legacy_binary_is_safe_to_migrate() {
+    [[ -x "$LEGACY_BIN" && -f "$SERVICE_FILE" ]] || return 1
+    grep -Fq "ExecStart=$LEGACY_BIN " "$SERVICE_FILE" || return 1
+    "$LEGACY_BIN" version 2>/dev/null | grep -Eiq '^cloudflared version[[:space:]]'
+}
+
+migrate_legacy_service_path() {
+    [[ -f "$SERVICE_FILE" ]] || return 0
+    grep -Fq "ExecStart=$LEGACY_BIN " "$SERVICE_FILE" || return 0
+
+    local backup_dir service_temp was_active=false
+    backup_dir="$STATE_DIR/legacy-service-$(date +%Y%m%d_%H%M%S)"
+    backup_path "$SERVICE_FILE" "$backup_dir"
+    service_temp=$(mktemp)
+    sed "s#^ExecStart=$LEGACY_BIN #ExecStart=/usr/bin/cloudflared #" "$SERVICE_FILE" > "$service_temp"
+    grep -Fq 'ExecStart=/usr/bin/cloudflared ' "$service_temp" || {
+        rm -f "$service_temp"
+        error "旧服务路径迁移验证失败"
+        return 1
+    }
+    systemctl is-active --quiet cloudflared.service && was_active=true || true
+    install -m 0644 "$service_temp" "$SERVICE_FILE"
+    rm -f "$service_temp"
+    systemctl daemon-reload
+    if [[ "$was_active" == true ]]; then
+        if ! systemctl restart cloudflared.service || ! systemctl is-active --quiet cloudflared.service; then
+            cp -a "$backup_dir/$(basename "$SERVICE_FILE")" "$SERVICE_FILE"
+            systemctl daemon-reload
+            systemctl restart cloudflared.service >/dev/null 2>&1 || true
+            error "新 APT 二进制启动失败，已恢复旧服务路径"
+            return 1
+        fi
+    fi
+    info "cloudflared.service 已迁移到 /usr/bin/cloudflared；原 unit 已备份。"
 }
 
 migrate_legacy_binary() {
@@ -125,17 +218,19 @@ migrate_legacy_binary() {
         return 0
     fi
 
-    warn "$LEGACY_BIN 会遮蔽 APT 安装的 /usr/bin/cloudflared"
-    if ! confirm "备份并移除该旧二进制？"; then
-        error "必须先处理旧二进制；也可运行 migrate-legacy"
+    if ! legacy_binary_is_safe_to_migrate; then
+        error "无法确认 $LEGACY_BIN 属于旧版受管安装，已保留并停止迁移"
         return 1
     fi
+
+    info "检测到可安全迁移的旧版 cloudflared 安装"
+    migrate_legacy_service_path
 
     local backup_dir
     backup_dir="$STATE_DIR/legacy-$(date +%Y%m%d_%H%M%S)"
     backup_path "$LEGACY_BIN" "$backup_dir"
     rm -f "$LEGACY_BIN"
-    info "旧二进制已备份到 $backup_dir"
+    info "旧二进制已自动备份并移除: $backup_dir"
 }
 
 write_auto_update_files() {
@@ -263,8 +358,8 @@ disable_auto_update() {
     systemctl stop cloudflared-apt-update.service >/dev/null 2>&1 || true
     for path in "$AUTO_UPDATE_SCRIPT" "$AUTO_UPDATE_SERVICE" "$AUTO_UPDATE_TIMER"; do
         [[ -e "$path" ]] || continue
-        backup_path "$path" "$backup_dir"
-        rm -f "$path"
+        backup_path "$path" "$backup_dir" || return 1
+        rm -f "$path" || return 1
     done
     systemctl daemon-reload
     info "APT 自动更新组件已禁用；备份目录: $backup_dir"
@@ -279,15 +374,47 @@ show_auto_update_status() {
     fi
 }
 
+validate_migration_inputs() {
+    local path
+    if [[ -e "$LEGACY_BIN" || -L "$LEGACY_BIN" ]] &&
+        ! dpkg-query -S "$LEGACY_BIN" >/dev/null 2>&1 &&
+        ! legacy_binary_is_safe_to_migrate; then
+        error "无法确认 $LEGACY_BIN 属于旧版受管安装，拒绝自动迁移"
+        return 1
+    fi
+    for path in "$LEGACY_UPDATER" "$LEGACY_SERVICE" "$LEGACY_TIMER"; do
+        [[ -e "$path" ]] || continue
+        legacy_updater_is_managed "$path" || {
+            error "旧更新文件归属不明，拒绝自动迁移: $path"
+            return 1
+        }
+    done
+    for path in "$BINARY_UPDATE_SERVICE" "$BINARY_UPDATE_TIMER"; do
+        [[ -e "$path" ]] || continue
+        binary_updater_is_managed "$path" || {
+            error "二进制更新单元归属不明，拒绝自动迁移: $path"
+            return 1
+        }
+    done
+}
+
 install_package() {
+    validate_migration_inputs
+    PRESERVE_AUTO_UPDATE=false
+    legacy_auto_update_present && PRESERVE_AUTO_UPDATE=true || true
     configure_repository
     apt-get update
     DEBIAN_FRONTEND=noninteractive apt-get install -y cloudflared
     migrate_legacy_binary
-    cleanup_legacy_updater || warn "旧自动更新组件未完全清理"
+    cleanup_legacy_updater || { error "旧自定义更新组件清理失败"; return 1; }
+    cleanup_binary_updater || { error "二进制更新单元清理失败"; return 1; }
+    if [[ "$PRESERVE_AUTO_UPDATE" == true ]]; then
+        enable_auto_update
+        info "检测到旧版每日更新配置，已自动迁移为 APT timer。"
+    fi
 
-    command -v cloudflared >/dev/null || { error "cloudflared 安装后不可用"; return 1; }
-    cloudflared version
+    [[ -x /usr/bin/cloudflared ]] || { error "APT cloudflared 安装后不可用"; return 1; }
+    /usr/bin/cloudflared version
 }
 
 install_service() {
@@ -301,7 +428,7 @@ install_service() {
     read -r -s -p "粘贴 Cloudflare Tunnel Token: " token
     printf '\n'
     [[ -n "$token" ]] || { error "Token 不能为空"; return 1; }
-    if ! cloudflared service install "$token"; then
+    if ! cloudflared service install --no-update-service "$token"; then
         unset token
         error "官方 service install 执行失败"
         return 1
@@ -319,23 +446,35 @@ install_cloudflared() {
     check_platform
     install_package
     install_service
-    info "安装完成。版本由 APT 管理；自动检查默认关闭。"
-    warn "自动更新安装新版时会重启正在运行的 cloudflared，单实例 Tunnel 会短暂中断。"
-    if confirm "是否启用每日 APT 更新检测与安装？"; then
-        enable_auto_update
+    info "安装完成。版本由 APT 管理。"
+    if [[ "$PRESERVE_AUTO_UPDATE" == true ]]; then
+        info "旧版自动更新行为已保留，无需再次确认。"
     else
-        info "自动更新未启用；稍后可运行: sudo $(basename "$0") enable-auto-update"
+        warn "自动更新安装新版时会重启正在运行的 cloudflared，单实例 Tunnel 会短暂中断。"
+        if confirm "是否启用每日 APT 更新检测与安装？"; then
+            enable_auto_update
+        else
+            info "自动更新未启用；稍后可运行: sudo $(basename "$0") enable-auto-update"
+        fi
     fi
 }
 
 upgrade_cloudflared() {
     require_root
     check_platform
+    validate_migration_inputs
+    PRESERVE_AUTO_UPDATE=false
+    legacy_auto_update_present && PRESERVE_AUTO_UPDATE=true || true
     configure_repository
     apt-get update
     DEBIAN_FRONTEND=noninteractive apt-get install -y --only-upgrade cloudflared
     migrate_legacy_binary
-    cleanup_legacy_updater || warn "旧自动更新组件未完全清理"
+    cleanup_legacy_updater || { error "旧自定义更新组件清理失败"; return 1; }
+    cleanup_binary_updater || { error "二进制更新单元清理失败"; return 1; }
+    if [[ "$PRESERVE_AUTO_UPDATE" == true ]]; then
+        enable_auto_update
+        info "检测到旧版每日更新配置，已自动迁移为 APT timer。"
+    fi
     if systemctl cat cloudflared.service >/dev/null 2>&1; then
         systemctl restart cloudflared.service
         systemctl is-active --quiet cloudflared.service || {
@@ -343,7 +482,7 @@ upgrade_cloudflared() {
             return 1
         }
     fi
-    cloudflared version
+    /usr/bin/cloudflared version
 }
 
 show_status() {
@@ -362,6 +501,8 @@ show_status() {
     [[ -e "$LEGACY_BIN" ]] && warn "旧二进制仍存在: $LEGACY_BIN"
     [[ -e "$LEGACY_TIMER" || -e "$LEGACY_SERVICE" || -e "$LEGACY_UPDATER" ]] &&
         warn "旧自定义更新组件仍存在"
+    [[ -e "$BINARY_UPDATE_SERVICE" || -e "$BINARY_UPDATE_TIMER" ]] &&
+        warn "不适用于 APT 安装的 cloudflared 二进制更新单元仍存在"
     show_auto_update_status
 }
 
@@ -440,8 +581,7 @@ main() {
         migrate-legacy)
             require_root
             check_platform
-            migrate_legacy_binary
-            cleanup_legacy_updater
+            install_package
             ;;
         uninstall) uninstall_cloudflared ;;
         purge) purge_config ;;

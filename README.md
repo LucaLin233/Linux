@@ -281,9 +281,17 @@ sudo bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/t
 `auto-update-setup.sh` 每周执行完整系统升级，通常无需重复启用此 timer；只有需要更频繁检测
 cloudflared 时再启用。`upgrade` 可用于立即手动检查、升级并重启服务。
 
-`migrate-legacy` 会识别、备份并清理旧版脚本放在 `/usr/local/bin` 的二进制和自定义 updater；
-无法确认归属的文件会保留。`uninstall` 删除服务、APT 包及本脚本管理的软件源，但保留 Tunnel
-配置和凭据。彻底清理须显式运行 `purge`，并在交互终端输入 `PURGE` 二次确认。
+旧版脚本用户无需先卸载，可直接重新运行 `install`。确认旧二进制、unit 路径和版本均匹配旧版
+受管安装后，脚本会全自动安装 APT 包，把 `cloudflared.service` 从
+`/usr/local/bin/cloudflared` 事务式迁移到 `/usr/bin/cloudflared`，原样保留 Token/config 参数，
+验证服务后再备份并移除旧二进制，无需重新输入 Token。任一验证失败都会恢复旧 unit 和运行状态；
+归属证据不足则保留文件并停止，不盲删。`migrate-legacy` 可单独执行相同迁移流程。
+
+脚本使用 `service install --no-update-service`，并识别、备份和清理旧版裸二进制更新单元，避免
+APT 包与 `cloudflared update` 混用。若旧环境已有每日自动更新 timer，迁移时会自动换成新的
+APT timer；旧环境未启用自动更新时仍保持关闭并询问是否启用。`uninstall` 删除服务、APT 包及
+本脚本管理的软件源，但保留 Tunnel 配置和凭据。彻底清理须显式运行 `purge`，并在交互终端
+输入 `PURGE` 二次确认。
 
 ### 出口流量整形 tcshape
 

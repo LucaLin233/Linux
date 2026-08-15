@@ -15,6 +15,9 @@ export CLOUDFLARED_LEGACY_TIMER="$TEST_DIR/cloudflared-updater.timer"
 export CLOUDFLARED_AUTO_UPDATE_SCRIPT="$TEST_DIR/cloudflared-apt-update"
 export CLOUDFLARED_AUTO_UPDATE_SERVICE="$TEST_DIR/cloudflared-apt-update.service"
 export CLOUDFLARED_AUTO_UPDATE_TIMER="$TEST_DIR/cloudflared-apt-update.timer"
+export CLOUDFLARED_SERVICE_FILE="$TEST_DIR/cloudflared.service"
+export CLOUDFLARED_BINARY_UPDATE_SERVICE="$TEST_DIR/cloudflared-update.service"
+export CLOUDFLARED_BINARY_UPDATE_TIMER="$TEST_DIR/cloudflared-update.timer"
 # shellcheck source=../tools/cloudflare_tunnel.sh
 source "$ROOT_DIR/tools/cloudflare_tunnel.sh"
 
@@ -39,6 +42,32 @@ configure_repository
 grep -Fq 'https://pkg.cloudflare.com/cloudflared any main' "$SOURCE_FILE" ||
     fail "official repository definition was not written"
 pass "configure official stable APT repository"
+
+cat > "$SERVICE_FILE" <<EOF
+[Service]
+ExecStart=$LEGACY_BIN --no-autoupdate --token-file /etc/cloudflared/token
+EOF
+cat > "$LEGACY_BIN" <<'EOF'
+#!/usr/bin/env bash
+echo 'cloudflared version 2025.1.0'
+EOF
+chmod 0755 "$LEGACY_BIN"
+migrate_legacy_binary
+[[ ! -e "$LEGACY_BIN" ]] || fail "recognized legacy binary was not removed automatically"
+grep -Fq 'ExecStart=/usr/bin/cloudflared --no-autoupdate --token-file /etc/cloudflared/token' "$SERVICE_FILE" ||
+    fail "legacy service executable path was not migrated safely"
+find "$STATE_DIR" -type f -name cloudflared.service -print -quit | grep -q . ||
+    fail "legacy service unit was not backed up"
+pass "automatically migrate legacy binary and service without replacing credentials"
+
+printf '#!/bin/sh\necho custom\n' > "$LEGACY_BIN"
+chmod 0755 "$LEGACY_BIN"
+if migrate_legacy_binary >/dev/null 2>&1; then
+    fail "unrecognized legacy binary unexpectedly migrated"
+fi
+[[ -f "$LEGACY_BIN" ]] || fail "unrecognized legacy binary was deleted"
+rm -f "$LEGACY_BIN"
+pass "preserve legacy binary without ownership evidence"
 
 write_auto_update_files
 bash -n "$AUTO_UPDATE_SCRIPT"
@@ -69,12 +98,31 @@ cat > "$LEGACY_TIMER" <<'EOF'
 [Unit]
 Description=Cloudflared Auto Updater Timer
 EOF
+legacy_auto_update_present || fail "legacy auto-update intent was not detected"
+pass "detect legacy auto-update intent"
 cleanup_legacy_updater
 [[ ! -e "$LEGACY_UPDATER" && ! -e "$LEGACY_SERVICE" && ! -e "$LEGACY_TIMER" ]] ||
     fail "managed legacy updater was not removed"
 find "$STATE_DIR" -type f -name cloudflared-update -print -quit | grep -q . ||
     fail "legacy updater was not backed up"
 pass "backup and remove recognized legacy updater"
+
+cat > "$BINARY_UPDATE_SERVICE" <<'EOF'
+[Unit]
+Description=Update cloudflared
+[Service]
+ExecStart=/bin/bash -c '/usr/bin/cloudflared update; code=$?; exit $code'
+EOF
+cat > "$BINARY_UPDATE_TIMER" <<'EOF'
+[Unit]
+Description=Update cloudflared
+[Timer]
+OnCalendar=daily
+EOF
+cleanup_binary_updater
+[[ ! -e "$BINARY_UPDATE_SERVICE" && ! -e "$BINARY_UPDATE_TIMER" ]] ||
+    fail "package-incompatible binary updater was not removed"
+pass "remove binary updater after migrating to APT"
 
 printf custom > "$LEGACY_UPDATER"
 if cleanup_legacy_updater >/dev/null 2>&1; then
@@ -87,6 +135,7 @@ script="$ROOT_DIR/tools/cloudflare_tunnel.sh"
 grep -Fq 'https://pkg.cloudflare.com/cloudflared' "$script" || fail "official APT repository missing"
 grep -Fq 'apt-get install -y --only-upgrade cloudflared' "$script" || fail "APT upgrade path missing"
 grep -Fq 'read -r -s -p' "$script" || fail "Token input is not hidden"
+grep -Fq 'service install --no-update-service' "$script" || fail "package install still enables binary self-update"
 grep -Fq 'enable-auto-update' "$script" || fail "opt-in auto-update command missing"
 pass "use official APT lifecycle with opt-in update detection"
 
