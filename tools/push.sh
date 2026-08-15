@@ -1,21 +1,11 @@
 #!/bin/bash
 
 # =============================================================================
-# Server File Push Tool v1.2.0
-# 高效的多服务器文件推送工具 (支持密钥和密码认证)
-#
-# v1.2.0 修复:
-# [HIGH]   #1 并发控制改用 wait -n，实现真正的滑动窗口
-# [HIGH]   #2 移除 eval，用 Bash 数组构建命令，消除命令注入
-# [MEDIUM] #3 RSYNC_ARCHIVE / RSYNC_COMPRESS 配置项现在实际生效
-# [MEDIUM] #4 实现 ENABLE_LOGGING / LOG_FILE 日志功能
-# [MEDIUM] #5 --test-auth 分支补充显式 exit，不依赖函数内部 exit
-# [MEDIUM] #6 rsync 退出码 23/24 单独处理，不做无意义重试
-# [LOW]    #7 parse_server_info 支持 IPv6 地址 [::1]:22
-# [LOW]    #8 interactive_retry 改为参数传递，消除全局变量依赖
+# Server File Push Tool v1.3.0
+# 多服务器文件推送工具：持久主机指纹、显式删除授权、IPv6 和并发重试。
 # =============================================================================
 
-SCRIPT_VERSION="1.2.0"
+SCRIPT_VERSION="1.3.0"
 SCRIPT_NAME="Server File Push Tool"
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
@@ -32,6 +22,7 @@ declare -a RUNNING_PIDS=()
 TEMP_DIR=$(mktemp -d)
 SUCCESS_FILE="$TEMP_DIR/success"
 FAILED_FILE="$TEMP_DIR/failed"
+SSH_WRAPPER="$TEMP_DIR/ssh-wrapper"
 
 # =============================================================================
 # FIX #4: 实现日志函数（原版 ENABLE_LOGGING/LOG_FILE 有配置无实现）
@@ -47,6 +38,27 @@ log() {
         >> "${LOG_FILE:-/var/log/push.log}"
 }
 
+create_ssh_wrapper() {
+    cat > "$SSH_WRAPPER" <<'EOF'
+#!/usr/bin/env bash
+set -eu
+args=(
+    -p "$PUSH_SSH_PORT"
+    -o "ConnectTimeout=$PUSH_CONNECTION_TIMEOUT"
+    -o "StrictHostKeyChecking=$PUSH_STRICT_HOST_KEY_CHECKING"
+    -o "UserKnownHostsFile=$PUSH_USER_KNOWN_HOSTS_FILE"
+    -o LogLevel=ERROR
+)
+if [[ "$PUSH_AUTH_METHOD" == key ]]; then
+    args+=(-i "$PUSH_KEY_FILE")
+else
+    args+=(-o PreferredAuthentications=password)
+fi
+exec ssh "${args[@]}" "$@"
+EOF
+    chmod 700 "$SSH_WRAPPER"
+}
+
 # =============================================================================
 # 配置文件生成
 # =============================================================================
@@ -55,7 +67,7 @@ generate_config() {
     local config_file=${1:-"config.conf"}
     cat > "$config_file" << 'EOF'
 # =============================================================================
-# Server File Push Tool - 配置文件 v1.2.0
+# Server File Push Tool - 配置文件 v1.3.0
 # =============================================================================
 
 # 认证方式: "key" | "password"
@@ -81,7 +93,8 @@ MAX_RETRIES=3
 RETRY_DELAY=5
 
 # 同步选项
-DELETE_EXTRA="true"       # true: 删除目标多余文件
+DELETE_EXTRA="false"      # true: 删除目标多余文件（高风险）
+ALLOW_DELETE_EXTRA="false" # 非交互模式显式授权 --delete
 RSYNC_ARCHIVE="true"      # true: 启用 -a 归档模式（保留权限/时间戳/软链接）
 RSYNC_COMPRESS="true"     # true: 启用 -z 压缩传输
 
@@ -112,7 +125,8 @@ LOG_FILE="/var/log/push.log"
 # "no"         - 自动接受所有指纹（有 MITM 风险）
 # "accept-new" - 自动接受新主机，已变更指纹将被拒绝（推荐，SSH 7.6+）
 STRICT_HOST_KEY_CHECKING="accept-new"
-USER_KNOWN_HOSTS_FILE="/dev/null"
+USER_KNOWN_HOSTS_FILE="${HOME}/.ssh/known_hosts"
+ALLOW_INSECURE_HOST_KEY_STORAGE="false"
 EOF
     chmod 600 "$config_file"
     echo -e "${GREEN}${ICON_SUCCESS} 配置文件已生成: ${WHITE}$config_file${NC}"
@@ -124,7 +138,7 @@ EOF
 
 check_dependencies() {
     local missing_deps=()
-    for cmd in rsync ssh; do
+    for cmd in rsync ssh timeout flock stat dirname mkdir chmod install; do
         command -v "$cmd" &>/dev/null || missing_deps+=("$cmd")
     done
     if [[ "$AUTH_METHOD" == "password" ]]; then
@@ -190,31 +204,43 @@ get_password() {
 # 原版正则 ^(.+):([0-9]+)$ 会将 [::1]:22 错误拆分为 host=[: port=1]22
 # =============================================================================
 
+PARSED_PORT=""
+PARSED_TARGET=""
+
 parse_server_info() {
     local server_info="$1"
-    local user="$DEFAULT_USER"
-    local host="" port="$DEFAULT_PORT"
+    local user="$DEFAULT_USER" host="" port="$DEFAULT_PORT"
 
-    # 解析 user@ 前缀
     if [[ "$server_info" =~ ^([^@]+)@(.+)$ ]]; then
         user="${BASH_REMATCH[1]}"
         server_info="${BASH_REMATCH[2]}"
     fi
-
-    # IPv6: [::1]:port
     if [[ "$server_info" =~ ^\[([^\]]+)\]:([0-9]+)$ ]]; then
         host="${BASH_REMATCH[1]}"; port="${BASH_REMATCH[2]}"
-    # IPv6: [::1]（无端口）
     elif [[ "$server_info" =~ ^\[([^\]]+)\]$ ]]; then
         host="${BASH_REMATCH[1]}"
-    # 普通 host:port
-    elif [[ "$server_info" =~ ^(.+):([0-9]+)$ ]]; then
+    elif [[ "$server_info" =~ ^([^:]+):([0-9]+)$ ]]; then
         host="${BASH_REMATCH[1]}"; port="${BASH_REMATCH[2]}"
+    elif [[ "$server_info" == *:* ]]; then
+        echo -e "${RED}${ICON_ERROR} IPv6 地址必须使用方括号: [$server_info]${NC}" >&2
+        return 1
     else
         host="$server_info"
     fi
 
-    echo "$user@$host:$port"
+    [[ -n "$user" && -n "$host" && "$port" =~ ^[0-9]+$ ]] || return 1
+    (( port >= 1 && port <= 65535 )) || return 1
+    PARSED_PORT="$port"
+    if [[ "$host" == *:* ]]; then
+        PARSED_TARGET="$user@[$host]"
+    else
+        PARSED_TARGET="$user@$host"
+    fi
+}
+
+format_server_info() {
+    parse_server_info "$1" || return 1
+    printf '%s:%s\n' "$PARSED_TARGET" "$PARSED_PORT"
 }
 
 # =============================================================================
@@ -227,28 +253,14 @@ retry_rsync() {
     local server_info=$1 src=$2 dst=$3
     local attempt=1
 
-    local parsed_info
-    parsed_info=$(parse_server_info "$server_info")
-    local user host port tmp
-    user="${parsed_info%%@*}"
-    tmp="${parsed_info#*@}"
-    port="${tmp##*:}"
-    host="${tmp%:*}"
+    parse_server_info "$server_info" || return 1
+    local port="$PARSED_PORT" target="$PARSED_TARGET"
 
     # FIX #3: 根据配置动态构建 rsync 选项数组，不再硬编码 -az
     local rsync_opts=("--timeout=$CONNECTION_TIMEOUT")
     [[ "${RSYNC_ARCHIVE:-true}"   == "true" ]] && rsync_opts+=("-a") || rsync_opts+=("-r")
     [[ "${RSYNC_COMPRESS:-true}"  == "true" ]] && rsync_opts+=("-z")
-    [[ "${DELETE_EXTRA:-true}"    == "true" ]] && rsync_opts+=("--delete")
-
-    # FIX #2: SSH 选项用数组，消除字符串拼接后 eval 的注入风险
-    local ssh_opts=(
-        -p "$port"
-        -o "ConnectTimeout=$CONNECTION_TIMEOUT"
-        -o "StrictHostKeyChecking=${STRICT_HOST_KEY_CHECKING:-accept-new}"
-        -o "UserKnownHostsFile=${USER_KNOWN_HOSTS_FILE:-/dev/null}"
-        -o "LogLevel=ERROR"
-    )
+    [[ "${DELETE_EXTRA:-false}" == "true" ]] && rsync_opts+=("--delete")
 
     while [[ $attempt -le $MAX_RETRIES ]]; do
         [[ $attempt -gt 1 ]] && {
@@ -258,16 +270,22 @@ retry_rsync() {
 
         local output exit_code
         if [[ "$AUTH_METHOD" == "key" ]]; then
-            # FIX #2: 直接数组展开执行，不经过 eval
-            output=$(timeout "$TOTAL_TIMEOUT" rsync "${rsync_opts[@]}" \
-                -e "ssh -i $KEY_FILE ${ssh_opts[*]}" \
-                "$src" "$user@$host:$dst" 2>&1)
+            output=$(PUSH_SSH_PORT="$port" \
+                PUSH_CONNECTION_TIMEOUT="$CONNECTION_TIMEOUT" \
+                PUSH_STRICT_HOST_KEY_CHECKING="$STRICT_HOST_KEY_CHECKING" \
+                PUSH_USER_KNOWN_HOSTS_FILE="$USER_KNOWN_HOSTS_FILE" \
+                PUSH_AUTH_METHOD="$AUTH_METHOD" PUSH_KEY_FILE="$KEY_FILE" \
+                timeout "$TOTAL_TIMEOUT" rsync "${rsync_opts[@]}" \
+                -e "$SSH_WRAPPER" "$src" "$target:$dst" 2>&1)
             exit_code=$?
         else
-            local ssh_pw_opts=("${ssh_opts[@]}" -o "PreferredAuthentications=password")
-            output=$(timeout "$TOTAL_TIMEOUT" sshpass -e rsync "${rsync_opts[@]}" \
-                -e "ssh ${ssh_pw_opts[*]}" \
-                "$src" "$user@$host:$dst" 2>&1)
+            output=$(PUSH_SSH_PORT="$port" \
+                PUSH_CONNECTION_TIMEOUT="$CONNECTION_TIMEOUT" \
+                PUSH_STRICT_HOST_KEY_CHECKING="$STRICT_HOST_KEY_CHECKING" \
+                PUSH_USER_KNOWN_HOSTS_FILE="$USER_KNOWN_HOSTS_FILE" \
+                PUSH_AUTH_METHOD="$AUTH_METHOD" PUSH_KEY_FILE="" \
+                timeout "$TOTAL_TIMEOUT" sshpass -e rsync "${rsync_opts[@]}" \
+                -e "$SSH_WRAPPER" "$src" "$target:$dst" 2>&1)
             exit_code=$?
         fi
 
@@ -306,7 +324,7 @@ retry_rsync() {
 push_to_server() {
     local server_info=$1 src=$2 dst=$3 index=$4 total=$5
     local display_info
-    display_info=$(parse_server_info "$server_info")
+    display_info=$(format_server_info "$server_info")
 
     echo -e "${BLUE}[${index}/${total}]${NC} ${ICON_WORKING} ${CYAN}$display_info${NC}"
 
@@ -347,7 +365,7 @@ trap cleanup SIGINT SIGTERM
 # =============================================================================
 
 check_and_generate_config() {
-    local config_file=${1:-"config.conf"}
+    local config_file="config.conf"
     if [[ ! -f "$config_file" ]]; then
         echo -e "${CYAN}${ICON_INFO} 欢迎使用 ${WHITE}$SCRIPT_NAME v$SCRIPT_VERSION${NC}"
         echo ""
@@ -360,8 +378,62 @@ check_and_generate_config() {
     fi
 }
 
+load_config() {
+    local config_file="$1" perms owner
+    [[ -f "$config_file" && ! -L "$config_file" ]] || {
+        echo -e "${RED}${ICON_ERROR} 配置必须是普通文件且不能是符号链接: $config_file${NC}"
+        return 1
+    }
+    perms=$(stat -c %a "$config_file" 2>/dev/null) || return 1
+    owner=$(stat -c %u "$config_file" 2>/dev/null) || return 1
+    (( (8#$perms & 8#022) == 0 )) || {
+        echo -e "${RED}${ICON_ERROR} 配置文件不能允许组或其他用户写入: $config_file${NC}"
+        return 1
+    }
+    [[ "$owner" == "$EUID" || "$owner" == 0 ]] || {
+        echo -e "${RED}${ICON_ERROR} 配置文件所有者不可信: $config_file${NC}"
+        return 1
+    }
+    # config.conf 是受信任的 Bash 配置，只允许从上述受保护文件加载。
+    # shellcheck source=/dev/null
+    source "$config_file"
+}
+
 validate_config() {
-    local errors=0
+    local errors=0 name value server
+
+    DELETE_EXTRA="${DELETE_EXTRA:-false}"
+    ALLOW_DELETE_EXTRA="${ALLOW_DELETE_EXTRA:-false}"
+    ALLOW_INSECURE_HOST_KEY_STORAGE="${ALLOW_INSECURE_HOST_KEY_STORAGE:-false}"
+    USER_KNOWN_HOSTS_FILE="${USER_KNOWN_HOSTS_FILE:-${HOME}/.ssh/known_hosts}"
+
+    for name in DELETE_EXTRA ALLOW_DELETE_EXTRA ALLOW_INSECURE_HOST_KEY_STORAGE RSYNC_ARCHIVE RSYNC_COMPRESS ENABLE_LOGGING; do
+        value="${!name:-}"
+        [[ "$value" == true || "$value" == false ]] || {
+            echo -e "${RED}${ICON_ERROR} $name 必须是 true 或 false${NC}"
+            ((errors++))
+        }
+    done
+    for name in DEFAULT_PORT MAX_PARALLEL CONNECTION_TIMEOUT TOTAL_TIMEOUT MAX_RETRIES RETRY_DELAY; do
+        value="${!name:-}"
+        [[ "$value" =~ ^[0-9]+$ ]] && (( value >= 1 )) || {
+            echo -e "${RED}${ICON_ERROR} $name 必须是正整数${NC}"
+            ((errors++))
+        }
+    done
+    [[ "${DEFAULT_PORT:-0}" =~ ^[0-9]+$ ]] && (( DEFAULT_PORT <= 65535 )) || {
+        echo -e "${RED}${ICON_ERROR} DEFAULT_PORT 必须在 1-65535 之间${NC}"
+        ((errors++))
+    }
+    [[ "$STRICT_HOST_KEY_CHECKING" == yes || "$STRICT_HOST_KEY_CHECKING" == no ||
+        "$STRICT_HOST_KEY_CHECKING" == accept-new ]] || {
+        echo -e "${RED}${ICON_ERROR} STRICT_HOST_KEY_CHECKING 值无效${NC}"
+        ((errors++))
+    }
+    if [[ "$USER_KNOWN_HOSTS_FILE" == /dev/null && "$ALLOW_INSECURE_HOST_KEY_STORAGE" != true ]]; then
+        echo -e "${RED}${ICON_ERROR} /dev/null 不保存主机指纹；如确需使用，显式设置 ALLOW_INSECURE_HOST_KEY_STORAGE=true${NC}"
+        ((errors++))
+    fi
 
     [[ "$AUTH_METHOD" != "key" && "$AUTH_METHOD" != "password" ]] && {
         echo -e "${RED}${ICON_ERROR} 无效认证方式: $AUTH_METHOD${NC}"; ((errors++))
@@ -398,9 +470,15 @@ validate_config() {
     [[ ${#SERVERS[@]} -eq 0 ]] && {
         echo -e "${RED}${ICON_ERROR} 未配置任何服务器${NC}"; ((errors++))
     }
+    for server in "${SERVERS[@]}"; do
+        parse_server_info "$server" >/dev/null 2>&1 || {
+            echo -e "${RED}${ICON_ERROR} 服务器地址无效: $server${NC}"
+            ((errors++))
+        }
+    done
 
-    if [[ " ${SERVERS[*]} " =~ " 192.168.1.100 " || \
-          " ${SERVERS[*]} " =~ " root@server1.example.com:22 " ]]; then
+    if [[ " ${SERVERS[*]} " == *" 192.168.1.100 "* ||
+          " ${SERVERS[*]} " == *" root@server1.example.com:22 "* ]]; then
         echo -e "${YELLOW}${ICON_WARNING} 检测到示例服务器配置，请替换为实际服务器${NC}"
     fi
 
@@ -409,6 +487,41 @@ validate_config() {
         [[ -d "$TEMP_DIR" ]] && rm -rf "$TEMP_DIR"
         exit 1
     fi
+}
+
+prepare_transfer_safety() {
+    if [[ "$DELETE_EXTRA" == true && "$ALLOW_DELETE_EXTRA" != true ]]; then
+        if [[ ! -t 0 ]]; then
+            echo -e "${RED}${ICON_ERROR} 非交互模式启用 --delete 必须设置 ALLOW_DELETE_EXTRA=true${NC}"
+            return 1
+        fi
+        local answer
+        echo -e "${RED}${ICON_WARNING} rsync --delete 会删除远端多余文件。${NC}"
+        read -r -p "请输入 DELETE 确认: " answer
+        [[ "$answer" == DELETE ]] || return 1
+    fi
+
+    if [[ "$USER_KNOWN_HOSTS_FILE" != /dev/null ]]; then
+        local known_hosts_dir
+        known_hosts_dir=$(dirname "$USER_KNOWN_HOSTS_FILE")
+        if [[ ! -d "$known_hosts_dir" ]]; then
+            mkdir -p "$known_hosts_dir"
+            chmod 700 "$known_hosts_dir"
+        fi
+        [[ ! -L "$USER_KNOWN_HOSTS_FILE" ]] || {
+            echo -e "${RED}${ICON_ERROR} known_hosts 不能是符号链接${NC}"
+            return 1
+        }
+        if [[ ! -e "$USER_KNOWN_HOSTS_FILE" ]]; then
+            install -m 0600 /dev/null "$USER_KNOWN_HOSTS_FILE"
+        elif [[ ! -f "$USER_KNOWN_HOSTS_FILE" || ! -w "$USER_KNOWN_HOSTS_FILE" ]]; then
+            echo -e "${RED}${ICON_ERROR} known_hosts 必须是可写普通文件${NC}"
+            return 1
+        fi
+    else
+        echo -e "${RED}${ICON_WARNING} 主机指纹不会持久保存，存在中间人攻击风险。${NC}"
+    fi
+    create_ssh_wrapper
 }
 
 # =============================================================================
@@ -427,7 +540,7 @@ show_summary() {
     if [[ $failed -gt 0 && -f "$FAILED_FILE" ]]; then
         echo ""; echo -e "${RED}${ICON_WARNING} 失败的服务器：${NC}"
         while IFS= read -r server; do
-            [[ -n "$server" ]] && echo -e "${RED}  • $(parse_server_info "$server")${NC}"
+            [[ -n "$server" ]] && echo -e "${RED}  • $(format_server_info "$server")${NC}"
         done < "$FAILED_FILE"
     fi
 }
@@ -456,7 +569,7 @@ interactive_retry() {
 
     local retry_file="$TEMP_DIR/retry_list"
     cp "$FAILED_FILE" "$retry_file"
-    > "$FAILED_FILE"; rm -f "$FAILED_FILE.lock"
+    : > "$FAILED_FILE"; rm -f "$FAILED_FILE.lock"
 
     local index=0 total_retry
     total_retry=$(wc -l < "$retry_file" 2>/dev/null || echo 0)
@@ -466,7 +579,7 @@ interactive_retry() {
         [[ -n "$server" ]] || continue
         ((index++))
         while (( $(jobs -rp | wc -l) >= MAX_PARALLEL )); do
-            wait -n 2>/dev/null || wait
+            wait -n 2>/dev/null || true
         done
         push_to_server "$server" "$src" "$dst" "$index" "$total_retry" &
         RUNNING_PIDS+=($!)
@@ -567,6 +680,7 @@ finish_cleanup() {
 # FIX #5: --test-auth 分支补充显式 exit $?，不再依赖函数内部 exit 来结束主流程
 # =============================================================================
 
+main() {
 case "${1:-}" in
     "--generate-config")
         echo -e "${CYAN}${ICON_CONFIG} 生成新的配置文件...${NC}"
@@ -577,25 +691,31 @@ case "${1:-}" in
         ;;
     "--test-auth")
         check_and_generate_config
-        source config.conf
+        load_config config.conf
         validate_config
         test_authentication
         exit $?    # FIX #5: 显式退出，防止继续执行后续推送逻辑
         ;;
     "-h"|"--help")
         check_and_generate_config
-        source config.conf
+        load_config config.conf
         show_help
         [[ -d "$TEMP_DIR" ]] && rm -rf "$TEMP_DIR"
         exit 0
         ;;
     *)
         check_and_generate_config
-        source config.conf
+        load_config config.conf
         validate_config
         check_dependencies
         ;;
 esac
+
+prepare_transfer_safety || {
+    echo -e "${RED}${ICON_ERROR} 传输安全检查失败${NC}"
+    finish_cleanup
+    exit 1
+}
 
 # 密码认证准备
 if [[ "$AUTH_METHOD" == "password" ]]; then
@@ -648,7 +768,7 @@ fi
 
 echo ""; echo -e "${YELLOW}开始推送... (按 Ctrl+C 可安全中断)${NC}"; echo ""
 
-> "$SUCCESS_FILE"; > "$FAILED_FILE"
+: > "$SUCCESS_FILE"; : > "$FAILED_FILE"
 TOTAL_SERVERS=${#SERVERS[@]}
 CURRENT_INDEX=0
 START_TIME=$(date +%s)
@@ -662,7 +782,7 @@ for server in "${SERVERS[@]}"; do
     # 修复: 循环 + wait -n（bash 4.3+）→ 等待任意一个子进程退出
     #        保持活跃进程数始终贴近 MAX_PARALLEL
     while (( $(jobs -rp | wc -l) >= MAX_PARALLEL )); do
-        wait -n 2>/dev/null || wait
+        wait -n 2>/dev/null || true
     done
 
     push_to_server "$server" "$SRC_PATH" "$DST_PATH" "$CURRENT_INDEX" "$TOTAL_SERVERS" &
@@ -705,4 +825,9 @@ log "INFO" "任务完成: 成功=$final_success 失败=$final_failed 耗时=$DUR
 
 finish_cleanup
 
-[[ $final_failed -gt 0 ]] && exit 1 || exit 0
+[[ $final_failed -gt 0 ]] && return 1 || return 0
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi

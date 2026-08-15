@@ -11,6 +11,7 @@ log() {
     local level="${2:-info}"
     local -A colors=(
         [info]="\033[0;36m"
+        [warn]="\033[0;33m"
         [error]="\033[0;31m"
         [success]="\033[0;32m"
     )
@@ -18,6 +19,7 @@ log() {
 }
 
 info() { log "$1" "info"; }
+warn() { log "$1" "warn"; }
 error() { log "$1" "error"; }
 success() { log "$1" "success"; }
 
@@ -28,7 +30,7 @@ require_root() {
     fi
 }
 
-backup_initial_file() {
+backup_managed_file() {
     local file="$1"
     local backup_prefix="$file"
     local state_dir=""
@@ -52,20 +54,76 @@ backup_initial_file() {
         done
     fi
 
-    if [[ -e "${backup_prefix}.initial-backup" ||
-        -e "${backup_prefix}.initial-absent" ||
-        -e "${backup_prefix}.initial-unknown" ]]; then
+    local initial_backup="${backup_prefix}.initial-backup"
+    local previous_backup="${backup_prefix}.previous-backup"
+    local initial_absent="${backup_prefix}.initial-absent"
+    local previous_absent="${backup_prefix}.previous-absent"
+    local initial_unknown="${backup_prefix}.initial-unknown"
+
+    if [[ ! -e "$initial_backup" && ! -e "$initial_absent" && ! -e "$initial_unknown" ]]; then
+        if [[ -f "$file" ]] &&
+            grep -Eq '# linux-setup:managed-motd|由 (system-customize|setup-motd)\.sh 自动生成' "$file"; then
+            install -D -m 0600 /dev/null "$initial_unknown" || return 1
+        elif [[ -e "$file" || -L "$file" ]]; then
+            cp -a "$file" "$initial_backup" || return 1
+        else
+            install -D -m 0600 /dev/null "$initial_absent" || return 1
+        fi
+    fi
+
+    rm -f "$previous_backup" "$previous_absent"
+    if [[ -e "$file" || -L "$file" ]]; then
+        cp -a "$file" "$previous_backup" || return 1
+    else
+        install -D -m 0600 /dev/null "$previous_absent" || return 1
+    fi
+}
+
+get_managed_backup_prefix() {
+    local target="$1"
+    local state_prefix
+
+    if [[ "$target" != /etc/update-motd.d/* ]]; then
+        printf '%s\n' "$target"
         return 0
     fi
 
-    if [[ -f "$file" ]] &&
-        grep -Eq '由 (system-customize|setup-motd)\.sh 自动生成' "$file"; then
-        install -D -m 0600 /dev/null "${backup_prefix}.initial-unknown"
-    elif [[ -e "$file" || -L "$file" ]]; then
-        cp -a "$file" "${backup_prefix}.initial-backup"
+    state_prefix="/var/lib/linux-setup/motd-backups/$(basename "$target")"
+    if [[ -e "${state_prefix}.initial-backup" || -e "${state_prefix}.initial-absent" ||
+        -e "${state_prefix}.initial-unknown" || -e "${state_prefix}.previous-backup" ||
+        -e "${state_prefix}.previous-absent" ]]; then
+        printf '%s\n' "$state_prefix"
     else
-        install -D -m 0600 /dev/null "${backup_prefix}.initial-absent"
+        printf '%s\n' "$target"
     fi
+}
+
+restore_managed_file() {
+    local target="$1"
+    local scope="$2"
+    local backup_prefix backup absent unknown
+
+    backup_prefix=$(get_managed_backup_prefix "$target") || return 1
+    backup="${backup_prefix}.${scope}-backup"
+    absent="${backup_prefix}.${scope}-absent"
+    unknown="${backup_prefix}.${scope}-unknown"
+
+    if [[ -e "$backup" || -L "$backup" ]]; then
+        install -d -m 0755 "$(dirname "$target")" || return 1
+        rm -f "$target" || return 1
+        cp -a "$backup" "$target" || return 1
+        return 0
+    fi
+    if [[ -e "$absent" ]]; then
+        rm -f "$target" || return 1
+        return 0
+    fi
+    if [[ -e "$unknown" ]]; then
+        warn "初始状态未知，跳过恢复：$target"
+        return 2
+    fi
+    warn "没有 $scope 配置状态，跳过恢复：$target"
+    return 2
 }
 
 replace_with_empty_regular_file() {
@@ -80,18 +138,18 @@ configure_motd() {
 
     install -d -m 0755 /etc/update-motd.d
 
-    backup_initial_file /etc/motd || return 1
-    backup_initial_file /etc/issue || return 1
-    backup_initial_file /etc/issue.net || return 1
+    backup_managed_file /etc/motd || return 1
+    backup_managed_file /etc/issue || return 1
+    backup_managed_file /etc/issue.net || return 1
     replace_with_empty_regular_file /etc/motd
     replace_with_empty_regular_file /etc/issue
     replace_with_empty_regular_file /etc/issue.net
 
-    backup_initial_file "$MOTD_SCRIPT" || return 1
+    backup_managed_file "$MOTD_SCRIPT" || return 1
 
     local file
     for file in /etc/update-motd.d/10-uname /etc/update-motd.d/50-motd-news; do
-        backup_initial_file "$file" || return 1
+        backup_managed_file "$file" || return 1
         if [[ -x "$file" ]]; then
             chmod -x "$file"
             info "已禁用原生 MOTD 脚本: $(basename "$file")"
@@ -100,8 +158,11 @@ configure_motd() {
 
     install -m 0755 /dev/stdin "$MOTD_SCRIPT" <<'SCRIPT'
 #!/usr/bin/env bash
-# 由 setup-motd.sh 自动生成。
+# linux-setup:managed-motd
+# 由 Linux Scripts Collection 自动生成。
 # 欢迎横幅与系统状态面板。
+
+export LC_ALL=C
 
 hostname_value=$(hostname)
 kernel=$(uname -r)
@@ -150,28 +211,6 @@ pick_color() {
     fi
 }
 
-read -r _ user1 nice1 system1 idle1 iowait1 irq1 softirq1 steal1 _ < <(grep '^cpu ' /proc/stat)
-total1=$((user1 + nice1 + system1 + idle1 + iowait1 + irq1 + softirq1 + steal1))
-busy1=$((user1 + nice1 + system1 + irq1 + softirq1 + steal1))
-
-sleep 0.5
-
-read -r _ user2 nice2 system2 idle2 iowait2 irq2 softirq2 steal2 _ < <(grep '^cpu ' /proc/stat)
-total2=$((user2 + nice2 + system2 + idle2 + iowait2 + irq2 + softirq2 + steal2))
-busy2=$((user2 + nice2 + system2 + irq2 + softirq2 + steal2))
-
-total_delta=$((total2 - total1))
-busy_delta=$((busy2 - busy1))
-
-if (( total_delta > 0 )); then
-    cpu_percent=$(awk -v busy="$busy_delta" -v total="$total_delta" \
-        'BEGIN {printf "%.1f", busy / total * 100}')
-    cpu_color=$(pick_color "$cpu_percent" "cpu")
-else
-    cpu_percent="N/A"
-    cpu_color="$VALUE"
-fi
-
 load_average=$(awk '{printf "%.2f %.2f %.2f", $1, $2, $3}' /proc/loadavg)
 
 memory_raw=$(awk '
@@ -190,8 +229,8 @@ memory_total="${memory_rest%%|*}G"
 memory_percent="${memory_raw##*|}"
 memory_color=$(pick_color "$memory_percent" "memory")
 
-disk_percent=$(df / | awk 'NR == 2 {gsub(/%/, "", $5); print $5}')
-disk_usage=$(df -h / | awk 'NR == 2 {printf "%s / %s", $3, $2}')
+disk_percent=$(df -P / | awk 'NR == 2 {gsub(/%/, "", $5); print $5}')
+disk_usage=$(df -Ph / | awk 'NR == 2 {printf "%s / %s", $3, $2}')
 disk_color=$(pick_color "$disk_percent" "disk")
 
 printf "\n${BLUE_BG} 已连接 %s 服务器 ${RESET}\n" "$hostname_value"
@@ -199,8 +238,7 @@ printf "${ITALIC_DIM} 今天想要做些什么？${RESET}\n\n"
 
 printf "  ${LABEL}内核${RESET}      ${VALUE}%s${RESET}\n" "$kernel"
 printf "  ${LABEL}运行时间${RESET}  ${VALUE}%s${RESET}\n" "$uptime_value"
-printf "  ${LABEL}CPU负载${RESET}   ${VALUE}%s  (${cpu_color}%s%%${VALUE})${RESET}\n" \
-    "$load_average" "$cpu_percent"
+printf "  ${LABEL}CPU负载${RESET}   ${VALUE}%s${RESET}\n" "$load_average"
 printf "  ${LABEL}内存${RESET}      ${VALUE}%s / %s  (${memory_color}%s%%${VALUE})${RESET}\n" \
     "$memory_used" "$memory_total" "$memory_percent"
 printf "  ${LABEL}磁盘${RESET}      ${VALUE}%s  (${disk_color}%s%%${VALUE})${RESET}\n" \
@@ -215,20 +253,63 @@ SCRIPT
     echo "----------------------------------------"
 }
 
+restore_motd() {
+    local scope="${1:-previous}" target result restored=0 failed=false
+    local -a targets=(/etc/motd /etc/issue /etc/issue.net "$MOTD_SCRIPT" /etc/update-motd.d/10-uname /etc/update-motd.d/50-motd-news)
+    case "$scope" in
+        previous|initial) ;;
+        *) error "恢复范围必须是 previous 或 initial"; return 1 ;;
+    esac
+    for target in "${targets[@]}"; do
+        if restore_managed_file "$target" "$scope"; then
+            ((restored += 1))
+        else
+            result=$?
+            (( result == 1 )) && failed=true
+        fi
+    done
+    (( restored > 0 )) || { error "没有可恢复的可信配置"; return 1; }
+    [[ "$failed" == false ]] || { error "部分 MOTD 配置恢复失败"; return 1; }
+    success "MOTD 已恢复到 $scope 状态"
+}
+
+show_status() {
+    if [[ -x "$MOTD_SCRIPT" ]] && grep -Fq '# linux-setup:managed-motd' "$MOTD_SCRIPT"; then
+        echo "MOTD 状态: 已安装并受管"
+    elif [[ -e "$MOTD_SCRIPT" ]]; then
+        echo "MOTD 状态: 存在但不受本工具管理"
+    else
+        echo "MOTD 状态: 未安装"
+    fi
+}
+
+show_help() {
+    printf '%s\n' '用法: setup-motd.sh [install|status|restore|help]'
+}
+
 main() {
+    local action="${1:-install}"
     require_root
 
     local required_command
-    for required_command in awk basename cat chmod cp date df grep hostname install mv sed sleep uname uptime; do
+    for required_command in awk basename chmod cp date df dirname grep hostname install mv rm sed uname uptime; do
         if ! command -v "$required_command" >/dev/null 2>&1; then
             error "缺少必要命令: $required_command"
             exit 1
         fi
     done
 
-    configure_motd
+    case "$action" in
+        install) configure_motd ;;
+        status) show_status ;;
+        restore) restore_motd "${2:-previous}" ;;
+        help|-h|--help) show_help ;;
+        *) error "未知参数: $action"; show_help; return 1 ;;
+    esac
 }
 
 trap 'error "MOTD 配置脚本在第 $LINENO 行执行失败"' ERR
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi
