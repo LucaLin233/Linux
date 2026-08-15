@@ -13,6 +13,9 @@ readonly LEGACY_BIN="${CLOUDFLARED_LEGACY_BIN:-/usr/local/bin/cloudflared}"
 readonly LEGACY_UPDATER="${CLOUDFLARED_LEGACY_UPDATER:-/usr/local/bin/cloudflared-update}"
 readonly LEGACY_SERVICE="${CLOUDFLARED_LEGACY_SERVICE:-/etc/systemd/system/cloudflared-updater.service}"
 readonly LEGACY_TIMER="${CLOUDFLARED_LEGACY_TIMER:-/etc/systemd/system/cloudflared-updater.timer}"
+readonly AUTO_UPDATE_SCRIPT="${CLOUDFLARED_AUTO_UPDATE_SCRIPT:-/usr/local/libexec/cloudflared-apt-update}"
+readonly AUTO_UPDATE_SERVICE="${CLOUDFLARED_AUTO_UPDATE_SERVICE:-/etc/systemd/system/cloudflared-apt-update.service}"
+readonly AUTO_UPDATE_TIMER="${CLOUDFLARED_AUTO_UPDATE_TIMER:-/etc/systemd/system/cloudflared-apt-update.timer}"
 
 info() { printf '[INFO] %s\n' "$*"; }
 warn() { printf '[WARN] %s\n' "$*" >&2; }
@@ -135,6 +138,147 @@ migrate_legacy_binary() {
     info "旧二进制已备份到 $backup_dir"
 }
 
+write_auto_update_files() {
+    install -d -m 0755 "$(dirname "$AUTO_UPDATE_SCRIPT")" "$(dirname "$AUTO_UPDATE_SERVICE")"
+
+    cat > "$AUTO_UPDATE_SCRIPT" <<'UPDATER'
+#!/usr/bin/env bash
+# Managed by tools/cloudflare_tunnel.sh
+set -euo pipefail
+
+exec 9>/run/lock/cloudflared-apt-update.lock
+if ! flock -n 9; then
+    echo "另一项 cloudflared APT 更新正在运行，跳过"
+    exit 0
+fi
+
+export DEBIAN_FRONTEND=noninteractive
+installed=$(dpkg-query -W -f='${Version}' cloudflared 2>/dev/null) || {
+    echo "cloudflared APT 包未安装" >&2
+    exit 1
+}
+
+apt-get -o DPkg::Lock::Timeout=300 update -qq
+candidate=$(apt-cache policy cloudflared | awk '/Candidate:/ {print $2; exit}')
+if [[ -z "$candidate" || "$candidate" == "(none)" ]]; then
+    echo "无法取得 cloudflared 候选版本" >&2
+    exit 1
+fi
+if ! dpkg --compare-versions "$candidate" gt "$installed"; then
+    echo "cloudflared 已是最新版本: $installed"
+    exit 0
+fi
+
+was_active=false
+systemctl is-active --quiet cloudflared.service && was_active=true || true
+echo "升级 cloudflared: $installed -> $candidate"
+apt-get -o DPkg::Lock::Timeout=300 install -y --only-upgrade cloudflared
+
+if [[ "$was_active" == true ]]; then
+    systemctl restart cloudflared.service
+    systemctl is-active --quiet cloudflared.service
+fi
+/usr/bin/cloudflared version
+UPDATER
+    chmod 0755 "$AUTO_UPDATE_SCRIPT"
+
+    cat > "$AUTO_UPDATE_SERVICE" <<EOF
+# Managed by tools/cloudflare_tunnel.sh
+[Unit]
+Description=Check and install cloudflared APT updates
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=$AUTO_UPDATE_SCRIPT
+EOF
+
+    cat > "$AUTO_UPDATE_TIMER" <<'EOF'
+# Managed by tools/cloudflare_tunnel.sh
+[Unit]
+Description=Daily cloudflared APT update check
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=6h
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+    chmod 0644 "$AUTO_UPDATE_SERVICE" "$AUTO_UPDATE_TIMER"
+}
+
+auto_update_file_is_managed() {
+    grep -Fq '# Managed by tools/cloudflare_tunnel.sh' "$1"
+}
+
+enable_auto_update() {
+    local path backup_dir
+    require_root
+    check_platform
+    dpkg-query -W -f='${db:Status-Status}' cloudflared 2>/dev/null | grep -qx installed || {
+        error "请先安装 cloudflared APT 包"
+        return 1
+    }
+    configure_repository
+    command -v flock >/dev/null || {
+        apt-get update
+        DEBIAN_FRONTEND=noninteractive apt-get install -y util-linux
+    }
+    for path in "$AUTO_UPDATE_SCRIPT" "$AUTO_UPDATE_SERVICE" "$AUTO_UPDATE_TIMER"; do
+        [[ -e "$path" ]] || continue
+        auto_update_file_is_managed "$path" || {
+            error "现有自动更新文件不受本脚本管理，拒绝覆盖: $path"
+            return 1
+        }
+    done
+    backup_dir="$STATE_DIR/auto-update-previous-$(date +%Y%m%d_%H%M%S)"
+    for path in "$AUTO_UPDATE_SCRIPT" "$AUTO_UPDATE_SERVICE" "$AUTO_UPDATE_TIMER"; do
+        backup_path "$path" "$backup_dir"
+    done
+    write_auto_update_files
+    systemctl daemon-reload
+    systemctl enable --now cloudflared-apt-update.timer
+    info "已启用每日 APT 更新检查；更新时仅重启原本正在运行的 cloudflared 服务。"
+}
+
+disable_auto_update() {
+    local confirmed="${1:-}" path backup_dir
+    require_root
+    check_platform
+    for path in "$AUTO_UPDATE_SCRIPT" "$AUTO_UPDATE_SERVICE" "$AUTO_UPDATE_TIMER"; do
+        [[ -e "$path" ]] || continue
+        auto_update_file_is_managed "$path" || {
+            error "自动更新文件不受本脚本管理，拒绝删除: $path"
+            return 1
+        }
+    done
+    if [[ "$confirmed" != --confirmed ]]; then
+        confirm "禁用并删除 cloudflared APT 自动更新组件？" || { info "已取消"; return 0; }
+    fi
+    backup_dir="$STATE_DIR/auto-update-$(date +%Y%m%d_%H%M%S)"
+    systemctl disable --now cloudflared-apt-update.timer >/dev/null 2>&1 || true
+    systemctl stop cloudflared-apt-update.service >/dev/null 2>&1 || true
+    for path in "$AUTO_UPDATE_SCRIPT" "$AUTO_UPDATE_SERVICE" "$AUTO_UPDATE_TIMER"; do
+        [[ -e "$path" ]] || continue
+        backup_path "$path" "$backup_dir"
+        rm -f "$path"
+    done
+    systemctl daemon-reload
+    info "APT 自动更新组件已禁用；备份目录: $backup_dir"
+}
+
+show_auto_update_status() {
+    if command -v systemctl >/dev/null && systemctl is-enabled --quiet cloudflared-apt-update.timer 2>/dev/null; then
+        echo "APT 自动更新: 已启用"
+        systemctl list-timers cloudflared-apt-update.timer --no-pager 2>/dev/null || true
+    else
+        echo "APT 自动更新: 未启用"
+    fi
+}
+
 install_package() {
     configure_repository
     apt-get update
@@ -175,7 +319,13 @@ install_cloudflared() {
     check_platform
     install_package
     install_service
-    info "安装完成。后续版本由 APT 管理；本脚本不创建独立更新定时器。"
+    info "安装完成。版本由 APT 管理；自动检查默认关闭。"
+    warn "自动更新安装新版时会重启正在运行的 cloudflared，单实例 Tunnel 会短暂中断。"
+    if confirm "是否启用每日 APT 更新检测与安装？"; then
+        enable_auto_update
+    else
+        info "自动更新未启用；稍后可运行: sudo $(basename "$0") enable-auto-update"
+    fi
 }
 
 upgrade_cloudflared() {
@@ -212,6 +362,7 @@ show_status() {
     [[ -e "$LEGACY_BIN" ]] && warn "旧二进制仍存在: $LEGACY_BIN"
     [[ -e "$LEGACY_TIMER" || -e "$LEGACY_SERVICE" || -e "$LEGACY_UPDATER" ]] &&
         warn "旧自定义更新组件仍存在"
+    show_auto_update_status
 }
 
 remove_managed_repository() {
@@ -233,6 +384,7 @@ uninstall_cloudflared() {
         confirm "继续卸载？" || { info "已取消"; return 0; }
     fi
 
+    disable_auto_update --confirmed
     if command -v cloudflared >/dev/null 2>&1; then
         cloudflared service uninstall >/dev/null 2>&1 || true
     fi
@@ -264,13 +416,16 @@ show_help() {
 用法：
   cloudflare_tunnel.sh install          配置官方 APT 源、安装包并安装 Tunnel 服务
   cloudflare_tunnel.sh upgrade          通过 APT 升级并重启服务
-  cloudflare_tunnel.sh status           查看包、服务和旧版残留
+  cloudflare_tunnel.sh status                查看包、服务、自动更新和旧版残留
+  cloudflare_tunnel.sh enable-auto-update    启用每日 APT 更新检测与安装
+  cloudflare_tunnel.sh disable-auto-update   禁用并备份自动更新组件
   cloudflare_tunnel.sh migrate-legacy   备份并清理旧二进制和自定义更新器
   cloudflare_tunnel.sh uninstall        删除服务、APT 包和本工具管理的软件源，保留配置
   cloudflare_tunnel.sh purge            二次确认后彻底删除本地 Tunnel 配置
   cloudflare_tunnel.sh help             显示帮助
 
-APT 包会随 apt upgrade/full-upgrade 更新；是否自动执行取决于系统更新策略。
+APT 包会随系统 apt upgrade/full-upgrade 更新。enable-auto-update 会每日运行 apt-get update，
+仅在候选版本较新时升级；原服务正在运行时会重启并造成短暂流量中断。
 EOF
 }
 
@@ -280,6 +435,8 @@ main() {
         install) install_cloudflared ;;
         upgrade) upgrade_cloudflared ;;
         status) show_status ;;
+        enable-auto-update) enable_auto_update ;;
+        disable-auto-update) disable_auto_update ;;
         migrate-legacy)
             require_root
             check_platform

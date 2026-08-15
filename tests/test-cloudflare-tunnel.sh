@@ -12,6 +12,9 @@ export CLOUDFLARED_LEGACY_BIN="$TEST_DIR/cloudflared"
 export CLOUDFLARED_LEGACY_UPDATER="$TEST_DIR/cloudflared-update"
 export CLOUDFLARED_LEGACY_SERVICE="$TEST_DIR/cloudflared-updater.service"
 export CLOUDFLARED_LEGACY_TIMER="$TEST_DIR/cloudflared-updater.timer"
+export CLOUDFLARED_AUTO_UPDATE_SCRIPT="$TEST_DIR/cloudflared-apt-update"
+export CLOUDFLARED_AUTO_UPDATE_SERVICE="$TEST_DIR/cloudflared-apt-update.service"
+export CLOUDFLARED_AUTO_UPDATE_TIMER="$TEST_DIR/cloudflared-apt-update.timer"
 # shellcheck source=../tools/cloudflare_tunnel.sh
 source "$ROOT_DIR/tools/cloudflare_tunnel.sh"
 
@@ -36,6 +39,21 @@ configure_repository
 grep -Fq 'https://pkg.cloudflare.com/cloudflared any main' "$SOURCE_FILE" ||
     fail "official repository definition was not written"
 pass "configure official stable APT repository"
+
+write_auto_update_files
+bash -n "$AUTO_UPDATE_SCRIPT"
+grep -Fq 'apt-get -o DPkg::Lock::Timeout=300 update -qq' "$AUTO_UPDATE_SCRIPT" ||
+    fail "auto updater does not refresh APT metadata"
+grep -Fq 'dpkg --compare-versions "$candidate" gt "$installed"' "$AUTO_UPDATE_SCRIPT" ||
+    fail "auto updater does not compare installed and candidate versions"
+grep -Fq 'install -y --only-upgrade cloudflared' "$AUTO_UPDATE_SCRIPT" ||
+    fail "auto updater does not restrict upgrade to cloudflared"
+grep -Fq 'systemctl restart cloudflared.service' "$AUTO_UPDATE_SCRIPT" ||
+    fail "auto updater does not restart an active service"
+grep -Fq 'OnCalendar=daily' "$AUTO_UPDATE_TIMER" || fail "daily timer missing"
+grep -Fq 'RandomizedDelaySec=6h' "$AUTO_UPDATE_TIMER" || fail "timer jitter missing"
+grep -Fq 'Persistent=true' "$AUTO_UPDATE_TIMER" || fail "persistent timer missing"
+pass "generate opt-in APT update timer"
 
 cat > "$LEGACY_UPDATER" <<'EOF'
 #!/usr/bin/env bash
@@ -69,9 +87,7 @@ script="$ROOT_DIR/tools/cloudflare_tunnel.sh"
 grep -Fq 'https://pkg.cloudflare.com/cloudflared' "$script" || fail "official APT repository missing"
 grep -Fq 'apt-get install -y --only-upgrade cloudflared' "$script" || fail "APT upgrade path missing"
 grep -Fq 'read -r -s -p' "$script" || fail "Token input is not hidden"
-if grep -Fq 'OnCalendar=' "$script"; then
-    fail "custom updater timer still generated"
-fi
-pass "use official APT lifecycle without custom timer"
+grep -Fq 'enable-auto-update' "$script" || fail "opt-in auto-update command missing"
+pass "use official APT lifecycle with opt-in update detection"
 
 printf 'All cloudflare wrapper tests passed.\n'

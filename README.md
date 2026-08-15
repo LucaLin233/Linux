@@ -259,19 +259,27 @@ bash <(curl -fsSL "$RAW_BASE/network-optimize.sh") help
 
 [`tools/cloudflare_tunnel.sh`](tools/cloudflare_tunnel.sh) 是 Cloudflare 官方 APT 安装流程的薄包装器，
 只支持 Debian/Ubuntu 与 systemd。它使用官方 stable 软件源和 `cloudflared service install`，
-不会再下载裸二进制或创建独立更新 timer。
+不再下载裸二进制。安装完成后会询问是否启用受管的 APT systemd timer，默认不启用；也可稍后
+使用独立命令启用。
 
 ```bash
 sudo bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/tools/cloudflare_tunnel.sh) install
 sudo bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/tools/cloudflare_tunnel.sh) upgrade
 bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/tools/cloudflare_tunnel.sh) status
+sudo bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/tools/cloudflare_tunnel.sh) enable-auto-update
+sudo bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/tools/cloudflare_tunnel.sh) disable-auto-update
 sudo bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/tools/cloudflare_tunnel.sh) migrate-legacy
 sudo bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/tools/cloudflare_tunnel.sh) uninstall
 ```
 
 安装时 Token 使用隐藏输入，不会写入日志。APT 包会随普通 `apt upgrade` 或 `apt full-upgrade`
-更新；是否自动执行取决于系统的 unattended-upgrades、定时任务或本仓库的自动更新模块。
-`upgrade` 按 Cloudflare 官方要求通过 APT 更新并重启服务，因此单实例 Tunnel 会短暂中断。
+更新，但这些命令本身不会自动运行。`enable-auto-update` 会创建每日 systemd timer：先执行
+`apt-get update`，比较已安装版本与候选版本，只在存在新版时升级 `cloudflared`；服务原本运行时
+才会重启。timer 使用随机延迟、APT 锁等待和独立 flock，日志进入 journal。
+
+启用自动更新意味着升级时单实例 Tunnel 会短暂中断。如果已经使用本仓库
+`auto-update-setup.sh` 每周执行完整系统升级，通常无需重复启用此 timer；只有需要更频繁检测
+cloudflared 时再启用。`upgrade` 可用于立即手动检查、升级并重启服务。
 
 `migrate-legacy` 会识别、备份并清理旧版脚本放在 `/usr/local/bin` 的二进制和自定义 updater；
 无法确认归属的文件会保留。`uninstall` 删除服务、APT 包及本脚本管理的软件源，但保留 Tunnel
