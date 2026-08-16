@@ -88,6 +88,22 @@ qdisc fq 0: parent :1 limit 10000p
 qdisc clsact ffff: parent ffff:fff1
 EOF
 )" "classify mq with all fq leaves as effective"
+assert_eq 'effective|root htb; all 1 leaves fq' "$(classify_active_qdisc <<'EOF'
+qdisc htb 1: root refcnt 2 r2q 10 default 0xa direct_packets_stat 0
+qdisc fq 10: parent 1:10 limit 10000p flow_limit 100p
+qdisc clsact ffff: parent ffff:fff1
+EOF
+)" "classify htb with fq leaf as effective"
+assert_eq 'mixed|root htb; fq leaves 1/2; other: fq_codel' "$(classify_active_qdisc <<'EOF'
+qdisc htb 1: root refcnt 2 r2q 10 default 0xa direct_packets_stat 0
+qdisc fq 10: parent 1:10 limit 10000p flow_limit 100p
+qdisc fq_codel 20: parent 1:20 limit 10240p
+EOF
+)" "classify mixed htb leaves"
+assert_eq 'inactive|root htb; no readable leaves' "$(classify_active_qdisc <<'EOF'
+qdisc htb 1: root refcnt 2 r2q 10 default 0xa direct_packets_stat 0
+EOF
+)" "classify htb without readable leaves as inactive"
 assert_eq 'mixed|root mq; fq leaves 1/2; other: fq_codel' "$(classify_active_qdisc <<'EOF'
 qdisc mq 0: root
 qdisc fq 0: parent :2 limit 10000p
@@ -125,6 +141,39 @@ assert_eq "异常：测速期间 softnet 丢包 +0，网卡丢包 +2000（2000 p
 assert_eq "异常：测速期间 softnet 丢包 +0，网卡丢包 +0（0 ppm），网卡错误 +1" \
     "$(classify_network_health 0 0 1 0 1000000)" \
     "classify NIC errors as abnormal"
+
+ethtool() {
+    [[ "$*" == '-S eth0' ]] || return 1
+    printf '%s\n' \
+        'NIC statistics:' \
+        '     bw_out_allowance_exceeded: 4' \
+        '     pps_allowance_exceeded: 7' \
+        '     unrelated_counter: 99'
+}
+assert_eq $'bw_out_allowance_exceeded=4\npps_allowance_exceeded=7' \
+    "$(nic_allowance_snapshot eth0)" "read supported driver allowance counters"
+ethtool() { return 1; }
+assert_eq '' "$(nic_allowance_snapshot eth0)" \
+    "ignore unsupported ethtool statistics"
+unset -f ethtool
+
+assert_eq $'系统计数增量：softnet_dropped +1 / time_squeeze +5 / 全机 TCP 重传 +30\n网卡计数增量：drops rx +10 tx +20 / errors rx +0 tx +1 / packets rx +100 tx +500\n网络健康：异常：测速期间 softnet 丢包 +1，网卡丢包 +30（50000 ppm），网卡错误 +1；当前受限 socket 2\n驱动 allowance：bw_out_allowance_exceeded +2' \
+    "$(format_verify_health_delta \
+        '0 10 0 0 2 3 100 0 1000 2000' \
+        '1 15 0 1 12 23 130 2 1100 2500' \
+        'bw_out_allowance_exceeded=4' \
+        'bw_out_allowance_exceeded=6')" \
+    "format verify health and allowance deltas"
+assert_eq '驱动 allowance：无新增超额事件' \
+    "$(format_nic_allowance_delta \
+        $'bw_out_allowance_exceeded=4\npps_allowance_exceeded=7' \
+        $'bw_out_allowance_exceeded=4\npps_allowance_exceeded=7')" \
+    "format unchanged allowance counters"
+assert_eq '网络健康：测试期间计数器重置，无法计算可靠增量' \
+    "$(format_verify_health_delta \
+        '1 0 0 0 0 0 10 0 100 100' \
+        '0 0 0 0 0 0 10 0 100 100' '' '')" \
+    "reject reset verify counters"
 
 CURRENT_ROUTE="default via 192.0.2.1 dev eth0 proto dhcp src 192.0.2.10 metric 100 onlink"
 LAST_ROUTE_ARGS=""

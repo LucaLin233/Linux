@@ -885,13 +885,15 @@ classify_active_qdisc() {
                 print "unreadable|no qdisc data"
             } else if (root == "fq") {
                 print "effective|root fq"
-            } else if (root == "mq") {
+            } else if (root == "mq" || root == "htb") {
                 if (leaves > 0 && fq == leaves) {
-                    printf "effective|root mq; all %d leaves fq\n", leaves
-                } else if (leaves == 0) {
+                    printf "effective|root %s; all %d leaves fq\n", root, leaves
+                } else if (leaves == 0 && root == "mq") {
                     print "unreadable|root mq; no readable leaves"
+                } else if (leaves == 0) {
+                    print "inactive|root htb; no readable leaves"
                 } else {
-                    printf "mixed|root mq; fq leaves %d/%d", fq, leaves
+                    printf "mixed|root %s; fq leaves %d/%d", root, fq, leaves
                     if (other != "") printf "; other: %s", other
                     print ""
                 }
@@ -1433,16 +1435,18 @@ cleanup_verify() {
 
 verify_impl() {
     local answer ranked rtt host peer_ip location provider port
+    local health_before allowance_before
     local single_result="" four_result="" candidate_single rc
     local single_sender single_receiver single_retrans single_retrans_pct single_cpu single_remote_cpu
     local four_sender four_receiver four_retrans four_retrans_pct four_cpu four_remote_cpu
-    local qdisc_state qdisc_detail selected="false" attempts=0
+    local qdisc_state qdisc_detail selected="false" traffic_started="false" attempts=0
 
     echo "verify 将运行 5 秒单流 + 5 秒四流上传测试。"
     echo "每个候选先测 1 流再测 4 流；任一步失败则整组作废并轮换，最多尝试 ${VERIFY_MAX_GROUP_ATTEMPTS} 组。"
     echo "正常完成约为 10 秒实际发送速率；若 1 流成功后 4 流失败，重试会重复单流并产生额外流量。"
     echo "最坏最多约 30 秒实际发送速率：1 Gbps 约 3.75 GB，10 Gbps 约 37.5 GB。"
     echo "沿用安全阈值：上传 40 GB 或合计 85 GB 时提前停止；不会修改 sysctl、路由或 qdisc。"
+    echo "同时读取测试前后内核与网卡计数器；ethtool 可用时附加驱动 allowance 增量。"
     if [[ "$VERIFY_ASSUME_YES" != "true" ]]; then
         if ! is_interactive_terminal; then
             error "非交互环境拒绝产生流量；显式传入 verify --yes 后重试"
@@ -1460,6 +1464,8 @@ verify_impl() {
         error "无法读取默认网卡流量计数器，拒绝测速"
         return 1
     }
+    health_before=$(network_health_snapshot "$PROBE_IFACE")
+    allowance_before=$(nic_allowance_snapshot "$PROBE_IFACE")
     VERIFY_TEMP_DIR=$(mktemp -d) || return 1
     ranked=$(rank_iperf_peers || true)
     [[ -n "$ranked" ]] || {
@@ -1475,10 +1481,12 @@ verify_impl() {
             ((attempts += 1))
             candidate_single=""
 
+            traffic_started="true"
             run_verify_iperf "$peer_ip" "$port" 1 && rc=0 || rc=$?
             if (( rc == 0 )); then
                 candidate_single="$VERIFY_RESULT"
             elif (( rc == 75 )); then
+                show_verify_health_since "$health_before" "$allowance_before"
                 return 1
             else
                 warn "候选 $host [$peer_ip]:$port 单流测试失败，整组作废"
@@ -1492,6 +1500,7 @@ verify_impl() {
                     selected="true"
                     break 2
                 elif (( rc == 75 )); then
+                    show_verify_health_since "$health_before" "$allowance_before"
                     return 1
                 else
                     warn "候选 $host [$peer_ip]:$port 四流测试失败，整组作废"
@@ -1501,6 +1510,7 @@ verify_impl() {
         done < <(ordered_iperf_ports)
     done <<< "$ranked"
     [[ "$selected" == "true" ]] || {
+        [[ "$traffic_started" != "true" ]] || show_verify_health_since "$health_before" "$allowance_before"
         error "${attempts} 组公共 iperf3 候选均未得到完整的 1 流和 4 流结果"
         return 1
     }
@@ -1519,6 +1529,7 @@ verify_impl() {
         "$four_sender" "$four_receiver" "$four_retrans_pct" "$four_retrans" \
         "$four_cpu" "$four_remote_cpu"
     printf '活动 qdisc: %s\n' "$(format_qdisc_state "$qdisc_state" "$qdisc_detail")"
+    show_verify_health_since "$health_before" "$allowance_before"
     traffic_report
     if (( four_receiver * 100 >= single_receiver * 125 )); then
         echo "结论：4 流 goodput 明显高于 1 流；单流可能受 RTT、拥塞控制或路径限制。"
@@ -2155,6 +2166,124 @@ classify_network_health() {
     else
         printf '正常：测速期间 softnet 和网卡无新增丢包或错误'
     fi
+}
+
+nic_allowance_snapshot() {
+    local iface="${1:-}"
+    local output
+
+    [[ -n "$iface" ]] || return 0
+    command -v ethtool >/dev/null 2>&1 || return 0
+    output=$(ethtool -S "$iface" 2>/dev/null) || return 0
+    awk '
+            $1 ~ /_allowance_exceeded:$/ && $2 ~ /^[0-9]+$/ {
+                key = $1
+                sub(/:$/, "", key)
+                print key "=" $2
+            }
+        ' <<< "$output"
+}
+
+format_nic_allowance_delta() {
+    local before="$1" after="$2"
+    local key value before_value after_value delta part
+    local output=""
+    local -a keys=()
+    local -A before_values=()
+    local -A after_values=()
+
+    while IFS='=' read -r key value; do
+        [[ -n "$key" && "$value" =~ ^[0-9]+$ ]] || continue
+        before_values["$key"]="$value"
+    done <<< "$before"
+    while IFS='=' read -r key value; do
+        [[ -n "$key" && "$value" =~ ^[0-9]+$ ]] || continue
+        after_values["$key"]="$value"
+    done <<< "$after"
+    mapfile -t keys < <(
+        printf '%s\n' "${!before_values[@]}" "${!after_values[@]}" |
+            sed '/^$/d' | sort -u
+    )
+    (( ${#keys[@]} > 0 )) || return 0
+
+    for key in "${keys[@]}"; do
+        before_value=${before_values[$key]:-0}
+        after_value=${after_values[$key]:-$before_value}
+        if (( after_value < before_value )); then
+            part="$key 计数器重置（$before_value -> $after_value）"
+        else
+            delta=$((after_value - before_value))
+            (( delta > 0 )) || continue
+            part="$key +$delta"
+        fi
+        [[ -z "$output" ]] || output+=", "
+        output+="$part"
+    done
+
+    if [[ -n "$output" ]]; then
+        printf '驱动 allowance：%s\n' "$output"
+    else
+        printf '驱动 allowance：无新增超额事件\n'
+    fi
+}
+
+format_verify_health_delta() {
+    local before="$1" after="$2" allowance_before="$3" allowance_after="$4"
+    local b_drop b_squeeze b_rxerr b_txerr b_rxdrop b_txdrop b_retrans _ b_rxpkt b_txpkt
+    local a_drop a_squeeze a_rxerr a_txerr a_rxdrop a_txdrop a_retrans a_limited a_rxpkt a_txpkt
+    local delta_drop delta_squeeze delta_rxerr delta_txerr delta_rxdrop delta_txdrop
+    local delta_retrans delta_rxpkt delta_txpkt delta_packets health value
+
+    read -r b_drop b_squeeze b_rxerr b_txerr b_rxdrop b_txdrop b_retrans _ b_rxpkt b_txpkt <<< "$before"
+    read -r a_drop a_squeeze a_rxerr a_txerr a_rxdrop a_txdrop a_retrans a_limited a_rxpkt a_txpkt <<< "$after"
+    for value in "$b_drop" "$b_squeeze" "$b_rxerr" "$b_txerr" "$b_rxdrop" "$b_txdrop" \
+        "$b_retrans" "$b_rxpkt" "$b_txpkt" "$a_drop" "$a_squeeze" "$a_rxerr" \
+        "$a_txerr" "$a_rxdrop" "$a_txdrop" "$a_retrans" "$a_limited" "$a_rxpkt" "$a_txpkt"; do
+        [[ "$value" =~ ^[0-9]+$ ]] || {
+            printf '网络健康：计数器不可读，无法计算 verify 增量\n'
+            format_nic_allowance_delta "$allowance_before" "$allowance_after"
+            return 0
+        }
+    done
+    if (( a_drop < b_drop || a_squeeze < b_squeeze || a_rxerr < b_rxerr ||
+          a_txerr < b_txerr || a_rxdrop < b_rxdrop || a_txdrop < b_txdrop ||
+          a_retrans < b_retrans || a_rxpkt < b_rxpkt || a_txpkt < b_txpkt )); then
+        printf '网络健康：测试期间计数器重置，无法计算可靠增量\n'
+        format_nic_allowance_delta "$allowance_before" "$allowance_after"
+        return 0
+    fi
+
+    delta_drop=$((a_drop - b_drop))
+    delta_squeeze=$((a_squeeze - b_squeeze))
+    delta_rxerr=$((a_rxerr - b_rxerr))
+    delta_txerr=$((a_txerr - b_txerr))
+    delta_rxdrop=$((a_rxdrop - b_rxdrop))
+    delta_txdrop=$((a_txdrop - b_txdrop))
+    delta_retrans=$((a_retrans - b_retrans))
+    delta_rxpkt=$((a_rxpkt - b_rxpkt))
+    delta_txpkt=$((a_txpkt - b_txpkt))
+    delta_packets=$((delta_rxpkt + delta_txpkt))
+    health=$(classify_network_health "$delta_drop" "$delta_squeeze" \
+        "$((delta_rxerr + delta_txerr))" "$((delta_rxdrop + delta_txdrop))" \
+        "$delta_packets")
+
+    printf '系统计数增量：softnet_dropped +%s / time_squeeze +%s / 全机 TCP 重传 +%s\n' \
+        "$delta_drop" "$delta_squeeze" "$delta_retrans"
+    printf '网卡计数增量：drops rx +%s tx +%s / errors rx +%s tx +%s / packets rx +%s tx +%s\n' \
+        "$delta_rxdrop" "$delta_txdrop" "$delta_rxerr" "$delta_txerr" \
+        "$delta_rxpkt" "$delta_txpkt"
+    printf '网络健康：%s；当前受限 socket %s\n' "$health" "$a_limited"
+    format_nic_allowance_delta "$allowance_before" "$allowance_after"
+}
+
+show_verify_health_since() {
+    local health_before="$1" allowance_before="$2"
+    local health_after allowance_after
+
+    health_after=$(network_health_snapshot "$PROBE_IFACE")
+    allowance_after=$(nic_allowance_snapshot "$PROBE_IFACE")
+    format_verify_health_delta "$health_before" "$health_after" \
+        "$allowance_before" "$allowance_after"
 }
 
 format_rtt_selection_summary() {

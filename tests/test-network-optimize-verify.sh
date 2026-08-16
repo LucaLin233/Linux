@@ -62,6 +62,30 @@ rank_iperf_peers() {
 tcp_port_open() { [[ "$1:$2" == '192.0.2.10:5201' ]]; }
 traffic_budget_reached() { return 1; }
 traffic_report() { printf '%s\n' '流量：上传 1.00 GB / 下载 0 MB / 合计 1.00 GB'; }
+HEALTH_SNAPSHOT_CALLS="$TEMP_DIR/health-snapshot.calls"
+ALLOWANCE_SNAPSHOT_CALLS="$TEMP_DIR/allowance-snapshot.calls"
+printf '0\n' > "$HEALTH_SNAPSHOT_CALLS"
+printf '0\n' > "$ALLOWANCE_SNAPSHOT_CALLS"
+network_health_snapshot() {
+    local calls
+    calls=$(cat "$HEALTH_SNAPSHOT_CALLS")
+    printf '%s\n' "$((calls + 1))" > "$HEALTH_SNAPSHOT_CALLS"
+    if (( calls == 0 )); then
+        printf '%s\n' '0 10 0 0 2 3 100 0 1000 2000'
+    else
+        printf '%s\n' '1 15 0 1 12 23 130 2 1100 2500'
+    fi
+}
+nic_allowance_snapshot() {
+    local calls
+    calls=$(cat "$ALLOWANCE_SNAPSHOT_CALLS")
+    printf '%s\n' "$((calls + 1))" > "$ALLOWANCE_SNAPSHOT_CALLS"
+    if (( calls == 0 )); then
+        printf '%s\n' 'bw_out_allowance_exceeded=4'
+    else
+        printf '%s\n' 'bw_out_allowance_exceeded=6'
+    fi
+}
 run_verify_iperf() {
     case "$3" in
         1) VERIFY_RESULT='500|490|20|0.0100|10.0|5.0' ;;
@@ -84,6 +108,12 @@ grep -Fq '4 流：sender 900 Mbps / receiver 880 Mbps' <<< "$verify_output" ||
     fail "verify output misses four-stream metrics"
 grep -Fq '活动 qdisc: 生效（root fq）' <<< "$verify_output" ||
     fail "verify output misses active qdisc"
+grep -Fq '系统计数增量：softnet_dropped +1 / time_squeeze +5 / 全机 TCP 重传 +30' \
+    <<< "$verify_output" || fail "verify output misses system counter deltas"
+grep -Fq '网卡计数增量：drops rx +10 tx +20 / errors rx +0 tx +1 / packets rx +100 tx +500' \
+    <<< "$verify_output" || fail "verify output misses NIC counter deltas"
+grep -Fq '驱动 allowance：bw_out_allowance_exceeded +2' <<< "$verify_output" ||
+    fail "verify output misses driver allowance deltas"
 grep -Fq '最多尝试 3 组' <<< "$verify_output" ||
     fail "verify confirmation misses retry cap"
 grep -Fq '重试会重复单流并产生额外流量' <<< "$verify_output" ||
@@ -93,7 +123,10 @@ grep -Fq '最坏最多约 30 秒实际发送速率' <<< "$verify_output" ||
 grep -Fq '结论：4 流 goodput 明显高于 1 流' <<< "$verify_output" ||
     fail "verify output misses comparison conclusion"
 assert_eq 'qdisc show dev eth0' "$(cat "$TC_CALLS")" \
-    "verify only reads qdisc state"
+    "verify does not mutate qdisc state"
+
+network_health_snapshot() { printf '%s\n' '0 0 0 0 0 0 0 0 0 0'; }
+nic_allowance_snapshot() { return 0; }
 
 VERIFY_CALLS="$TEMP_DIR/verify.calls"
 rank_iperf_peers() {

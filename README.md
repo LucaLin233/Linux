@@ -218,7 +218,7 @@ bash <(curl -fsSL "$RAW_BASE/network-optimize.sh") help
 
 主脚本交互运行到网络模块时会显示相同的三项选择；选择多个模块也不会跳过该确认。无 TTY 且未传模式参数时自动使用静态 32 MiB 缓冲区，不安装 `iperf3`/`jq`，也不产生测速流量。明确传入 `--auto`、`--probe`、`--static` 或线路参数时跳过交互；手填带宽缺少 RTT 时按 150 ms 计算且不测速，显式 `--rtt-ms` 严格使用用户值；主动探测成功时保留观测 RTT，并按 `max(观测 RTT, 150 ms)` 计算，失败回退到 150 ms。配置、计划、状态和摘要会区分观测值、计算值、来源和策略。`--target` 必须配合 `--probe`。
 
-`initcwnd` 默认为 `auto`：已知上传带宽不高于 100 Mbps 时保留内核默认，否则在默认路由设置 `initcwnd/initrwnd=32`；`--enable-initcwnd` 和 `--disable-initcwnd` 可显式覆盖。`status` 同时检查 ownership marker 与真实默认路由，并把 marker/路由不一致报告为漂移；也会区分 `default qdisc` 和默认出口实际 `active qdisc`。`verify` 自动选择附近公共 iperf3 对端和可用端口，只有交互确认或非交互显式 `--yes` 后才测试；比较 1 流与 4 流 sender/receiver goodput、重传率和 CPU，全程不修改 sysctl、路由或 qdisc，也不自动安装依赖。
+`initcwnd` 默认为 `auto`：已知上传带宽不高于 100 Mbps 时保留内核默认，否则在默认路由设置 `initcwnd/initrwnd=32`；`--enable-initcwnd` 和 `--disable-initcwnd` 可显式覆盖。`status` 同时检查 ownership marker 与真实默认路由，并把 marker/路由不一致报告为漂移；也会区分 `default qdisc` 和默认出口实际 `active qdisc`，能识别 root `fq`、`mq` + 全 `fq` leaves、`htb` + 全 `fq` leaves，以及混合或不可读状态。`verify` 自动选择附近公共 iperf3 对端和可用端口，只有交互确认或非交互显式 `--yes` 后才测试；比较 1 流与 4 流 sender/receiver goodput、重传率和 CPU，并报告测试期间 softnet、网卡丢包/错误、全机 TCP 重传及可用的驱动 allowance 增量。全程不修改 sysctl、路由或 qdisc，也不自动安装依赖。
 
 旧版受管配置中的 `ip_local_port_range = 1024 65535` 会恢复首次运行前的值；备份不可用时恢复 Debian 默认 `32768 60999`，新版不再管理该参数。默认不写入 `net.ipv4.tcp_ecn`；只有显式传入 `--disable-ecn` 时才持久写入 `0`。升级旧版受管配置时，ECN 和 `nf_conntrack_max` 有可信首次运行备份便恢复原值；初始值未知则不猜测，仅停止持久管理并保留当前运行值到重启。
 
