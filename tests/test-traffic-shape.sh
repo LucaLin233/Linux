@@ -169,6 +169,11 @@ assert_ok "validate install source" validate_install_file \
     "$ROOT_DIR/tools/traffic-shape.sh"
 assert_ok "validate managed update file" validate_update_file \
     "$ROOT_DIR/tools/traffic-shape.sh" "1.0.13"
+grep -Fq '# Upstream version: v0.5.6' "$ROOT_DIR/tools/traffic-shape.sh" ||
+    fail "traffic-shape upstream version is not pinned to v0.5.6"
+grep -Fq '`v0.5.6`' "$ROOT_DIR/docs/traffic-shape.md" ||
+    fail "traffic-shape documentation does not name v0.5.6 baseline"
+printf 'PASS: tcpfit migration and algorithm baseline is v0.5.6\n'
 
 temp_dir=$(mktemp -d)
 trap 'rm -rf "$temp_dir"' EXIT

@@ -12,6 +12,7 @@
 #   bash network-optimize.sh plan [选项]       # 只计算，不修改系统
 #   bash network-optimize.sh restore           # 恢复上一次配置
 #   bash network-optimize.sh status            # 查看当前状态
+#   bash network-optimize.sh verify [--yes]    # 确认后只读验证网络性能
 #
 # install/plan 可选参数：
 #   --auto, --probe              明确执行自动探测
@@ -23,7 +24,8 @@
 #   --target HOST                自定义 RTT 目标，可重复指定；需配合 --probe
 #   --no-probe                   不发起网络探测；缺失数据时按内存保守配置
 #   --disable-ecn                禁用 ECN，回退到传统丢包信号
-#   --disable-initcwnd           保留内核默认初始拥塞窗口
+#   --enable-initcwnd            强制设置初始拥塞窗口为 32
+#   --disable-initcwnd           强制保留内核默认初始拥塞窗口
 
 set -euo pipefail
 
@@ -102,6 +104,7 @@ readonly -a GLOBAL_TCP_TARGETS=(www.cloudflare.com www.google.com www.wikipedia.
 readonly AUTO_RTT_MIN_MS=10
 readonly AUTO_RTT_MAX_MS=300
 readonly DEFAULT_RTT_MS=150
+readonly INITCWND_AUTO_UPLOAD_LIMIT_MBPS=100
 
 # 参数与计算结果。命令行参数优先于自动探测。
 COMMAND="install"
@@ -111,7 +114,9 @@ NO_PROBE="false"
 TUNING_SELECTION_EXPLICIT="false"
 ACTIVE_PROBE_REQUESTED="false"
 ECN_DISABLED="false"
+INITCWND_MODE="auto"
 INITCWND_ENABLED="true"
+INITCWND_POLICY="unknown"
 MANUAL_BANDWIDTH_MBPS=""
 MANUAL_DOWNLOAD_MBPS=""
 MANUAL_UPLOAD_MBPS=""
@@ -148,6 +153,10 @@ PROBE_IFACE=""
 TRAFFIC_RX_START=0
 TRAFFIC_TX_START=0
 PREFERRED_IPERF_PORT=""
+VERIFY_ASSUME_YES="false"
+VERIFY_CONFIRM_EXPLICIT="false"
+VERIFY_TEMP_DIR=""
+VERIFY_RESULT=""
 
 # 旧版 kernel2.sh 使用的配置文件。
 readonly LEGACY_KERNEL_CONF="/etc/sysctl.d/99-kernel.conf"
@@ -447,8 +456,25 @@ parse_arguments() {
                 ECN_DISABLED="true"
                 shift
                 ;;
+            --enable-initcwnd)
+                if [[ "$INITCWND_MODE" == "disabled" ]]; then
+                    error "--enable-initcwnd 不能与 --disable-initcwnd 同时使用"
+                    return 1
+                fi
+                INITCWND_MODE="enabled"
+                shift
+                ;;
             --disable-initcwnd)
-                INITCWND_ENABLED="false"
+                if [[ "$INITCWND_MODE" == "enabled" ]]; then
+                    error "--enable-initcwnd 不能与 --disable-initcwnd 同时使用"
+                    return 1
+                fi
+                INITCWND_MODE="disabled"
+                shift
+                ;;
+            --yes)
+                VERIFY_ASSUME_YES="true"
+                VERIFY_CONFIRM_EXPLICIT="true"
                 shift
                 ;;
             initial)
@@ -471,7 +497,7 @@ parse_arguments() {
     done
 
     case "$COMMAND" in
-        install|plan|restore|status|help) ;;
+        install|plan|restore|status|verify|help) ;;
         *)
             error "未知命令: $COMMAND"
             return 1
@@ -528,6 +554,18 @@ parse_arguments() {
         fi
     elif [[ -n "$MANUAL_RTT_MS" && "$ACTIVE_PROBE_REQUESTED" != "true" ]]; then
         error "仅指定 RTT 无法计算缓冲区；请同时指定带宽，或使用 --probe"
+        return 1
+    fi
+
+    if [[ "$COMMAND" != "verify" && "$VERIFY_CONFIRM_EXPLICIT" == "true" ]]; then
+        error "--yes 只能用于 verify"
+        return 1
+    fi
+    if [[ "$COMMAND" == "verify" ]] &&
+        [[ -n "$MANUAL_BANDWIDTH_MBPS$MANUAL_DOWNLOAD_MBPS$MANUAL_UPLOAD_MBPS$MANUAL_RTT_MS" ||
+            ${#CUSTOM_RTT_TARGETS[@]} -gt 0 || "$TUNING_SELECTION_EXPLICIT" == "true" ||
+            "$ECN_DISABLED" == "true" || "$INITCWND_MODE" != "auto" ]]; then
+        error "verify 仅接受 --yes；不会安装或应用网络优化"
         return 1
     fi
 }
@@ -830,6 +868,66 @@ detect_rtt() {
     DETECTED_RTT_MS=$(clamp_auto_rtt "$DETECTED_RTT_MS")
 }
 
+classify_active_qdisc() {
+    awk '
+        $1 == "qdisc" && $4 == "root" && root == "" { root = $2 }
+        $1 == "qdisc" && $4 == "parent" && $2 != "clsact" && $2 != "ingress" {
+            leaves++
+            if ($2 == "fq") fq++
+            else {
+                if (other != "") other = other ","
+                other = other $2
+            }
+        }
+        END {
+            if (root == "") {
+                print "unreadable|no qdisc data"
+            } else if (root == "fq") {
+                print "effective|root fq"
+            } else if (root == "mq") {
+                if (leaves > 0 && fq == leaves) {
+                    printf "effective|root mq; all %d leaves fq\n", leaves
+                } else if (leaves == 0) {
+                    print "unreadable|root mq; no readable leaves"
+                } else {
+                    printf "mixed|root mq; fq leaves %d/%d", fq, leaves
+                    if (other != "") printf "; other: %s", other
+                    print ""
+                }
+            } else if (root == "noqueue") {
+                print "inactive|root noqueue"
+            } else {
+                printf "inactive|root %s\n", root
+            }
+        }
+    '
+}
+
+active_qdisc_state() {
+    local iface="$1"
+    local output
+
+    [[ -n "$iface" ]] || {
+        printf '%s\n' 'unreadable|default interface unavailable'
+        return 0
+    }
+    output=$(tc qdisc show dev "$iface" 2>/dev/null) || {
+        printf '%s\n' 'unreadable|tc qdisc read failed'
+        return 0
+    }
+    classify_active_qdisc <<< "$output"
+}
+
+format_qdisc_state() {
+    local state="$1" detail_text="$2"
+    case "$state" in
+        effective) printf '生效（%s）\n' "$detail_text" ;;
+        mixed) printf '混合/未完全生效（%s）\n' "$detail_text" ;;
+        inactive) printf '未生效（%s）\n' "$detail_text" ;;
+        *) printf '不可读（%s）\n' "$detail_text" ;;
+    esac
+}
+
 route_value_after() {
     local key="$1"
     awk -v key="$key" '
@@ -894,6 +992,50 @@ backup_default_route() {
         printf '%s\n' "$route" > "$ROUTE_INITIAL_BACKUP"
         chmod 600 "$ROUTE_INITIAL_BACKUP"
         [[ ! -e "$ROUTE_OWNED_MARKER" ]] || install -m 0600 /dev/null "$ROUTE_INITIAL_OWNED"
+    fi
+}
+
+resolve_initcwnd_policy() {
+    case "$INITCWND_MODE" in
+        enabled)
+            INITCWND_ENABLED="true"
+            INITCWND_POLICY="explicit enabled"
+            ;;
+        disabled)
+            INITCWND_ENABLED="false"
+            INITCWND_POLICY="explicit disabled"
+            ;;
+        auto)
+            if [[ "$DETECTED_UPLOAD_MBPS" =~ ^[0-9]+$ ]] &&
+                (( DETECTED_UPLOAD_MBPS <= INITCWND_AUTO_UPLOAD_LIMIT_MBPS )); then
+                INITCWND_ENABLED="false"
+                INITCWND_POLICY="auto: upload <= 100 Mbps, preserve kernel default"
+            else
+                INITCWND_ENABLED="true"
+                if [[ "$DETECTED_UPLOAD_MBPS" =~ ^[0-9]+$ ]]; then
+                    INITCWND_POLICY="auto: upload > 100 Mbps, set 32"
+                else
+                    INITCWND_POLICY="auto: upload unknown, set 32"
+                fi
+            fi
+            ;;
+    esac
+}
+
+detect_initcwnd_state() {
+    local route
+    route=$(default_ipv4_route)
+    if [[ -e "$ROUTE_OWNED_MARKER" ]]; then
+        if grep -Eq '(^| )initcwnd 32( |$)' <<< "$route" &&
+            grep -Eq '(^| )initrwnd 32( |$)' <<< "$route"; then
+            printf '%s\n' 'effective|owned default route has initcwnd/initrwnd 32'
+        else
+            printf '%s\n' 'drift|ownership marker exists but default route lacks initcwnd/initrwnd 32'
+        fi
+    elif grep -Eq '(^| )initcwnd [0-9]+' <<< "$route"; then
+        printf '%s\n' 'external|default route has unowned initcwnd/initrwnd settings'
+    else
+        printf '%s\n' 'default|kernel default; no ownership marker'
     fi
 }
 
@@ -1059,7 +1201,11 @@ rank_iperf_peers() {
     local file
 
     command -v ping >/dev/null 2>&1 || return 1
-    temp_dir=$(mktemp -d) || return 1
+    if [[ -n "${VERIFY_TEMP_DIR:-}" ]]; then
+        temp_dir=$(mktemp -d "$VERIFY_TEMP_DIR/peers.XXXXXX") || return 1
+    else
+        temp_dir=$(mktemp -d) || return 1
+    fi
 
     while IFS='|' read -r host location provider; do
         [[ -n "$host" ]] || continue
@@ -1143,8 +1289,8 @@ run_iperf_test() {
     if [[ "$limited" != "true" ]]; then
         stats=$(jq -r '
             [
-                (.end.sum_received.bits_per_second
-                    // .end.sum_sent.bits_per_second // ""),
+                (.end.sum_received.bits_per_second //
+                    .end.sum_sent.bits_per_second // ""),
                 (.end.cpu_utilization_percent.host_total // ""),
                 (.end.sum_sent.retransmits // ""),
                 (.end.sum_sent.bytes // "")
@@ -1180,6 +1326,205 @@ format_cpu_percent() {
     else
         echo "?"
     fi
+}
+
+parse_iperf_metrics() {
+    local output_file="$1"
+    local stats
+    local sender_bps receiver_bps sent_bytes retransmits mss host_cpu remote_cpu
+    local retransmit_percent
+
+    stats=$(jq -r '
+        [
+            (.end.sum_sent.bits_per_second // ""),
+            (.end.sum_received.bits_per_second // ""),
+            (.end.sum_sent.bytes // ""),
+            (.end.sum_sent.retransmits // ""),
+            (.start.tcp_mss_default // 1448),
+            (.end.cpu_utilization_percent.host_total // ""),
+            (.end.cpu_utilization_percent.remote_total // "")
+        ] | join("|")
+    ' "$output_file" 2>/dev/null) || return 1
+    IFS='|' read -r sender_bps receiver_bps sent_bytes retransmits mss host_cpu remote_cpu <<< "$stats"
+    [[ "$sender_bps" =~ ^[0-9]+([.][0-9]+)?$ ]] || return 1
+    [[ "$receiver_bps" =~ ^[0-9]+([.][0-9]+)?$ ]] || return 1
+
+    retransmit_percent="?"
+    if [[ "$retransmits" =~ ^[0-9]+$ && "$sent_bytes" =~ ^[0-9]+$ &&
+          "$mss" =~ ^[0-9]+$ ]] && (( sent_bytes > 0 && mss > 0 )); then
+        retransmit_percent=$(awk -v retransmits="$retransmits" \
+            -v bytes="$sent_bytes" -v mss="$mss" '
+            BEGIN {printf "%.4f", retransmits * 100 / (bytes / mss)}
+        ')
+    fi
+
+    printf '%s|%s|%s|%s|%s|%s\n' \
+        "$(awk -v bps="$sender_bps" 'BEGIN {printf "%.0f", bps / 1000000}')" \
+        "$(awk -v bps="$receiver_bps" 'BEGIN {printf "%.0f", bps / 1000000}')" \
+        "${retransmits:-?}" "$retransmit_percent" \
+        "$(format_cpu_percent "$host_cpu")" "$(format_cpu_percent "$remote_cpu")"
+}
+
+verify_dependencies_available() {
+    local command_name
+    local -a missing=()
+
+    for command_name in ip iperf3 jq ping timeout pkill tc getent; do
+        command -v "$command_name" >/dev/null 2>&1 || missing+=("$command_name")
+    done
+    (( ${#missing[@]} == 0 )) || {
+        error "verify 缺少依赖：${missing[*]}；请先安装后重试（verify 不自动安装）"
+        return 1
+    }
+}
+
+run_verify_iperf() {
+    local host="$1" port="$2" streams="$3"
+    local output_file rc=0
+
+    traffic_budget_reached upload && {
+        error "verify 已达到上传或总流量停止阈值"
+        return 1
+    }
+    output_file="$VERIFY_TEMP_DIR/iperf-${streams}.json"
+    iperf3 -4 -c "$host" -p "$port" -t "$IPERF_DURATION" -P "$streams" -J \
+        > "$output_file" 2>&1 &
+    VERIFY_PID=$!
+
+    while kill -0 "$VERIFY_PID" 2>/dev/null; do
+        if traffic_budget_reached upload; then
+            kill_process_tree_now "$VERIFY_PID"
+            wait "$VERIFY_PID" 2>/dev/null || true
+            VERIFY_PID=""
+            error "verify 达到上传或总流量停止阈值，已终止 iperf3"
+            return 1
+        fi
+        sleep 0.05
+    done
+    wait "$VERIFY_PID" || rc=$?
+    VERIFY_PID=""
+    (( rc == 0 )) || {
+        error "iperf3 ${streams} 流测试失败"
+        return 1
+    }
+    VERIFY_RESULT=$(parse_iperf_metrics "$output_file") || {
+        error "无法解析 iperf3 ${streams} 流结果"
+        return 1
+    }
+}
+
+cleanup_verify() {
+    local child_pid
+
+    if [[ -n "${VERIFY_PID:-}" ]]; then
+        kill_process_tree_now "$VERIFY_PID"
+        wait "$VERIFY_PID" 2>/dev/null || true
+        VERIFY_PID=""
+    fi
+    while IFS= read -r child_pid; do
+        [[ "$child_pid" =~ ^[0-9]+$ ]] || continue
+        kill_process_tree_now "$child_pid"
+        wait "$child_pid" 2>/dev/null || true
+    done < <(jobs -pr)
+    [[ -z "${VERIFY_TEMP_DIR:-}" ]] || rm -rf "$VERIFY_TEMP_DIR"
+}
+
+verify_impl() {
+    local answer ranked rtt host peer_ip location provider port
+    local single_result four_result
+    local single_sender single_receiver single_retrans single_retrans_pct single_cpu single_remote_cpu
+    local four_sender four_receiver four_retrans four_retrans_pct four_cpu four_remote_cpu
+    local qdisc_state qdisc_detail selected="false"
+
+    echo "verify 将运行 5 秒单流 + 5 秒四流上传测试。"
+    echo "预计流量约为 10 秒实际发送速率：1 Gbps 约 1.25 GB，10 Gbps 约 12.5 GB。"
+    echo "沿用安全阈值：上传 40 GB 或合计 85 GB 时提前停止；不会修改 sysctl、路由或 qdisc。"
+    if [[ "$VERIFY_ASSUME_YES" != "true" ]]; then
+        if ! is_interactive_terminal; then
+            error "非交互环境拒绝产生流量；显式传入 verify --yes 后重试"
+            return 1
+        fi
+        read -r -p "确认开始 verify？[y/N]: " answer || return 1
+        [[ "$answer" =~ ^[Yy]$ ]] || {
+            info "已取消 verify；未产生测速流量"
+            return 2
+        }
+    fi
+
+    verify_dependencies_available || return 1
+    traffic_mark || {
+        error "无法读取默认网卡流量计数器，拒绝测速"
+        return 1
+    }
+    VERIFY_TEMP_DIR=$(mktemp -d) || return 1
+    ranked=$(rank_iperf_peers || true)
+    [[ -n "$ranked" ]] || {
+        error "无法找到可用的附近公共 iperf3 对端"
+        return 1
+    }
+
+    while IFS='|' read -r rtt host peer_ip location provider; do
+        [[ -n "$peer_ip" ]] || continue
+        while IFS= read -r port; do
+            tcp_port_open "$peer_ip" "$port" || continue
+            selected="true"
+            break 2
+        done < <(ordered_iperf_ports)
+    done <<< "$ranked"
+    [[ "$selected" == "true" ]] || {
+        error "附近公共 iperf3 对端无可用端口"
+        return 1
+    }
+
+    echo "对端: $location/$provider $host [$peer_ip]:$port（IPv4 RTT ${rtt} ms）"
+    run_verify_iperf "$peer_ip" "$port" 1 || return 1
+    single_result="$VERIFY_RESULT"
+    run_verify_iperf "$peer_ip" "$port" 4 || return 1
+    four_result="$VERIFY_RESULT"
+    IFS='|' read -r single_sender single_receiver single_retrans single_retrans_pct \
+        single_cpu single_remote_cpu <<< "$single_result"
+    IFS='|' read -r four_sender four_receiver four_retrans four_retrans_pct \
+        four_cpu four_remote_cpu <<< "$four_result"
+    IFS='|' read -r qdisc_state qdisc_detail <<< "$(active_qdisc_state "$PROBE_IFACE")"
+
+    printf '1 流：sender %s Mbps / receiver %s Mbps / 重传率 %s%%（%s 次）/ CPU 本机 %s%% 对端 %s%%\n' \
+        "$single_sender" "$single_receiver" "$single_retrans_pct" "$single_retrans" \
+        "$single_cpu" "$single_remote_cpu"
+    printf '4 流：sender %s Mbps / receiver %s Mbps / 重传率 %s%%（%s 次）/ CPU 本机 %s%% 对端 %s%%\n' \
+        "$four_sender" "$four_receiver" "$four_retrans_pct" "$four_retrans" \
+        "$four_cpu" "$four_remote_cpu"
+    printf '活动 qdisc: %s\n' "$(format_qdisc_state "$qdisc_state" "$qdisc_detail")"
+    traffic_report
+    if (( four_receiver * 100 >= single_receiver * 125 )); then
+        echo "结论：4 流 goodput 明显高于 1 流；单流可能受 RTT、拥塞控制或路径限制。"
+    elif (( single_receiver * 100 >= four_receiver * 125 )); then
+        echo "结论：1 流 goodput 高于 4 流；对端负载或多流竞争可能影响结果。"
+    else
+        echo "结论：1 流与 4 流 goodput 接近；未见明显并行收益。"
+    fi
+}
+
+run_verify_command() {
+    local rc=0
+    local previous_int_trap previous_term_trap
+
+    previous_int_trap=$(trap -p INT)
+    previous_term_trap=$(trap -p TERM)
+    trap 'cleanup_verify; exit 130' INT
+    trap 'cleanup_verify; exit 143' TERM
+    verify_impl || rc=$?
+    cleanup_verify
+    if [[ -n "$previous_int_trap" ]]; then
+        eval "$previous_int_trap"
+    else
+        trap - INT
+    fi
+    if [[ -n "$previous_term_trap" ]]; then
+        eval "$previous_term_trap"
+    else
+        trap - TERM
+    fi
+    return "$rc"
 }
 
 probe_iperf_bandwidth() {
@@ -1605,6 +1950,7 @@ resolve_tuning_values() {
         BANDWIDTH_SOURCE="not used"
         RTT_SOURCE="not used"
         RTT_POLICY="not used"
+        resolve_initcwnd_policy
         return 0
     fi
 
@@ -1622,14 +1968,15 @@ resolve_tuning_values() {
             RTT_POLICY="150 ms fallback for manual bandwidth"
         else
             RTT_SOURCE="command line"
-            RTT_POLICY="manual override"
+            RTT_POLICY="manual override (no automatic floor)"
         fi
     elif [[ "$NO_PROBE" != "true" ]]; then
         info "自动探测中国大陆与全球 RTT..."
         if detect_rtt; then
             OBSERVED_RTT_MS="$DETECTED_RTT_MS"
             rtt_ms="$OBSERVED_RTT_MS"
-            RTT_POLICY="observed RTT"
+            (( rtt_ms < DEFAULT_RTT_MS )) && rtt_ms="$DEFAULT_RTT_MS"
+            RTT_POLICY="max(observed RTT, 150 ms coverage floor)"
         else
             warn "RTT 探测失败，将按默认 150 ms 计算"
             rtt_ms="$DEFAULT_RTT_MS"
@@ -1681,6 +2028,8 @@ resolve_tuning_values() {
         WMEM_REASON="RAM fallback"
         CALCULATION_REASON="rmem: $RMEM_REASON; wmem: $WMEM_REASON"
     fi
+
+    resolve_initcwnd_policy
 }
 
 format_mib() {
@@ -1708,7 +2057,8 @@ show_tuning_plan() {
     echo "rmem_default: $(format_mib "$RMEM_DEFAULT_BYTES") MiB"
     echo "wmem_default: $(format_mib "$WMEM_DEFAULT_BYTES") MiB"
     echo "计算依据: $CALCULATION_REASON"
-    echo "initcwnd/initrwnd: $([[ "$INITCWND_ENABLED" == "true" ]] && echo "32（默认启用；浅层 policer 可能增加首秒突发）" || echo "内核默认")"
+    echo "initcwnd 模式: $INITCWND_MODE"
+    echo "initcwnd/initrwnd: $([[ "$INITCWND_ENABLED" == "true" ]] && echo "32" || echo "内核默认")（策略: $INITCWND_POLICY）"
     echo "ECN: $([[ "$ECN_DISABLED" == "true" ]] && echo "显式禁用" || echo "保留当前设置（不持久接管）")"
 }
 
@@ -1781,7 +2131,7 @@ format_rtt_selection_summary() {
         return
     fi
 
-    printf 'RTT：观测 %s / 最终采用 %s ms（来源 %s；策略 %s）\n' \
+    printf 'RTT：观测 %s / 计算 %s ms（来源 %s；策略 %s）\n' \
         "${OBSERVED_RTT_MS:+${OBSERVED_RTT_MS} ms}" \
         "${DETECTED_RTT_MS:-未知}" "${RTT_SOURCE:-unknown}" "${RTT_POLICY:-unknown}" |
         sed 's/RTT：观测  /RTT：观测 未获得 /'
@@ -1796,6 +2146,7 @@ show_install_summary() {
     local delta_drop delta_squeeze delta_rxerr delta_txerr delta_rxdrop delta_txdrop
     local delta_packets health
     local algorithm="当前拥塞控制"
+    local qdisc_state qdisc_detail
 
     after=$(network_health_snapshot "$PROBE_IFACE")
     read -r b_drop b_squeeze b_rxerr b_txerr b_rxdrop b_txdrop b_retrans _ b_rxpkt b_txpkt <<< "$before"
@@ -1812,6 +2163,8 @@ show_install_summary() {
         "$delta_drop" "$delta_squeeze" "$((delta_rxerr + delta_txerr))" \
         "$((delta_rxdrop + delta_txdrop))" "$delta_packets")
     [[ "$bbr_enabled" == "true" ]] && algorithm="BBR"
+    IFS='|' read -r qdisc_state qdisc_detail <<< \
+        "$(active_qdisc_state "${PROBE_IFACE:-}")"
 
     printf '环境：%s CPU / %.1f GiB / %s\n' \
         "$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 未知)" \
@@ -1824,8 +2177,12 @@ show_install_summary() {
         "$(format_mib "$WMEM_DEFAULT_BYTES")" "$(format_mib "$WMEM_MAX_BYTES")"
     printf '网络健康：%s；TCP 重传新增 %s；受限 socket %s\n' \
         "$health" "$((a_retrans - b_retrans))" "$a_limited"
-    printf '应用：%s + fq + ECN %s，配置成功\n' \
-        "$algorithm" "$([[ "$ECN_DISABLED" == "true" ]] && echo 已禁用 || echo 未接管)"
+    printf '应用：%s + ECN %s，配置成功；fq %s\n' \
+        "$algorithm" "$([[ "$ECN_DISABLED" == "true" ]] && echo 已禁用 || echo 未接管)" \
+        "$(format_qdisc_state "$qdisc_state" "$qdisc_detail")"
+    printf 'initcwnd：%s（策略 %s）\n' \
+        "$([[ "$INITCWND_ENABLED" == "true" ]] && echo 32 || echo 内核默认)" \
+        "$INITCWND_POLICY"
 }
 
 # === 新版网络配置 ===
@@ -2009,6 +2366,8 @@ create_network_config() {
 # 计算 RTT: ${DETECTED_RTT_MS:-unknown} ms
 # RTT 来源: $RTT_SOURCE
 # RTT 策略: $RTT_POLICY
+# initcwnd 模式: $INITCWND_MODE
+# initcwnd 策略: $INITCWND_POLICY
 # 缓冲区依据: $CALCULATION_REASON
 # 适用于 Debian 13 代理、转发及中高延迟公网 VPS。
 
@@ -2765,6 +3124,10 @@ show_status() {
     local available_cc
     local current_cc
     local current_qdisc
+    local default_iface
+    local active_qdisc
+    local active_qdisc_state_name
+    local active_qdisc_detail
     local current_tfo
     local ip_forward
     local rp_filter_all
@@ -2788,6 +3151,8 @@ show_status() {
     local optmem_max
     local keepalive_time
     local initcwnd_state
+    local initcwnd_state_name
+    local initcwnd_detail
     local tcp_ecn
     local conntrack_count
     local conntrack_max
@@ -2797,6 +3162,9 @@ show_status() {
     current_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "未知")
     current_qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "未知")
     current_tfo=$(sysctl -n net.ipv4.tcp_fastopen 2>/dev/null || echo "未知")
+    default_iface=$(detect_default_iface || true)
+    active_qdisc=$(active_qdisc_state "$default_iface")
+    IFS='|' read -r active_qdisc_state_name active_qdisc_detail <<< "$active_qdisc"
     ip_forward=$(sysctl -n net.ipv4.ip_forward 2>/dev/null || echo "未知")
     rp_filter_all=$(sysctl -n net.ipv4.conf.all.rp_filter 2>/dev/null || echo "未知")
     rp_filter_default=$(sysctl -n net.ipv4.conf.default.rp_filter 2>/dev/null || echo "未知")
@@ -2821,14 +3189,15 @@ show_status() {
     conntrack_count=$(sysctl -n net.netfilter.nf_conntrack_count 2>/dev/null || echo "不可用")
     conntrack_max=$(sysctl -n net.netfilter.nf_conntrack_max 2>/dev/null || echo "不可用")
     conntrack_buckets=$(sysctl -n net.netfilter.nf_conntrack_buckets 2>/dev/null || echo "不可用")
-    initcwnd_state=$(default_ipv4_route | grep -oE 'initcwnd [0-9]+( initrwnd [0-9]+)?' || echo "内核默认")
+    initcwnd_state=$(detect_initcwnd_state)
+    IFS='|' read -r initcwnd_state_name initcwnd_detail <<< "$initcwnd_state"
     tcp_ecn=$(sysctl -n net.ipv4.tcp_ecn 2>/dev/null || echo "不可用")
 
     echo "========== 网络优化状态 =========="
     echo "配置文件: $NETWORK_CONF"
     [[ -f "$NETWORK_CONF" ]] && echo "配置状态: 已存在" || echo "配置状态: 未创建"
     if [[ -f "$NETWORK_CONF" ]]; then
-        grep -E '^# (模式|内存|下载带宽|上传带宽|带宽来源|中国组 RTT|全球组 RTT|观测 RTT|计算 RTT|RTT 来源|RTT 策略|缓冲区依据):'             "$NETWORK_CONF" | sed 's/^# /  /'
+        grep -E '^# (模式|内存|下载带宽|上传带宽|带宽来源|中国组 RTT|全球组 RTT|观测 RTT|计算 RTT|RTT 来源|RTT 策略|initcwnd 模式|initcwnd 策略|缓冲区依据):' "$NETWORK_CONF" | sed 's/^# /  /'
     fi
     [[ -f "$NETWORK_INITIAL_BACKUP" ]] && echo "初始备份: $NETWORK_INITIAL_BACKUP"
     [[ -f "$NETWORK_INITIAL_ABSENT" ]] && echo "初始状态: 配置文件原本不存在"
@@ -2839,7 +3208,8 @@ show_status() {
     echo "拥塞控制:"
     echo "  可用算法: $available_cc"
     echo "  当前算法: $current_cc"
-    echo "  默认队列: $current_qdisc"
+    echo "  default qdisc: $current_qdisc"
+    echo "  active qdisc (${default_iface:-未知接口}): $(format_qdisc_state "$active_qdisc_state_name" "$active_qdisc_detail")"
     echo "  TCP Fast Open: $current_tfo"
 
     echo
@@ -2880,7 +3250,9 @@ show_status() {
     echo "  slow_start_after_idle: $slow_start_after_idle"
     echo "  mtu_probing: $mtu_probing"
     echo "  keepalive_time: $keepalive_time"
-    echo "  默认路由窗口: $initcwnd_state"
+    echo "  initcwnd ownership marker: $([[ -e "$ROUTE_OWNED_MARKER" ]] && echo 存在 || echo 不存在)"
+    echo "  默认路由窗口: $initcwnd_detail"
+    [[ "$initcwnd_state_name" != "drift" ]] || echo "  initcwnd 状态: 漂移"
     echo "  ECN: $tcp_ecn"
     echo "  健康快照字段: softnet_dropped time_squeeze rx_errors tx_errors rx_dropped tx_dropped tcp_retrans limited_sockets rx_packets tx_packets"
     echo "  健康快照累计值: $(network_health_snapshot "$(detect_default_iface || true)")"
@@ -2905,6 +3277,7 @@ show_help() {
   network-optimize.sh restore           恢复上一次运行前的配置
   network-optimize.sh restore initial   恢复首次运行前的可信配置
   network-optimize.sh status            查看当前网络优化状态
+  network-optimize.sh verify [--yes]    确认后比较 1 流与 4 流 iperf3，只读系统状态
   network-optimize.sh help              显示帮助
 
 install/plan 选项：
@@ -2917,7 +3290,11 @@ install/plan 选项：
   --target HOST           自定义 RTT 目标，可重复指定；需配合 --probe
   --no-probe              禁止外部探测，缺失数据时按内存保守配置
   --disable-ecn           禁用 ECN，兼容存在 ECN 黑洞的旧链路
-  --disable-initcwnd      保留内核默认初始拥塞窗口（默认设置为 32）
+  --enable-initcwnd       强制把默认路由 initcwnd/initrwnd 设置为 32
+  --disable-initcwnd      强制保留内核默认初始拥塞窗口
+
+verify 选项：
+  --yes                   非交互环境显式确认产生测速流量
 
 示例：
   network-optimize.sh                 # 交互选择参数来源
@@ -2927,21 +3304,25 @@ install/plan 选项：
   network-optimize.sh install --download-mbps 1000 --upload-mbps 500 --rtt-ms 180
   network-optimize.sh plan --probe --target example.com --target 203.0.113.10
   network-optimize.sh install --static
+  network-optimize.sh verify --yes
 
 默认行为：
   - 交互终端无参数运行时选择静态、手填或自动探测；默认静态 32 MiB
   - 非交互终端无参数运行时自动使用静态模式，不安装探测依赖、不产生测速流量
-  - 手填带宽缺少 RTT 时按 150 ms 计算；主动探测成功使用观测值，失败回退到 150 ms
+  - 手填带宽缺少 RTT 时按 150 ms 计算；显式 --rtt-ms 严格采用用户值，不应用 floor
+  - 主动探测成功按 max(观测 RTT, 150 ms) 计算，失败回退到 150 ms
   - 只有 --auto、--probe 或交互确认后才主动探测并安装缺失依赖
   - 自动探测测量中国大陆与全球 RTT，并使用公共 iperf3 与 Cloudflare
   - 自动测速在单方向 40 GB 或合计 85 GB 时提前停止，保留 5 GB 终止余量
   - 默认不持久管理 ECN；只在传入 --disable-ecn 时写入 tcp_ecn=0
-  - 默认把 IPv4 默认路由的 initcwnd/initrwnd 设为 32；浅层 policer 可能增加首秒突发
-  - 可用 --disable-initcwnd 保留内核默认初始拥塞窗口
+  - initcwnd 默认 auto：已知上传 <= 100 Mbps 保留内核默认，否则设置为 32
+  - --enable-initcwnd/--disable-initcwnd 显式覆盖 auto，冲突参数会被拒绝
   - 根据 2 × BDP + 2 MiB 余量动态设置缓冲区上限，默认值按半个 BDP 取 4-8 MiB
   - RTT 探测失败回退到 150 ms；带宽探测失败时默认缓冲回退到 4 MiB，最大值按内存限制
   - RAM 小于 2 GiB 时上限为 RAM / 16、最高 256 MiB；否则为 RAM / 8、最高 512 MiB
   - 只在本次运行计算和应用，不创建定时任务
+  - verify 仅在交互确认或显式 --yes 后产生流量；install/status 不会调用 verify
+  - verify 不修改 sysctl、路由或 qdisc，也不安装依赖或持久服务
 EOF
 }
 
@@ -2999,6 +3380,9 @@ main() {
             ;;
         status)
             show_status
+            ;;
+        verify)
+            run_verify_command
             ;;
         help)
             show_help

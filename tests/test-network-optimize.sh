@@ -45,16 +45,16 @@ assert_eq "RAM-based cap" "$(buffer_limit_reason 10000 150 67108864)" \
     "buffer reason reports the memory-derived cap"
 TUNING_MODE=auto
 OBSERVED_RTT_MS=69
-DETECTED_RTT_MS=69
+DETECTED_RTT_MS=150
 RTT_SOURCE='max(CN, global)'
-RTT_POLICY='observed RTT'
-assert_eq 'RTT：观测 69 ms / 最终采用 69 ms（来源 max(CN, global)；策略 observed RTT）' \
-    "$(format_rtt_selection_summary)" "summary shows the selected observed RTT"
+RTT_POLICY='max(observed RTT, 150 ms coverage floor)'
+assert_eq 'RTT：观测 69 ms / 计算 150 ms（来源 max(CN, global)；策略 max(observed RTT, 150 ms coverage floor)）' \
+    "$(format_rtt_selection_summary)" "summary distinguishes observed and calculation RTT"
 OBSERVED_RTT_MS=''
 DETECTED_RTT_MS=150
 RTT_SOURCE='default after failed active probe'
 RTT_POLICY='150 ms fallback'
-assert_eq 'RTT：观测 未获得 / 最终采用 150 ms（来源 default after failed active probe；策略 150 ms fallback）' \
+assert_eq 'RTT：观测 未获得 / 计算 150 ms（来源 default after failed active probe；策略 150 ms fallback）' \
     "$(format_rtt_selection_summary)" "summary shows the selected fallback RTT"
 TUNING_MODE=static
 assert_eq 'RTT：未使用（静态 32 MiB 缓冲区）' \
@@ -76,6 +76,30 @@ assert_eq '流量：上传 2.25 GB / 下载 1.50 GB / 合计 3.75 GB' \
 assert_eq "default via 192.0.2.1 dev eth0 proto dhcp metric 100" \
     "$(strip_route_window_fields 'default via 192.0.2.1 dev eth0 proto dhcp metric 100 initcwnd 32 initrwnd 32')" \
     "strip route window fields without losing route attributes"
+
+assert_eq 'effective|root fq' "$(classify_active_qdisc <<'EOF'
+qdisc fq 0: root refcnt 2 limit 10000p flow_limit 100p
+EOF
+)" "classify root fq as effective"
+assert_eq 'effective|root mq; all 2 leaves fq' "$(classify_active_qdisc <<'EOF'
+qdisc mq 0: root
+qdisc fq 0: parent :2 limit 10000p
+qdisc fq 0: parent :1 limit 10000p
+qdisc clsact ffff: parent ffff:fff1
+EOF
+)" "classify mq with all fq leaves as effective"
+assert_eq 'mixed|root mq; fq leaves 1/2; other: fq_codel' "$(classify_active_qdisc <<'EOF'
+qdisc mq 0: root
+qdisc fq 0: parent :2 limit 10000p
+qdisc fq_codel 0: parent :1 limit 10240p
+EOF
+)" "classify mixed mq leaves"
+assert_eq 'inactive|root noqueue' "$(classify_active_qdisc <<'EOF'
+qdisc noqueue 0: root refcnt 2
+EOF
+)" "classify root noqueue explicitly"
+assert_eq 'unreadable|no qdisc data' "$(classify_active_qdisc </dev/null)" \
+    "classify unreadable qdisc output"
 
 assert_eq "正常：测速期间 softnet 和网卡无新增丢包或错误" \
     "$(classify_network_health 0 0 0 0 1000000)" \
@@ -157,5 +181,13 @@ assert_eq "default via 192.0.2.1 dev eth0 proto dhcp metric 100" "$CURRENT_ROUTE
     "failed initcwnd application leaves route unchanged"
 [[ ! -e "$ROUTE_OWNED_MARKER" ]] || fail "failed initcwnd application does not claim ownership"
 printf 'PASS: failed initcwnd application does not claim ownership\n'
+
+CURRENT_ROUTE="default via 192.0.2.1 dev eth0 proto dhcp metric 100"
+install -D -m 0600 /dev/null "$ROUTE_OWNED_MARKER"
+assert_eq 'drift|ownership marker exists but default route lacks initcwnd/initrwnd 32' \
+    "$(detect_initcwnd_state)" "detect marker and route drift"
+CURRENT_ROUTE="default via 192.0.2.1 dev eth0 proto dhcp metric 100 initcwnd 32 initrwnd 32"
+assert_eq 'effective|owned default route has initcwnd/initrwnd 32' \
+    "$(detect_initcwnd_state)" "detect owned initcwnd route as effective"
 
 printf 'All network-optimize tests passed.\n'

@@ -50,6 +50,11 @@ reset_selection() {
     MANUAL_RTT_MS=""
     MANUAL_RTT_DEFAULTED=false
     CUSTOM_RTT_TARGETS=()
+    INITCWND_MODE=auto
+    INITCWND_ENABLED=true
+    INITCWND_POLICY=unknown
+    VERIFY_ASSUME_YES=false
+    VERIFY_CONFIRM_EXPLICIT=false
 }
 
 is_interactive_terminal() { return 1; }
@@ -111,6 +116,16 @@ parse_arguments install --disable-ecn
 assert_eq true "$ECN_DISABLED" "disable ECN requires an explicit flag"
 
 reset_selection
+parse_arguments install --enable-initcwnd
+assert_eq enabled "$INITCWND_MODE" "explicitly enable initcwnd"
+reset_selection
+parse_arguments install --disable-initcwnd
+assert_eq disabled "$INITCWND_MODE" "explicitly disable initcwnd"
+reset_selection
+assert_fail "reject conflicting initcwnd flags" \
+    parse_arguments install --enable-initcwnd --disable-initcwnd
+
+reset_selection
 parse_arguments install --static
 read() { fail "explicit static mode unexpectedly prompted"; }
 select_tuning_mode
@@ -142,6 +157,9 @@ prepare_dynamic_case() {
     RTT_SOURCE=unknown
     RTT_POLICY=unknown
     BANDWIDTH_SOURCE=unknown
+    INITCWND_MODE=auto
+    INITCWND_ENABLED=true
+    INITCWND_POLICY=unknown
 }
 
 detect_memory_mb() { printf '%s\n' 8192; }
@@ -156,9 +174,30 @@ detect_rtt() {
 prepare_dynamic_case
 resolve_tuning_values >/dev/null
 assert_eq 40 "$OBSERVED_RTT_MS" "active probe records RTT below 150 ms"
-assert_eq 40 "$DETECTED_RTT_MS" "active probe calculates with observed RTT"
-assert_eq 'observed RTT' "$RTT_POLICY" "active probe records observed RTT policy"
-assert_eq 12582912 "$RMEM_MAX_BYTES" "active probe uses lower RTT in buffer calculation"
+assert_eq 150 "$DETECTED_RTT_MS" "active probe restores 150 ms coverage floor"
+assert_eq 'max(observed RTT, 150 ms coverage floor)' "$RTT_POLICY" \
+    "active probe records coverage-floor policy"
+assert_eq 39845888 "$RMEM_MAX_BYTES" "active probe uses coverage-floor RTT in calculation"
+
+detect_rtt() {
+    DETECTED_RTT_MS=180
+    RTT_SOURCE="test active probe"
+}
+prepare_dynamic_case
+resolve_tuning_values >/dev/null
+assert_eq 180 "$OBSERVED_RTT_MS" "active probe records RTT above 150 ms"
+assert_eq 180 "$DETECTED_RTT_MS" "active RTT above coverage floor is unchanged"
+
+prepare_dynamic_case
+NO_PROBE=true
+MANUAL_DOWNLOAD_MBPS=1000
+MANUAL_UPLOAD_MBPS=500
+MANUAL_RTT_MS=40
+resolve_tuning_values >/dev/null
+assert_eq '' "$OBSERVED_RTT_MS" "manual RTT is not reported as observed"
+assert_eq 40 "$DETECTED_RTT_MS" "manual RTT below 150 ms remains unchanged"
+assert_eq 'manual override (no automatic floor)' "$RTT_POLICY" \
+    "manual RTT records strict override policy"
 
 detect_rtt() { return 1; }
 prepare_dynamic_case
@@ -168,6 +207,25 @@ assert_eq 'default after failed active probe' "$RTT_SOURCE" \
     "failed active probe records fallback source"
 assert_eq '150 ms fallback' "$RTT_POLICY" "failed active probe records fallback policy"
 assert_eq 39845888 "$RMEM_MAX_BYTES" "failed active probe uses fallback RTT in calculation"
+
+INITCWND_MODE=auto
+DETECTED_UPLOAD_MBPS=100
+resolve_initcwnd_policy
+assert_eq false "$INITCWND_ENABLED" "auto initcwnd keeps kernel default at 100 Mbps"
+assert_eq 'auto: upload <= 100 Mbps, preserve kernel default' "$INITCWND_POLICY" \
+    "auto initcwnd explains low-upload policy"
+INITCWND_MODE=auto
+DETECTED_UPLOAD_MBPS=101
+resolve_initcwnd_policy
+assert_eq true "$INITCWND_ENABLED" "auto initcwnd enables 32 above 100 Mbps"
+INITCWND_MODE=enabled
+DETECTED_UPLOAD_MBPS=10
+resolve_initcwnd_policy
+assert_eq true "$INITCWND_ENABLED" "explicit initcwnd enable overrides low upload"
+INITCWND_MODE=disabled
+DETECTED_UPLOAD_MBPS=1000
+resolve_initcwnd_policy
+assert_eq false "$INITCWND_ENABLED" "explicit initcwnd disable overrides high upload"
 
 NETWORK_TEST_TOTAL=84999999999
 NETWORK_TEST_UPLOAD=39999999999
