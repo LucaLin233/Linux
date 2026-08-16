@@ -5,6 +5,7 @@ readonly ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 readonly TEMP_DIR=$(mktemp -d)
 trap 'rm -rf "$TEMP_DIR"' EXIT
 export NETWORK_OPTIMIZE_STATE_DIR="$TEMP_DIR/state"
+export NETWORK_OPTIMIZE_INITCWND_HOOK="$TEMP_DIR/networkd-dispatcher/routable.d/50-network-optimize-initcwnd"
 
 # shellcheck source=../modules/network-optimize.sh
 source "$ROOT_DIR/modules/network-optimize.sh"
@@ -163,6 +164,7 @@ prepare_dynamic_case() {
 }
 
 detect_memory_mb() { printf '%s\n' 8192; }
+detect_cgroup_memory_limit_mb() { return 1; }
 probe_bandwidth() {
     DETECTED_DOWNLOAD_MBPS=1000
     DETECTED_UPLOAD_MBPS=500
@@ -256,7 +258,24 @@ fi
 if grep -Eq '^net[.]netfilter[.]nf_conntrack_max[[:space:]]*=' "$generated_config"; then
     fail "generated config still owns nf_conntrack_max"
 fi
-printf 'PASS: default generated config leaves ECN and Conntrack max unmanaged\n'
+for retired_key in \
+    net.ipv4.tcp_mem \
+    net.ipv4.tcp_adv_win_scale \
+    net.core.rmem_default \
+    net.core.wmem_default \
+    net.core.netdev_budget \
+    net.core.netdev_budget_usecs; do
+    if grep -Eq "^${retired_key//./[.]}[[:space:]]*=" "$generated_config"; then
+        fail "generated config still owns $retired_key"
+    fi
+done
+assert_eq '4096 131072 39845888' \
+    "$(read_saved_sysctl_value "$generated_config" net.ipv4.tcp_rmem)" \
+    "generated config uses unified receive start"
+assert_eq '4096 16384 20971520' \
+    "$(read_saved_sysctl_value "$generated_config" net.ipv4.tcp_wmem)" \
+    "generated config uses unified send start"
+printf 'PASS: default generated config leaves retired global parameters unmanaged\n'
 
 ECN_DISABLED=true
 create_network_config "$generated_config" false
@@ -316,17 +335,47 @@ removed_config_unknown="$TEMP_DIR/removed-initial-config-unknown"
 printf '%s\n' \
     '# 由 network-optimize.sh 自动生成。' \
     'net.ipv4.tcp_ecn = 1' \
+    'net.ipv4.tcp_mem = 16384 32768 65536' \
+    'net.ipv4.tcp_adv_win_scale = 1' \
+    'net.core.rmem_default = 4194304' \
+    'net.core.wmem_default = 4194304' \
+    'net.core.netdev_budget = 600' \
+    'net.core.netdev_budget_usecs = 4000' \
     'net.netfilter.nf_conntrack_max = 262144' > "$removed_managed_config"
 printf '%s\n' \
     'net.ipv4.tcp_ecn=2' \
+    'net.ipv4.tcp_mem=4096 8192 16384' \
+    'net.ipv4.tcp_adv_win_scale=1' \
+    'net.core.rmem_default=212992' \
+    'net.core.wmem_default=212992' \
+    'net.core.netdev_budget=300' \
+    'net.core.netdev_budget_usecs=2000' \
     'net.netfilter.nf_conntrack_max=131072' > "$removed_initial_runtime"
 printf '%s\n' \
     'net.ipv4.tcp_ecn = 0' \
+    'net.ipv4.tcp_mem = 8192 16384 32768' \
+    'net.ipv4.tcp_adv_win_scale = 1' \
+    'net.core.rmem_default = 262144' \
+    'net.core.wmem_default = 262144' \
+    'net.core.netdev_budget = 300' \
+    'net.core.netdev_budget_usecs = 2000' \
     'net.netfilter.nf_conntrack_max = 65536' > "$removed_initial_config"
 assert_ok "detect old managed ECN" managed_removed_sysctl_present \
     "$removed_managed_config" net.ipv4.tcp_ecn
 assert_ok "detect old managed Conntrack max" managed_removed_sysctl_present \
     "$removed_managed_config" net.netfilter.nf_conntrack_max
+assert_ok "detect old managed tcp_mem" managed_removed_sysctl_present \
+    "$removed_managed_config" net.ipv4.tcp_mem
+assert_ok "detect old managed netdev budget" managed_removed_sysctl_present \
+    "$removed_managed_config" net.core.netdev_budget
+assert_eq '4096 8192 16384' "$(resolve_removed_sysctl_restore_value \
+    "$removed_initial_runtime" "$removed_runtime_unknown" \
+    "$removed_initial_config" "$removed_config_unknown" net.ipv4.tcp_mem)" \
+    "prefer initial runtime tcp_mem"
+assert_eq '300' "$(resolve_removed_sysctl_restore_value \
+    "$removed_initial_runtime" "$removed_runtime_unknown" \
+    "$removed_initial_config" "$removed_config_unknown" net.core.netdev_budget)" \
+    "prefer initial runtime netdev budget"
 assert_eq '2' "$(resolve_removed_sysctl_restore_value \
     "$removed_initial_runtime" "$removed_runtime_unknown" \
     "$removed_initial_config" "$removed_config_unknown" net.ipv4.tcp_ecn)" \
@@ -336,6 +385,10 @@ assert_eq '131072' "$(resolve_removed_sysctl_restore_value \
     "$removed_initial_config" "$removed_config_unknown" net.netfilter.nf_conntrack_max)" \
     "prefer initial runtime Conntrack max"
 rm -f "$removed_initial_runtime"
+assert_eq '8192 16384 32768' "$(resolve_removed_sysctl_restore_value \
+    "$removed_initial_runtime" "$removed_runtime_unknown" \
+    "$removed_initial_config" "$removed_config_unknown" net.ipv4.tcp_mem)" \
+    "fall back to initial config tcp_mem"
 assert_eq '0' "$(resolve_removed_sysctl_restore_value \
     "$removed_initial_runtime" "$removed_runtime_unknown" \
     "$removed_initial_config" "$removed_config_unknown" net.ipv4.tcp_ecn)" \
@@ -353,6 +406,10 @@ printf '%s\n' 'net.ipv4.tcp_ecn = invalid' > "$removed_initial_config"
 assert_fail "reject unknown ECN restore value" resolve_removed_sysctl_restore_value \
     "$removed_initial_runtime" "$removed_runtime_unknown" \
     "$removed_initial_config" "$removed_config_unknown" net.ipv4.tcp_ecn
+assert_fail "reject malformed tcp_mem" normalize_removed_sysctl_value \
+    net.ipv4.tcp_mem '8192 4096 16384'
+assert_fail "reject invalid tcp_adv_win_scale" normalize_removed_sysctl_value \
+    net.ipv4.tcp_adv_win_scale 32
 
 runtime_backup="$TEMP_DIR/runtime-backup"
 : > "$runtime_backup"

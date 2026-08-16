@@ -5,6 +5,7 @@ readonly ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 readonly TEMP_DIR=$(mktemp -d)
 trap 'rm -rf "$TEMP_DIR"' EXIT
 export NETWORK_OPTIMIZE_STATE_DIR="$TEMP_DIR/state"
+export NETWORK_OPTIMIZE_INITCWND_HOOK="$TEMP_DIR/networkd-dispatcher/routable.d/50-network-optimize-initcwnd"
 # shellcheck source=../modules/network-optimize.sh
 source "$ROOT_DIR/modules/network-optimize.sh"
 
@@ -21,28 +22,57 @@ assert_eq() {
     printf 'PASS: %s\n' "$name"
 }
 
-assert_eq "8388608" "$(calculate_buffer_max 100 150 268435456)" \
-    "buffer max keeps 8 MiB floor"
+assert_eq "6291456" "$(calculate_buffer_max 100 150 268435456)" \
+    "buffer max follows 2 x BDP above 4 MiB floor"
 assert_eq "39845888" "$(calculate_buffer_max 1000 150 268435456)" \
     "buffer max includes 2 MiB headroom"
-assert_eq "4194304" "$(calculate_buffer_default 100 150 8388608)" \
-    "buffer default keeps 4 MiB floor"
-assert_eq "7340032" "$(calculate_buffer_default 700 150 37748736)" \
-    "buffer default rounds half BDP within range"
-assert_eq "8388608" "$(calculate_buffer_default 1000 150 37748736)" \
-    "buffer default keeps 8 MiB ceiling"
-assert_eq "67108864" "$(calculate_memory_cap 1024)" \
-    "small-memory cap uses RAM / 16"
-assert_eq "536870912" "$(calculate_memory_cap 8192)" \
-    "large-memory cap uses RAM / 8 with 512 MiB ceiling"
-assert_eq "16384 32768 65536" "$(calculate_tcp_mem 1024 4096)" \
-    "tcp memory budget follows RAM with 4 KiB pages"
-assert_eq "4096 8192 16384" "$(calculate_tcp_mem 1024 65536)" \
-    "tcp memory budget follows RAM with 64 KiB pages"
-assert_eq "4096 8192 16384" "$(calculate_tcp_mem 128 4096)" \
-    "tcp memory budget keeps minimums"
-assert_eq "RAM-based cap" "$(buffer_limit_reason 10000 150 67108864)" \
+assert_eq "4194304" "$(calculate_buffer_max 10 20 268435456)" \
+    "buffer max keeps 4 MiB floor"
+assert_eq "16777216" "$(calculate_memory_cap 512)" \
+    "512 MiB host caps each socket at RAM / 32"
+assert_eq "33554432" "$(calculate_memory_cap 1024)" \
+    "1 GiB host caps each socket at RAM / 32"
+assert_eq "67108864" "$(calculate_memory_cap 2048)" \
+    "2 GiB host caps each socket at RAM / 32"
+assert_eq "134217728" "$(calculate_memory_cap 4096)" \
+    "4 GiB host caps each socket at RAM / 32"
+assert_eq "268435456" "$(calculate_memory_cap 16384)" \
+    "large-memory cap keeps 256 MiB ceiling"
+assert_eq "effective RAM / 32 cap" "$(buffer_limit_reason 10000 150 67108864)" \
     "buffer reason reports the memory-derived cap"
+assert_eq "131072" "$TCP_RMEM_DEFAULT_BYTES" \
+    "TCP receive default uses the unified 128 KiB start"
+assert_eq "16384" "$TCP_WMEM_DEFAULT_BYTES" \
+    "TCP send default uses the unified 16 KiB start"
+detect_cgroup_memory_limit_mb() { printf '%s\n' 512; }
+assert_eq '512' "$(detect_effective_memory_mb 1024)" \
+    "effective memory honors a smaller cgroup limit"
+detect_cgroup_memory_limit_mb() { printf '%s\n' 2048; }
+assert_eq '1024' "$(detect_effective_memory_mb 1024)" \
+    "effective memory does not exceed physical RAM"
+detect_cgroup_memory_limit_mb() { return 1; }
+
+meminfo_fixture="$TEMP_DIR/meminfo"
+printf '%s\n' \
+    'MemTotal:        1048576 kB' \
+    'MemAvailable:     262144 kB' \
+    'SwapTotal:        524288 kB' \
+    'SwapFree:         393216 kB' > "$meminfo_fixture"
+assert_eq '已用 768 MiB / 可用 256 MiB / 总计 1024 MiB' \
+    "$(memory_status_summary "$meminfo_fixture")" "format RAM status"
+assert_eq '已用 128 MiB / 总计 512 MiB' \
+    "$(swap_status_summary "$meminfo_fixture")" "format Swap status"
+printf '%s\n' 'SwapTotal: 0 kB' 'SwapFree: 0 kB' > "$meminfo_fixture"
+assert_eq '未配置' "$(swap_status_summary "$meminfo_fixture")" "report absent Swap"
+journalctl() {
+    printf '%s\n' \
+        'oom-kill:constraint=CONSTRAINT_NONE' \
+        'Out of memory: Killed process 123' \
+        'oom-kill:constraint=CONSTRAINT_MEMCG'
+}
+assert_eq '2' "$(recent_oom_event_count)" "count canonical OOM events once"
+unset -f journalctl
+
 TUNING_MODE=auto
 OBSERVED_RTT_MS=69
 DETECTED_RTT_MS=150
@@ -188,13 +218,18 @@ ip() {
     CURRENT_ROUTE="$*"
 }
 
-mkdir -p "$NETWORK_OPTIMIZE_STATE_DIR"
+mkdir -p "$NETWORK_OPTIMIZE_STATE_DIR" "$(dirname "$INITCWND_ROUTE_HOOK")"
 backup_default_route
 apply_initcwnd >/dev/null
 assert_eq "default via 192.0.2.1 dev eth0 proto dhcp src 192.0.2.10 metric 100 onlink initcwnd 32 initrwnd 32" \
     "$LAST_ROUTE_ARGS" "apply initcwnd while preserving route attributes"
 [[ -e "$ROUTE_OWNED_MARKER" ]] || fail "apply initcwnd records ownership"
 printf 'PASS: apply initcwnd records ownership\n'
+[[ -x "$INITCWND_ROUTE_HOOK" ]] || fail "apply initcwnd installs executable route hook"
+grep -Fq '# Managed by network-optimize.sh' "$INITCWND_ROUTE_HOOK" ||
+    fail "initcwnd route hook lacks ownership marker"
+bash -n "$INITCWND_ROUTE_HOOK" || fail "generated initcwnd route hook has invalid syntax"
+printf 'PASS: apply initcwnd installs managed persistence hook\n'
 
 backup_default_route
 [[ -e "$ROUTE_PREVIOUS_OWNED" ]] || fail "rerun records previous route ownership"
@@ -204,7 +239,8 @@ apply_initcwnd >/dev/null
 assert_eq "default via 192.0.2.1 dev eth0 proto dhcp src 192.0.2.10 metric 100 onlink" \
     "$CURRENT_ROUTE" "disable initcwnd removes owned route windows"
 [[ ! -e "$ROUTE_OWNED_MARKER" ]] || fail "disable initcwnd clears ownership"
-printf 'PASS: disable initcwnd clears ownership\n'
+[[ ! -e "$INITCWND_ROUTE_HOOK" ]] || fail "disable initcwnd removes managed route hook"
+printf 'PASS: disable initcwnd clears ownership and persistence hook\n'
 
 CURRENT_ROUTE="default via 198.51.100.1 dev eth1 proto dhcp metric 200"
 restore_default_route "$ROUTE_PREVIOUS_BACKUP" "$ROUTE_PREVIOUS_OWNED"

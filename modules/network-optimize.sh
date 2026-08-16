@@ -52,6 +52,11 @@ readonly ROUTE_INITIAL_UNKNOWN="${NETWORK_OPTIMIZE_STATE_DIR}/network-optimize.i
 readonly ROUTE_INITIAL_OWNED="${ROUTE_INITIAL_BACKUP}.owned"
 readonly ROUTE_PREVIOUS_OWNED="${ROUTE_PREVIOUS_BACKUP}.owned"
 readonly ROUTE_OWNED_MARKER="${NETWORK_OPTIMIZE_STATE_DIR}/network-optimize.initcwnd-owned"
+readonly INITCWND_ROUTE_HOOK="${NETWORK_OPTIMIZE_INITCWND_HOOK:-/etc/networkd-dispatcher/routable.d/50-network-optimize-initcwnd}"
+readonly ROUTE_HOOK_INITIAL_BACKUP="${NETWORK_OPTIMIZE_STATE_DIR}/network-optimize.initial-initcwnd-hook"
+readonly ROUTE_HOOK_PREVIOUS_BACKUP="${NETWORK_OPTIMIZE_STATE_DIR}/network-optimize.previous-initcwnd-hook"
+readonly ROUTE_HOOK_INITIAL_ABSENT="${NETWORK_OPTIMIZE_STATE_DIR}/network-optimize.initial-initcwnd-hook-absent"
+readonly ROUTE_HOOK_PREVIOUS_ABSENT="${NETWORK_OPTIMIZE_STATE_DIR}/network-optimize.previous-initcwnd-hook-absent"
 readonly LOCK_FILE="/run/lock/network-optimize.lock"
 readonly NETWORK_DETAIL_LOG="${NETWORK_OPTIMIZE_LOG:-/var/log/linux-setup.log}"
 
@@ -106,6 +111,8 @@ readonly AUTO_RTT_MIN_MS=10
 readonly AUTO_RTT_MAX_MS=300
 readonly DEFAULT_RTT_MS=150
 readonly INITCWND_AUTO_UPLOAD_LIMIT_MBPS=100
+readonly TCP_RMEM_DEFAULT_BYTES=131072
+readonly TCP_WMEM_DEFAULT_BYTES=16384
 
 # 参数与计算结果。命令行参数优先于自动探测。
 COMMAND="install"
@@ -138,15 +145,15 @@ GLOBAL_RTT_METHOD=""
 CHINA_RTT_SAMPLES=""
 GLOBAL_RTT_SAMPLES=""
 BANDWIDTH_SOURCE="unknown"
+PHYSICAL_RAM_MB=0
 RAM_MB=0
 MEMORY_CAP_BYTES=0
 RX_BDP_BYTES=0
 TX_BDP_BYTES=0
 RMEM_MAX_BYTES=33554432
 WMEM_MAX_BYTES=33554432
-RMEM_DEFAULT_BYTES=4194304
-WMEM_DEFAULT_BYTES=4194304
-TCP_MEM_PAGES="4096 8192 16384"
+RMEM_DEFAULT_BYTES=$TCP_RMEM_DEFAULT_BYTES
+WMEM_DEFAULT_BYTES=$TCP_WMEM_DEFAULT_BYTES
 CALCULATION_REASON="static 32 MiB"
 RMEM_REASON="static 32 MiB"
 WMEM_REASON="static 32 MiB"
@@ -661,19 +668,91 @@ detect_memory_mb() {
     awk '/^MemTotal:/ {printf "%d", $2 / 1024}' /proc/meminfo
 }
 
+detect_cgroup_memory_limit_mb() {
+    local value=""
+    local limit_file
+
+    for limit_file in /sys/fs/cgroup/memory.max \
+        /sys/fs/cgroup/memory/memory.limit_in_bytes; do
+        [[ -r "$limit_file" ]] || continue
+        value=$(<"$limit_file")
+        [[ "$value" =~ ^[0-9]+$ ]] || continue
+        (( value > 0 && value < 9223372036854771712 )) || continue
+        printf '%d\n' "$((value / 1024 / 1024))"
+        return 0
+    done
+    return 1
+}
+
+detect_effective_memory_mb() {
+    local physical_mb="${1:-}"
+    local cgroup_mb=""
+
+    [[ "$physical_mb" =~ ^[0-9]+$ ]] || physical_mb=$(detect_memory_mb)
+    cgroup_mb=$(detect_cgroup_memory_limit_mb 2>/dev/null || true)
+    if [[ "$cgroup_mb" =~ ^[0-9]+$ ]] && (( cgroup_mb > 0 && cgroup_mb < physical_mb )); then
+        printf '%s\n' "$cgroup_mb"
+    else
+        printf '%s\n' "$physical_mb"
+    fi
+}
+
+memory_status_summary() {
+    local meminfo_file="${1:-/proc/meminfo}"
+
+    [[ -r "$meminfo_file" ]] || {
+        printf '%s\n' '不可读'
+        return 0
+    }
+    awk '
+        /^MemTotal:/ {total=$2}
+        /^MemAvailable:/ {available=$2}
+        END {
+            if (!total || available == "") {print "不可读"; exit}
+            used=total-available
+            printf "已用 %.0f MiB / 可用 %.0f MiB / 总计 %.0f MiB", \
+                used/1024, available/1024, total/1024
+        }
+    ' "$meminfo_file" 2>/dev/null
+}
+
+swap_status_summary() {
+    local meminfo_file="${1:-/proc/meminfo}"
+
+    [[ -r "$meminfo_file" ]] || {
+        printf '%s\n' '不可读'
+        return 0
+    }
+    awk '
+        /^SwapTotal:/ {total=$2}
+        /^SwapFree:/ {free=$2}
+        END {
+            if (total == "" || free == "") {print "不可读"; exit}
+            if (total == 0) {print "未配置"; exit}
+            printf "已用 %.0f MiB / 总计 %.0f MiB", (total-free)/1024, total/1024
+        }
+    ' "$meminfo_file" 2>/dev/null
+}
+
+recent_oom_event_count() {
+    local journal
+
+    command -v journalctl >/dev/null 2>&1 || {
+        printf '%s\n' '不可读'
+        return 0
+    }
+    if ! journal=$(journalctl -k --since '-1 hour' --no-pager -o cat 2>/dev/null); then
+        printf '%s\n' '不可读'
+        return 0
+    fi
+    awk '/oom-kill:/ {count += 1} END {print count + 0}' <<< "$journal"
+}
+
 calculate_memory_cap() {
     local ram_mb="$1"
-    local cap
+    local cap=$((ram_mb * 32768)) # 有效 RAM / 32
     local minimum=$((8 * 1024 * 1024))
-    local maximum
-
-    if (( ram_mb >= 2048 )); then
-        cap=$((ram_mb * 131072)) # RAM / 8
-        maximum=$((512 * 1024 * 1024))
-    else
-        cap=$((ram_mb * 65536)) # RAM / 16
-        maximum=$((256 * 1024 * 1024))
-    fi
+    local maximum=$((256 * 1024 * 1024))
 
     (( cap < minimum )) && cap=$minimum
     (( cap > maximum )) && cap=$maximum
@@ -959,7 +1038,10 @@ detect_default_iface() {
 }
 
 default_ipv4_route() {
-    ip -4 route show default 2>/dev/null | head -n 1
+    local routes
+
+    routes=$(ip -4 route show default 2>/dev/null || true)
+    printf '%s\n' "${routes%%$'\n'*}"
 }
 
 strip_route_window_fields() {
@@ -1042,14 +1124,93 @@ detect_initcwnd_state() {
     fi
 }
 
+is_managed_initcwnd_hook() {
+    [[ -f "$INITCWND_ROUTE_HOOK" ]] &&
+        grep -Fq '# Managed by network-optimize.sh' "$INITCWND_ROUTE_HOOK"
+}
+
+initcwnd_hook_status() {
+    if is_managed_initcwnd_hook; then
+        printf '%s\n' '已安装（network-optimize 管理）'
+    elif [[ -e "$INITCWND_ROUTE_HOOK" || -L "$INITCWND_ROUTE_HOOK" ]]; then
+        printf '%s\n' '外部文件占用'
+    elif [[ -d "$(dirname "$INITCWND_ROUTE_HOOK")" ]]; then
+        printf '%s\n' '未安装'
+    else
+        printf '%s\n' '不可用（未检测到 networkd-dispatcher）'
+    fi
+}
+
+remove_initcwnd_hook() {
+    [[ -e "$INITCWND_ROUTE_HOOK" || -L "$INITCWND_ROUTE_HOOK" ]] || return 0
+    if ! is_managed_initcwnd_hook; then
+        warn "initcwnd 持久化路径已被其他配置占用，保留不动：$INITCWND_ROUTE_HOOK"
+        return 0
+    fi
+    rm -f "$INITCWND_ROUTE_HOOK"
+}
+
+write_initcwnd_hook() {
+    local hook_dir
+    local temp_hook
+
+    hook_dir=$(dirname "$INITCWND_ROUTE_HOOK")
+    if [[ ! -d "$hook_dir" ]]; then
+        warn "未检测到 networkd-dispatcher，initcwnd 仅对当前 IPv4 默认路由生效"
+        return 0
+    fi
+    if [[ -e "$INITCWND_ROUTE_HOOK" || -L "$INITCWND_ROUTE_HOOK" ]] &&
+        ! is_managed_initcwnd_hook; then
+        error "initcwnd 持久化路径已被其他配置占用：$INITCWND_ROUTE_HOOK"
+        return 1
+    fi
+
+    temp_hook=$(mktemp "${INITCWND_ROUTE_HOOK}.new.XXXXXX") || return 1
+    cat > "$temp_hook" <<EOF
+#!/usr/bin/env bash
+# Managed by network-optimize.sh
+set -euo pipefail
+
+[[ -e "$ROUTE_OWNED_MARKER" ]] || exit 0
+routes=\$(ip -4 route show default 2>/dev/null || true)
+route=\${routes%%\$'\\n'*}
+[[ -n "\$route" ]] || exit 0
+read -r -a fields <<< "\$route"
+skip=false
+clean=()
+for token in "\${fields[@]}"; do
+    if [[ "\$skip" == "true" ]]; then
+        skip=false
+        continue
+    fi
+    case "\$token" in
+        initcwnd|initrwnd) skip=true ;;
+        *) clean+=("\$token") ;;
+    esac
+done
+(( \${#clean[@]} > 0 )) || exit 0
+ip -4 route replace "\${clean[@]}" initcwnd 32 initrwnd 32
+EOF
+    if ! install -m 0755 "$temp_hook" "$INITCWND_ROUTE_HOOK"; then
+        rm -f "$temp_hook"
+        return 1
+    fi
+    rm -f "$temp_hook"
+}
+
 apply_initcwnd() {
     local route clean
     local -a route_args=()
 
     if [[ "$INITCWND_ENABLED" != "true" ]]; then
+        remove_initcwnd_hook || return 1
         [[ -e "$ROUTE_OWNED_MARKER" ]] || return 0
         route=$(default_ipv4_route)
-        [[ -n "$route" ]] || return 0
+        if [[ -z "$route" ]]; then
+            rm -f "$ROUTE_OWNED_MARKER"
+            success "已移除 initcwnd 持久化状态；当前没有 IPv4 默认路由需要清理"
+            return 0
+        fi
         clean=$(strip_route_window_fields "$route")
         read -r -a route_args <<< "$clean"
         ip -4 route replace "${route_args[@]}" || return 1
@@ -1066,7 +1227,15 @@ apply_initcwnd() {
     read -r -a route_args <<< "$clean"
     if ip -4 route replace "${route_args[@]}" initcwnd 32 initrwnd 32; then
         install -D -m 0600 /dev/null "$ROUTE_OWNED_MARKER"
-        success "默认路由已设置 initcwnd/initrwnd = 32（可能增加有浅层 policer 链路的首秒突发）"
+        if ! write_initcwnd_hook; then
+            error "无法写入 initcwnd 持久化钩子"
+            return 1
+        fi
+        if is_managed_initcwnd_hook; then
+            success "默认路由已设置 initcwnd/initrwnd = 32，并通过 networkd-dispatcher 持久化"
+        else
+            success "默认路由已设置 initcwnd/initrwnd = 32（当前系统没有可用持久化钩子）"
+        fi
     else
         error "默认路由不支持 initcwnd/initrwnd，网络 sysctl 已应用但路由优化失败"
         return 1
@@ -1858,11 +2027,11 @@ calculate_buffer_max() {
     local bandwidth_mbps="$1"
     local rtt_ms="$2"
     local memory_cap="$3"
-    local minimum=$((8 * 1024 * 1024))
+    local minimum=$((4 * 1024 * 1024))
     local mib=$((1024 * 1024))
     local desired
 
-    # 2 × BDP + 2 MiB，为 socket 记账和通告窗口保留余量。
+    # 2 x BDP + 2 MiB，为 socket 记账和通告窗口保留余量。
     desired=$((bandwidth_mbps * rtt_ms * 250 + 2 * 1024 * 1024))
     desired=$((((desired + mib - 1) / mib) * mib))
     (( desired < minimum )) && desired=$minimum
@@ -1870,55 +2039,11 @@ calculate_buffer_max() {
     echo "$desired"
 }
 
-calculate_tcp_mem() {
-    local ram_mb="$1"
-    local page_size="${2:-}"
-    local total_pages
-    local low
-    local pressure
-    local maximum
-
-    if [[ -z "$page_size" ]]; then
-        page_size=$(getconf PAGESIZE 2>/dev/null || true)
-    fi
-    [[ "$page_size" =~ ^[0-9]+$ ]] && (( page_size > 0 )) || return 1
-
-    total_pages=$((ram_mb * 1024 * 1024 / page_size))
-    low=$((total_pages / 16))
-    pressure=$((total_pages / 8))
-    maximum=$((total_pages / 4))
-
-    (( low < 4096 )) && low=4096
-    (( pressure < 8192 )) && pressure=8192
-    (( maximum < 16384 )) && maximum=16384
-    printf '%s %s %s\n' "$low" "$pressure" "$maximum"
-}
-
-calculate_buffer_default() {
-    local bandwidth_mbps="$1"
-    local rtt_ms="$2"
-    local buffer_max="$3"
-    local minimum=$((4 * 1024 * 1024))
-    local maximum=$((8 * 1024 * 1024))
-    local mib=$((1024 * 1024))
-    local bdp
-    local desired
-
-    # 代理节点使用半个 BDP 作为起点，并限制在 4-8 MiB。
-    bdp=$((bandwidth_mbps * rtt_ms * 125))
-    desired=$(((bdp + 1) / 2))
-    desired=$((((desired + mib - 1) / mib) * mib))
-    (( desired < minimum )) && desired=$minimum
-    (( desired > maximum )) && desired=$maximum
-    (( desired > buffer_max )) && desired=$buffer_max
-    echo "$desired"
-}
-
 buffer_limit_reason() {
     local bandwidth_mbps="$1"
     local rtt_ms="$2"
     local memory_cap="$3"
-    local minimum=$((8 * 1024 * 1024))
+    local minimum=$((4 * 1024 * 1024))
     local mib=$((1024 * 1024))
     local desired
 
@@ -1926,9 +2051,9 @@ buffer_limit_reason() {
     desired=$((((desired + mib - 1) / mib) * mib))
 
     if (( desired < minimum )); then
-        echo "8 MiB floor"
+        echo "4 MiB floor"
     elif (( desired > memory_cap )); then
-        echo "RAM-based cap"
+        echo "effective RAM / 32 cap"
     else
         echo "2 x BDP + 2 MiB headroom"
     fi
@@ -1974,21 +2099,32 @@ resolve_tuning_values() {
     local upload_mbps=""
     local rtt_ms=""
 
-    RAM_MB=$(detect_memory_mb)
-    is_positive_integer "$RAM_MB" 1 1073741824 || {
+    PHYSICAL_RAM_MB=$(detect_memory_mb)
+    is_positive_integer "$PHYSICAL_RAM_MB" 1 1073741824 || {
         error "无法读取系统内存"
         return 1
     }
+    RAM_MB=$(detect_effective_memory_mb "$PHYSICAL_RAM_MB")
+    is_positive_integer "$RAM_MB" 1 "$PHYSICAL_RAM_MB" || {
+        error "无法确定有效内存上限"
+        return 1
+    }
     MEMORY_CAP_BYTES=$(calculate_memory_cap "$RAM_MB")
-    TCP_MEM_PAGES=$(calculate_tcp_mem "$RAM_MB")
 
     if [[ "$TUNING_MODE" == "static" ]]; then
-        RMEM_MAX_BYTES=33554432
-        WMEM_MAX_BYTES=33554432
-        RMEM_DEFAULT_BYTES=4194304
-        WMEM_DEFAULT_BYTES=4194304
-        RMEM_REASON="static 32 MiB"
-        WMEM_REASON="static 32 MiB"
+        RMEM_MAX_BYTES=$((32 * 1024 * 1024))
+        WMEM_MAX_BYTES=$((32 * 1024 * 1024))
+        (( RMEM_MAX_BYTES > MEMORY_CAP_BYTES )) && RMEM_MAX_BYTES=$MEMORY_CAP_BYTES
+        (( WMEM_MAX_BYTES > MEMORY_CAP_BYTES )) && WMEM_MAX_BYTES=$MEMORY_CAP_BYTES
+        RMEM_DEFAULT_BYTES=$TCP_RMEM_DEFAULT_BYTES
+        WMEM_DEFAULT_BYTES=$TCP_WMEM_DEFAULT_BYTES
+        if (( MEMORY_CAP_BYTES < 32 * 1024 * 1024 )); then
+            RMEM_REASON="static 32 MiB capped by effective RAM / 32"
+            WMEM_REASON="static 32 MiB capped by effective RAM / 32"
+        else
+            RMEM_REASON="static 32 MiB"
+            WMEM_REASON="static 32 MiB"
+        fi
         CALCULATION_REASON="rmem: $RMEM_REASON; wmem: $WMEM_REASON"
         BANDWIDTH_SOURCE="not used"
         RTT_SOURCE="not used"
@@ -2057,18 +2193,25 @@ resolve_tuning_values() {
         TX_BDP_BYTES=$((upload_mbps * rtt_ms * 125))
         RMEM_MAX_BYTES=$(calculate_buffer_max "$download_mbps" "$rtt_ms" "$MEMORY_CAP_BYTES")
         WMEM_MAX_BYTES=$(calculate_buffer_max "$upload_mbps" "$rtt_ms" "$MEMORY_CAP_BYTES")
-        RMEM_DEFAULT_BYTES=$(calculate_buffer_default "$download_mbps" "$rtt_ms" "$RMEM_MAX_BYTES")
-        WMEM_DEFAULT_BYTES=$(calculate_buffer_default "$upload_mbps" "$rtt_ms" "$WMEM_MAX_BYTES")
+        RMEM_DEFAULT_BYTES=$TCP_RMEM_DEFAULT_BYTES
+        WMEM_DEFAULT_BYTES=$TCP_WMEM_DEFAULT_BYTES
         RMEM_REASON=$(buffer_limit_reason "$download_mbps" "$rtt_ms" "$MEMORY_CAP_BYTES")
         WMEM_REASON=$(buffer_limit_reason "$upload_mbps" "$rtt_ms" "$MEMORY_CAP_BYTES")
         CALCULATION_REASON="rmem: $RMEM_REASON; wmem: $WMEM_REASON"
     else
-        RMEM_MAX_BYTES="$MEMORY_CAP_BYTES"
-        WMEM_MAX_BYTES="$MEMORY_CAP_BYTES"
-        RMEM_DEFAULT_BYTES=4194304
-        WMEM_DEFAULT_BYTES=4194304
-        RMEM_REASON="RAM fallback"
-        WMEM_REASON="RAM fallback"
+        RMEM_MAX_BYTES=$((32 * 1024 * 1024))
+        WMEM_MAX_BYTES=$((32 * 1024 * 1024))
+        (( RMEM_MAX_BYTES > MEMORY_CAP_BYTES )) && RMEM_MAX_BYTES=$MEMORY_CAP_BYTES
+        (( WMEM_MAX_BYTES > MEMORY_CAP_BYTES )) && WMEM_MAX_BYTES=$MEMORY_CAP_BYTES
+        RMEM_DEFAULT_BYTES=$TCP_RMEM_DEFAULT_BYTES
+        WMEM_DEFAULT_BYTES=$TCP_WMEM_DEFAULT_BYTES
+        if (( MEMORY_CAP_BYTES < 32 * 1024 * 1024 )); then
+            RMEM_REASON="fallback 32 MiB capped by effective RAM / 32"
+            WMEM_REASON="fallback 32 MiB capped by effective RAM / 32"
+        else
+            RMEM_REASON="fallback 32 MiB"
+            WMEM_REASON="fallback 32 MiB"
+        fi
         CALCULATION_REASON="rmem: $RMEM_REASON; wmem: $WMEM_REASON"
     fi
 
@@ -2079,11 +2222,19 @@ format_mib() {
     awk -v bytes="$1" 'BEGIN {printf "%.1f", bytes / 1048576}'
 }
 
+format_buffer_size() {
+    awk -v bytes="$1" 'BEGIN {
+        if (bytes < 1048576) printf "%.0f KiB", bytes / 1024
+        else printf "%.1f MiB", bytes / 1048576
+    }'
+}
+
 show_tuning_plan() {
     echo "========== 网络动态配置计划 =========="
     echo "模式: $TUNING_MODE"
-    echo "内存: ${RAM_MB} MiB"
-    echo "内存缓冲区上限: $(format_mib "$MEMORY_CAP_BYTES") MiB"
+    echo "物理内存: ${PHYSICAL_RAM_MB} MiB"
+    echo "有效内存: ${RAM_MB} MiB"
+    echo "单 socket 上限: $(format_mib "$MEMORY_CAP_BYTES") MiB（有效内存 / 32，绝对上限 256 MiB）"
     echo "下载带宽: ${DETECTED_DOWNLOAD_MBPS:-未知} Mbps"
     echo "上传带宽: ${DETECTED_UPLOAD_MBPS:-未知} Mbps"
     echo "带宽来源: $BANDWIDTH_SOURCE"
@@ -2095,10 +2246,10 @@ show_tuning_plan() {
     echo "RTT 策略: $RTT_POLICY"
     echo "接收 BDP: $((RX_BDP_BYTES / 1024)) KiB"
     echo "发送 BDP: $((TX_BDP_BYTES / 1024)) KiB"
-    echo "rmem_max: $(format_mib "$RMEM_MAX_BYTES") MiB"
-    echo "wmem_max: $(format_mib "$WMEM_MAX_BYTES") MiB"
-    echo "rmem_default: $(format_mib "$RMEM_DEFAULT_BYTES") MiB"
-    echo "wmem_default: $(format_mib "$WMEM_DEFAULT_BYTES") MiB"
+    echo "rmem_max: $(format_buffer_size "$RMEM_MAX_BYTES")"
+    echo "wmem_max: $(format_buffer_size "$WMEM_MAX_BYTES")"
+    echo "tcp_rmem default: $(format_buffer_size "$RMEM_DEFAULT_BYTES")"
+    echo "tcp_wmem default: $(format_buffer_size "$WMEM_DEFAULT_BYTES")"
     echo "计算依据: $CALCULATION_REASON"
     echo "initcwnd 模式: $INITCWND_MODE"
     echo "initcwnd/initrwnd: $([[ "$INITCWND_ENABLED" == "true" ]] && echo "32" || echo "内核默认")（策略: $INITCWND_POLICY）"
@@ -2334,8 +2485,8 @@ show_install_summary() {
     printf '测量：%s↓ %s↑ Mbps\n' \
         "${DETECTED_DOWNLOAD_MBPS:-未知}" "${DETECTED_UPLOAD_MBPS:-未知}"
     format_rtt_selection_summary
-    printf '缓冲：默认 %s MiB / 最大 %s MiB\n' \
-        "$(format_mib "$WMEM_DEFAULT_BYTES")" "$(format_mib "$WMEM_MAX_BYTES")"
+    printf '缓冲：TCP 起点 %s / 最大 %s\n' \
+        "$(format_buffer_size "$WMEM_DEFAULT_BYTES")" "$(format_buffer_size "$WMEM_MAX_BYTES")"
     printf '网络健康：%s；TCP 重传新增 %s；受限 socket %s\n' \
         "$health" "$((a_retrans - b_retrans))" "$a_limited"
     printf '应用：%s + ECN %s，配置成功；fq %s\n' \
@@ -2360,10 +2511,6 @@ net.ipv4.tcp_sack = 1
 net.ipv4.tcp_dsack = 1
 net.ipv4.tcp_timestamps = 1
 EOF
-
-    if [[ -e /proc/sys/net/ipv4/tcp_adv_win_scale ]]; then
-        echo "net.ipv4.tcp_adv_win_scale = 1" >> "$target_file"
-    fi
 
     if [[ -e /proc/sys/net/ipv4/tcp_shrink_window ]]; then
         echo "net.ipv4.tcp_shrink_window = 1" >> "$target_file"
@@ -2479,37 +2626,6 @@ net.ipv6.conf.all.forwarding = 1
 EOF
 }
 
-append_adaptive_capacity_settings() {
-    local target_file="$1"
-    local cpu_count=1
-    local netdev_budget=300
-    local peak_bandwidth=0
-
-    if [[ -n "${DETECTED_DOWNLOAD_MBPS:-}" ]] && (( DETECTED_DOWNLOAD_MBPS > peak_bandwidth )); then
-        peak_bandwidth="$DETECTED_DOWNLOAD_MBPS"
-    fi
-    if [[ -n "${DETECTED_UPLOAD_MBPS:-}" ]] && (( DETECTED_UPLOAD_MBPS > peak_bandwidth )); then
-        peak_bandwidth="$DETECTED_UPLOAD_MBPS"
-    fi
-
-    cpu_count=$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)
-    [[ "$cpu_count" =~ ^[0-9]+$ ]] && (( cpu_count > 0 )) || cpu_count=1
-
-    if [[ -e /proc/sys/net/core/netdev_budget ]]; then
-        if (( peak_bandwidth >= 2500 && cpu_count >= 2 )); then
-            netdev_budget=600
-        fi
-        cat >> "$target_file" <<EOF
-
-# NAPI 数据包预算：高速多核提高吞吐，单核保留默认值避免挤压代理进程
-net.core.netdev_budget = $netdev_budget
-EOF
-    fi
-
-    # Linux 6.15+ 将最小值收紧为 2 jiffies；不同 HZ 内核可能拒绝固定 4000。
-    # 保留内核当前值，避免在无 softnet time_squeeze 证据时盲目延长 softirq 周期。
-}
-
 create_network_config() {
     local target_file="$1"
     local enable_bbr="$2"
@@ -2517,7 +2633,8 @@ create_network_config() {
     cat > "$target_file" <<EOF
 # 由 network-optimize.sh 自动生成。
 # 模式: $TUNING_MODE
-# 内存: ${RAM_MB} MiB
+# 物理内存: ${PHYSICAL_RAM_MB} MiB
+# 有效内存: ${RAM_MB} MiB
 # 下载带宽: ${DETECTED_DOWNLOAD_MBPS:-unknown} Mbps
 # 上传带宽: ${DETECTED_UPLOAD_MBPS:-unknown} Mbps
 # 带宽来源: $BANDWIDTH_SOURCE
@@ -2551,14 +2668,12 @@ net.ipv4.tcp_max_syn_backlog = 16384
 net.core.netdev_max_backlog = 16384
 net.core.optmem_max = 65536
 
-# 6. TCP/UDP 缓冲区；默认值按半个 BDP 推导并限制在 4-8 MiB
-net.core.rmem_default = $RMEM_DEFAULT_BYTES
-net.core.wmem_default = $WMEM_DEFAULT_BYTES
+# 6. TCP/UDP 缓冲区；使用 Linux 常规 TCP 起点，长流依赖 autotuning 增长
+# core default 与全局 tcp_mem 保留内核或发行版值，避免放大所有 socket 的内存承诺
 net.core.rmem_max = $RMEM_MAX_BYTES
 net.core.wmem_max = $WMEM_MAX_BYTES
 net.ipv4.tcp_rmem = 4096 $RMEM_DEFAULT_BYTES $RMEM_MAX_BYTES
 net.ipv4.tcp_wmem = 4096 $WMEM_DEFAULT_BYTES $WMEM_MAX_BYTES
-net.ipv4.tcp_mem = $TCP_MEM_PAGES
 net.ipv4.udp_rmem_min = 8192
 net.ipv4.udp_wmem_min = 8192
 
@@ -2579,7 +2694,6 @@ EOF
 
     append_supported_tcp_settings "$target_file"
     append_ipv6_forwarding_config "$target_file"
-    append_adaptive_capacity_settings "$target_file"
 
     if [[ "$enable_bbr" == "true" ]]; then
         cat >> "$target_file" <<'EOF'
@@ -2667,7 +2781,14 @@ backup_network_state() {
         "$BBR_MODULES_INITIAL_BACKUP" \
         "$BBR_MODULES_PREVIOUS_BACKUP" \
         "$BBR_MODULES_INITIAL_ABSENT" \
-        "$BBR_MODULES_PREVIOUS_ABSENT"
+        "$BBR_MODULES_PREVIOUS_ABSENT" || return 1
+
+    backup_managed_file \
+        "$INITCWND_ROUTE_HOOK" \
+        "$ROUTE_HOOK_INITIAL_BACKUP" \
+        "$ROUTE_HOOK_PREVIOUS_BACKUP" \
+        "$ROUTE_HOOK_INITIAL_ABSENT" \
+        "$ROUTE_HOOK_PREVIOUS_ABSENT"
 }
 
 read_saved_sysctl_value() {
@@ -2727,7 +2848,19 @@ normalize_removed_sysctl_value() {
         net.ipv4.tcp_ecn)
             awk 'NF == 1 && $1 ~ /^[0-2]$/ {print $1; found=1} END {exit !found}' <<< "$value"
             ;;
-        net.netfilter.nf_conntrack_max)
+        net.ipv4.tcp_adv_win_scale)
+            awk 'NF == 1 && $1 ~ /^-?[0-9]+$/ && $1 >= -31 && $1 <= 31 {
+                print $1; found=1
+            } END {exit !found}' <<< "$value"
+            ;;
+        net.ipv4.tcp_mem)
+            awk 'NF == 3 && $1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ && $3 ~ /^[0-9]+$/ &&
+                $1 > 0 && $1 <= $2 && $2 <= $3 {
+                printf "%d %d %d\n", $1, $2, $3; found=1
+            } END {exit !found}' <<< "$value"
+            ;;
+        net.core.rmem_default|net.core.wmem_default|net.core.netdev_budget|\
+        net.core.netdev_budget_usecs|net.netfilter.nf_conntrack_max)
             awk 'NF == 1 && $1 ~ /^[0-9]+$/ && $1 > 0 {print $1; found=1} END {exit !found}' <<< "$value"
             ;;
         *)
@@ -2767,6 +2900,12 @@ EOF
 removed_sysctl_display_name() {
     case "$1" in
         net.ipv4.tcp_ecn) printf '%s\n' 'ECN' ;;
+        net.ipv4.tcp_mem) printf '%s\n' 'tcp_mem' ;;
+        net.ipv4.tcp_adv_win_scale) printf '%s\n' 'tcp_adv_win_scale' ;;
+        net.core.rmem_default) printf '%s\n' 'rmem_default' ;;
+        net.core.wmem_default) printf '%s\n' 'wmem_default' ;;
+        net.core.netdev_budget) printf '%s\n' 'netdev_budget' ;;
+        net.core.netdev_budget_usecs) printf '%s\n' 'netdev_budget_usecs' ;;
         net.netfilter.nf_conntrack_max) printf '%s\n' 'nf_conntrack_max' ;;
         *) printf '%s\n' "$1" ;;
     esac
@@ -2965,6 +3104,16 @@ install_optimization() {
     local port_range_restore=""
     local restore_value
     local migration_index
+    local removed_key
+    local -a removed_sysctl_candidates=(
+        net.ipv4.tcp_mem
+        net.ipv4.tcp_adv_win_scale
+        net.core.rmem_default
+        net.core.wmem_default
+        net.core.netdev_budget
+        net.core.netdev_budget_usecs
+        net.netfilter.nf_conntrack_max
+    )
     local -a removed_sysctl_keys=()
     local -a removed_sysctl_values=()
 
@@ -3019,29 +3168,24 @@ install_optimization() {
         fi
     fi
 
-    if [[ "$ECN_DISABLED" != "true" ]] &&
-        managed_removed_sysctl_present "$NETWORK_CONF" net.ipv4.tcp_ecn; then
+    if [[ "$ECN_DISABLED" != "true" ]]; then
+        removed_sysctl_candidates+=(net.ipv4.tcp_ecn)
+    fi
+    for removed_key in "${removed_sysctl_candidates[@]}"; do
+        managed_removed_sysctl_present "$NETWORK_CONF" "$removed_key" || continue
+        if ! sysctl -n "$removed_key" >/dev/null 2>&1; then
+            warn "当前内核不存在旧版受管参数，停止持久管理：$removed_key"
+            continue
+        fi
         if restore_value=$(resolve_removed_sysctl_restore_value \
             "$RUNTIME_INITIAL_BACKUP" "$RUNTIME_INITIAL_UNKNOWN" \
-            "$NETWORK_INITIAL_BACKUP" "$NETWORK_INITIAL_UNKNOWN" net.ipv4.tcp_ecn); then
-            removed_sysctl_keys+=(net.ipv4.tcp_ecn)
+            "$NETWORK_INITIAL_BACKUP" "$NETWORK_INITIAL_UNKNOWN" "$removed_key"); then
+            removed_sysctl_keys+=("$removed_key")
             removed_sysctl_values+=("$restore_value")
         else
-            warn "旧版受管 ECN 初始值未知；停止持久管理并保留当前运行值到重启"
+            warn "旧版受管 $(removed_sysctl_display_name "$removed_key") 初始值未知；停止持久管理并保留当前运行值到重启"
         fi
-    fi
-
-    if managed_removed_sysctl_present "$NETWORK_CONF" net.netfilter.nf_conntrack_max; then
-        if restore_value=$(resolve_removed_sysctl_restore_value \
-            "$RUNTIME_INITIAL_BACKUP" "$RUNTIME_INITIAL_UNKNOWN" \
-            "$NETWORK_INITIAL_BACKUP" "$NETWORK_INITIAL_UNKNOWN" \
-            net.netfilter.nf_conntrack_max); then
-            removed_sysctl_keys+=(net.netfilter.nf_conntrack_max)
-            removed_sysctl_values+=("$restore_value")
-        else
-            warn "旧版受管 nf_conntrack_max 初始值未知；停止持久管理并保留当前运行值到重启"
-        fi
-    fi
+    done
 
     install -d -m 0755 /var/lib/linux-setup
     merge_initial_runtime_values "$runtime_backup" || {
@@ -3116,6 +3260,9 @@ install_optimization() {
 
     if ! apply_initcwnd; then
         restore_default_route "$ROUTE_PREVIOUS_BACKUP" "$ROUTE_PREVIOUS_OWNED" || true
+        restore_managed_file \
+            "$INITCWND_ROUTE_HOOK" "$ROUTE_HOOK_PREVIOUS_BACKUP" \
+            "$ROUTE_HOOK_PREVIOUS_ABSENT" || true
         restore_runtime_values "$RUNTIME_PREVIOUS_BACKUP"
         if ! restore_managed_file \
             "$NETWORK_CONF" "$NETWORK_PREVIOUS_BACKUP" "$NETWORK_PREVIOUS_ABSENT"; then
@@ -3165,12 +3312,16 @@ rollback_restore_transaction() {
     local config_absent="$2"
     local modules_backup="$3"
     local modules_absent="$4"
-    local runtime_backup="$5"
+    local hook_backup="$5"
+    local hook_absent="$6"
+    local runtime_backup="$7"
 
     restore_managed_file "$NETWORK_CONF" "$config_backup" "$config_absent" ||
         warn "恢复失败后无法还原原网络配置文件"
     restore_managed_file "$BBR_MODULES_FILE" "$modules_backup" "$modules_absent" ||
         warn "恢复失败后无法还原原 BBR 模块配置"
+    restore_managed_file "$INITCWND_ROUTE_HOOK" "$hook_backup" "$hook_absent" ||
+        warn "恢复失败后无法还原 initcwnd 持久化钩子"
     restore_runtime_values "$runtime_backup"
 }
 
@@ -3180,12 +3331,15 @@ restore_optimization() {
     local config_absent
     local modules_backup
     local modules_absent
+    local hook_backup
+    local hook_absent
     local runtime_backup
     local route_backup
     local route_owned
     local transaction_dir
     local current_runtime
     local restore_modules=false
+    local restore_hook=false
 
     case "$scope" in
         previous)
@@ -3193,6 +3347,8 @@ restore_optimization() {
             config_absent="$NETWORK_PREVIOUS_ABSENT"
             modules_backup="$BBR_MODULES_PREVIOUS_BACKUP"
             modules_absent="$BBR_MODULES_PREVIOUS_ABSENT"
+            hook_backup="$ROUTE_HOOK_PREVIOUS_BACKUP"
+            hook_absent="$ROUTE_HOOK_PREVIOUS_ABSENT"
             runtime_backup="$RUNTIME_PREVIOUS_BACKUP"
             route_backup="$ROUTE_PREVIOUS_BACKUP"
             route_owned="$ROUTE_PREVIOUS_OWNED"
@@ -3202,6 +3358,8 @@ restore_optimization() {
             config_absent="$NETWORK_INITIAL_ABSENT"
             modules_backup="$BBR_MODULES_INITIAL_BACKUP"
             modules_absent="$BBR_MODULES_INITIAL_ABSENT"
+            hook_backup="$ROUTE_HOOK_INITIAL_BACKUP"
+            hook_absent="$ROUTE_HOOK_INITIAL_ABSENT"
             runtime_backup="$RUNTIME_INITIAL_BACKUP"
             route_backup="$ROUTE_INITIAL_BACKUP"
             route_owned="$ROUTE_INITIAL_OWNED"
@@ -3219,6 +3377,9 @@ restore_optimization() {
     if [[ -e "$modules_backup" || -e "$modules_absent" ]]; then
         restore_modules=true
     fi
+    if [[ -e "$hook_backup" || -e "$hook_absent" ]]; then
+        restore_hook=true
+    fi
 
     transaction_dir=$(mktemp -d) || return 1
     current_runtime="$transaction_dir/current-runtime"
@@ -3229,6 +3390,11 @@ restore_optimization() {
     }
     snapshot_managed_file_state "$BBR_MODULES_FILE" \
         "$transaction_dir/current-modules" "$transaction_dir/current-modules-absent" || {
+        rm -rf "$transaction_dir"
+        return 1
+    }
+    snapshot_managed_file_state "$INITCWND_ROUTE_HOOK" \
+        "$transaction_dir/current-hook" "$transaction_dir/current-hook-absent" || {
         rm -rf "$transaction_dir"
         return 1
     }
@@ -3258,17 +3424,23 @@ restore_optimization() {
 
     if ! restore_managed_file "$NETWORK_CONF" "$config_backup" "$config_absent" ||
         { [[ "$restore_modules" == "true" ]] &&
-          ! restore_managed_file "$BBR_MODULES_FILE" "$modules_backup" "$modules_absent"; }; then
+          ! restore_managed_file "$BBR_MODULES_FILE" "$modules_backup" "$modules_absent"; } ||
+        { [[ "$restore_hook" == "true" ]] &&
+          ! restore_managed_file "$INITCWND_ROUTE_HOOK" "$hook_backup" "$hook_absent"; }; then
         error "提交恢复后的持久配置失败，正在回滚"
         rollback_restore_transaction \
             "$transaction_dir/current-config" "$transaction_dir/current-config-absent" \
             "$transaction_dir/current-modules" "$transaction_dir/current-modules-absent" \
+            "$transaction_dir/current-hook" "$transaction_dir/current-hook-absent" \
             "$current_runtime"
         rm -rf "$transaction_dir"
         return 1
     fi
     if [[ "$restore_modules" != "true" ]]; then
         warn "未找到可信的 $scope BBR 模块配置状态，保留当前文件"
+    fi
+    if [[ "$restore_hook" != "true" ]]; then
+        warn "未找到可信的 $scope initcwnd 钩子状态，保留当前文件"
     fi
 
     if [[ "$scope" == "initial" && -e "$ROUTE_INITIAL_UNKNOWN" ]]; then
@@ -3303,12 +3475,15 @@ show_status() {
     local wmem_max
     local tcp_rmem
     local tcp_wmem
+    local tcp_mem
+    local tcp_moderate_rcvbuf
     local udp_rmem_min
     local udp_wmem_min
     local fin_timeout
     local slow_start_after_idle
     local mtu_probing
     local netdev_budget
+    local netdev_budget_usecs
     local optmem_max
     local keepalive_time
     local initcwnd_state
@@ -3339,12 +3514,15 @@ show_status() {
     wmem_max=$(sysctl -n net.core.wmem_max 2>/dev/null || echo "未知")
     tcp_rmem=$(sysctl -n net.ipv4.tcp_rmem 2>/dev/null || echo "未知")
     tcp_wmem=$(sysctl -n net.ipv4.tcp_wmem 2>/dev/null || echo "未知")
+    tcp_mem=$(sysctl -n net.ipv4.tcp_mem 2>/dev/null || echo "未知")
+    tcp_moderate_rcvbuf=$(sysctl -n net.ipv4.tcp_moderate_rcvbuf 2>/dev/null || echo "未知")
     udp_rmem_min=$(sysctl -n net.ipv4.udp_rmem_min 2>/dev/null || echo "未知")
     udp_wmem_min=$(sysctl -n net.ipv4.udp_wmem_min 2>/dev/null || echo "未知")
     fin_timeout=$(sysctl -n net.ipv4.tcp_fin_timeout 2>/dev/null || echo "未知")
     slow_start_after_idle=$(sysctl -n net.ipv4.tcp_slow_start_after_idle 2>/dev/null || echo "未知")
     mtu_probing=$(sysctl -n net.ipv4.tcp_mtu_probing 2>/dev/null || echo "未知")
     netdev_budget=$(sysctl -n net.core.netdev_budget 2>/dev/null || echo "不可用")
+    netdev_budget_usecs=$(sysctl -n net.core.netdev_budget_usecs 2>/dev/null || echo "不可用")
     optmem_max=$(sysctl -n net.core.optmem_max 2>/dev/null || echo "不可用")
     keepalive_time=$(sysctl -n net.ipv4.tcp_keepalive_time 2>/dev/null || echo "不可用")
     conntrack_count=$(sysctl -n net.netfilter.nf_conntrack_count 2>/dev/null || echo "不可用")
@@ -3358,12 +3536,18 @@ show_status() {
     echo "配置文件: $NETWORK_CONF"
     [[ -f "$NETWORK_CONF" ]] && echo "配置状态: 已存在" || echo "配置状态: 未创建"
     if [[ -f "$NETWORK_CONF" ]]; then
-        grep -E '^# (模式|内存|下载带宽|上传带宽|带宽来源|中国组 RTT|全球组 RTT|观测 RTT|计算 RTT|RTT 来源|RTT 策略|initcwnd 模式|initcwnd 策略|缓冲区依据):' "$NETWORK_CONF" | sed 's/^# /  /'
+        grep -E '^# (模式|内存|物理内存|有效内存|下载带宽|上传带宽|带宽来源|中国组 RTT|全球组 RTT|观测 RTT|计算 RTT|RTT 来源|RTT 策略|initcwnd 模式|initcwnd 策略|缓冲区依据):' "$NETWORK_CONF" | sed 's/^# /  /'
     fi
     [[ -f "$NETWORK_INITIAL_BACKUP" ]] && echo "初始备份: $NETWORK_INITIAL_BACKUP"
     [[ -f "$NETWORK_INITIAL_ABSENT" ]] && echo "初始状态: 配置文件原本不存在"
     [[ -f "$NETWORK_INITIAL_UNKNOWN" ]] && echo "初始状态: 旧版未记录，无法安全推测"
     [[ -f "$NETWORK_PREVIOUS_BACKUP" ]] && echo "上次备份: $NETWORK_PREVIOUS_BACKUP"
+
+    echo
+    echo "系统资源:"
+    echo "  RAM: $(memory_status_summary)"
+    echo "  Swap: $(swap_status_summary)"
+    echo "  最近一小时 OOM: $(recent_oom_event_count)"
 
     echo
     echo "拥塞控制:"
@@ -3389,6 +3573,7 @@ show_status() {
     echo "  tcp_max_syn_backlog: $syn_backlog"
     echo "  netdev_max_backlog: $backlog"
     echo "  netdev_budget: $netdev_budget"
+    echo "  netdev_budget_usecs: $netdev_budget_usecs"
     echo "  optmem_max: $optmem_max"
     echo "  临时端口范围: $port_range"
     echo "  Conntrack 使用量: $conntrack_count / $conntrack_max"
@@ -3402,6 +3587,8 @@ show_status() {
     echo "  wmem_max: $wmem_max"
     echo "  tcp_rmem: $tcp_rmem"
     echo "  tcp_wmem: $tcp_wmem"
+    echo "  tcp_mem（内核管理）: $tcp_mem"
+    echo "  tcp_moderate_rcvbuf: $tcp_moderate_rcvbuf"
     echo "  udp_rmem_min: $udp_rmem_min"
     echo "  udp_wmem_min: $udp_wmem_min"
 
@@ -3412,6 +3599,7 @@ show_status() {
     echo "  mtu_probing: $mtu_probing"
     echo "  keepalive_time: $keepalive_time"
     echo "  initcwnd ownership marker: $([[ -e "$ROUTE_OWNED_MARKER" ]] && echo 存在 || echo 不存在)"
+    echo "  initcwnd 持久化钩子: $(initcwnd_hook_status)"
     echo "  默认路由窗口: $initcwnd_detail"
     [[ "$initcwnd_state_name" != "drift" ]] || echo "  initcwnd 状态: 漂移"
     echo "  ECN: $tcp_ecn"
@@ -3477,10 +3665,12 @@ verify 选项：
   - 自动测速在单方向 40 GB 或合计 85 GB 时提前停止，保留 5 GB 终止余量
   - 默认不持久管理 ECN；只在传入 --disable-ecn 时写入 tcp_ecn=0
   - initcwnd 默认 auto：已知上传 <= 100 Mbps 保留内核默认，否则设置为 32
+  - 检测到 networkd-dispatcher 时持久化 IPv4 默认路由的 initcwnd/initrwnd；不扩展 IPv6
   - --enable-initcwnd/--disable-initcwnd 显式覆盖 auto，冲突参数会被拒绝
-  - 根据 2 × BDP + 2 MiB 余量动态设置缓冲区上限，默认值按半个 BDP 取 4-8 MiB
-  - RTT 探测失败回退到 150 ms；带宽探测失败时默认缓冲回退到 4 MiB，最大值按内存限制
-  - RAM 小于 2 GiB 时上限为 RAM / 16、最高 256 MiB；否则为 RAM / 8、最高 512 MiB
+  - 根据 2 x BDP + 2 MiB 余量动态设置缓冲区上限，TCP 起点统一为接收 128 KiB、发送 16 KiB
+  - RTT 探测失败回退到 150 ms；带宽探测失败时最大值回退到 32 MiB
+  - 单 socket 上限为有效 RAM / 32，最低 8 MiB、最高 256 MiB，并识别有限 cgroup memory limit
+  - core socket 默认值和全局 tcp_mem 保留内核或发行版值
   - 只在本次运行计算和应用，不创建定时任务
   - verify 仅在交互确认或显式 --yes 后产生流量；install/status 不会调用 verify
   - verify 不修改 sysctl、路由或 qdisc，也不安装依赖或持久服务
