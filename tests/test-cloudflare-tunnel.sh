@@ -164,6 +164,11 @@ fi
 pass "preserve unrecognized legacy updater"
 
 script="$ROOT_DIR/tools/cloudflare_tunnel.sh"
+entrypoint_output=$(bash -c "$(cat "$script")" cloudflare_tunnel.sh help)
+grep -Fq 'cloudflare_tunnel.sh install' <<< "$entrypoint_output" ||
+    fail "bash -c entrypoint did not dispatch script arguments"
+pass "support bash -c one-line invocation"
+
 grep -Fq 'https://pkg.cloudflare.com/cloudflared' "$script" || fail "official APT repository missing"
 grep -Fq 'apt-get install -y --only-upgrade cloudflared' "$script" || fail "APT upgrade path missing"
 grep -Fq 'read -r -s -p' "$script" || fail "Token input is not hidden"
