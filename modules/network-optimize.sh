@@ -62,6 +62,7 @@ readonly IPERF_DURATION=5
 readonly IPERF_PARALLEL=4
 readonly IPERF_MAX_PEERS=2
 readonly -a IPERF_PORTS=(5201 5202 5203 5204 5205 5206 5207 5208 5209 5210 5200)
+readonly VERIFY_MAX_GROUP_ATTEMPTS=3
 readonly CLOUDFLARE_PARALLEL=8
 readonly CLOUDFLARE_DURATION=6
 readonly CLOUDFLARE_DOWNLOAD_BYTES=50000000
@@ -1384,7 +1385,7 @@ run_verify_iperf() {
 
     traffic_budget_reached upload && {
         error "verify 已达到上传或总流量停止阈值"
-        return 1
+        return 75
     }
     output_file="$VERIFY_TEMP_DIR/iperf-${streams}.json"
     iperf3 -4 -c "$host" -p "$port" -t "$IPERF_DURATION" -P "$streams" -J \
@@ -1397,7 +1398,7 @@ run_verify_iperf() {
             wait "$VERIFY_PID" 2>/dev/null || true
             VERIFY_PID=""
             error "verify 达到上传或总流量停止阈值，已终止 iperf3"
-            return 1
+            return 75
         fi
         sleep 0.05
     done
@@ -1427,17 +1428,20 @@ cleanup_verify() {
         wait "$child_pid" 2>/dev/null || true
     done < <(jobs -pr)
     [[ -z "${VERIFY_TEMP_DIR:-}" ]] || rm -rf "$VERIFY_TEMP_DIR"
+    VERIFY_TEMP_DIR=""
 }
 
 verify_impl() {
     local answer ranked rtt host peer_ip location provider port
-    local single_result four_result
+    local single_result="" four_result="" candidate_single rc
     local single_sender single_receiver single_retrans single_retrans_pct single_cpu single_remote_cpu
     local four_sender four_receiver four_retrans four_retrans_pct four_cpu four_remote_cpu
-    local qdisc_state qdisc_detail selected="false"
+    local qdisc_state qdisc_detail selected="false" attempts=0
 
     echo "verify 将运行 5 秒单流 + 5 秒四流上传测试。"
-    echo "预计流量约为 10 秒实际发送速率：1 Gbps 约 1.25 GB，10 Gbps 约 12.5 GB。"
+    echo "每个候选先测 1 流再测 4 流；任一步失败则整组作废并轮换，最多尝试 ${VERIFY_MAX_GROUP_ATTEMPTS} 组。"
+    echo "正常完成约为 10 秒实际发送速率；若 1 流成功后 4 流失败，重试会重复单流并产生额外流量。"
+    echo "最坏最多约 30 秒实际发送速率：1 Gbps 约 3.75 GB，10 Gbps 约 37.5 GB。"
     echo "沿用安全阈值：上传 40 GB 或合计 85 GB 时提前停止；不会修改 sysctl、路由或 qdisc。"
     if [[ "$VERIFY_ASSUME_YES" != "true" ]]; then
         if ! is_interactive_terminal; then
@@ -1466,21 +1470,42 @@ verify_impl() {
     while IFS='|' read -r rtt host peer_ip location provider; do
         [[ -n "$peer_ip" ]] || continue
         while IFS= read -r port; do
+            (( attempts >= VERIFY_MAX_GROUP_ATTEMPTS )) && break 2
             tcp_port_open "$peer_ip" "$port" || continue
-            selected="true"
-            break 2
+            ((attempts += 1))
+            candidate_single=""
+
+            run_verify_iperf "$peer_ip" "$port" 1 && rc=0 || rc=$?
+            if (( rc == 0 )); then
+                candidate_single="$VERIFY_RESULT"
+            elif (( rc == 75 )); then
+                return 1
+            else
+                warn "候选 $host [$peer_ip]:$port 单流测试失败，整组作废"
+            fi
+
+            if [[ -n "$candidate_single" ]]; then
+                run_verify_iperf "$peer_ip" "$port" 4 && rc=0 || rc=$?
+                if (( rc == 0 )); then
+                    single_result="$candidate_single"
+                    four_result="$VERIFY_RESULT"
+                    selected="true"
+                    break 2
+                elif (( rc == 75 )); then
+                    return 1
+                else
+                    warn "候选 $host [$peer_ip]:$port 四流测试失败，整组作废"
+                fi
+            fi
+
         done < <(ordered_iperf_ports)
     done <<< "$ranked"
     [[ "$selected" == "true" ]] || {
-        error "附近公共 iperf3 对端无可用端口"
+        error "${attempts} 组公共 iperf3 候选均未得到完整的 1 流和 4 流结果"
         return 1
     }
 
     echo "对端: $location/$provider $host [$peer_ip]:$port（IPv4 RTT ${rtt} ms）"
-    run_verify_iperf "$peer_ip" "$port" 1 || return 1
-    single_result="$VERIFY_RESULT"
-    run_verify_iperf "$peer_ip" "$port" 4 || return 1
-    four_result="$VERIFY_RESULT"
     IFS='|' read -r single_sender single_receiver single_retrans single_retrans_pct \
         single_cpu single_remote_cpu <<< "$single_result"
     IFS='|' read -r four_sender four_receiver four_retrans four_retrans_pct \
@@ -1506,14 +1531,21 @@ verify_impl() {
 
 run_verify_command() {
     local rc=0
-    local previous_int_trap previous_term_trap
+    local previous_hup_trap previous_int_trap previous_term_trap
 
+    previous_hup_trap=$(trap -p HUP)
     previous_int_trap=$(trap -p INT)
     previous_term_trap=$(trap -p TERM)
+    trap 'cleanup_verify; exit 129' HUP
     trap 'cleanup_verify; exit 130' INT
     trap 'cleanup_verify; exit 143' TERM
     verify_impl || rc=$?
     cleanup_verify
+    if [[ -n "$previous_hup_trap" ]]; then
+        eval "$previous_hup_trap"
+    else
+        trap - HUP
+    fi
     if [[ -n "$previous_int_trap" ]]; then
         eval "$previous_int_trap"
     else
