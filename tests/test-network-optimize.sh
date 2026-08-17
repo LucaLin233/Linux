@@ -378,16 +378,11 @@ printf 'PASS: owned cleanup failure propagates\n'
 # Hook deletion failure must return nonzero and leave the now-inert hook for retry.
 CURRENT_ROUTE="default via 192.0.2.1 dev eth0 proto dhcp metric 100 initcwnd 32 initrwnd 32"
 write_initcwnd_hook
-rm() {
-    if [[ "$*" == *"$INITCWND_ROUTE_HOOK"* ]]; then
-        return 1
-    fi
-    command rm "$@"
-}
+remove_initcwnd_hook() { return 1; }
 if apply_initcwnd >/dev/null 2>&1; then
     fail "failed managed hook deletion unexpectedly succeeded"
 fi
-unset -f rm
+unset -f remove_initcwnd_hook
 assert_eq "default via 192.0.2.1 dev eth0 proto dhcp metric 100" \
     "$CURRENT_ROUTE" "hook deletion failure does not undo completed route cleanup"
 [[ -e "$INITCWND_ROUTE_HOOK" ]] || fail "failed hook deletion removed the hook"
