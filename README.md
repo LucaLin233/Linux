@@ -78,7 +78,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/linux_
 | ---: | --- | --- | --- |
 | 1 | `system-optimize.sh` | Zram、系统 sysctl、journald、THP、时区和 Chrony | 为 headless VPS 设置 Panic 恢复、日志上限和低干扰 THP 策略；Ubuntu 可能安装内核模块、固件与 CPU 微码 |
 | 2 | `system-customize.sh` | 动态 MOTD、中文 Locale、可选 XanMod | 可能修改 Locale、欢迎信息和内核 |
-| 3 | `network-optimize.sh` | BBR、fq、按需禁用 ECN、动态 TCP/UDP 缓冲区、IPv4/IPv6 转发 | 默认静态零测速；主动测速需明确选择，单方向 40 GB 或合计 85 GB 时提前停止；保留云平台 IPv6 RA |
+| 3 | `network-optimize.sh` | BBR、fq、按需禁用 ECN、动态 TCP/UDP 缓冲区、IPv4/IPv6 转发 | 交互时先询问是否测速，拒绝后手填带宽；单方向 40 GB 或合计 85 GB 时提前停止；保留云平台 IPv6 RA |
 | 4 | `zsh-setup.sh` | Zsh、Oh My Zsh、Powerlevel10k 和插件 | 备份后重写 root 的 `.zshrc`，可修改默认 Shell |
 | 5 | `mise-setup.sh` | Mise、Python、Node.js 和依赖迁移 | 配置 Shell 集成及每周 Mise 自动更新 |
 | 6 | `tools-setup.sh` | NextTrace、Speedtest、htop、jq、tree 等 | 可能添加 NextTrace 第三方 APT 源 |
@@ -194,11 +194,12 @@ sudo bash <(curl -fsSL "$RAW_BASE/system-customize.sh") help
 
 ```bash
 RAW_BASE="https://raw.githubusercontent.com/LucaLin233/Linux/main/modules"
-# 交互终端无参数运行：选择静态、手填或主动探测
+# 交互终端无参数运行：选择测速，或拒绝后手填上下行带宽
 sudo bash <(curl -fsSL "$RAW_BASE/network-optimize.sh")
 
-# 非交互默认静态；也可明确指定静态模式
-bash <(curl -fsSL "$RAW_BASE/network-optimize.sh") plan --static
+# 非交互必须明确指定完整带宽或使用 --probe
+bash <(curl -fsSL "$RAW_BASE/network-optimize.sh") \
+  plan --download-mbps 1000 --upload-mbps 500
 
 # 明确允许主动探测
 sudo bash <(curl -fsSL "$RAW_BASE/network-optimize.sh") install --probe
@@ -216,15 +217,15 @@ sudo bash <(curl -fsSL "$RAW_BASE/network-optimize.sh") restore initial
 bash <(curl -fsSL "$RAW_BASE/network-optimize.sh") help
 ```
 
-主脚本交互运行到网络模块时会显示相同的三项选择；选择多个模块也不会跳过该确认。无 TTY 且未传模式参数时自动使用静态 32 MiB 缓冲区，不安装 `iperf3`/`jq`，也不产生测速流量。明确传入 `--auto`、`--probe`、`--static` 或线路参数时跳过交互；手填带宽缺少 RTT 时按 150 ms 计算且不测速，显式 `--rtt-ms` 严格使用用户值；主动探测成功时保留观测 RTT，并按 `max(观测 RTT, 150 ms)` 计算，失败回退到 150 ms。配置、计划、状态和摘要会区分观测值、计算值、来源和策略。`--target` 必须配合 `--probe`。
+主脚本交互运行到网络模块时只询问是否执行主动测速；选择多个模块也不会跳过该确认。拒绝测速后必须手填下载和上传带宽，RTT 缺省按 150 ms 计算；显式 `--rtt-ms` 严格使用用户值。无 TTY 时只接受 `--probe`、`--bandwidth-mbps` 或完整的 `--download-mbps` 与 `--upload-mbps`。主动探测失败时，有 TTY 会转为手填，无 TTY 则在写配置、sysctl 或路由前失败。主动探测只测带宽、不采集 RTT；未显式提供 `--rtt-ms` 时，BDP 按 150 ms 计算。
 
 `initcwnd` 默认为 `auto`：已知上传带宽不高于 100 Mbps 时保留内核默认，否则在默认路由设置 `initcwnd/initrwnd=32`；`--enable-initcwnd` 和 `--disable-initcwnd` 可显式覆盖。`status` 同时检查 ownership marker 与真实默认路由，并把 marker/路由不一致报告为漂移；也会区分 `default qdisc` 和默认出口实际 `active qdisc`，能识别 root `fq`、`mq` + 全 `fq` leaves、`htb` + 全 `fq` leaves，以及混合或不可读状态。`verify` 自动选择附近公共 iperf3 对端和可用端口，只有交互确认或非交互显式 `--yes` 后才测试；比较 1 流与 4 流 sender/receiver goodput、重传率和 CPU，并报告测试期间 softnet、网卡丢包/错误、全机 TCP 重传及可用的驱动 allowance 增量。全程不修改 sysctl、路由或 qdisc，也不自动安装依赖。
 
-旧版受管配置中的 `ip_local_port_range = 1024 65535` 会恢复首次运行前的值；备份不可用时恢复 Debian 默认 `32768 60999`，新版不再管理该参数。默认不写入 `net.ipv4.tcp_ecn`；只有显式传入 `--disable-ecn` 时才持久写入 `0`。升级旧版受管配置时，ECN、`tcp_mem`、`tcp_adv_win_scale`、core socket 默认值、NAPI budget 和 `nf_conntrack_max` 有可信首次运行备份便恢复原值；初始值未知则不猜测，仅停止持久管理并保留当前运行值到重启。
+默认不写入 `net.ipv4.tcp_ecn`；只有显式传入 `--disable-ecn` 时才持久写入 `0`。
 
 网络模块默认面向同时承载 TCP、UDP 与 Docker 流量的代理节点：连接队列使用
-`somaxconn=65535`、`tcp_max_syn_backlog=16384`，TCP 缓冲起点按半个 BDP 分方向向上取整到
-1-4 MiB；静态模式或带宽未知时回退到 2 MiB。动态最大值按 `2 × BDP + 2 MiB`
+`somaxconn=65535`、`tcp_max_syn_backlog=16384`，TCP 缓冲起点固定为 2 MiB，长流继续依赖
+autotuning。动态最大值按 `2 × BDP + 2 MiB`
 计算，并限制为有效 RAM（物理 RAM 与有限 cgroup memory limit 的较小值）的 1/32；RAM cap
 最低 8 MiB、最高 256 MiB，动态 socket 最大值另保留 4 MiB 绝对下限。模块启用 TCP receive
 autotuning、window scaling、SACK、DSACK、时间戳和 syncookies，但保留内核或发行版管理的
@@ -426,8 +427,11 @@ sudo bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/t
 | 一键系统定制 | `system-customize.sh` | 重复运行 `setup-motd.sh` |
 | 仅安装 XanMod | `xanmod-install.sh` | 同时让多个脚本反复管理内核源 |
 
-`network-optimize.sh` 与 `traffic-shape.sh` 职责不同，可以配合：前者管理 BBR、缓冲区和默认
-`fq`、仅上联网卡接收 RA 的 IPv6 转发和按内核能力启用的 TCP 参数；现有 Docker、veth、CNI 与隧道接口的 RA 会在运行时设为 `0` 并纳入回滚快照。后者在确实检测到 policer 后才使用 HTB 控制聚合出口速率，并保留 fq 叶子 pacing。
+`network-optimize.sh` 与 `traffic-shape.sh` 职责不同，可以配合：前者管理 BBR、缓冲区、默认
+`fq` 和按内核能力启用的 TCP 参数。IPv4/IPv6 forwarding 与 RA 管理不是 tcpfit 移植内容，
+而是为当前 Docker/VPS 环境保留的下游扩展：`all`/`default` 保留 `accept_ra=1`，实际 IPv6
+默认出口使用 `accept_ra=2`，现有 Docker、veth、CNI 与隧道接口的 RA 在运行时设为 `0` 并
+纳入回滚快照。后者在确实检测到 policer 后才使用 HTB 控制聚合出口速率，并保留 fq 叶子 pacing。
 
 ## 高风险提醒
 

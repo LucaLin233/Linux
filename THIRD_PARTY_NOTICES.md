@@ -17,7 +17,7 @@
 
 ## `modules/network-optimize.sh`
 
-`modules/network-optimize.sh` 移植或参考
+`modules/network-optimize.sh` 的基础网络调优移植或参考
 [Kylin010/tcpfit](https://github.com/Kylin010/tcpfit) `v0.5.6`（提交
 `67c0bdfb35dd98e86982600298237b6ecc08ebe4`）的以下 MIT 许可实现与策略：
 
@@ -26,11 +26,20 @@
 - BDP 与 2 MiB 余量
 - 物理内存/cgroup 有效内存 cap
 - initcwnd 100 Mbps 策略
-- initcwnd ownership 与 owned-only 清理思路
+- initcwnd 阈值、ownership 与 owned-only 清理思路
 
-下游主要差异：tcpfit 被拆为基础调优与 `traffic-shape` 两部分；
-`network-optimize.sh` 仅做 IPv4 TCP 调优；自动 RTT 固定为 150 ms；备份、恢复和交互流程
-使用本仓库实现。本条目描述移植与参考范围，不代表对 tcpfit 的完整等价实现。
+这些条目表示 tcpfit 衍生范围，不表示逐行复制或完整等价实现。tcpfit 在本项目中被拆为
+基础调优与 `traffic-shape` 两部分，`network-optimize.sh` 仅对 IPv4 TCP 应用基础调优，
+自动 RTT 固定为 150 ms。
+
+以下是本仓库自行实现的下游扩展，不属于 tcpfit 移植范围：
+
+- 命令行与交互式带宽输入、探测失败处理
+- previous/initial 备份、restore 与事务回滚
+- `verify` 的只读诊断和流量预算
+- 面向当前 Docker/VPS 环境保留的 IPv4/IPv6 forwarding 与 RA 管理，包括
+  `all`/`default` 的 `accept_ra`、IPv6 默认出口 `accept_ra=2`、虚拟接口 RA 归一化及回滚
+- 本仓库选择的 sysctl 配置集合与按需禁用 ECN 行为
 
 上述上游代码采用 MIT License：
 

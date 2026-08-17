@@ -40,11 +40,28 @@ assert_fail() {
     printf 'PASS: %s\n' "$name"
 }
 
+read_config_value() {
+    local file="$1"
+    local wanted_key="$2"
+
+    awk -F= -v wanted="$wanted_key" '
+        {
+            key=$1
+            gsub(/[[:space:]]/, "", key)
+            if (key == wanted) {
+                value=substr($0, index($0, "=") + 1)
+                gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
+                print value
+                exit
+            }
+        }
+    ' "$file"
+}
+
 reset_selection() {
     COMMAND=install
     RESTORE_SCOPE=previous
-    TUNING_MODE=auto
-    NO_PROBE=false
+    TUNING_MODE=""
     TUNING_SELECTION_EXPLICIT=false
     ACTIVE_PROBE_REQUESTED=false
     ECN_DISABLED=false
@@ -53,6 +70,7 @@ reset_selection() {
     MANUAL_UPLOAD_MBPS=""
     MANUAL_RTT_MS=""
     MANUAL_RTT_DEFAULTED=false
+    BANDWIDTH_SOURCE=unknown
     INITCWND_MODE=auto
     INITCWND_ENABLED=true
     INITCWND_POLICY=unknown
@@ -62,48 +80,27 @@ reset_selection() {
 
 is_interactive_terminal() { return 1; }
 reset_selection
-select_tuning_mode >/dev/null
-assert_eq static "$TUNING_MODE" "non-interactive execution selects static mode"
-assert_eq true "$NO_PROBE" "non-interactive execution disables probing"
+assert_fail "non-interactive execution requires an explicit bandwidth source" \
+    select_tuning_mode >/dev/null 2>&1
+assert_eq '' "$TUNING_MODE" "refused non-interactive selection leaves mode unset"
 
 is_interactive_terminal() { return 0; }
 reset_selection
-select_tuning_mode >/dev/null <<< "1"
-assert_eq static "$TUNING_MODE" "interactive default selects static mode"
-assert_eq true "$NO_PROBE" "interactive static mode disables probing"
+select_tuning_mode >/dev/null <<< "y"
+assert_eq probe "$TUNING_MODE" "interactive yes selects active probe"
+assert_eq true "$ACTIVE_PROBE_REQUESTED" "interactive yes records probe consent"
 
 reset_selection
 select_tuning_mode >/dev/null <<'EOF'
-2
+n
 1000
 500
-
 EOF
-assert_eq auto "$TUNING_MODE" "manual mode keeps dynamic buffer calculation"
-assert_eq true "$NO_PROBE" "manual mode disables active probing"
+assert_eq manual "$TUNING_MODE" "interactive no selects manual bandwidth"
 assert_eq 1000 "$MANUAL_DOWNLOAD_MBPS" "manual mode records download bandwidth"
 assert_eq 500 "$MANUAL_UPLOAD_MBPS" "manual mode records upload bandwidth"
 assert_eq 150 "$MANUAL_RTT_MS" "manual mode defaults RTT to 150 ms"
-
-reset_selection
-select_tuning_mode >/dev/null <<'EOF'
-3
-y
-EOF
-assert_eq auto "$TUNING_MODE" "confirmed probe selects auto mode"
-assert_eq false "$NO_PROBE" "confirmed probe enables active probing"
-assert_eq true "$ACTIVE_PROBE_REQUESTED" "interactive probe records explicit consent"
-
-reset_selection
-if select_tuning_mode >/dev/null <<'EOF'
-3
-n
-EOF
-then
-    fail "declined active probe unexpectedly succeeded"
-else
-    assert_eq 2 "$?" "declined active probe returns cancellation status"
-fi
+assert_eq true "$MANUAL_RTT_DEFAULTED" "interactive manual mode records default RTT"
 
 reset_selection
 parse_arguments install --probe
@@ -111,8 +108,15 @@ read() { fail "explicit probe unexpectedly prompted"; }
 select_tuning_mode
 unset -f read
 assert_eq true "$TUNING_SELECTION_EXPLICIT" "explicit probe bypasses selection menu"
-assert_eq false "$NO_PROBE" "explicit probe remains enabled"
+assert_eq probe "$TUNING_MODE" "explicit probe selects probe mode"
 assert_eq true "$ACTIVE_PROBE_REQUESTED" "probe flag records explicit consent"
+
+reset_selection
+assert_fail "reject removed --auto option" parse_arguments install --auto
+reset_selection
+assert_fail "reject removed --static option" parse_arguments install --static
+reset_selection
+assert_fail "reject removed --no-probe option" parse_arguments install --no-probe
 
 reset_selection
 parse_arguments install --disable-ecn
@@ -129,23 +133,31 @@ assert_fail "reject conflicting initcwnd flags" \
     parse_arguments install --enable-initcwnd --disable-initcwnd
 
 reset_selection
-parse_arguments install --static
-read() { fail "explicit static mode unexpectedly prompted"; }
+parse_arguments install --download-mbps 1000 --upload-mbps 500
+read() { fail "explicit manual bandwidth unexpectedly prompted"; }
 select_tuning_mode
 unset -f read
-assert_eq static "$TUNING_MODE" "explicit static mode bypasses selection menu"
-assert_eq true "$NO_PROBE" "explicit static mode disables probing"
-
-reset_selection
-parse_arguments install --download-mbps 1000
-assert_eq true "$NO_PROBE" "manual bandwidth never triggers active probing"
+assert_eq manual "$TUNING_MODE" "complete manual bandwidth bypasses interaction"
 assert_eq 150 "$MANUAL_RTT_MS" "manual bandwidth defaults missing RTT to 150 ms"
 assert_eq true "$MANUAL_RTT_DEFAULTED" "manual bandwidth records default RTT source"
+reset_selection
+parse_arguments plan --bandwidth-mbps 800
+assert_eq 800 "$MANUAL_DOWNLOAD_MBPS" "symmetric bandwidth fills download"
+assert_eq 800 "$MANUAL_UPLOAD_MBPS" "symmetric bandwidth fills upload"
+reset_selection
+assert_fail "reject incomplete manual download bandwidth" \
+    parse_arguments plan --download-mbps 1000
+reset_selection
+assert_fail "reject incomplete manual upload bandwidth" \
+    parse_arguments plan --upload-mbps 500
+reset_selection
+assert_fail "reject probe combined with manual bandwidth" \
+    parse_arguments plan --probe --bandwidth-mbps 1000
+reset_selection
 assert_fail "removed custom RTT target is rejected" parse_arguments plan --probe --target example.com
 
 prepare_dynamic_case() {
-    TUNING_MODE=auto
-    NO_PROBE=false
+    TUNING_MODE=probe
     MANUAL_BANDWIDTH_MBPS=""
     MANUAL_DOWNLOAD_MBPS=""
     MANUAL_UPLOAD_MBPS=""
@@ -164,7 +176,9 @@ prepare_dynamic_case() {
 
 detect_memory_mb() { printf '%s\n' 8192; }
 detect_cgroup_memory_limit_mb() { return 1; }
+PROBE_SHOULD_FAIL=false
 probe_bandwidth() {
+    [[ "$PROBE_SHOULD_FAIL" == "false" ]] || return 1
     DETECTED_DOWNLOAD_MBPS=1000
     DETECTED_UPLOAD_MBPS=500
 }
@@ -179,9 +193,67 @@ for observed_rtt in 40 180 300; do
 done
 assert_eq 39845888 "$RMEM_MAX_BYTES" "automatic calculation uses fixed 150 ms for buffer max"
 
+PROBE_SHOULD_FAIL=true
+is_interactive_terminal() { return 0; }
+prepare_dynamic_case
+resolve_tuning_values >/dev/null <<'EOF'
+1200
+600
+EOF
+assert_eq manual "$TUNING_MODE" "interactive probe failure switches to manual mode"
+assert_eq 1200 "$DETECTED_DOWNLOAD_MBPS" "probe failure fallback records download"
+assert_eq 600 "$DETECTED_UPLOAD_MBPS" "probe failure fallback records upload"
+assert_eq 150 "$DETECTED_RTT_MS" "probe failure fallback keeps 150 ms default RTT"
+
+prepare_dynamic_case
+MANUAL_RTT_MS=180
+resolve_tuning_values >/dev/null <<'EOF'
+1200
+600
+EOF
+assert_eq 180 "$DETECTED_RTT_MS" "probe failure fallback preserves explicit RTT"
+assert_eq 'manual override' "$RTT_POLICY" "probe fallback records explicit RTT policy"
+
+is_interactive_terminal() { return 1; }
+prepare_dynamic_case
+assert_fail "non-interactive probe failure rejects missing bandwidth" \
+    resolve_tuning_values >/dev/null 2>&1
+
+install_probe_dependencies() { return 0; }
+detect_container() { return 1; }
+detect_default_iface() { return 1; }
+network_health_snapshot() { printf '%s\n' '0 0 0 0 0 0 0 0 0 0'; }
+ZERO_SYSCTL_WRITES=0
+ZERO_ROUTE_WRITES=0
+sysctl() {
+    case "$1" in
+        -w|-p) ((ZERO_SYSCTL_WRITES += 1)) ;;
+    esac
+    return 1
+}
+ip() {
+    case "$1 $2 $3" in
+        '-4 route replace'|'-4 route del') ((ZERO_ROUTE_WRITES += 1)) ;;
+    esac
+    return 1
+}
+rm -rf "$NETWORK_CONF" "$NETWORK_OPTIMIZE_STATE_DIR" "$ROUTE_OWNED_MARKER"
+prepare_dynamic_case
+assert_fail "failed non-interactive probe aborts install" \
+    install_optimization >/dev/null 2>&1
+[[ ! -e "$NETWORK_CONF" && ! -e "$NETWORK_OPTIMIZE_STATE_DIR" &&
+    ! -e "$ROUTE_OWNED_MARKER" ]] ||
+    fail "failed probe wrote config, state, or route ownership"
+assert_eq 0 "$ZERO_SYSCTL_WRITES" "failed probe performs zero sysctl writes"
+assert_eq 0 "$ZERO_ROUTE_WRITES" "failed probe performs zero route writes"
+printf 'PASS: invalid bandwidth fails before config, sysctl, or route writes\n'
+unset -f sysctl ip
+
+PROBE_SHOULD_FAIL=false
+is_interactive_terminal() { return 0; }
 for manual_rtt in 40 300; do
     prepare_dynamic_case
-    NO_PROBE=true
+    TUNING_MODE=manual
     MANUAL_DOWNLOAD_MBPS=1000
     MANUAL_UPLOAD_MBPS=500
     MANUAL_RTT_MS="$manual_rtt"
@@ -271,6 +343,11 @@ fi
 for retired_key in \
     net.ipv4.tcp_mem \
     net.ipv4.tcp_adv_win_scale \
+    net.ipv4.ip_local_port_range \
+    net.ipv4.conf.all.rp_filter \
+    net.ipv4.conf.default.rp_filter \
+    net.ipv4.udp_rmem_min \
+    net.ipv4.udp_wmem_min \
     net.core.rmem_default \
     net.core.wmem_default \
     net.core.netdev_budget \
@@ -279,20 +356,22 @@ for retired_key in \
         fail "generated config still owns $retired_key"
     fi
 done
+assert_eq '1' "$(read_config_value "$generated_config" net.ipv4.ip_forward)" \
+    "generated config preserves IPv4 forwarding"
 assert_eq '4096 2097152 39845888' \
-    "$(read_saved_sysctl_value "$generated_config" net.ipv4.tcp_rmem)" \
+    "$(read_config_value "$generated_config" net.ipv4.tcp_rmem)" \
     "generated config uses fixed 2 MiB receive default"
 assert_eq '4096 2097152 20971520' \
-    "$(read_saved_sysctl_value "$generated_config" net.ipv4.tcp_wmem)" \
+    "$(read_config_value "$generated_config" net.ipv4.tcp_wmem)" \
     "generated config uses fixed 2 MiB send default"
 printf 'PASS: default generated config leaves retired global parameters unmanaged\n'
 
 ECN_DISABLED=true
 create_network_config "$generated_config" false
-assert_eq '0' "$(read_saved_sysctl_value "$generated_config" net.ipv4.tcp_ecn)" \
+assert_eq '0' "$(read_config_value "$generated_config" net.ipv4.tcp_ecn)" \
     "explicit disable writes tcp_ecn=0"
 
-mkdir -p "$IPV6_CONF_ROOT"/{all,default,eth0,eth1,br0,veth123}
+mkdir -p "$IPV6_CONF_ROOT"/{all,default,eth0,eth1,br0,br-docker,veth123}
 touch "$IPV6_CONF_ROOT/all/forwarding" "$IPV6_CONF_ROOT/all/accept_ra"
 for ra_iface in default eth0 eth1 br0 veth123; do
     touch "$IPV6_CONF_ROOT/$ra_iface/accept_ra"
@@ -317,6 +396,14 @@ ip() {
 ra_config="$TEMP_DIR/ra.conf"
 : > "$ra_config"
 append_ipv6_forwarding_config "$ra_config"
+for expected_ra_line in \
+    'net.ipv6.conf.all.accept_ra = 1' \
+    'net.ipv6.conf.default.accept_ra = 1' \
+    'net.ipv6.conf.default.forwarding = 1' \
+    'net.ipv6.conf.all.forwarding = 1'; do
+    grep -Fq "$expected_ra_line" "$ra_config" ||
+        fail "forwarding/RA config misses $expected_ra_line"
+done
 grep -Fq 'net.ipv6.conf.eth1.accept_ra = 2' "$ra_config" ||
     fail "actual IPv6 route interface did not receive accept_ra=2"
 for excluded_iface in eth0 br0 veth123; do
@@ -342,138 +429,45 @@ append_ipv6_forwarding_config "$ra_config"
 printf 'PASS: no IPv6 default route generates no per-interface accept_ra=2\n'
 unset -f ip
 
-managed_config="$TEMP_DIR/managed.conf"
-initial_runtime="$TEMP_DIR/initial-runtime"
-runtime_unknown="$TEMP_DIR/initial-runtime-unknown"
-initial_config="$TEMP_DIR/initial-config"
-config_unknown="$TEMP_DIR/initial-config-unknown"
-printf '%s\n' 'net.ipv4.ip_local_port_range = 1024 65535' > "$managed_config"
-printf '%s\n' 'net.ipv4.ip_local_port_range=40000 65000' > "$initial_runtime"
-printf '%s\n' 'net.ipv4.ip_local_port_range = 32768 62000' > "$initial_config"
-assert_ok "detect legacy managed unsafe port range" managed_unsafe_port_range_present "$managed_config"
-assert_eq '40000 65000' \
-    "$(resolve_port_range_restore_value "$managed_config" "$initial_runtime" "$runtime_unknown" \
-        "$initial_config" "$config_unknown")" \
-    "prefer initial runtime port range"
+printf '%s\n' 1 > "$IPV6_CONF_ROOT/br-docker/accept_ra"
+printf '%s\n' 2 > "$IPV6_CONF_ROOT/veth123/accept_ra"
+virtual_ra_backup="$TEMP_DIR/virtual-ra.runtime"
+: > "$virtual_ra_backup"
+capture_virtual_ipv6_ra_values "$virtual_ra_backup"
+assert_eq $'net.ipv6.conf.br-docker.accept_ra=1\nnet.ipv6.conf.veth123.accept_ra=2' \
+    "$(sort "$virtual_ra_backup")" "capture virtual interface RA values"
+RA_BR_DOCKER=1
+RA_VETH123=2
+sysctl() {
+    local key
 
-rm -f "$initial_runtime"
-assert_eq '32768 62000' \
-    "$(resolve_port_range_restore_value "$managed_config" "$initial_runtime" "$runtime_unknown" \
-        "$initial_config" "$config_unknown")" \
-    "fall back to initial config port range"
+    case "$1" in
+        -n)
+            case "$2" in
+                net.ipv6.conf.br-docker.accept_ra) printf '%s\n' "$RA_BR_DOCKER" ;;
+                net.ipv6.conf.veth123.accept_ra) printf '%s\n' "$RA_VETH123" ;;
+                *) return 1 ;;
+            esac
+            ;;
+        -w)
+            key="${2%%=*}"
+            case "$key" in
+                net.ipv6.conf.br-docker.accept_ra) RA_BR_DOCKER="${2#*=}" ;;
+                net.ipv6.conf.veth123.accept_ra) RA_VETH123="${2#*=}" ;;
+                *) return 1 ;;
+            esac
+            ;;
+        *) return 1 ;;
+    esac
+}
+normalize_virtual_ipv6_ra "$virtual_ra_backup" >/dev/null
+assert_eq 0 "$RA_BR_DOCKER" "normalize bridge RA"
+assert_eq 0 "$RA_VETH123" "normalize veth RA"
+restore_runtime_values "$virtual_ra_backup"
+assert_eq 1 "$RA_BR_DOCKER" "rollback restores bridge RA"
+assert_eq 2 "$RA_VETH123" "rollback restores veth RA"
+unset -f sysctl
 
-rm -f "$initial_config"
-assert_eq '32768 60999' \
-    "$(resolve_port_range_restore_value "$managed_config" "$initial_runtime" "$runtime_unknown" \
-        "$initial_config" "$config_unknown")" \
-    "fall back to Debian default port range"
-
-printf '%s\n' 'net.ipv4.ip_local_port_range = 32768 60999' > "$managed_config"
-assert_fail "ignore non-legacy port range" resolve_port_range_restore_value \
-    "$managed_config" "$initial_runtime" "$runtime_unknown" "$initial_config" "$config_unknown"
-
-printf '%s\n' 'net.ipv4.ip_local_port_range=1024 65535' > "$initial_runtime"
-printf '%s\n' 'net.ipv4.ip_local_port_range = 1024 65535' > "$initial_config"
-printf '%s\n' 'net.ipv4.ip_local_port_range = 1024 65535' > "$managed_config"
-assert_eq '32768 60999' \
-    "$(resolve_port_range_restore_value "$managed_config" "$initial_runtime" "$runtime_unknown" \
-        "$initial_config" "$config_unknown")" \
-    "reject contaminated unsafe initial port range"
-touch "$runtime_unknown"
-printf '%s\n' 'net.ipv4.ip_local_port_range = 32768 62000' > "$initial_config"
-assert_eq '32768 62000' \
-    "$(resolve_port_range_restore_value "$managed_config" "$initial_runtime" "$runtime_unknown" \
-        "$initial_config" "$config_unknown")" \
-    "ignore runtime backup marked unknown"
-assert_fail "reject malformed port range" normalize_port_range '1024 invalid'
-
-removed_managed_config="$TEMP_DIR/removed-managed.conf"
-removed_initial_runtime="$TEMP_DIR/removed-initial-runtime"
-removed_runtime_unknown="$TEMP_DIR/removed-initial-runtime-unknown"
-removed_initial_config="$TEMP_DIR/removed-initial-config"
-removed_config_unknown="$TEMP_DIR/removed-initial-config-unknown"
-printf '%s\n' \
-    '# 由 network-optimize.sh 自动生成。' \
-    'net.ipv4.tcp_ecn = 1' \
-    'net.ipv4.tcp_mem = 16384 32768 65536' \
-    'net.ipv4.tcp_adv_win_scale = 1' \
-    'net.core.rmem_default = 4194304' \
-    'net.core.wmem_default = 4194304' \
-    'net.core.netdev_budget = 600' \
-    'net.core.netdev_budget_usecs = 4000' \
-    'net.netfilter.nf_conntrack_max = 262144' > "$removed_managed_config"
-printf '%s\n' \
-    'net.ipv4.tcp_ecn=2' \
-    'net.ipv4.tcp_mem=4096 8192 16384' \
-    'net.ipv4.tcp_adv_win_scale=1' \
-    'net.core.rmem_default=212992' \
-    'net.core.wmem_default=212992' \
-    'net.core.netdev_budget=300' \
-    'net.core.netdev_budget_usecs=2000' \
-    'net.netfilter.nf_conntrack_max=131072' > "$removed_initial_runtime"
-printf '%s\n' \
-    'net.ipv4.tcp_ecn = 0' \
-    'net.ipv4.tcp_mem = 8192 16384 32768' \
-    'net.ipv4.tcp_adv_win_scale = 1' \
-    'net.core.rmem_default = 262144' \
-    'net.core.wmem_default = 262144' \
-    'net.core.netdev_budget = 300' \
-    'net.core.netdev_budget_usecs = 2000' \
-    'net.netfilter.nf_conntrack_max = 65536' > "$removed_initial_config"
-assert_ok "detect old managed ECN" managed_removed_sysctl_present \
-    "$removed_managed_config" net.ipv4.tcp_ecn
-assert_ok "detect old managed Conntrack max" managed_removed_sysctl_present \
-    "$removed_managed_config" net.netfilter.nf_conntrack_max
-assert_ok "detect old managed tcp_mem" managed_removed_sysctl_present \
-    "$removed_managed_config" net.ipv4.tcp_mem
-assert_ok "detect old managed netdev budget" managed_removed_sysctl_present \
-    "$removed_managed_config" net.core.netdev_budget
-assert_eq '4096 8192 16384' "$(resolve_removed_sysctl_restore_value \
-    "$removed_initial_runtime" "$removed_runtime_unknown" \
-    "$removed_initial_config" "$removed_config_unknown" net.ipv4.tcp_mem)" \
-    "prefer initial runtime tcp_mem"
-assert_eq '300' "$(resolve_removed_sysctl_restore_value \
-    "$removed_initial_runtime" "$removed_runtime_unknown" \
-    "$removed_initial_config" "$removed_config_unknown" net.core.netdev_budget)" \
-    "prefer initial runtime netdev budget"
-assert_eq '2' "$(resolve_removed_sysctl_restore_value \
-    "$removed_initial_runtime" "$removed_runtime_unknown" \
-    "$removed_initial_config" "$removed_config_unknown" net.ipv4.tcp_ecn)" \
-    "prefer initial runtime ECN"
-assert_eq '131072' "$(resolve_removed_sysctl_restore_value \
-    "$removed_initial_runtime" "$removed_runtime_unknown" \
-    "$removed_initial_config" "$removed_config_unknown" net.netfilter.nf_conntrack_max)" \
-    "prefer initial runtime Conntrack max"
-rm -f "$removed_initial_runtime"
-assert_eq '8192 16384 32768' "$(resolve_removed_sysctl_restore_value \
-    "$removed_initial_runtime" "$removed_runtime_unknown" \
-    "$removed_initial_config" "$removed_config_unknown" net.ipv4.tcp_mem)" \
-    "fall back to initial config tcp_mem"
-assert_eq '0' "$(resolve_removed_sysctl_restore_value \
-    "$removed_initial_runtime" "$removed_runtime_unknown" \
-    "$removed_initial_config" "$removed_config_unknown" net.ipv4.tcp_ecn)" \
-    "fall back to initial config ECN"
-assert_eq '65536' "$(resolve_removed_sysctl_restore_value \
-    "$removed_initial_runtime" "$removed_runtime_unknown" \
-    "$removed_initial_config" "$removed_config_unknown" net.netfilter.nf_conntrack_max)" \
-    "fall back to initial config Conntrack max"
-touch "$removed_config_unknown"
-assert_fail "reject config backup marked unknown" resolve_removed_sysctl_restore_value \
-    "$removed_initial_runtime" "$removed_runtime_unknown" \
-    "$removed_initial_config" "$removed_config_unknown" net.ipv4.tcp_ecn
-rm -f "$removed_config_unknown"
-printf '%s\n' 'net.ipv4.tcp_ecn = invalid' > "$removed_initial_config"
-assert_fail "reject unknown ECN restore value" resolve_removed_sysctl_restore_value \
-    "$removed_initial_runtime" "$removed_runtime_unknown" \
-    "$removed_initial_config" "$removed_config_unknown" net.ipv4.tcp_ecn
-assert_fail "reject malformed tcp_mem" normalize_removed_sysctl_value \
-    net.ipv4.tcp_mem '8192 4096 16384'
-assert_fail "reject invalid tcp_adv_win_scale" normalize_removed_sysctl_value \
-    net.ipv4.tcp_adv_win_scale 32
-
-runtime_backup="$TEMP_DIR/runtime-backup"
-: > "$runtime_backup"
-SYSCTL_PORT_RANGE='1024 65535'
 SYSCTL_TCP_ECN='1'
 SYSCTL_CONNTRACK_MAX='262144'
 SYSCTL_WRITE_FAIL_KEY=''
@@ -481,7 +475,6 @@ sysctl() {
     case "$1" in
         -n)
             case "$2" in
-                net.ipv4.ip_local_port_range) printf '%s\n' "$SYSCTL_PORT_RANGE" ;;
                 net.ipv4.tcp_ecn) printf '%s\n' "$SYSCTL_TCP_ECN" ;;
                 net.netfilter.nf_conntrack_max) printf '%s\n' "$SYSCTL_CONNTRACK_MAX" ;;
                 *) return 1 ;;
@@ -490,7 +483,6 @@ sysctl() {
         -w)
             [[ "${2%%=*}" != "$SYSCTL_WRITE_FAIL_KEY" ]] || return 1
             case "$2" in
-                net.ipv4.ip_local_port_range=*) SYSCTL_PORT_RANGE="${2#*=}" ;;
                 net.ipv4.tcp_ecn=*) SYSCTL_TCP_ECN="${2#*=}" ;;
                 net.netfilter.nf_conntrack_max=*) SYSCTL_CONNTRACK_MAX="${2#*=}" ;;
                 *) return 1 ;;
@@ -517,33 +509,6 @@ restore_runtime_values "$transaction_current"
 assert_eq 1 "$SYSCTL_TCP_ECN" "transaction rollback restores ECN after partial failure"
 assert_eq 262144 "$SYSCTL_CONNTRACK_MAX" \
     "transaction rollback preserves Conntrack max after partial failure"
-
-assert_ok "capture current port range for rollback" capture_port_range_for_rollback "$runtime_backup"
-assert_eq 'net.ipv4.ip_local_port_range=1024 65535' "$(cat "$runtime_backup")" \
-    "rollback snapshot includes previous port range"
-assert_ok "apply safe port range migration" apply_port_range_migration '32768 60999'
-assert_eq '32768 60999' "$SYSCTL_PORT_RANGE" "port range migration applies expected value"
-assert_ok "capture current ECN for rollback" capture_runtime_value_for_rollback \
-    "$runtime_backup" net.ipv4.tcp_ecn
-assert_ok "capture current Conntrack max for rollback" capture_runtime_value_for_rollback \
-    "$runtime_backup" net.netfilter.nf_conntrack_max
-assert_eq '1' "$(read_saved_sysctl_value "$runtime_backup" net.ipv4.tcp_ecn)" \
-    "rollback snapshot includes previous ECN"
-assert_eq '262144' "$(read_saved_sysctl_value "$runtime_backup" net.netfilter.nf_conntrack_max)" \
-    "rollback snapshot includes previous Conntrack max"
-assert_ok "apply ECN migration" apply_removed_sysctl_migration net.ipv4.tcp_ecn 2
-assert_ok "apply Conntrack max migration" apply_removed_sysctl_migration \
-    net.netfilter.nf_conntrack_max 131072
-assert_eq '2' "$SYSCTL_TCP_ECN" "ECN migration applies expected value"
-assert_eq '131072' "$SYSCTL_CONNTRACK_MAX" "Conntrack migration applies expected value"
-restore_runtime_values "$runtime_backup"
-assert_eq '1' "$SYSCTL_TCP_ECN" "runtime rollback restores previous ECN"
-assert_eq '262144' "$SYSCTL_CONNTRACK_MAX" "runtime rollback restores previous Conntrack max"
-if grep -Eq '^net[.]ipv4[.]ip_local_port_range[[:space:]]*=' \
-    "$ROOT_DIR/modules/network-optimize.sh"; then
-    fail "generated sysctl configuration still owns ip_local_port_range"
-fi
-printf 'PASS: generated sysctl configuration no longer owns ip_local_port_range\n'
 
 # Failed staging must not destroy the prior previous-backup snapshot.
 mkdir -p "$(dirname "$NETWORK_CONF")"
@@ -811,5 +776,11 @@ if grep -Eq 'restore_legacy_limits|LIMITS_|/etc/security/limits|[.]conf[.]disabl
     fail "legacy limits management code remains in network-optimize.sh"
 fi
 printf 'PASS: legacy limits functions, constants, calls, and paths are absent\n'
+
+if grep -Eq 'LEGACY_(KERNEL|SYSCTL)|RETIRED_SYSCTL_KEYS|migrate_legacy_(kernel|sysctl)|managed_removed_sysctl|normalize_removed_sysctl|apply_removed_sysctl_migration|resolve_port_range_restore_value|apply_port_range_migration|NO_PROBE' \
+    "$ROOT_DIR/modules/network-optimize.sh"; then
+    fail "removed network migration or mode framework remains"
+fi
+printf 'PASS: removed network migration and mode framework is absent\n'
 
 printf 'All network-optimize entry tests passed.\n'

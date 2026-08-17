@@ -5,9 +5,9 @@
 # linux-setup:enabled=true
 # 网络优化模块
 # TCP 调优仅覆盖 IPv4；IPv6 forwarding/RA 仅维护转发正确性。
-# 部分策略参考 Kylin010/tcpfit v0.5.6（MIT，提交 67c0bdfb35dd98e86982600298237b6ecc08ebe4）。
+# 基础调优移植或参考 Kylin010/tcpfit v0.5.6（MIT，提交 67c0bdfb35dd98e86982600298237b6ecc08ebe4）。
+# 事务备份、交互、验证及 Docker/VPS forwarding/RA 为本仓库下游扩展。
 # 功能：配置 BBR、fq、TCP 缓冲区及 RA 安全的双栈转发；主动探测必须明确选择。
-# 无参数交互运行会选择静态、手填或自动探测；非交互运行默认使用静态缓冲区。
 #
 # 用法：
 #   bash network-optimize.sh [install] [选项]  # 自动计算并应用
@@ -17,13 +17,11 @@
 #   bash network-optimize.sh verify [--yes]    # 确认后只读验证网络性能
 #
 # install/plan 可选参数：
-#   --auto, --probe              明确执行自动探测
-#   --static                     使用原有固定 32 MiB 缓冲区
+#   --probe                      明确执行自动探测
 #   --bandwidth-mbps N           手动指定对称带宽
 #   --download-mbps N            手动指定下载带宽
 #   --upload-mbps N              手动指定上传带宽
 #   --rtt-ms N                   手动指定 RTT
-#   --no-probe                   不发起网络探测；缺失数据时按内存保守配置
 #   --disable-ecn                禁用 ECN，回退到传统丢包信号
 #   --enable-initcwnd            强制设置初始拥塞窗口为 32
 #   --disable-initcwnd           强制保留内核默认初始拥塞窗口
@@ -106,22 +104,10 @@ readonly IPERF_DEADLINE_GRACE_SECONDS=15
 readonly IPERF_KILL_AFTER_SECONDS=3
 readonly IPV6_CONF_ROOT="${NETWORK_OPTIMIZE_IPV6_CONF_ROOT:-/proc/sys/net/ipv6/conf}"
 
-# 仅用于从旧版受管配置迁移；新配置不再写入这些全局参数。
-readonly -a RETIRED_SYSCTL_KEYS=(
-    net.ipv4.tcp_mem
-    net.ipv4.tcp_adv_win_scale
-    net.core.rmem_default
-    net.core.wmem_default
-    net.core.netdev_budget
-    net.core.netdev_budget_usecs
-    net.netfilter.nf_conntrack_max
-)
-
 # 参数与计算结果。命令行参数优先于自动探测。
 COMMAND="install"
 RESTORE_SCOPE="previous"
-TUNING_MODE="auto"
-NO_PROBE="false"
+TUNING_MODE=""
 TUNING_SELECTION_EXPLICIT="false"
 ACTIVE_PROBE_REQUESTED="false"
 ECN_DISABLED="false"
@@ -145,13 +131,13 @@ RAM_MB=0
 MEMORY_CAP_BYTES=0
 RX_BDP_BYTES=0
 TX_BDP_BYTES=0
-RMEM_MAX_BYTES=33554432
-WMEM_MAX_BYTES=33554432
+RMEM_MAX_BYTES=0
+WMEM_MAX_BYTES=0
 RMEM_DEFAULT_BYTES=$TCP_BUFFER_DEFAULT_BYTES
 WMEM_DEFAULT_BYTES=$TCP_BUFFER_DEFAULT_BYTES
-CALCULATION_REASON="static 32 MiB"
-RMEM_REASON="static 32 MiB"
-WMEM_REASON="static 32 MiB"
+CALCULATION_REASON="pending bandwidth"
+RMEM_REASON="pending bandwidth"
+WMEM_REASON="pending bandwidth"
 PROBE_IFACE=""
 PROBE_ENVIRONMENT_SHOWN="false"
 declare -a TRAFFIC_IFACES=()
@@ -164,14 +150,6 @@ VERIFY_ASSUME_YES="false"
 VERIFY_CONFIRM_EXPLICIT="false"
 VERIFY_TEMP_DIR=""
 VERIFY_RESULT=""
-
-# 旧版 kernel2.sh 使用的配置文件。
-readonly LEGACY_KERNEL_CONF="/etc/sysctl.d/99-kernel.conf"
-readonly LEGACY_KERNEL_ARCHIVE="/etc/sysctl.d/99-kernel.conf.legacy"
-
-# 旧版脚本可能迁移过的主 sysctl 文件。
-readonly LEGACY_SYSCTL_CONF="/etc/sysctl.conf"
-readonly LEGACY_SYSCTL_BACKUP="/etc/sysctl.conf.bak"
 
 # === 日志函数 ===
 log() {
@@ -499,35 +477,6 @@ ensure_bbr_available() {
     return 1
 }
 
-# === 旧配置迁移 ===
-migrate_legacy_kernel_config() {
-    if [[ ! -f "$LEGACY_KERNEL_CONF" ]]; then
-        return 0
-    fi
-
-    if [[ -e "$LEGACY_KERNEL_ARCHIVE" ]]; then
-        warn "检测到旧配置 $LEGACY_KERNEL_CONF，但历史归档已存在，保留旧文件不自动覆盖"
-        warn "请手动检查并处理：$LEGACY_KERNEL_CONF"
-        return 0
-    fi
-
-    if mv "$LEGACY_KERNEL_CONF" "$LEGACY_KERNEL_ARCHIVE"; then
-        info "旧网络配置已迁移为历史归档：$LEGACY_KERNEL_ARCHIVE"
-        info "新版配置将使用：$NETWORK_CONF"
-        return 0
-    fi
-
-    error "无法迁移旧网络配置：$LEGACY_KERNEL_CONF"
-    return 1
-}
-
-migrate_legacy_sysctl_conf() {
-    # /etc/sysctl.conf 可能由系统或管理员维护。无法可靠确认来源时，
-    # 只管理独立的 sysctl.d 文件，不移动或覆盖主配置。
-    [[ -s "$LEGACY_SYSCTL_CONF" ]] || return 0
-    warn "检测到 $LEGACY_SYSCTL_CONF；为保留现有系统配置，不自动迁移或覆盖"
-}
-
 # === 一次性动态探测与计算 ===
 is_positive_integer() {
     [[ "$1" =~ ^[0-9]+$ ]] && (( 10#$1 >= $2 && 10#$1 <= $3 ))
@@ -541,17 +490,10 @@ parse_arguments() {
 
     while (( $# > 0 )); do
         case "$1" in
-            --auto|--probe)
-                TUNING_MODE="auto"
-                NO_PROBE="false"
+            --probe)
+                TUNING_MODE="probe"
                 TUNING_SELECTION_EXPLICIT="true"
                 ACTIVE_PROBE_REQUESTED="true"
-                shift
-                ;;
-            --static)
-                TUNING_MODE="static"
-                NO_PROBE="true"
-                TUNING_SELECTION_EXPLICIT="true"
                 shift
                 ;;
             --bandwidth-mbps|--download-mbps|--upload-mbps|--rtt-ms)
@@ -567,11 +509,6 @@ parse_arguments() {
                     --rtt-ms) MANUAL_RTT_MS="$2" ;;
                 esac
                 shift 2
-                ;;
-            --no-probe)
-                NO_PROBE="true"
-                TUNING_SELECTION_EXPLICIT="true"
-                shift
                 ;;
             --disable-ecn)
                 ECN_DISABLED="true"
@@ -646,15 +583,23 @@ parse_arguments() {
         return 1
     fi
 
-    if [[ "$TUNING_MODE" == "static" ]] &&
-        [[ -n "$MANUAL_BANDWIDTH_MBPS$MANUAL_DOWNLOAD_MBPS$MANUAL_UPLOAD_MBPS$MANUAL_RTT_MS" ]]; then
-        error "--static 不能与动态带宽或 RTT 参数同时使用"
+    if [[ "$ACTIVE_PROBE_REQUESTED" == "true" ]] &&
+        [[ -n "$MANUAL_BANDWIDTH_MBPS$MANUAL_DOWNLOAD_MBPS$MANUAL_UPLOAD_MBPS" ]]; then
+        error "--probe 不能与手动带宽参数同时使用"
         return 1
     fi
 
-    if [[ -n "$MANUAL_BANDWIDTH_MBPS$MANUAL_DOWNLOAD_MBPS$MANUAL_UPLOAD_MBPS" ]] &&
-        [[ "$ACTIVE_PROBE_REQUESTED" != "true" ]]; then
-        NO_PROBE="true"
+    if [[ -n "$MANUAL_BANDWIDTH_MBPS" ]]; then
+        MANUAL_DOWNLOAD_MBPS="$MANUAL_BANDWIDTH_MBPS"
+        MANUAL_UPLOAD_MBPS="$MANUAL_BANDWIDTH_MBPS"
+    fi
+
+    if [[ -n "$MANUAL_DOWNLOAD_MBPS$MANUAL_UPLOAD_MBPS" ]]; then
+        if [[ -z "$MANUAL_DOWNLOAD_MBPS" || -z "$MANUAL_UPLOAD_MBPS" ]]; then
+            error "手动配置必须同时指定 --download-mbps 和 --upload-mbps"
+            return 1
+        fi
+        TUNING_MODE="manual"
         if [[ -z "$MANUAL_RTT_MS" ]]; then
             MANUAL_RTT_MS="$DEFAULT_RTT_MS"
             MANUAL_RTT_DEFAULTED="true"
@@ -688,78 +633,51 @@ show_active_probe_warning() {
     warn "流量按实际 IPv4 目标的路由接口分别计量并汇总；接口计数含后台流量，属于保守预算"
 }
 
-select_tuning_mode() {
-    local choice
+prompt_manual_bandwidth() {
+    local source="${1:-interactive manual entry}"
     local download_mbps
     local upload_mbps
-    local rtt_ms
+
+    read -r -p "下载带宽 Mbps: " download_mbps || return 1
+    is_positive_integer "$download_mbps" 1 100000 || {
+        error "下载带宽必须是 1–100000 的整数"
+        return 1
+    }
+    read -r -p "上传带宽 Mbps: " upload_mbps || return 1
+    is_positive_integer "$upload_mbps" 1 100000 || {
+        error "上传带宽必须是 1–100000 的整数"
+        return 1
+    }
+
+    TUNING_MODE="manual"
+    MANUAL_DOWNLOAD_MBPS="$download_mbps"
+    MANUAL_UPLOAD_MBPS="$upload_mbps"
+    if [[ -z "$MANUAL_RTT_MS" ]]; then
+        MANUAL_RTT_MS="$DEFAULT_RTT_MS"
+        MANUAL_RTT_DEFAULTED="true"
+    fi
+    BANDWIDTH_SOURCE="$source"
+}
+
+select_tuning_mode() {
     local answer
 
     [[ "$COMMAND" == "install" || "$COMMAND" == "plan" ]] || return 0
     [[ "$TUNING_SELECTION_EXPLICIT" == "false" ]] || return 0
 
     if ! is_interactive_terminal; then
-        TUNING_MODE="static"
-        NO_PROBE="true"
-        info "未检测到交互终端，使用静态 32 MiB 缓冲区；不执行主动探测"
-        return 0
+        error "非交互运行必须使用 --probe，或显式提供上下行带宽"
+        return 1
     fi
 
-    echo "网络优化参数来源："
-    echo "  1) 静态配置（默认；零测速，固定 32 MiB 缓冲区）"
-    echo "  2) 手填线路参数（零测速；按 2 × BDP + 2 MiB 计算）"
-    echo "  3) 自动探测（安装探测依赖并产生大量流量）"
-    read -r -p "选择 [1-3]（默认 1）: " choice || return 1
-    choice="${choice:-1}"
-
-    case "$choice" in
-        1)
-            TUNING_MODE="static"
-            NO_PROBE="true"
-            ;;
-        2)
-            read -r -p "下载带宽 Mbps: " download_mbps || return 1
-            is_positive_integer "$download_mbps" 1 100000 || {
-                error "下载带宽必须是 1–100000 的整数"
-                return 1
-            }
-            read -r -p "上传带宽 Mbps（默认与下载相同）: " upload_mbps || return 1
-            upload_mbps="${upload_mbps:-$download_mbps}"
-            is_positive_integer "$upload_mbps" 1 100000 || {
-                error "上传带宽必须是 1–100000 的整数"
-                return 1
-            }
-            read -r -p "计算 RTT ms（默认 150）: " rtt_ms || return 1
-            if [[ -z "$rtt_ms" ]]; then
-                rtt_ms="$DEFAULT_RTT_MS"
-                MANUAL_RTT_DEFAULTED="true"
-            fi
-            is_positive_integer "$rtt_ms" 1 5000 || {
-                error "RTT 必须是 1–5000 的整数"
-                return 1
-            }
-            TUNING_MODE="auto"
-            NO_PROBE="true"
-            MANUAL_DOWNLOAD_MBPS="$download_mbps"
-            MANUAL_UPLOAD_MBPS="$upload_mbps"
-            MANUAL_RTT_MS="$rtt_ms"
-            ;;
-        3)
-            show_active_probe_warning
-            read -r -p "确认执行主动探测？[y/N]: " answer || return 1
-            if [[ ! "$answer" =~ ^[Yy]$ ]]; then
-                info "已取消网络优化"
-                return 2
-            fi
-            TUNING_MODE="auto"
-            NO_PROBE="false"
-            ACTIVE_PROBE_REQUESTED="true"
-            ;;
-        *)
-            error "无效选择: $choice"
-            return 1
-            ;;
-    esac
+    show_active_probe_warning
+    read -r -p "是否执行主动测速？[y/N]: " answer || return 1
+    if [[ "$answer" =~ ^[Yy]$ ]]; then
+        TUNING_MODE="probe"
+        ACTIVE_PROBE_REQUESTED="true"
+    else
+        prompt_manual_bandwidth || return 1
+    fi
 
     TUNING_SELECTION_EXPLICIT="true"
 }
@@ -2175,7 +2093,7 @@ buffer_limit_reason() {
 }
 
 needs_automatic_probe() {
-    [[ "$TUNING_MODE" == "auto" && "$NO_PROBE" != "true" ]] || return 1
+    [[ "$TUNING_MODE" == "probe" ]] || return 1
     [[ -z "$MANUAL_BANDWIDTH_MBPS" &&
        ( -z "$MANUAL_DOWNLOAD_MBPS" || -z "$MANUAL_UPLOAD_MBPS" ) ]]
 }
@@ -2192,7 +2110,7 @@ install_probe_dependencies() {
     (( ${#packages[@]} > 0 )) || return 0
 
     if ! command -v apt-get >/dev/null 2>&1; then
-        warn "缺少探测工具且未找到 apt-get，将使用可用方法或内存保守配置"
+        warn "缺少探测工具且未找到 apt-get"
         return 1
     fi
 
@@ -2202,7 +2120,7 @@ install_probe_dependencies() {
     fi
     if ! DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
         "${packages[@]}"; then
-        warn "网络探测依赖安装失败，将使用可用方法或内存保守配置"
+        warn "网络探测依赖安装失败"
         return 1
     fi
 }
@@ -2223,28 +2141,6 @@ resolve_tuning_values() {
         return 1
     }
     MEMORY_CAP_BYTES=$(calculate_memory_cap "$RAM_MB")
-
-    if [[ "$TUNING_MODE" == "static" ]]; then
-        RMEM_MAX_BYTES=$((32 * 1024 * 1024))
-        WMEM_MAX_BYTES=$((32 * 1024 * 1024))
-        (( RMEM_MAX_BYTES > MEMORY_CAP_BYTES )) && RMEM_MAX_BYTES=$MEMORY_CAP_BYTES
-        (( WMEM_MAX_BYTES > MEMORY_CAP_BYTES )) && WMEM_MAX_BYTES=$MEMORY_CAP_BYTES
-        RMEM_DEFAULT_BYTES=$TCP_BUFFER_DEFAULT_BYTES
-        WMEM_DEFAULT_BYTES=$TCP_BUFFER_DEFAULT_BYTES
-        if (( MEMORY_CAP_BYTES < 32 * 1024 * 1024 )); then
-            RMEM_REASON="static 32 MiB capped by effective RAM / 32"
-            WMEM_REASON="static 32 MiB capped by effective RAM / 32"
-        else
-            RMEM_REASON="static 32 MiB"
-            WMEM_REASON="static 32 MiB"
-        fi
-        CALCULATION_REASON="rmem: $RMEM_REASON; wmem: $WMEM_REASON"
-        BANDWIDTH_SOURCE="not used"
-        RTT_SOURCE="not used"
-        RTT_POLICY="not used"
-        resolve_initcwnd_policy
-        return 0
-    fi
 
     download_mbps="$MANUAL_DOWNLOAD_MBPS"
     upload_mbps="$MANUAL_UPLOAD_MBPS"
@@ -2269,55 +2165,56 @@ resolve_tuning_values() {
     fi
 
     if [[ -z "$download_mbps" || -z "$upload_mbps" ]]; then
-        if [[ "$NO_PROBE" != "true" ]] && probe_bandwidth; then
+        if [[ "$TUNING_MODE" != "probe" ]]; then
+            error "缺少有效上下行带宽，拒绝生成或应用配置"
+            return 1
+        fi
+        if probe_bandwidth; then
             [[ -n "$download_mbps" ]] || download_mbps="$DETECTED_DOWNLOAD_MBPS"
             [[ -n "$upload_mbps" ]] || upload_mbps="$DETECTED_UPLOAD_MBPS"
-        elif [[ "$NO_PROBE" != "true" ]]; then
-            warn "带宽探测失败，将使用内存保守配置"
+        else
+            warn "带宽探测失败"
+            if ! is_interactive_terminal; then
+                error "非交互终端无法手填带宽，拒绝生成或应用配置"
+                return 1
+            fi
+            info "请手动提供上下行带宽"
+            prompt_manual_bandwidth "interactive fallback after probe failure" || return 1
+            download_mbps="$MANUAL_DOWNLOAD_MBPS"
+            upload_mbps="$MANUAL_UPLOAD_MBPS"
+            rtt_ms="$MANUAL_RTT_MS"
+            if [[ "$MANUAL_RTT_DEFAULTED" == "true" ]]; then
+                RTT_SOURCE="default for manual bandwidth"
+                RTT_POLICY="fixed 150 ms default"
+            else
+                RTT_SOURCE="command line"
+                RTT_POLICY="manual override"
+            fi
         fi
     fi
 
-    if [[ -n "$download_mbps" && -z "$upload_mbps" ]]; then
-        upload_mbps="$download_mbps"
-        (( upload_mbps > 1000 )) && upload_mbps=1000
-    elif [[ -n "$upload_mbps" && -z "$download_mbps" ]]; then
-        download_mbps="$upload_mbps"
+    if ! is_positive_integer "$download_mbps" 1 100000 ||
+        ! is_positive_integer "$upload_mbps" 1 100000; then
+        error "未获得有效上下行带宽，拒绝生成或应用配置"
+        return 1
     fi
-
-    if [[ -n "$MANUAL_BANDWIDTH_MBPS$MANUAL_DOWNLOAD_MBPS$MANUAL_UPLOAD_MBPS" ]]; then
-        BANDWIDTH_SOURCE="command line / auto fill"
+    if [[ "$TUNING_MODE" == "manual" && "$BANDWIDTH_SOURCE" == "unknown" ]]; then
+        BANDWIDTH_SOURCE="command line"
     fi
 
     DETECTED_DOWNLOAD_MBPS="$download_mbps"
     DETECTED_UPLOAD_MBPS="$upload_mbps"
     DETECTED_RTT_MS="$rtt_ms"
 
-    if [[ -n "$download_mbps" && -n "$upload_mbps" && -n "$rtt_ms" ]]; then
-        RX_BDP_BYTES=$((download_mbps * rtt_ms * 125))
-        TX_BDP_BYTES=$((upload_mbps * rtt_ms * 125))
-        RMEM_MAX_BYTES=$(calculate_buffer_max "$download_mbps" "$rtt_ms" "$MEMORY_CAP_BYTES")
-        WMEM_MAX_BYTES=$(calculate_buffer_max "$upload_mbps" "$rtt_ms" "$MEMORY_CAP_BYTES")
-        RMEM_DEFAULT_BYTES=$TCP_BUFFER_DEFAULT_BYTES
-        WMEM_DEFAULT_BYTES=$TCP_BUFFER_DEFAULT_BYTES
-        RMEM_REASON=$(buffer_limit_reason "$download_mbps" "$rtt_ms" "$MEMORY_CAP_BYTES")
-        WMEM_REASON=$(buffer_limit_reason "$upload_mbps" "$rtt_ms" "$MEMORY_CAP_BYTES")
-        CALCULATION_REASON="rmem: $RMEM_REASON; wmem: $WMEM_REASON"
-    else
-        RMEM_MAX_BYTES=$((32 * 1024 * 1024))
-        WMEM_MAX_BYTES=$((32 * 1024 * 1024))
-        (( RMEM_MAX_BYTES > MEMORY_CAP_BYTES )) && RMEM_MAX_BYTES=$MEMORY_CAP_BYTES
-        (( WMEM_MAX_BYTES > MEMORY_CAP_BYTES )) && WMEM_MAX_BYTES=$MEMORY_CAP_BYTES
-        RMEM_DEFAULT_BYTES=$TCP_BUFFER_DEFAULT_BYTES
-        WMEM_DEFAULT_BYTES=$TCP_BUFFER_DEFAULT_BYTES
-        if (( MEMORY_CAP_BYTES < 32 * 1024 * 1024 )); then
-            RMEM_REASON="fallback 32 MiB capped by effective RAM / 32"
-            WMEM_REASON="fallback 32 MiB capped by effective RAM / 32"
-        else
-            RMEM_REASON="fallback 32 MiB"
-            WMEM_REASON="fallback 32 MiB"
-        fi
-        CALCULATION_REASON="rmem: $RMEM_REASON; wmem: $WMEM_REASON"
-    fi
+    RX_BDP_BYTES=$((download_mbps * rtt_ms * 125))
+    TX_BDP_BYTES=$((upload_mbps * rtt_ms * 125))
+    RMEM_MAX_BYTES=$(calculate_buffer_max "$download_mbps" "$rtt_ms" "$MEMORY_CAP_BYTES")
+    WMEM_MAX_BYTES=$(calculate_buffer_max "$upload_mbps" "$rtt_ms" "$MEMORY_CAP_BYTES")
+    RMEM_DEFAULT_BYTES=$TCP_BUFFER_DEFAULT_BYTES
+    WMEM_DEFAULT_BYTES=$TCP_BUFFER_DEFAULT_BYTES
+    RMEM_REASON=$(buffer_limit_reason "$download_mbps" "$rtt_ms" "$MEMORY_CAP_BYTES")
+    WMEM_REASON=$(buffer_limit_reason "$upload_mbps" "$rtt_ms" "$MEMORY_CAP_BYTES")
+    CALCULATION_REASON="rmem: $RMEM_REASON; wmem: $WMEM_REASON"
 
     resolve_initcwnd_policy
 }
@@ -2539,11 +2436,6 @@ show_verify_health_since() {
 }
 
 format_rtt_selection_summary() {
-    if [[ "$TUNING_MODE" == "static" ]]; then
-        printf '%s\n' 'RTT：未使用（静态 32 MiB 缓冲区）'
-        return
-    fi
-
     printf 'RTT：计算 %s ms（来源 %s；策略 %s）\n' \
         "${DETECTED_RTT_MS:-未知}" "${RTT_SOURCE:-unknown}" "${RTT_POLICY:-unknown}"
 }
@@ -2738,32 +2630,26 @@ create_network_config() {
 # 1. IPv4 转发
 net.ipv4.ip_forward = 1
 
-# 2. 代理与非对称路由兼容
-net.ipv4.conf.all.rp_filter = 2
-net.ipv4.conf.default.rp_filter = 2
-
-# 3. 队列调度
+# 2. 队列调度
 net.core.default_qdisc = fq
 
-# 4. TCP Fast Open
+# 3. TCP Fast Open
 net.ipv4.tcp_fastopen = 3
 
-# 5. 连接与接收队列
+# 4. 连接与接收队列
 net.core.somaxconn = 65535
 net.ipv4.tcp_max_syn_backlog = 16384
 net.core.netdev_max_backlog = 16384
 net.core.optmem_max = 65536
 
-# 6. TCP/UDP 缓冲区；TCP 初始默认固定 2 MiB，长流继续依赖 autotuning
+# 5. TCP/UDP 缓冲区；TCP 初始默认固定 2 MiB，长流继续依赖 autotuning
 # core default 与全局 tcp_mem 保留内核或发行版值，避免放大所有 socket 的内存承诺
 net.core.rmem_max = $RMEM_MAX_BYTES
 net.core.wmem_max = $WMEM_MAX_BYTES
 net.ipv4.tcp_rmem = 4096 $RMEM_DEFAULT_BYTES $RMEM_MAX_BYTES
 net.ipv4.tcp_wmem = 4096 $WMEM_DEFAULT_BYTES $WMEM_MAX_BYTES
-net.ipv4.udp_rmem_min = 8192
-net.ipv4.udp_wmem_min = 8192
 
-# 7. 长连接、连接回收与复杂路径
+# 6. 长连接、连接回收与复杂路径
 net.ipv4.tcp_fin_timeout = 30
 net.ipv4.tcp_slow_start_after_idle = 0
 net.ipv4.tcp_keepalive_time = 600
@@ -2884,201 +2770,6 @@ backup_network_state() {
         "$ROUTE_HOOK_PREVIOUS_ABSENT"
 }
 
-read_saved_sysctl_value() {
-    local file="$1"
-    local wanted_key="$2"
-
-    [[ -f "$file" ]] || return 1
-    awk -F= -v wanted="$wanted_key" '
-        {
-            key=$1
-            gsub(/[[:space:]]/, "", key)
-            if (key == wanted) {
-                value=substr($0, index($0, "=") + 1)
-                gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
-                print value
-                exit
-            }
-        }
-    ' "$file"
-}
-
-normalize_port_range() {
-    awk '
-        NF == 2 && $1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ &&
-        $1 >= 1 && $2 <= 65535 && $1 < $2 {
-            printf "%d %d\n", $1, $2
-            found=1
-        }
-        END {exit !found}
-    ' <<< "$1"
-}
-
-managed_unsafe_port_range_present() {
-    local config_file="$1"
-    local value
-
-    value=$(read_saved_sysctl_value "$config_file" net.ipv4.ip_local_port_range || true)
-    [[ "$(normalize_port_range "$value" 2>/dev/null || true)" == "1024 65535" ]]
-}
-
-managed_removed_sysctl_present() {
-    local config_file="$1"
-    local key="$2"
-    local value
-
-    [[ -f "$config_file" ]] || return 1
-    grep -Fq '# 由 network-optimize.sh 自动生成。' "$config_file" || return 1
-    value=$(read_saved_sysctl_value "$config_file" "$key" || true)
-    [[ -n "$value" ]]
-}
-
-normalize_removed_sysctl_value() {
-    local key="$1"
-    local value="$2"
-
-    case "$key" in
-        net.ipv4.tcp_ecn)
-            awk 'NF == 1 && $1 ~ /^[0-2]$/ {print $1; found=1} END {exit !found}' <<< "$value"
-            ;;
-        net.ipv4.tcp_adv_win_scale)
-            awk 'NF == 1 && $1 ~ /^-?[0-9]+$/ && $1 >= -31 && $1 <= 31 {
-                print $1; found=1
-            } END {exit !found}' <<< "$value"
-            ;;
-        net.ipv4.tcp_mem)
-            awk 'NF == 3 && $1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ && $3 ~ /^[0-9]+$/ &&
-                $1 > 0 && $1 <= $2 && $2 <= $3 {
-                printf "%d %d %d\n", $1, $2, $3; found=1
-            } END {exit !found}' <<< "$value"
-            ;;
-        net.core.rmem_default|net.core.wmem_default|net.core.netdev_budget|\
-        net.core.netdev_budget_usecs|net.netfilter.nf_conntrack_max)
-            awk 'NF == 1 && $1 ~ /^[0-9]+$/ && $1 > 0 {print $1; found=1} END {exit !found}' <<< "$value"
-            ;;
-        *)
-            return 1
-            ;;
-    esac
-}
-
-resolve_removed_sysctl_restore_value() {
-    local initial_runtime="$1"
-    local runtime_unknown="$2"
-    local initial_config="$3"
-    local config_unknown="$4"
-    local key="$5"
-    local source_file
-    local unknown_marker
-    local value
-
-    while IFS= read -r source_file && IFS= read -r unknown_marker; do
-        [[ ! -e "$unknown_marker" ]] || continue
-        value=$(read_saved_sysctl_value "$source_file" "$key" || true)
-        value=$(normalize_removed_sysctl_value "$key" "$value" 2>/dev/null || true)
-        if [[ -n "$value" ]]; then
-            printf '%s\n' "$value"
-            return 0
-        fi
-    done <<EOF
-$initial_runtime
-$runtime_unknown
-$initial_config
-$config_unknown
-EOF
-
-    return 1
-}
-
-removed_sysctl_display_name() {
-    local retired_key
-
-    if [[ "$1" == "net.ipv4.tcp_ecn" ]]; then
-        printf '%s\n' 'ECN'
-        return
-    fi
-    for retired_key in "${RETIRED_SYSCTL_KEYS[@]}"; do
-        if [[ "$1" == "$retired_key" ]]; then
-            printf '%s\n' "${1##*.}"
-            return
-        fi
-    done
-    printf '%s\n' "$1"
-}
-
-capture_runtime_value_for_rollback() {
-    local output_file="$1"
-    local key="$2"
-    local value
-
-    grep -Fq "${key}=" "$output_file" && return 0
-    value=$(sysctl -n "$key" 2>/dev/null) || return 1
-    value=$(normalize_removed_sysctl_value "$key" "$value") || return 1
-    printf '%s=%s\n' "$key" "$value" >> "$output_file"
-}
-
-apply_removed_sysctl_migration() {
-    local key="$1"
-    local expected="$2"
-    local actual
-
-    sysctl -w "$key=$expected" >/dev/null 2>&1 || return 1
-    actual=$(sysctl -n "$key" 2>/dev/null) || return 1
-    actual=$(normalize_removed_sysctl_value "$key" "$actual") || return 1
-    [[ "$actual" == "$expected" ]]
-}
-
-resolve_port_range_restore_value() {
-    local current_config="$1"
-    local initial_runtime="$2"
-    local runtime_unknown="$3"
-    local initial_config="$4"
-    local config_unknown="$5"
-    local value
-
-    managed_unsafe_port_range_present "$current_config" || return 1
-
-    if [[ ! -e "$runtime_unknown" ]]; then
-        value=$(read_saved_sysctl_value "$initial_runtime" net.ipv4.ip_local_port_range || true)
-        value=$(normalize_port_range "$value" 2>/dev/null || true)
-        if [[ -n "$value" && "$value" != "1024 65535" ]]; then
-            printf '%s\n' "$value"
-            return 0
-        fi
-    fi
-
-    if [[ ! -e "$config_unknown" ]]; then
-        value=$(read_saved_sysctl_value "$initial_config" net.ipv4.ip_local_port_range || true)
-        value=$(normalize_port_range "$value" 2>/dev/null || true)
-        if [[ -n "$value" && "$value" != "1024 65535" ]]; then
-            printf '%s\n' "$value"
-            return 0
-        fi
-    fi
-
-    printf '%s\n' "32768 60999"
-}
-
-capture_port_range_for_rollback() {
-    local output_file="$1"
-    local value
-
-    value=$(sysctl -n net.ipv4.ip_local_port_range 2>/dev/null) || return 1
-    value=$(normalize_port_range "$value") || return 1
-    grep -Fq 'net.ipv4.ip_local_port_range=' "$output_file" ||
-        printf 'net.ipv4.ip_local_port_range=%s\n' "$value" >> "$output_file"
-}
-
-apply_port_range_migration() {
-    local expected="$1"
-    local actual
-
-    sysctl -w "net.ipv4.ip_local_port_range=$expected" >/dev/null 2>&1 || return 1
-    actual=$(sysctl -n net.ipv4.ip_local_port_range 2>/dev/null) || return 1
-    actual=$(normalize_port_range "$actual") || return 1
-    [[ "$actual" == "$expected" ]]
-}
-
 capture_runtime_values_from_files() {
     local output_file="$1"
     local input_file
@@ -3197,13 +2888,6 @@ install_optimization() {
     local runtime_backup
     local bbr_enabled="false"
     local health_before
-    local port_range_restore=""
-    local restore_value
-    local migration_index
-    local removed_key
-    local -a removed_sysctl_candidates=("${RETIRED_SYSCTL_KEYS[@]}")
-    local -a removed_sysctl_keys=()
-    local -a removed_sysctl_values=()
 
     info "开始配置网络优化..."
 
@@ -3243,48 +2927,11 @@ install_optimization() {
     capture_virtual_ipv6_ra_values "$runtime_backup"
     prepare_legacy_backup_state
 
-    if port_range_restore=$(resolve_port_range_restore_value \
-        "$NETWORK_CONF" "$RUNTIME_INITIAL_BACKUP" "$RUNTIME_INITIAL_UNKNOWN" \
-        "$NETWORK_INITIAL_BACKUP" "$NETWORK_INITIAL_UNKNOWN"); then
-        if ! capture_port_range_for_rollback "$runtime_backup"; then
-            error "无法保存当前临时端口范围，拒绝执行迁移"
-            rm -f "$temp_config" "$runtime_backup"
-            return 1
-        fi
-    fi
-
-    if [[ "$ECN_DISABLED" != "true" ]]; then
-        removed_sysctl_candidates+=(net.ipv4.tcp_ecn)
-    fi
-    for removed_key in "${removed_sysctl_candidates[@]}"; do
-        managed_removed_sysctl_present "$NETWORK_CONF" "$removed_key" || continue
-        if ! sysctl -n "$removed_key" >/dev/null 2>&1; then
-            warn "当前内核不存在旧版受管参数，停止持久管理：$removed_key"
-            continue
-        fi
-        if restore_value=$(resolve_removed_sysctl_restore_value \
-            "$RUNTIME_INITIAL_BACKUP" "$RUNTIME_INITIAL_UNKNOWN" \
-            "$NETWORK_INITIAL_BACKUP" "$NETWORK_INITIAL_UNKNOWN" "$removed_key"); then
-            removed_sysctl_keys+=("$removed_key")
-            removed_sysctl_values+=("$restore_value")
-        else
-            warn "旧版受管 $(removed_sysctl_display_name "$removed_key") 初始值未知；停止持久管理并保留当前运行值到重启"
-        fi
-    done
-
     install -d -m 0755 "$NETWORK_OPTIMIZE_STATE_DIR"
     merge_initial_runtime_values "$runtime_backup" || {
         rm -f "$temp_config" "$runtime_backup"
         return 1
     }
-    for migration_index in "${!removed_sysctl_keys[@]}"; do
-        if ! capture_runtime_value_for_rollback \
-            "$runtime_backup" "${removed_sysctl_keys[$migration_index]}"; then
-            error "无法保存待移除参数的当前值：${removed_sysctl_keys[$migration_index]}"
-            rm -f "$temp_config" "$runtime_backup"
-            return 1
-        fi
-    done
     backup_previous_state_set "$runtime_backup" || {
         rm -f "$temp_config" "$runtime_backup"
         return 1
@@ -3303,26 +2950,6 @@ install_optimization() {
         rm -f "$temp_config" "$runtime_backup"
         return 1
     fi
-    if [[ -n "$port_range_restore" ]]; then
-        if ! apply_port_range_migration "$port_range_restore"; then
-            error "无法恢复安全的临时端口范围，正在回滚"
-            restore_runtime_values "$runtime_backup"
-            rm -f "$temp_config" "$runtime_backup"
-            return 1
-        fi
-        info "已移除旧版临时端口覆盖并恢复为：$port_range_restore"
-    fi
-    for migration_index in "${!removed_sysctl_keys[@]}"; do
-        if ! apply_removed_sysctl_migration \
-            "${removed_sysctl_keys[$migration_index]}" \
-            "${removed_sysctl_values[$migration_index]}"; then
-            error "无法恢复待移除参数：${removed_sysctl_keys[$migration_index]}，正在回滚"
-            restore_runtime_values "$runtime_backup"
-            rm -f "$temp_config" "$runtime_backup"
-            return 1
-        fi
-        info "已停止管理 $(removed_sysctl_display_name "${removed_sysctl_keys[$migration_index]}") 并恢复首次运行值：${removed_sysctl_values[$migration_index]}"
-    done
     if ! normalize_virtual_ipv6_ra "$runtime_backup"; then
         restore_runtime_values "$runtime_backup"
         rm -f "$temp_config" "$runtime_backup"
@@ -3355,11 +2982,6 @@ install_optimization() {
         rm -f "$temp_config" "$runtime_backup"
         return 1
     fi
-
-    if ! migrate_legacy_kernel_config; then
-        warn "新版网络配置已生效，但旧配置归档失败；请检查 $LEGACY_KERNEL_CONF"
-    fi
-    migrate_legacy_sysctl_conf || true
 
     rm -f "$runtime_backup"
     success "网络优化配置已写入：$NETWORK_CONF"
@@ -3740,9 +3362,7 @@ show_status() {
         "tcp_rmem|net.ipv4.tcp_rmem|未知" \
         "tcp_wmem|net.ipv4.tcp_wmem|未知" \
         "tcp_mem（内核管理）|net.ipv4.tcp_mem|未知" \
-        "tcp_moderate_rcvbuf|net.ipv4.tcp_moderate_rcvbuf|未知" \
-        "udp_rmem_min|net.ipv4.udp_rmem_min|未知" \
-        "udp_wmem_min|net.ipv4.udp_wmem_min|未知"
+        "tcp_moderate_rcvbuf|net.ipv4.tcp_moderate_rcvbuf|未知"
 
     echo
     echo "TCP 行为:"
@@ -3773,14 +3393,6 @@ show_status() {
     echo "  健康快照字段: softnet_dropped time_squeeze rx_errors tx_errors rx_dropped tx_dropped tcp_retrans limited_sockets rx_packets tx_packets"
     echo "  健康快照累计值: $(network_health_snapshot "$(detect_default_iface || true)")"
 
-    echo
-    echo "兼容迁移:"
-    [[ -f "$LEGACY_KERNEL_ARCHIVE" ]] &&
-        echo "  旧 kernel 配置归档: $LEGACY_KERNEL_ARCHIVE"
-
-    [[ -f "$LEGACY_SYSCTL_BACKUP" ]] &&
-        echo "  旧 sysctl.conf 备份: $LEGACY_SYSCTL_BACKUP"
-
     return 0
 }
 
@@ -3796,13 +3408,11 @@ show_help() {
   network-optimize.sh help              显示帮助
 
 install/plan 选项：
-  --auto, --probe         明确执行自动探测
-  --static                使用原有固定 32 MiB 缓冲区
+  --probe                 明确执行自动探测
   --bandwidth-mbps N      指定对称带宽，单位 Mbps
   --download-mbps N       指定下载带宽，单位 Mbps
   --upload-mbps N         指定上传带宽，单位 Mbps
   --rtt-ms N              指定 RTT，单位 ms
-  --no-probe              禁止外部探测，缺失数据时按内存保守配置
   --disable-ecn           禁用 ECN，兼容存在 ECN 黑洞的旧链路
   --enable-initcwnd       强制把默认路由 initcwnd/initrwnd 设置为 32
   --disable-initcwnd      强制保留内核默认初始拥塞窗口
@@ -3811,22 +3421,22 @@ verify 选项：
   --yes                   非交互环境显式确认产生测速流量
 
 示例：
-  network-optimize.sh                 # 交互选择参数来源
-  network-optimize.sh plan            # 交互选择参数来源
+  network-optimize.sh                 # 交互选择测速或手填上下行带宽
+  network-optimize.sh plan            # 交互选择测速或手填上下行带宽
   network-optimize.sh install --probe # 明确执行主动探测
   network-optimize.sh install --bandwidth-mbps 1000 --rtt-ms 180
   network-optimize.sh install --download-mbps 1000 --upload-mbps 500 --rtt-ms 180
-  network-optimize.sh install --static
   network-optimize.sh verify --yes
 
 默认行为：
-  - 交互终端无参数运行时选择静态、手填或自动探测；默认静态 32 MiB
-  - 非交互终端无参数运行时自动使用静态模式，不安装探测依赖、不产生测速流量
+  - 交互终端只询问是否测速；拒绝后要求手填下载和上传带宽
+  - 非交互终端必须使用 --probe，或显式提供对称带宽/完整上下行带宽
   - 手填带宽缺少 RTT 时按 150 ms 计算；显式 --rtt-ms 严格采用用户值
-  - 自动模式固定按 150 ms 计算 BDP，不进行中国/全球 RTT 探测
-  - 只有 --auto、--probe 或交互确认后才主动探测并安装缺失依赖
+  - 主动探测不采集 RTT；未显式提供 --rtt-ms 时按 150 ms 计算 BDP
+  - 只有 --probe 或交互确认后才主动探测并安装缺失依赖
+  - 探测失败时，交互终端转为手填；非交互终端在写配置、sysctl 或路由前失败
   - 自动探测仅测量 IPv4 公网带宽，使用公共 iperf3 与 Cloudflare
-  - TCP 调优仅覆盖 IPv4；IPv6 forwarding/RA 是独立网络正确性配置
+  - TCP 调优仅覆盖 IPv4；Docker/VPS forwarding/RA 是本仓库保留的下游扩展
   - 自动测速在单方向 40 GB 或合计 85 GB 时提前停止，硬上限仍为 45/90 GB
   - 流量按实际 IPv4 测速目标的路由接口分别计量并汇总，接口计数包含后台流量
   - 默认不持久管理 ECN；只在传入 --disable-ecn 时写入 tcp_ecn=0
@@ -3835,13 +3445,15 @@ verify 选项：
   - 检测到 networkd-dispatcher 时持久化 IPv4 默认路由的 initcwnd/initrwnd；不扩展 IPv6
   - --enable-initcwnd/--disable-initcwnd 显式覆盖 auto，冲突参数会被拒绝
   - 根据 2 x BDP + 2 MiB 余量动态设置缓冲区上限，TCP 初始默认固定 2 MiB
-  - 静态或带宽未知时 TCP 初始默认仍为 2 MiB，socket 最大值保持原有 32 MiB 回退语义
-  - 带宽探测失败时最大值回退到 32 MiB
   - RAM cap 为有效 RAM / 32，最低 8 MiB、最高 256 MiB，并识别有限 cgroup memory limit
   - 动态 socket 最大值保留 4 MiB 绝对下限；core socket 默认值和全局 tcp_mem 保留系统值
   - 只在本次运行计算和应用，不创建定时任务
   - verify 仅在交互确认或显式 --yes 后产生流量；install/status 不会调用 verify
   - verify 不修改 sysctl、路由或 qdisc，也不安装依赖或持久服务
+
+实现来源：
+  - 公共 iperf3、带宽探测、BDP/memory cap 与 initcwnd 策略移植或参考 tcpfit v0.5.6
+  - 参数交互、事务备份/恢复、verify 和 Docker/VPS forwarding/RA 为本仓库下游实现
 EOF
 }
 
@@ -3855,11 +3467,7 @@ main() {
     fi
 
     select_tuning_mode || selection_rc=$?
-    case "$selection_rc" in
-        0) ;;
-        2) exit 2 ;;
-        *) exit 1 ;;
-    esac
+    (( selection_rc == 0 )) || exit 1
 
     for required_command in awk grep sort mktemp; do
         if ! command -v "$required_command" >/dev/null 2>&1; then

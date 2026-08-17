@@ -45,10 +45,6 @@ assert_eq "effective RAM / 32 cap" "$(buffer_limit_reason 10000 150 67108864)" \
     "buffer reason reports the memory-derived cap"
 assert_eq "2097152" "$TCP_BUFFER_DEFAULT_BYTES" \
     "TCP receive and send defaults stay fixed at 2 MiB"
-assert_eq 'netdev_budget' "$(removed_sysctl_display_name net.core.netdev_budget)" \
-    "display known retired sysctl by short name"
-assert_eq 'net.test.unknown' "$(removed_sysctl_display_name net.test.unknown)" \
-    "preserve the full name of an unknown retired sysctl"
 detect_cgroup_memory_limit_mb() { printf '%s\n' 512; }
 assert_eq '512' "$(detect_effective_memory_mb 1024)" \
     "effective memory honors a smaller cgroup limit"
@@ -115,15 +111,12 @@ printf 'PASS: status includes read-only kernel capacity diagnostics\n'
 show_status >/dev/null || fail "status fails when optional diagnostics are unavailable"
 printf 'PASS: status succeeds when optional diagnostics are unavailable\n'
 
-TUNING_MODE=auto
+TUNING_MODE=probe
 DETECTED_RTT_MS=150
 RTT_SOURCE='automatic policy'
 RTT_POLICY='fixed 150 ms'
 assert_eq 'RTT：计算 150 ms（来源 automatic policy；策略 fixed 150 ms）' \
     "$(format_rtt_selection_summary)" "summary reports fixed automatic calculation RTT"
-TUNING_MODE=static
-assert_eq 'RTT：未使用（静态 32 MiB 缓冲区）' \
-    "$(format_rtt_selection_summary)" "summary explains static RTT handling"
 
 PROBE_IFACE=eth0
 TRAFFIC_IFACES=(eth0 eth1)
