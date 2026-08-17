@@ -111,8 +111,20 @@ readonly AUTO_RTT_MIN_MS=10
 readonly AUTO_RTT_MAX_MS=300
 readonly DEFAULT_RTT_MS=150
 readonly INITCWND_AUTO_UPLOAD_LIMIT_MBPS=100
-readonly TCP_RMEM_DEFAULT_BYTES=131072
-readonly TCP_WMEM_DEFAULT_BYTES=16384
+readonly TCP_BUFFER_DEFAULT_MIN_BYTES=$((1 * 1024 * 1024))
+readonly TCP_BUFFER_DEFAULT_FALLBACK_BYTES=$((2 * 1024 * 1024))
+readonly TCP_BUFFER_DEFAULT_MAX_BYTES=$((4 * 1024 * 1024))
+
+# 仅用于从旧版受管配置迁移；新配置不再写入这些全局参数。
+readonly -a RETIRED_SYSCTL_KEYS=(
+    net.ipv4.tcp_mem
+    net.ipv4.tcp_adv_win_scale
+    net.core.rmem_default
+    net.core.wmem_default
+    net.core.netdev_budget
+    net.core.netdev_budget_usecs
+    net.netfilter.nf_conntrack_max
+)
 
 # 参数与计算结果。命令行参数优先于自动探测。
 COMMAND="install"
@@ -152,8 +164,8 @@ RX_BDP_BYTES=0
 TX_BDP_BYTES=0
 RMEM_MAX_BYTES=33554432
 WMEM_MAX_BYTES=33554432
-RMEM_DEFAULT_BYTES=$TCP_RMEM_DEFAULT_BYTES
-WMEM_DEFAULT_BYTES=$TCP_WMEM_DEFAULT_BYTES
+RMEM_DEFAULT_BYTES=$TCP_BUFFER_DEFAULT_FALLBACK_BYTES
+WMEM_DEFAULT_BYTES=$TCP_BUFFER_DEFAULT_FALLBACK_BYTES
 CALCULATION_REASON="static 32 MiB"
 RMEM_REASON="static 32 MiB"
 WMEM_REASON="static 32 MiB"
@@ -2039,6 +2051,38 @@ calculate_buffer_max() {
     echo "$desired"
 }
 
+calculate_buffer_default() {
+    local bandwidth_mbps="$1"
+    local rtt_ms="$2"
+    local buffer_max="$3"
+    local mib=$((1024 * 1024))
+    local desired
+    local default_cap=$((buffer_max / 4))
+
+    # 半个 BDP 缩短高 RTT 大流的爬升时间，同时限制每个新连接的排队空间。
+    desired=$(((bandwidth_mbps * rtt_ms * 125 + 1) / 2))
+    desired=$((((desired + mib - 1) / mib) * mib))
+    (( default_cap > TCP_BUFFER_DEFAULT_MAX_BYTES )) &&
+        default_cap=$TCP_BUFFER_DEFAULT_MAX_BYTES
+    (( default_cap < TCP_BUFFER_DEFAULT_MIN_BYTES )) &&
+        default_cap=$TCP_BUFFER_DEFAULT_MIN_BYTES
+    (( desired < TCP_BUFFER_DEFAULT_MIN_BYTES )) &&
+        desired=$TCP_BUFFER_DEFAULT_MIN_BYTES
+    (( desired > default_cap )) && desired=$default_cap
+    echo "$desired"
+}
+
+calculate_buffer_fallback() {
+    local buffer_max="$1"
+    local fallback="$TCP_BUFFER_DEFAULT_FALLBACK_BYTES"
+    local default_cap=$((buffer_max / 4))
+
+    (( default_cap < TCP_BUFFER_DEFAULT_MIN_BYTES )) &&
+        default_cap=$TCP_BUFFER_DEFAULT_MIN_BYTES
+    (( fallback > default_cap )) && fallback=$default_cap
+    echo "$fallback"
+}
+
 buffer_limit_reason() {
     local bandwidth_mbps="$1"
     local rtt_ms="$2"
@@ -2116,8 +2160,8 @@ resolve_tuning_values() {
         WMEM_MAX_BYTES=$((32 * 1024 * 1024))
         (( RMEM_MAX_BYTES > MEMORY_CAP_BYTES )) && RMEM_MAX_BYTES=$MEMORY_CAP_BYTES
         (( WMEM_MAX_BYTES > MEMORY_CAP_BYTES )) && WMEM_MAX_BYTES=$MEMORY_CAP_BYTES
-        RMEM_DEFAULT_BYTES=$TCP_RMEM_DEFAULT_BYTES
-        WMEM_DEFAULT_BYTES=$TCP_WMEM_DEFAULT_BYTES
+        RMEM_DEFAULT_BYTES=$(calculate_buffer_fallback "$RMEM_MAX_BYTES")
+        WMEM_DEFAULT_BYTES=$(calculate_buffer_fallback "$WMEM_MAX_BYTES")
         if (( MEMORY_CAP_BYTES < 32 * 1024 * 1024 )); then
             RMEM_REASON="static 32 MiB capped by effective RAM / 32"
             WMEM_REASON="static 32 MiB capped by effective RAM / 32"
@@ -2193,8 +2237,10 @@ resolve_tuning_values() {
         TX_BDP_BYTES=$((upload_mbps * rtt_ms * 125))
         RMEM_MAX_BYTES=$(calculate_buffer_max "$download_mbps" "$rtt_ms" "$MEMORY_CAP_BYTES")
         WMEM_MAX_BYTES=$(calculate_buffer_max "$upload_mbps" "$rtt_ms" "$MEMORY_CAP_BYTES")
-        RMEM_DEFAULT_BYTES=$TCP_RMEM_DEFAULT_BYTES
-        WMEM_DEFAULT_BYTES=$TCP_WMEM_DEFAULT_BYTES
+        RMEM_DEFAULT_BYTES=$(calculate_buffer_default \
+            "$download_mbps" "$rtt_ms" "$RMEM_MAX_BYTES")
+        WMEM_DEFAULT_BYTES=$(calculate_buffer_default \
+            "$upload_mbps" "$rtt_ms" "$WMEM_MAX_BYTES")
         RMEM_REASON=$(buffer_limit_reason "$download_mbps" "$rtt_ms" "$MEMORY_CAP_BYTES")
         WMEM_REASON=$(buffer_limit_reason "$upload_mbps" "$rtt_ms" "$MEMORY_CAP_BYTES")
         CALCULATION_REASON="rmem: $RMEM_REASON; wmem: $WMEM_REASON"
@@ -2203,8 +2249,8 @@ resolve_tuning_values() {
         WMEM_MAX_BYTES=$((32 * 1024 * 1024))
         (( RMEM_MAX_BYTES > MEMORY_CAP_BYTES )) && RMEM_MAX_BYTES=$MEMORY_CAP_BYTES
         (( WMEM_MAX_BYTES > MEMORY_CAP_BYTES )) && WMEM_MAX_BYTES=$MEMORY_CAP_BYTES
-        RMEM_DEFAULT_BYTES=$TCP_RMEM_DEFAULT_BYTES
-        WMEM_DEFAULT_BYTES=$TCP_WMEM_DEFAULT_BYTES
+        RMEM_DEFAULT_BYTES=$(calculate_buffer_fallback "$RMEM_MAX_BYTES")
+        WMEM_DEFAULT_BYTES=$(calculate_buffer_fallback "$WMEM_MAX_BYTES")
         if (( MEMORY_CAP_BYTES < 32 * 1024 * 1024 )); then
             RMEM_REASON="fallback 32 MiB capped by effective RAM / 32"
             WMEM_REASON="fallback 32 MiB capped by effective RAM / 32"
@@ -2668,7 +2714,7 @@ net.ipv4.tcp_max_syn_backlog = 16384
 net.core.netdev_max_backlog = 16384
 net.core.optmem_max = 65536
 
-# 6. TCP/UDP 缓冲区；使用 Linux 常规 TCP 起点，长流依赖 autotuning 增长
+# 6. TCP/UDP 缓冲区；TCP 起点按半个 BDP 取 1-4 MiB，长流继续依赖 autotuning
 # core default 与全局 tcp_mem 保留内核或发行版值，避免放大所有 socket 的内存承诺
 net.core.rmem_max = $RMEM_MAX_BYTES
 net.core.wmem_max = $WMEM_MAX_BYTES
@@ -2898,17 +2944,19 @@ EOF
 }
 
 removed_sysctl_display_name() {
-    case "$1" in
-        net.ipv4.tcp_ecn) printf '%s\n' 'ECN' ;;
-        net.ipv4.tcp_mem) printf '%s\n' 'tcp_mem' ;;
-        net.ipv4.tcp_adv_win_scale) printf '%s\n' 'tcp_adv_win_scale' ;;
-        net.core.rmem_default) printf '%s\n' 'rmem_default' ;;
-        net.core.wmem_default) printf '%s\n' 'wmem_default' ;;
-        net.core.netdev_budget) printf '%s\n' 'netdev_budget' ;;
-        net.core.netdev_budget_usecs) printf '%s\n' 'netdev_budget_usecs' ;;
-        net.netfilter.nf_conntrack_max) printf '%s\n' 'nf_conntrack_max' ;;
-        *) printf '%s\n' "$1" ;;
-    esac
+    local retired_key
+
+    if [[ "$1" == "net.ipv4.tcp_ecn" ]]; then
+        printf '%s\n' 'ECN'
+        return
+    fi
+    for retired_key in "${RETIRED_SYSCTL_KEYS[@]}"; do
+        if [[ "$1" == "$retired_key" ]]; then
+            printf '%s\n' "${1##*.}"
+            return
+        fi
+    done
+    printf '%s\n' "$1"
 }
 
 capture_runtime_value_for_rollback() {
@@ -3105,15 +3153,7 @@ install_optimization() {
     local restore_value
     local migration_index
     local removed_key
-    local -a removed_sysctl_candidates=(
-        net.ipv4.tcp_mem
-        net.ipv4.tcp_adv_win_scale
-        net.core.rmem_default
-        net.core.wmem_default
-        net.core.netdev_budget
-        net.core.netdev_budget_usecs
-        net.netfilter.nf_conntrack_max
-    )
+    local -a removed_sysctl_candidates=("${RETIRED_SYSCTL_KEYS[@]}")
     local -a removed_sysctl_keys=()
     local -a removed_sysctl_values=()
 
@@ -3453,6 +3493,43 @@ restore_optimization() {
     success "网络配置已恢复到 $scope 状态"
 }
 
+read_sysctl_or() {
+    local key="$1"
+    local fallback="${2:-不可用}"
+    local value
+
+    if value=$(sysctl -n "$key" 2>/dev/null); then
+        printf '%s\n' "${value:-$fallback}"
+    else
+        printf '%s\n' "$fallback"
+    fi
+}
+
+print_sysctl_rows() {
+    local spec
+    local label
+    local key
+    local fallback
+
+    for spec in "$@"; do
+        IFS='|' read -r label key fallback <<< "$spec"
+        printf '  %s: %s\n' "$label" "$(read_sysctl_or "$key" "${fallback:-不可用}")"
+    done
+}
+
+file_handle_status() {
+    local source_file="${1:-/proc/sys/fs/file-nr}"
+    local allocated
+    local unused
+    local maximum
+
+    if read -r allocated unused maximum 2>/dev/null < "$source_file"; then
+        printf '%s allocated / %s unused / %s max\n' "$allocated" "$unused" "$maximum"
+    else
+        printf '%s\n' '不可用'
+    fi
+}
+
 show_status() {
     local available_cc
     local current_cc
@@ -3461,76 +3538,18 @@ show_status() {
     local active_qdisc
     local active_qdisc_state_name
     local active_qdisc_detail
-    local current_tfo
-    local ip_forward
-    local rp_filter_all
-    local rp_filter_default
-    local somaxconn
-    local syn_backlog
-    local backlog
-    local port_range
-    local rmem_default
-    local wmem_default
-    local rmem_max
-    local wmem_max
-    local tcp_rmem
-    local tcp_wmem
-    local tcp_mem
-    local tcp_moderate_rcvbuf
-    local udp_rmem_min
-    local udp_wmem_min
-    local fin_timeout
-    local slow_start_after_idle
-    local mtu_probing
-    local netdev_budget
-    local netdev_budget_usecs
-    local optmem_max
-    local keepalive_time
     local initcwnd_state
     local initcwnd_state_name
     local initcwnd_detail
-    local tcp_ecn
-    local conntrack_count
-    local conntrack_max
-    local conntrack_buckets
 
     available_cc=$(cat /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null || echo "未知")
-    current_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "未知")
-    current_qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "未知")
-    current_tfo=$(sysctl -n net.ipv4.tcp_fastopen 2>/dev/null || echo "未知")
+    current_cc=$(read_sysctl_or net.ipv4.tcp_congestion_control "未知")
+    current_qdisc=$(read_sysctl_or net.core.default_qdisc "未知")
     default_iface=$(detect_default_iface || true)
     active_qdisc=$(active_qdisc_state "$default_iface")
     IFS='|' read -r active_qdisc_state_name active_qdisc_detail <<< "$active_qdisc"
-    ip_forward=$(sysctl -n net.ipv4.ip_forward 2>/dev/null || echo "未知")
-    rp_filter_all=$(sysctl -n net.ipv4.conf.all.rp_filter 2>/dev/null || echo "未知")
-    rp_filter_default=$(sysctl -n net.ipv4.conf.default.rp_filter 2>/dev/null || echo "未知")
-    somaxconn=$(sysctl -n net.core.somaxconn 2>/dev/null || echo "未知")
-    syn_backlog=$(sysctl -n net.ipv4.tcp_max_syn_backlog 2>/dev/null || echo "未知")
-    backlog=$(sysctl -n net.core.netdev_max_backlog 2>/dev/null || echo "未知")
-    port_range=$(sysctl -n net.ipv4.ip_local_port_range 2>/dev/null || echo "未知")
-    rmem_default=$(sysctl -n net.core.rmem_default 2>/dev/null || echo "未知")
-    wmem_default=$(sysctl -n net.core.wmem_default 2>/dev/null || echo "未知")
-    rmem_max=$(sysctl -n net.core.rmem_max 2>/dev/null || echo "未知")
-    wmem_max=$(sysctl -n net.core.wmem_max 2>/dev/null || echo "未知")
-    tcp_rmem=$(sysctl -n net.ipv4.tcp_rmem 2>/dev/null || echo "未知")
-    tcp_wmem=$(sysctl -n net.ipv4.tcp_wmem 2>/dev/null || echo "未知")
-    tcp_mem=$(sysctl -n net.ipv4.tcp_mem 2>/dev/null || echo "未知")
-    tcp_moderate_rcvbuf=$(sysctl -n net.ipv4.tcp_moderate_rcvbuf 2>/dev/null || echo "未知")
-    udp_rmem_min=$(sysctl -n net.ipv4.udp_rmem_min 2>/dev/null || echo "未知")
-    udp_wmem_min=$(sysctl -n net.ipv4.udp_wmem_min 2>/dev/null || echo "未知")
-    fin_timeout=$(sysctl -n net.ipv4.tcp_fin_timeout 2>/dev/null || echo "未知")
-    slow_start_after_idle=$(sysctl -n net.ipv4.tcp_slow_start_after_idle 2>/dev/null || echo "未知")
-    mtu_probing=$(sysctl -n net.ipv4.tcp_mtu_probing 2>/dev/null || echo "未知")
-    netdev_budget=$(sysctl -n net.core.netdev_budget 2>/dev/null || echo "不可用")
-    netdev_budget_usecs=$(sysctl -n net.core.netdev_budget_usecs 2>/dev/null || echo "不可用")
-    optmem_max=$(sysctl -n net.core.optmem_max 2>/dev/null || echo "不可用")
-    keepalive_time=$(sysctl -n net.ipv4.tcp_keepalive_time 2>/dev/null || echo "不可用")
-    conntrack_count=$(sysctl -n net.netfilter.nf_conntrack_count 2>/dev/null || echo "不可用")
-    conntrack_max=$(sysctl -n net.netfilter.nf_conntrack_max 2>/dev/null || echo "不可用")
-    conntrack_buckets=$(sysctl -n net.netfilter.nf_conntrack_buckets 2>/dev/null || echo "不可用")
     initcwnd_state=$(detect_initcwnd_state)
     IFS='|' read -r initcwnd_state_name initcwnd_detail <<< "$initcwnd_state"
-    tcp_ecn=$(sysctl -n net.ipv4.tcp_ecn 2>/dev/null || echo "不可用")
 
     echo "========== 网络优化状态 =========="
     echo "配置文件: $NETWORK_CONF"
@@ -3555,54 +3574,71 @@ show_status() {
     echo "  当前算法: $current_cc"
     echo "  default qdisc: $current_qdisc"
     echo "  active qdisc (${default_iface:-未知接口}): $(format_qdisc_state "$active_qdisc_state_name" "$active_qdisc_detail")"
-    echo "  TCP Fast Open: $current_tfo"
+    print_sysctl_rows "TCP Fast Open|net.ipv4.tcp_fastopen|未知"
 
     echo
     echo "转发与兼容性:"
-    echo "  IPv4 转发: $ip_forward"
-    echo "  rp_filter(all): $rp_filter_all"
-    echo "  rp_filter(default): $rp_filter_default"
-    echo "  IPv6 转发: $(sysctl -n net.ipv6.conf.all.forwarding 2>/dev/null || echo "不可用")"
-    echo "  IPv6 RA(all): $(sysctl -n net.ipv6.conf.all.accept_ra 2>/dev/null || echo "不可用")"
+    print_sysctl_rows \
+        "IPv4 转发|net.ipv4.ip_forward|未知" \
+        "rp_filter(all)|net.ipv4.conf.all.rp_filter|未知" \
+        "rp_filter(default)|net.ipv4.conf.default.rp_filter|未知" \
+        "IPv6 转发|net.ipv6.conf.all.forwarding|不可用" \
+        "IPv6 RA(all)|net.ipv6.conf.all.accept_ra|不可用"
     echo "  route_localnet: 未由本模块配置"
     echo "  MPTCP: 未由本模块配置"
 
     echo
     echo "连接容量:"
-    echo "  somaxconn: $somaxconn"
-    echo "  tcp_max_syn_backlog: $syn_backlog"
-    echo "  netdev_max_backlog: $backlog"
-    echo "  netdev_budget: $netdev_budget"
-    echo "  netdev_budget_usecs: $netdev_budget_usecs"
-    echo "  optmem_max: $optmem_max"
-    echo "  临时端口范围: $port_range"
-    echo "  Conntrack 使用量: $conntrack_count / $conntrack_max"
-    echo "  Conntrack buckets: $conntrack_buckets"
+    print_sysctl_rows \
+        "somaxconn|net.core.somaxconn|未知" \
+        "tcp_max_syn_backlog|net.ipv4.tcp_max_syn_backlog|未知" \
+        "netdev_max_backlog|net.core.netdev_max_backlog|未知" \
+        "optmem_max|net.core.optmem_max|不可用" \
+        "临时端口范围|net.ipv4.ip_local_port_range|未知" \
+        "保留本地端口|net.ipv4.ip_local_reserved_ports|未配置"
+    echo "  Conntrack 使用量: $(read_sysctl_or net.netfilter.nf_conntrack_count) / $(read_sysctl_or net.netfilter.nf_conntrack_max)"
+    print_sysctl_rows "Conntrack buckets|net.netfilter.nf_conntrack_buckets|不可用"
 
     echo
     echo "缓冲区:"
-    echo "  rmem_default: $rmem_default"
-    echo "  wmem_default: $wmem_default"
-    echo "  rmem_max: $rmem_max"
-    echo "  wmem_max: $wmem_max"
-    echo "  tcp_rmem: $tcp_rmem"
-    echo "  tcp_wmem: $tcp_wmem"
-    echo "  tcp_mem（内核管理）: $tcp_mem"
-    echo "  tcp_moderate_rcvbuf: $tcp_moderate_rcvbuf"
-    echo "  udp_rmem_min: $udp_rmem_min"
-    echo "  udp_wmem_min: $udp_wmem_min"
+    print_sysctl_rows \
+        "rmem_default|net.core.rmem_default|未知" \
+        "wmem_default|net.core.wmem_default|未知" \
+        "rmem_max|net.core.rmem_max|未知" \
+        "wmem_max|net.core.wmem_max|未知" \
+        "tcp_rmem|net.ipv4.tcp_rmem|未知" \
+        "tcp_wmem|net.ipv4.tcp_wmem|未知" \
+        "tcp_mem（内核管理）|net.ipv4.tcp_mem|未知" \
+        "tcp_moderate_rcvbuf|net.ipv4.tcp_moderate_rcvbuf|未知" \
+        "udp_rmem_min|net.ipv4.udp_rmem_min|未知" \
+        "udp_wmem_min|net.ipv4.udp_wmem_min|未知"
 
     echo
     echo "TCP 行为:"
-    echo "  fin_timeout: $fin_timeout"
-    echo "  slow_start_after_idle: $slow_start_after_idle"
-    echo "  mtu_probing: $mtu_probing"
-    echo "  keepalive_time: $keepalive_time"
+    print_sysctl_rows \
+        "fin_timeout|net.ipv4.tcp_fin_timeout|未知" \
+        "slow_start_after_idle|net.ipv4.tcp_slow_start_after_idle|未知" \
+        "mtu_probing|net.ipv4.tcp_mtu_probing|未知" \
+        "keepalive_time|net.ipv4.tcp_keepalive_time|不可用" \
+        "tcp_tw_reuse（只读）|net.ipv4.tcp_tw_reuse|不可用" \
+        "ECN|net.ipv4.tcp_ecn|不可用"
     echo "  initcwnd ownership marker: $([[ -e "$ROUTE_OWNED_MARKER" ]] && echo 存在 || echo 不存在)"
     echo "  initcwnd 持久化钩子: $(initcwnd_hook_status)"
     echo "  默认路由窗口: $initcwnd_detail"
     [[ "$initcwnd_state_name" != "drift" ]] || echo "  initcwnd 状态: 漂移"
-    echo "  ECN: $tcp_ecn"
+
+    echo
+    echo "内核容量诊断（只读）:"
+    print_sysctl_rows \
+        "min_free_kbytes|vm.min_free_kbytes|不可用" \
+        "file-max|fs.file-max|不可用" \
+        "nr_open|fs.nr_open|不可用" \
+        "netdev_budget|net.core.netdev_budget|不可用" \
+        "netdev_budget_usecs|net.core.netdev_budget_usecs|不可用"
+    echo "  file-nr: $(file_handle_status)"
+
+    echo
+    echo "网络健康:"
     echo "  健康快照字段: softnet_dropped time_squeeze rx_errors tx_errors rx_dropped tx_dropped tcp_retrans limited_sockets rx_packets tx_packets"
     echo "  健康快照累计值: $(network_health_snapshot "$(detect_default_iface || true)")"
 
@@ -3616,6 +3652,8 @@ show_status() {
 
     [[ -f "$LIMITS_LEGACY_ARCHIVE" ]] &&
         echo "  旧 limits 优化配置归档: $LIMITS_LEGACY_ARCHIVE"
+
+    return 0
 }
 
 show_help() {
@@ -3667,10 +3705,11 @@ verify 选项：
   - initcwnd 默认 auto：已知上传 <= 100 Mbps 保留内核默认，否则设置为 32
   - 检测到 networkd-dispatcher 时持久化 IPv4 默认路由的 initcwnd/initrwnd；不扩展 IPv6
   - --enable-initcwnd/--disable-initcwnd 显式覆盖 auto，冲突参数会被拒绝
-  - 根据 2 x BDP + 2 MiB 余量动态设置缓冲区上限，TCP 起点统一为接收 128 KiB、发送 16 KiB
+  - 根据 2 x BDP + 2 MiB 余量动态设置缓冲区上限，TCP 起点按半个 BDP 取 1-4 MiB
+  - 静态或带宽未知时 TCP 起点回退到 2 MiB，并且不超过 socket 最大值的四分之一
   - RTT 探测失败回退到 150 ms；带宽探测失败时最大值回退到 32 MiB
-  - 单 socket 上限为有效 RAM / 32，最低 8 MiB、最高 256 MiB，并识别有限 cgroup memory limit
-  - core socket 默认值和全局 tcp_mem 保留内核或发行版值
+  - RAM cap 为有效 RAM / 32，最低 8 MiB、最高 256 MiB，并识别有限 cgroup memory limit
+  - 动态 socket 最大值保留 4 MiB 绝对下限；core socket 默认值和全局 tcp_mem 保留系统值
   - 只在本次运行计算和应用，不创建定时任务
   - verify 仅在交互确认或显式 --yes 后产生流量；install/status 不会调用 verify
   - verify 不修改 sysctl、路由或 qdisc，也不安装依赖或持久服务

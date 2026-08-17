@@ -220,18 +220,17 @@ bash <(curl -fsSL "$RAW_BASE/network-optimize.sh") help
 
 `initcwnd` 默认为 `auto`：已知上传带宽不高于 100 Mbps 时保留内核默认，否则在默认路由设置 `initcwnd/initrwnd=32`；`--enable-initcwnd` 和 `--disable-initcwnd` 可显式覆盖。`status` 同时检查 ownership marker 与真实默认路由，并把 marker/路由不一致报告为漂移；也会区分 `default qdisc` 和默认出口实际 `active qdisc`，能识别 root `fq`、`mq` + 全 `fq` leaves、`htb` + 全 `fq` leaves，以及混合或不可读状态。`verify` 自动选择附近公共 iperf3 对端和可用端口，只有交互确认或非交互显式 `--yes` 后才测试；比较 1 流与 4 流 sender/receiver goodput、重传率和 CPU，并报告测试期间 softnet、网卡丢包/错误、全机 TCP 重传及可用的驱动 allowance 增量。全程不修改 sysctl、路由或 qdisc，也不自动安装依赖。
 
-旧版受管配置中的 `ip_local_port_range = 1024 65535` 会恢复首次运行前的值；备份不可用时恢复 Debian 默认 `32768 60999`，新版不再管理该参数。默认不写入 `net.ipv4.tcp_ecn`；只有显式传入 `--disable-ecn` 时才持久写入 `0`。升级旧版受管配置时，ECN 和 `nf_conntrack_max` 有可信首次运行备份便恢复原值；初始值未知则不猜测，仅停止持久管理并保留当前运行值到重启。
+旧版受管配置中的 `ip_local_port_range = 1024 65535` 会恢复首次运行前的值；备份不可用时恢复 Debian 默认 `32768 60999`，新版不再管理该参数。默认不写入 `net.ipv4.tcp_ecn`；只有显式传入 `--disable-ecn` 时才持久写入 `0`。升级旧版受管配置时，ECN、`tcp_mem`、`tcp_adv_win_scale`、core socket 默认值、NAPI budget 和 `nf_conntrack_max` 有可信首次运行备份便恢复原值；初始值未知则不猜测，仅停止持久管理并保留当前运行值到重启。
 
 网络模块默认面向同时承载 TCP、UDP 与 Docker 流量的代理节点：连接队列使用
-`somaxconn=65535`、`tcp_max_syn_backlog=16384`，TCP/socket 默认缓冲区按半个 BDP 动态取
-4-8 MiB，UDP 最小缓冲区为 8 KiB，`tcp_fin_timeout=30`。动态最大缓冲区按 `2 × BDP`
-计算；RAM 小于 2 GiB 时限制在 `RAM / 16`、最高 256 MiB，否则限制在 `RAM / 8`、最高 512 MiB；全局 `tcp_mem` 预算按 RAM 的 1/16、1/8、1/4
-生成（按系统实际页大小换算），并明确启用 SACK、DSACK 和 TCP 时间戳。`--static` 保持固定
-32 MiB 上限和 4 MiB 默认值。`netdev_budget` 在带宽达到
-2.5 Gbps 且至少 2 个在线 CPU 时使用 600，其他环境使用 300。`netdev_budget_usecs` 保留
-内核按 HZ 选择的默认值，避免新内核拒绝低于 `2 jiffies` 的固定值。模块不再按 RAM 放大
-`nf_conntrack_max`，避免在 buckets 不变时增加哈希链查找成本；`status` 仍显示 Conntrack 的
-`count / max` 和 buckets，供确有容量压力时判断。
+`somaxconn=65535`、`tcp_max_syn_backlog=16384`，TCP 缓冲起点按半个 BDP 分方向向上取整到
+1-4 MiB；静态模式或带宽未知时回退到 2 MiB。动态最大值按 `2 × BDP + 2 MiB`
+计算，并限制为有效 RAM（物理 RAM 与有限 cgroup memory limit 的较小值）的 1/32；RAM cap
+最低 8 MiB、最高 256 MiB，动态 socket 最大值另保留 4 MiB 绝对下限。模块启用 TCP receive
+autotuning、window scaling、SACK、DSACK、时间戳和 syncookies，但保留内核或发行版管理的
+`tcp_mem`、core socket 默认值、`netdev_budget` 与 `netdev_budget_usecs`。`status` 只读显示这些
+参数，并补充 `tcp_tw_reuse`、`min_free_kbytes`、`file-max`、`nr_open` 与 `file-nr`，供出现端口、
+内存、NAPI 或 file handle 压力时按证据判断，而不是无条件写入固定优化值。
 
 > `RAW_BASE` 只在当前 Shell 会话有效。上述进程替换语法需要 Bash 或 Zsh；不要改成
 > `curl ... | sudo bash`，否则交互模块可能无法正常读取终端输入。SSH、自动更新、内核和网络
