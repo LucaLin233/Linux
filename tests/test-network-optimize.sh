@@ -6,6 +6,7 @@ readonly TEMP_DIR=$(mktemp -d)
 trap 'rm -rf "$TEMP_DIR"' EXIT
 export NETWORK_OPTIMIZE_STATE_DIR="$TEMP_DIR/state"
 export NETWORK_OPTIMIZE_CONF="$TEMP_DIR/etc/sysctl.d/99-network-optimize.conf"
+export NETWORK_OPTIMIZE_BBR_MODULES_FILE="$TEMP_DIR/etc/modules-load.d/network-optimize-bbr.conf"
 export NETWORK_OPTIMIZE_IPV6_CONF_ROOT="$TEMP_DIR/proc/sys/net/ipv6/conf"
 export NETWORK_OPTIMIZE_INITCWND_HOOK="$TEMP_DIR/networkd-dispatcher/routable.d/50-network-optimize-initcwnd"
 # shellcheck source=../modules/network-optimize.sh
@@ -245,14 +246,32 @@ assert_eq '网络健康：测试期间计数器重置，无法计算可靠增量
 CURRENT_ROUTE="default via 192.0.2.1 dev eth0 proto dhcp src 192.0.2.10 metric 100 onlink"
 LAST_ROUTE_ARGS=""
 IP_FAIL=false
+IP_QUERY_FAIL=false
+ROUTE_MUTATION_CALLS=0
 
 default_ipv4_route() { printf '%s\n' "$CURRENT_ROUTE"; }
 ip() {
-    [[ "$1 $2 $3" == "-4 route replace" ]] || return 1
-    shift 3
-    LAST_ROUTE_ARGS="$*"
-    [[ "$IP_FAIL" == "false" ]] || return 1
-    CURRENT_ROUTE="$*"
+    case "$1 $2 $3" in
+        '-4 route show')
+            [[ "$IP_QUERY_FAIL" == "false" ]] || return 1
+            printf '%s\n' "$CURRENT_ROUTE"
+            ;;
+        '-4 route replace')
+            shift 3
+            LAST_ROUTE_ARGS="$*"
+            [[ "$IP_FAIL" == "false" ]] || return 1
+            CURRENT_ROUTE="$*"
+            ((ROUTE_MUTATION_CALLS += 1))
+            ;;
+        '-4 route del')
+            shift 3
+            LAST_ROUTE_ARGS="$*"
+            [[ "$IP_FAIL" == "false" ]] || return 1
+            CURRENT_ROUTE=""
+            ((ROUTE_MUTATION_CALLS += 1))
+            ;;
+        *) return 1 ;;
+    esac
 }
 
 mkdir -p "$NETWORK_OPTIMIZE_STATE_DIR" "$(dirname "$INITCWND_ROUTE_HOOK")"
@@ -318,15 +337,40 @@ assert_eq "default via 192.0.2.1 dev eth0 proto dhcp src 192.0.2.10 metric 100 o
     "$CURRENT_ROUTE" "managed hook ownership allows route-window cleanup"
 printf 'PASS: hook ownership evidence is accepted\n'
 
-# A trusted snapshot proving the pre-script route had no windows is also sufficient.
-rm -f "$ROUTE_OWNED_MARKER" "$INITCWND_ROUTE_HOOK"
-printf '%s\n' 'default via 192.0.2.1 dev eth0 proto dhcp src 192.0.2.10 metric 100 onlink' \
-    > "$ROUTE_PREVIOUS_BACKUP"
-CURRENT_ROUTE="default via 192.0.2.1 dev eth0 proto dhcp src 192.0.2.10 metric 100 onlink initcwnd 32 initrwnd 32"
+# Trusted legacy snapshots authorize cleanup only for the script's exact 32/32 values.
+rm -f "$ROUTE_OWNED_MARKER" "$INITCWND_ROUTE_HOOK" \
+    "$ROUTE_PREVIOUS_BACKUP" "$ROUTE_INITIAL_BACKUP" "$ROUTE_INITIAL_UNKNOWN"
+snapshot_route='default via 192.0.2.1 dev eth0 proto dhcp src 192.0.2.10 metric 100 onlink'
+printf '%s\n' "$snapshot_route" > "$ROUTE_INITIAL_BACKUP"
+CURRENT_ROUTE="$snapshot_route initcwnd 32 initrwnd 32"
 apply_initcwnd >/dev/null
-assert_eq "default via 192.0.2.1 dev eth0 proto dhcp src 192.0.2.10 metric 100 onlink" \
-    "$CURRENT_ROUTE" "trusted route snapshot allows owned cleanup"
-printf 'PASS: snapshot ownership evidence is accepted\n'
+assert_eq "$snapshot_route" "$CURRENT_ROUTE" \
+    "initial snapshot allows exact 32/32 cleanup"
+printf 'PASS: initial snapshot ownership evidence is accepted for 32/32\n'
+
+rm -f "$ROUTE_INITIAL_BACKUP"
+printf '%s\n' "$snapshot_route" > "$ROUTE_PREVIOUS_BACKUP"
+CURRENT_ROUTE="$snapshot_route initcwnd 32 initrwnd 32"
+apply_initcwnd >/dev/null
+assert_eq "$snapshot_route" "$CURRENT_ROUTE" \
+    "previous snapshot allows exact 32/32 cleanup"
+printf 'PASS: previous snapshot ownership evidence is accepted for 32/32\n'
+
+rm -f "$ROUTE_PREVIOUS_BACKUP"
+printf '%s\n' "$snapshot_route" > "$ROUTE_INITIAL_BACKUP"
+for third_party_windows in \
+    'initcwnd 16 initrwnd 20' \
+    'initcwnd 32 initrwnd 20' \
+    'initcwnd 16 initrwnd 32'; do
+    CURRENT_ROUTE="$snapshot_route $third_party_windows"
+    LAST_ROUTE_ARGS="not-called"
+    apply_initcwnd >/dev/null
+    assert_eq "$snapshot_route $third_party_windows" "$CURRENT_ROUTE" \
+        "snapshot preserves third-party $third_party_windows"
+    assert_eq "not-called" "$LAST_ROUTE_ARGS" \
+        "snapshot rejects ownership for $third_party_windows"
+done
+printf 'PASS: legacy snapshots reject non-32/32 route windows\n'
 
 # A stale snapshot for another default route must not authorize cleanup.
 printf '%s\n' 'default via 192.0.2.1 dev eth0 proto dhcp metric 100' \
@@ -361,6 +405,51 @@ apply_initcwnd >/dev/null
 assert_eq "default via 203.0.113.1 dev eth9 proto static src 203.0.113.2 metric 77 onlink initcwnd 16 initrwnd 20" \
     "$CURRENT_ROUTE" "unowned third-party route windows remain unchanged"
 assert_eq "not-called" "$LAST_ROUTE_ARGS" "unowned cleanup does not replace route"
+
+# Route backup distinguishes query failure from a confirmed absent default route.
+printf '%s\n' 'old previous route' > "$ROUTE_PREVIOUS_BACKUP"
+printf '%s\n' owned > "$ROUTE_PREVIOUS_OWNED"
+rm -f "$ROUTE_PREVIOUS_ABSENT"
+IP_QUERY_FAIL=true
+if backup_default_route >/dev/null 2>&1; then
+    fail "failed default-route query unexpectedly produced a backup"
+fi
+IP_QUERY_FAIL=false
+assert_eq 'old previous route' "$(cat "$ROUTE_PREVIOUS_BACKUP")" \
+    "route query failure preserves previous route backup"
+[[ -e "$ROUTE_PREVIOUS_OWNED" ]] ||
+    fail "route query failure removed previous ownership marker"
+printf 'PASS: route query failure preserves previous route state\n'
+
+rm -f "$ROUTE_INITIAL_BACKUP" "$ROUTE_INITIAL_ABSENT" "$ROUTE_INITIAL_UNKNOWN" \
+    "$ROUTE_INITIAL_OWNED" "$ROUTE_OWNED_MARKER" "$INITCWND_ROUTE_HOOK"
+CURRENT_ROUTE=""
+backup_default_route
+[[ -e "$ROUTE_PREVIOUS_ABSENT" ]] ||
+    fail "confirmed absent route did not write previous absent marker"
+[[ -e "$ROUTE_INITIAL_ABSENT" ]] ||
+    fail "confirmed absent route did not write initial absent marker"
+[[ ! -e "$ROUTE_PREVIOUS_BACKUP" && ! -e "$ROUTE_PREVIOUS_OWNED" ]] ||
+    fail "confirmed absent route retained misleading previous route state"
+printf 'PASS: confirmed absent route writes explicit absent markers\n'
+
+CURRENT_ROUTE="default via 203.0.113.1 dev eth9 proto static src 203.0.113.2 metric 77 onlink initcwnd 16 initrwnd 20"
+LAST_ROUTE_ARGS="not-called"
+restore_default_route \
+    "$ROUTE_PREVIOUS_BACKUP" "$ROUTE_PREVIOUS_OWNED" "$ROUTE_PREVIOUS_ABSENT"
+assert_eq "default via 203.0.113.1 dev eth9 proto static src 203.0.113.2 metric 77 onlink initcwnd 16 initrwnd 20" \
+    "$CURRENT_ROUTE" "absent restore preserves a later third-party default route"
+assert_eq "not-called" "$LAST_ROUTE_ARGS" \
+    "absent restore does not delete or replace a later route"
+printf 'PASS: absent route restore is conservative\n'
+
+CURRENT_ROUTE="default via 198.51.100.1 dev eth7 proto dhcp src 198.51.100.2 metric 55 onlink"
+backup_default_route
+assert_eq "$CURRENT_ROUTE" "$(cat "$ROUTE_PREVIOUS_BACKUP")" \
+    "present default route is written atomically"
+[[ ! -e "$ROUTE_PREVIOUS_ABSENT" ]] ||
+    fail "present route backup retained absent marker"
+printf 'PASS: present route backup replaces absent state\n'
 
 # Owned cleanup failure must propagate and retain ownership for retry.
 CURRENT_ROUTE="default via 192.0.2.1 dev eth0 proto dhcp metric 100 initcwnd 32 initrwnd 32"

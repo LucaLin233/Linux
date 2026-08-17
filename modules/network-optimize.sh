@@ -37,18 +37,20 @@ readonly NETWORK_PREVIOUS_BACKUP="${NETWORK_CONF}.previous-backup"
 readonly NETWORK_INITIAL_ABSENT="${NETWORK_CONF}.initial-absent"
 readonly NETWORK_INITIAL_UNKNOWN="${NETWORK_CONF}.initial-unknown"
 readonly NETWORK_PREVIOUS_ABSENT="${NETWORK_CONF}.previous-absent"
-readonly BBR_MODULES_FILE="/etc/modules-load.d/network-optimize-bbr.conf"
+readonly NETWORK_OPTIMIZE_STATE_DIR="${NETWORK_OPTIMIZE_STATE_DIR:-/var/lib/linux-setup}"
+readonly BBR_MODULES_FILE="${NETWORK_OPTIMIZE_BBR_MODULES_FILE:-/etc/modules-load.d/network-optimize-bbr.conf}"
 readonly BBR_MODULES_INITIAL_BACKUP="${BBR_MODULES_FILE}.initial-backup"
 readonly BBR_MODULES_PREVIOUS_BACKUP="${BBR_MODULES_FILE}.previous-backup"
 readonly BBR_MODULES_INITIAL_ABSENT="${BBR_MODULES_FILE}.initial-absent"
 readonly BBR_MODULES_INITIAL_UNKNOWN="${BBR_MODULES_FILE}.initial-unknown"
 readonly BBR_MODULES_PREVIOUS_ABSENT="${BBR_MODULES_FILE}.previous-absent"
-readonly RUNTIME_INITIAL_BACKUP="/var/lib/linux-setup/network-optimize.initial-runtime"
-readonly RUNTIME_INITIAL_UNKNOWN="/var/lib/linux-setup/network-optimize.initial-runtime-unknown"
-readonly RUNTIME_PREVIOUS_BACKUP="/var/lib/linux-setup/network-optimize.previous-runtime"
-readonly NETWORK_OPTIMIZE_STATE_DIR="${NETWORK_OPTIMIZE_STATE_DIR:-/var/lib/linux-setup}"
+readonly RUNTIME_INITIAL_BACKUP="${NETWORK_OPTIMIZE_STATE_DIR}/network-optimize.initial-runtime"
+readonly RUNTIME_INITIAL_UNKNOWN="${NETWORK_OPTIMIZE_STATE_DIR}/network-optimize.initial-runtime-unknown"
+readonly RUNTIME_PREVIOUS_BACKUP="${NETWORK_OPTIMIZE_STATE_DIR}/network-optimize.previous-runtime"
 readonly ROUTE_INITIAL_BACKUP="${NETWORK_OPTIMIZE_STATE_DIR}/network-optimize.initial-route"
 readonly ROUTE_PREVIOUS_BACKUP="${NETWORK_OPTIMIZE_STATE_DIR}/network-optimize.previous-route"
+readonly ROUTE_INITIAL_ABSENT="${NETWORK_OPTIMIZE_STATE_DIR}/network-optimize.initial-route-absent"
+readonly ROUTE_PREVIOUS_ABSENT="${NETWORK_OPTIMIZE_STATE_DIR}/network-optimize.previous-route-absent"
 readonly ROUTE_INITIAL_UNKNOWN="${NETWORK_OPTIMIZE_STATE_DIR}/network-optimize.initial-route-unknown"
 readonly ROUTE_INITIAL_OWNED="${ROUTE_INITIAL_BACKUP}.owned"
 readonly ROUTE_PREVIOUS_OWNED="${ROUTE_PREVIOUS_BACKUP}.owned"
@@ -285,6 +287,24 @@ atomic_write_file() {
     fi
 }
 
+atomic_restore_file() {
+    local source_file="$1"
+    local destination="$2"
+    local stage
+
+    install -d -m 0755 "$(dirname "$destination")" || return 1
+    stage=$(mktemp "${destination}.rollback.XXXXXX") || return 1
+    rm -f -- "$stage" || return 1
+    if ! cp -a -- "$source_file" "$stage"; then
+        rm -f -- "$stage"
+        return 1
+    fi
+    if ! mv -f -- "$stage" "$destination"; then
+        rm -f -- "$stage"
+        return 1
+    fi
+}
+
 backup_managed_file() {
     local target="$1"
     local initial_backup="$2"
@@ -301,20 +321,110 @@ backup_managed_file() {
     stage_managed_state "$target" "$previous_backup" "$previous_absent"
 }
 
+# Multi-file guard for command/function failures; not a power-loss transaction.
+previous_state_paths() {
+    printf '%s\n' \
+        "$NETWORK_PREVIOUS_BACKUP" \
+        "$NETWORK_PREVIOUS_ABSENT" \
+        "$BBR_MODULES_PREVIOUS_BACKUP" \
+        "$BBR_MODULES_PREVIOUS_ABSENT" \
+        "$RUNTIME_PREVIOUS_BACKUP" \
+        "$ROUTE_PREVIOUS_BACKUP" \
+        "$ROUTE_PREVIOUS_ABSENT" \
+        "$ROUTE_PREVIOUS_OWNED" \
+        "$ROUTE_HOOK_PREVIOUS_BACKUP" \
+        "$ROUTE_HOOK_PREVIOUS_ABSENT"
+}
+
+begin_previous_state_transaction() {
+    local transaction_dir=""
+    local path
+    local index=0
+
+    install -d -m 0755 "$NETWORK_OPTIMIZE_STATE_DIR" || return 1
+    transaction_dir=$(mktemp -d \
+        "${NETWORK_OPTIMIZE_STATE_DIR}/network-optimize.previous-transaction.XXXXXX") ||
+        return 1
+
+    while IFS= read -r path; do
+        if [[ -e "$path" || -L "$path" ]]; then
+            if ! cp -a -- "$path" "$transaction_dir/item.$index" ||
+                ! touch "$transaction_dir/present.$index"; then
+                rm -rf -- "$transaction_dir"
+                return 1
+            fi
+        fi
+        ((index += 1))
+    done < <(previous_state_paths)
+
+    printf '%s\n' "$transaction_dir"
+}
+
+restore_previous_state_transaction() {
+    local transaction_dir="$1"
+    local path
+    local index=0
+    local failed="false"
+
+    while IFS= read -r path; do
+        if [[ -e "$transaction_dir/present.$index" ]]; then
+            if ! atomic_restore_file "$transaction_dir/item.$index" "$path"; then
+                failed="true"
+            fi
+        elif ! rm -f -- "$path"; then
+            failed="true"
+        fi
+        ((index += 1))
+    done < <(previous_state_paths)
+
+    [[ "$failed" == "false" ]]
+}
+
+backup_previous_state_set() {
+    local runtime_snapshot="$1"
+    local transaction_dir
+    local failed_item=""
+
+    transaction_dir=$(begin_previous_state_transaction) || {
+        error "无法创建 previous 备份事务"
+        return 1
+    }
+
+    if ! atomic_install_file "$runtime_snapshot" "$RUNTIME_PREVIOUS_BACKUP" 0600; then
+        failed_item="runtime"
+    elif ! backup_network_state; then
+        failed_item="${PREVIOUS_BACKUP_FAILED_ITEM:-managed-files}"
+    elif ! backup_default_route; then
+        failed_item="route"
+    fi
+
+    if [[ -z "$failed_item" ]]; then
+        rm -rf -- "$transaction_dir" ||
+            warn "previous 备份事务临时目录清理失败：$transaction_dir"
+        return 0
+    fi
+
+    error "previous 备份更新失败（$failed_item），正在恢复旧回滚点"
+    if ! restore_previous_state_transaction "$transaction_dir"; then
+        error "previous 备份事务回滚不完整；操作前快照保留在：$transaction_dir"
+        return 1
+    fi
+    rm -rf -- "$transaction_dir" || true
+    return 1
+}
+
 restore_managed_file() {
     local target="$1"
     local backup="$2"
     local absent="$3"
 
     if [[ -e "$backup" || -L "$backup" ]]; then
-        install -d -m 0755 "$(dirname "$target")"
-        rm -f "$target"
-        cp -a "$backup" "$target"
-        return 0
+        atomic_restore_file "$backup" "$target"
+        return $?
     fi
 
     if [[ -e "$absent" ]]; then
-        rm -f "$target"
+        rm -f "$target" || return 1
         return 0
     fi
 
@@ -367,7 +477,7 @@ bbr_available() {
 persist_bbr_module() {
     local temp_file
 
-    temp_file=$(mktemp /etc/modules-load.d/network-optimize-bbr.conf.new.XXXXXX) || return 1
+    temp_file=$(mktemp "${BBR_MODULES_FILE}.new.XXXXXX") || return 1
     printf '%s\n' tcp_bbr > "$temp_file"
     chmod 644 "$temp_file"
     mv "$temp_file" "$BBR_MODULES_FILE"
@@ -855,11 +965,29 @@ detect_default_iface() {
     echo "$iface"
 }
 
-default_ipv4_route() {
+query_default_ipv4_route() {
     local routes
 
-    routes=$(ip -4 route show default 2>/dev/null || true)
-    printf '%s\n' "${routes%%$'\n'*}"
+    routes=$(ip -4 route show default 2>/dev/null) || return 1
+    routes="${routes%%$'\n'*}"
+    [[ -n "$routes" ]] || return 2
+    printf '%s\n' "$routes"
+}
+
+default_ipv4_route() {
+    local route
+    local query_status
+
+    if route=$(query_default_ipv4_route); then
+        printf '%s\n' "$route"
+        return 0
+    fi
+    query_status=$?
+    if (( query_status == 2 )); then
+        printf '\n'
+        return 0
+    fi
+    return 1
 }
 
 strip_route_window_fields() {
@@ -882,25 +1010,42 @@ strip_route_window_fields() {
 }
 
 backup_default_route() {
-    local route
+    local route=""
+    local query_status=0
 
-    route=$(default_ipv4_route)
+    route=$(query_default_ipv4_route) || query_status=$?
+    if (( query_status != 0 )); then
+        if (( query_status != 2 )); then
+            error "读取 IPv4 默认路由失败"
+            return 1
+        fi
+    fi
     install -d -m 0755 "$NETWORK_OPTIMIZE_STATE_DIR" || return 1
     if [[ -n "$route" ]]; then
         atomic_write_file "$ROUTE_PREVIOUS_BACKUP" "$route" 0600 || return 1
         if [[ -e "$ROUTE_OWNED_MARKER" ]]; then
             atomic_write_file "$ROUTE_PREVIOUS_OWNED" "owned" 0600 || return 1
         else
-            rm -f "$ROUTE_PREVIOUS_OWNED"
+            rm -f "$ROUTE_PREVIOUS_OWNED" || return 1
         fi
+        rm -f "$ROUTE_PREVIOUS_ABSENT" || return 1
     else
-        rm -f "$ROUTE_PREVIOUS_BACKUP" "$ROUTE_PREVIOUS_OWNED"
+        atomic_write_file "$ROUTE_PREVIOUS_ABSENT" "absent" 0600 || return 1
+        rm -f "$ROUTE_PREVIOUS_BACKUP" "$ROUTE_PREVIOUS_OWNED" || return 1
     fi
 
-    if [[ ! -e "$ROUTE_INITIAL_BACKUP" && ! -e "$ROUTE_INITIAL_UNKNOWN" && -n "$route" ]]; then
-        atomic_write_file "$ROUTE_INITIAL_BACKUP" "$route" 0600 || return 1
-        if [[ -e "$ROUTE_OWNED_MARKER" ]]; then
-            atomic_write_file "$ROUTE_INITIAL_OWNED" "owned" 0600 || return 1
+    if [[ ! -e "$ROUTE_INITIAL_BACKUP" && ! -e "$ROUTE_INITIAL_ABSENT" &&
+        ! -e "$ROUTE_INITIAL_UNKNOWN" ]]; then
+        if [[ -n "$route" ]]; then
+            atomic_write_file "$ROUTE_INITIAL_BACKUP" "$route" 0600 || return 1
+            if [[ -e "$ROUTE_OWNED_MARKER" ]]; then
+                atomic_write_file "$ROUTE_INITIAL_OWNED" "owned" 0600 || return 1
+            else
+                rm -f "$ROUTE_INITIAL_OWNED" || return 1
+            fi
+        else
+            atomic_write_file "$ROUTE_INITIAL_ABSENT" "absent" 0600 || return 1
+            rm -f "$ROUTE_INITIAL_OWNED" || return 1
         fi
     fi
 }
@@ -936,8 +1081,11 @@ resolve_initcwnd_policy() {
 }
 
 detect_initcwnd_state() {
-    local route
-    route=$(default_ipv4_route)
+    local route=""
+    if ! route=$(default_ipv4_route); then
+        printf '%s\n' 'unreadable|default route query failed'
+        return 0
+    fi
     if [[ -e "$ROUTE_OWNED_MARKER" ]]; then
         if grep -Eq '(^| )initcwnd 32( |$)' <<< "$route" &&
             grep -Eq '(^| )initrwnd 32( |$)' <<< "$route"; then
@@ -990,6 +1138,23 @@ is_managed_initcwnd_hook() {
     [[ "$actual" == "$expected" ]]
 }
 
+route_has_script_windows() {
+    awk '
+        {
+            for (i = 1; i <= NF; i++) {
+                if ($i == "initcwnd") {
+                    cwnd_count++
+                    if ($(i + 1) != "32") bad = 1
+                } else if ($i == "initrwnd") {
+                    rwnd_count++
+                    if ($(i + 1) != "32") bad = 1
+                }
+            }
+        }
+        END { exit !(bad == 0 && cwnd_count == 1 && rwnd_count == 1) }
+    ' <<< "$1"
+}
+
 route_snapshot_proves_no_windows() {
     local route_file="$1"
     local unknown_marker="${2:-}"
@@ -1001,8 +1166,9 @@ route_snapshot_proves_no_windows() {
     [[ -n "$snapshot_route" ]] || return 1
     ! grep -Eq '(^| )(initcwnd|initrwnd) [0-9]+( |$)' <<< "$snapshot_route" || return 1
 
-    current_route=$(default_ipv4_route)
+    current_route=$(default_ipv4_route) || return 1
     [[ -n "$current_route" ]] || return 1
+    route_has_script_windows "$current_route" || return 1
     [[ "$(strip_route_window_fields "$current_route")" == "$snapshot_route" ]]
 }
 
@@ -1071,7 +1237,10 @@ apply_initcwnd() {
             warn "当前默认路由的 initcwnd/initrwnd 无本脚本 ownership 证据，保留不动"
             return 0
         fi
-        route=$(default_ipv4_route)
+        if ! route=$(default_ipv4_route); then
+            error "读取 IPv4 默认路由失败"
+            return 1
+        fi
         if [[ -n "$route" ]] &&
             grep -Eq '(^| )(initcwnd|initrwnd) [0-9]+( |$)' <<< "$route"; then
             clean=$(strip_route_window_fields "$route")
@@ -1095,7 +1264,10 @@ apply_initcwnd() {
         fi
         return 0
     fi
-    route=$(default_ipv4_route)
+    if ! route=$(default_ipv4_route); then
+        error "读取 IPv4 默认路由失败"
+        return 1
+    fi
     [[ -n "$route" ]] || {
         warn "未找到 IPv4 默认路由，跳过 initcwnd/initrwnd"
         return 0
@@ -1122,12 +1294,31 @@ apply_initcwnd() {
 restore_default_route() {
     local route_file="$1"
     local owned_file="${2:-}"
+    local absent_file="${3:-}"
     local route=""
+    local clean=""
     local -a route_args=()
+
+    if [[ ! -f "$route_file" && -n "$absent_file" && -e "$absent_file" ]]; then
+        initcwnd_settings_owned || return 0
+        route=$(default_ipv4_route) || return 1
+        if [[ -z "$route" ]]; then
+            rm -f "$ROUTE_OWNED_MARKER"
+            return 0
+        fi
+        if grep -Eq '(^| )(initcwnd|initrwnd) [0-9]+( |$)' <<< "$route"; then
+            clean=$(strip_route_window_fields "$route")
+            read -r -a route_args <<< "$clean"
+            (( ${#route_args[@]} > 0 )) || return 1
+            ip -4 route replace "${route_args[@]}" || return 1
+        fi
+        rm -f "$ROUTE_OWNED_MARKER"
+        return 0
+    fi
 
     [[ -f "$route_file" ]] || {
         initcwnd_settings_owned || return 0
-        route=$(default_ipv4_route)
+        route=$(default_ipv4_route) || return 1
         if [[ -z "$route" ]]; then
             rm -f "$ROUTE_OWNED_MARKER"
             return 0
@@ -2619,7 +2810,8 @@ prepare_legacy_backup_state() {
         if [[ ! -e "$RUNTIME_INITIAL_BACKUP" && ! -e "$RUNTIME_INITIAL_UNKNOWN" ]]; then
             install -D -m 0600 /dev/null "$RUNTIME_INITIAL_UNKNOWN"
         fi
-        if [[ ! -e "$ROUTE_INITIAL_BACKUP" && ! -e "$ROUTE_INITIAL_UNKNOWN" ]]; then
+        if [[ ! -e "$ROUTE_INITIAL_BACKUP" && ! -e "$ROUTE_INITIAL_ABSENT" &&
+            ! -e "$ROUTE_INITIAL_UNKNOWN" ]]; then
             install -D -m 0600 /dev/null "$ROUTE_INITIAL_UNKNOWN"
         fi
     fi
@@ -2664,9 +2856,10 @@ merge_initial_runtime_values() {
 }
 
 backup_network_state() {
-    install -d -m 0755 /var/lib/linux-setup
+    install -d -m 0755 "$NETWORK_OPTIMIZE_STATE_DIR"
     prepare_legacy_backup_state
 
+    PREVIOUS_BACKUP_FAILED_ITEM="network"
     backup_managed_file \
         "$NETWORK_CONF" \
         "$NETWORK_INITIAL_BACKUP" \
@@ -2674,6 +2867,7 @@ backup_network_state() {
         "$NETWORK_INITIAL_ABSENT" \
         "$NETWORK_PREVIOUS_ABSENT" || return 1
 
+    PREVIOUS_BACKUP_FAILED_ITEM="modules"
     backup_managed_file \
         "$BBR_MODULES_FILE" \
         "$BBR_MODULES_INITIAL_BACKUP" \
@@ -2681,6 +2875,7 @@ backup_network_state() {
         "$BBR_MODULES_INITIAL_ABSENT" \
         "$BBR_MODULES_PREVIOUS_ABSENT" || return 1
 
+    PREVIOUS_BACKUP_FAILED_ITEM="hook"
     backup_managed_file \
         "$INITCWND_ROUTE_HOOK" \
         "$ROUTE_HOOK_INITIAL_BACKUP" \
@@ -2890,7 +3085,7 @@ capture_runtime_values_from_files() {
     local key
     shift
 
-    : > "$output_file"
+    : > "$output_file" || return 1
     for input_file in "$@"; do
         [[ -f "$input_file" ]] || continue
         while IFS='=' read -r key _; do
@@ -2898,7 +3093,8 @@ capture_runtime_values_from_files() {
             [[ -z "$key" || "$key" == \#* ]] && continue
             grep -Fq "${key}=" "$output_file" && continue
             if sysctl -n "$key" >/dev/null 2>&1; then
-                printf '%s=%s\n' "$key" "$(sysctl -n "$key")" >> "$output_file"
+                printf '%s=%s\n' "$key" "$(sysctl -n "$key")" >> "$output_file" ||
+                    return 1
             else
                 warn "当前内核不存在运行时参数，跳过快照: $key"
             fi
@@ -3026,7 +3222,7 @@ install_optimization() {
         show_tuning_plan
     fi
 
-    if ! temp_config=$(mktemp /etc/sysctl.d/99-network-optimize.conf.new.XXXXXX); then
+    if ! temp_config=$(mktemp "${NETWORK_CONF}.new.XXXXXX"); then
         error "无法创建网络配置临时文件"
         return 1
     fi
@@ -3076,7 +3272,7 @@ install_optimization() {
         fi
     done
 
-    install -d -m 0755 /var/lib/linux-setup
+    install -d -m 0755 "$NETWORK_OPTIMIZE_STATE_DIR"
     merge_initial_runtime_values "$runtime_backup" || {
         rm -f "$temp_config" "$runtime_backup"
         return 1
@@ -3089,16 +3285,7 @@ install_optimization() {
             return 1
         fi
     done
-    atomic_install_file "$runtime_backup" "$RUNTIME_PREVIOUS_BACKUP" 0600 || {
-        rm -f "$temp_config" "$runtime_backup"
-        return 1
-    }
-
-    backup_network_state || {
-        rm -f "$temp_config" "$runtime_backup"
-        return 1
-    }
-    backup_default_route || {
+    backup_previous_state_set "$runtime_backup" || {
         rm -f "$temp_config" "$runtime_backup"
         return 1
     }
@@ -3155,7 +3342,8 @@ install_optimization() {
     fi
 
     if ! apply_initcwnd; then
-        restore_default_route "$ROUTE_PREVIOUS_BACKUP" "$ROUTE_PREVIOUS_OWNED" || true
+        restore_default_route \
+            "$ROUTE_PREVIOUS_BACKUP" "$ROUTE_PREVIOUS_OWNED" "$ROUTE_PREVIOUS_ABSENT" || true
         restore_managed_file \
             "$INITCWND_ROUTE_HOOK" "$ROUTE_HOOK_PREVIOUS_BACKUP" \
             "$ROUTE_HOOK_PREVIOUS_ABSENT" || true
@@ -3189,12 +3377,135 @@ install_optimization() {
     show_install_summary "$health_before" "$bbr_enabled"
 }
 
+# Capture operation-before state for compensating rollback on restore failure.
+begin_restore_transaction() {
+    local config_backup="$1"
+    local runtime_backup="$2"
+    local transaction_dir=""
+    local route=""
+    local query_status=0
+
+    install -d -m 0755 "$NETWORK_OPTIMIZE_STATE_DIR" || return 1
+    transaction_dir=$(mktemp -d \
+        "${NETWORK_OPTIMIZE_STATE_DIR}/network-optimize.restore-transaction.XXXXXX") ||
+        return 1
+
+    if ! stage_managed_state \
+        "$NETWORK_CONF" "$transaction_dir/network" "$transaction_dir/network-absent" ||
+        ! stage_managed_state \
+            "$BBR_MODULES_FILE" "$transaction_dir/modules" "$transaction_dir/modules-absent" ||
+        ! stage_managed_state \
+            "$INITCWND_ROUTE_HOOK" "$transaction_dir/hook" "$transaction_dir/hook-absent" ||
+        ! capture_runtime_values_from_files \
+            "$transaction_dir/runtime" "$config_backup" "$runtime_backup"; then
+        rm -rf -- "$transaction_dir"
+        return 1
+    fi
+
+    route=$(query_default_ipv4_route) || query_status=$?
+    case "$query_status" in
+        0)
+            if ! atomic_write_file "$transaction_dir/route" "$route" 0600; then
+                rm -rf -- "$transaction_dir"
+                return 1
+            fi
+            ;;
+        2)
+            atomic_write_file "$transaction_dir/route-absent" "absent" 0600 || {
+                rm -rf -- "$transaction_dir"
+                return 1
+            }
+            ;;
+        *)
+            rm -rf -- "$transaction_dir"
+            return 1
+            ;;
+    esac
+
+    if [[ -e "$ROUTE_OWNED_MARKER" ]]; then
+        atomic_write_file "$transaction_dir/route-owned" "owned" 0600 || {
+            rm -rf -- "$transaction_dir"
+            return 1
+        }
+    fi
+
+    RESTORE_TRANSACTION_DIR="$transaction_dir"
+}
+
+restore_captured_default_route() {
+    local transaction_dir="$1"
+    local target_route_file="$2"
+    local current_route=""
+    local expected_route=""
+    local query_status=0
+    local -a route_args=()
+
+    if [[ -f "$transaction_dir/route" ]]; then
+        restore_default_route \
+            "$transaction_dir/route" "$transaction_dir/route-owned"
+        return $?
+    fi
+    [[ -e "$transaction_dir/route-absent" ]] || return 1
+
+    current_route=$(query_default_ipv4_route) || query_status=$?
+    if (( query_status == 2 )); then
+        if [[ -e "$transaction_dir/route-owned" ]]; then
+            install -D -m 0600 /dev/null "$ROUTE_OWNED_MARKER"
+        else
+            rm -f "$ROUTE_OWNED_MARKER"
+        fi
+        return $?
+    fi
+    (( query_status == 0 )) || return 1
+
+    [[ -f "$target_route_file" ]] || return 1
+    expected_route=$(<"$target_route_file")
+    [[ "$current_route" == "$expected_route" ]] || return 1
+    read -r -a route_args <<< "$current_route"
+    (( ${#route_args[@]} > 0 )) || return 1
+    ip -4 route del "${route_args[@]}" || return 1
+    if [[ -e "$transaction_dir/route-owned" ]]; then
+        install -D -m 0600 /dev/null "$ROUTE_OWNED_MARKER"
+    else
+        rm -f "$ROUTE_OWNED_MARKER"
+    fi
+}
+
+rollback_restore_transaction() {
+    local transaction_dir="$1"
+    local target_route_file="$2"
+
+    RESTORE_ROLLBACK_FAILED_ITEMS=()
+    if ! restore_managed_file \
+        "$NETWORK_CONF" "$transaction_dir/network" "$transaction_dir/network-absent"; then
+        RESTORE_ROLLBACK_FAILED_ITEMS+=(sysctl)
+    fi
+    if ! restore_managed_file \
+        "$BBR_MODULES_FILE" "$transaction_dir/modules" "$transaction_dir/modules-absent"; then
+        RESTORE_ROLLBACK_FAILED_ITEMS+=(modules)
+    fi
+    if ! apply_runtime_values_strict "$transaction_dir/runtime"; then
+        RESTORE_ROLLBACK_FAILED_ITEMS+=(runtime)
+    fi
+    if ! restore_captured_default_route "$transaction_dir" "$target_route_file"; then
+        RESTORE_ROLLBACK_FAILED_ITEMS+=(route)
+    fi
+    if ! restore_managed_file \
+        "$INITCWND_ROUTE_HOOK" "$transaction_dir/hook" "$transaction_dir/hook-absent"; then
+        RESTORE_ROLLBACK_FAILED_ITEMS+=(hook)
+    fi
+
+    (( ${#RESTORE_ROLLBACK_FAILED_ITEMS[@]} == 0 ))
+}
+
 restore_optimization() {
     local scope="${1:-previous}"
     local config_backup config_absent modules_backup modules_absent
-    local hook_backup hook_absent runtime_backup route_backup route_owned
+    local hook_backup hook_absent runtime_backup route_backup route_absent route_owned
+    local transaction_dir
     local sysctl_failed="false"
     local -a failed_items=()
+    RESTORE_ROLLBACK_FAILED_ITEMS=()
 
     case "$scope" in
         previous)
@@ -3206,6 +3517,7 @@ restore_optimization() {
             hook_absent="$ROUTE_HOOK_PREVIOUS_ABSENT"
             runtime_backup="$RUNTIME_PREVIOUS_BACKUP"
             route_backup="$ROUTE_PREVIOUS_BACKUP"
+            route_absent="$ROUTE_PREVIOUS_ABSENT"
             route_owned="$ROUTE_PREVIOUS_OWNED"
             ;;
         initial)
@@ -3217,6 +3529,7 @@ restore_optimization() {
             hook_absent="$ROUTE_HOOK_INITIAL_ABSENT"
             runtime_backup="$RUNTIME_INITIAL_BACKUP"
             route_backup="$ROUTE_INITIAL_BACKUP"
+            route_absent="$ROUTE_INITIAL_ABSENT"
             route_owned="$ROUTE_INITIAL_OWNED"
             ;;
         *)
@@ -3229,6 +3542,13 @@ restore_optimization() {
         error "未找到可信的 $scope 网络配置状态，拒绝推测"
         return 1
     fi
+
+    RESTORE_TRANSACTION_DIR=""
+    if ! begin_restore_transaction "$config_backup" "$runtime_backup"; then
+        error "无法保存恢复操作前状态，拒绝开始恢复"
+        return 1
+    fi
+    transaction_dir="$RESTORE_TRANSACTION_DIR"
 
     info "开始恢复网络优化配置（$scope）..."
 
@@ -3270,7 +3590,7 @@ restore_optimization() {
 
     if [[ "$scope" == "initial" && -e "$ROUTE_INITIAL_UNKNOWN" ]]; then
         warn "恢复项 route：初始状态未知，保留当前路由"
-    elif restore_default_route "$route_backup" "$route_owned"; then
+    elif restore_default_route "$route_backup" "$route_owned" "$route_absent"; then
         info "恢复项 route：成功"
     else
         error "恢复项 route：失败"
@@ -3289,10 +3609,18 @@ restore_optimization() {
     fi
 
     if (( ${#failed_items[@]} > 0 )); then
-        error "部分恢复：失败项 ${failed_items[*]}"
+        if rollback_restore_transaction "$transaction_dir" "$route_backup"; then
+            error "目标恢复失败，已回滚到操作前状态：失败项 ${failed_items[*]}"
+            rm -rf -- "$transaction_dir" || true
+        else
+            error "目标恢复失败，且回滚不完整：目标失败项 ${failed_items[*]}；回滚失败项 ${RESTORE_ROLLBACK_FAILED_ITEMS[*]}"
+            error "部分恢复：回滚失败项 ${RESTORE_ROLLBACK_FAILED_ITEMS[*]}；操作前快照保留在 $transaction_dir"
+        fi
         return 1
     fi
 
+    rm -rf -- "$transaction_dir" ||
+        warn "恢复事务临时目录清理失败：$transaction_dir"
     success "网络配置已恢复到 $scope 状态"
 }
 

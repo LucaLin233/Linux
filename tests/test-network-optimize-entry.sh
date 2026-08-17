@@ -6,6 +6,7 @@ readonly TEMP_DIR=$(mktemp -d)
 trap 'rm -rf "$TEMP_DIR"' EXIT
 export NETWORK_OPTIMIZE_STATE_DIR="$TEMP_DIR/state"
 export NETWORK_OPTIMIZE_CONF="$TEMP_DIR/etc/sysctl.d/99-network-optimize.conf"
+export NETWORK_OPTIMIZE_BBR_MODULES_FILE="$TEMP_DIR/etc/modules-load.d/network-optimize-bbr.conf"
 export NETWORK_OPTIMIZE_IPV6_CONF_ROOT="$TEMP_DIR/proc/sys/net/ipv6/conf"
 export NETWORK_OPTIMIZE_INITCWND_HOOK="$TEMP_DIR/networkd-dispatcher/routable.d/50-network-optimize-initcwnd"
 
@@ -557,21 +558,253 @@ unset -f cp
 assert_eq 'old previous config' "$(cat "$NETWORK_PREVIOUS_BACKUP")" \
     "failed staging copy preserves old previous backup"
 
-# Restore must accumulate route failure and never report overall success.
-printf '%s\n' 'restored config' > "$NETWORK_PREVIOUS_BACKUP"
-apply_network_config() { return 0; }
-restore_default_route() { return 1; }
-restore_log="$TEMP_DIR/restore-failure.log"
+# All previous resources form one function-failure transaction.
+eval "$(declare -f backup_managed_file | sed '1s/backup_managed_file/backup_managed_file_real/')"
+FAIL_BACKUP_TARGET=""
+SYSTEM_MUTATION_CALLS=0
+ROUTE_MUTATION_CALLS=0
+IP_QUERY_FAIL=false
+ROUTE_REPLACE_FAIL_MATCH=""
+INJECT_HOOK_TARGET_FAILURE=false
+CURRENT_ROUTE="default via 192.0.2.1 dev eth0 proto dhcp metric 100"
+PRE_RESTORE_ROUTE="$CURRENT_ROUTE"
+TARGET_RESTORE_ROUTE="default via 198.51.100.1 dev eth7 proto static metric 70"
+
+backup_managed_file() {
+    [[ -z "$FAIL_BACKUP_TARGET" || "$1" != "$FAIL_BACKUP_TARGET" ]] || return 1
+    backup_managed_file_real "$@"
+}
+modprobe() {
+    ((SYSTEM_MUTATION_CALLS += 1))
+    return 0
+}
+apply_network_config() {
+    ((SYSTEM_MUTATION_CALLS += 1))
+    return 0
+}
+ip() {
+    local route_args
+    case "$1 $2 $3" in
+        '-4 route show')
+            [[ "$IP_QUERY_FAIL" == "false" ]] || return 1
+            printf '%s\n' "$CURRENT_ROUTE"
+            ;;
+        '-4 route replace')
+            shift 3
+            route_args="$*"
+            if [[ "$ROUTE_REPLACE_FAIL_MATCH" == '*' ||
+                -n "$ROUTE_REPLACE_FAIL_MATCH" &&
+                "$route_args" == "$ROUTE_REPLACE_FAIL_MATCH" ]]; then
+                return 1
+            fi
+            CURRENT_ROUTE="$route_args"
+            ((ROUTE_MUTATION_CALLS += 1))
+            if [[ "$INJECT_HOOK_TARGET_FAILURE" == "true" &&
+                "$route_args" == "$TARGET_RESTORE_ROUTE" ]]; then
+                rm -rf -- "$(dirname "$INITCWND_ROUTE_HOOK")"
+                printf '%s\n' blocker > "$(dirname "$INITCWND_ROUTE_HOOK")"
+            elif [[ "$INJECT_HOOK_TARGET_FAILURE" == "true" &&
+                "$route_args" == "$PRE_RESTORE_ROUTE" ]]; then
+                rm -f -- "$(dirname "$INITCWND_ROUTE_HOOK")"
+                mkdir -p "$(dirname "$INITCWND_ROUTE_HOOK")"
+            fi
+            ;;
+        '-4 route del')
+            shift 3
+            CURRENT_ROUTE=""
+            ((ROUTE_MUTATION_CALLS += 1))
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+seed_previous_bundle() {
+    local path
+
+    while IFS= read -r path; do rm -f -- "$path"; done < <(previous_state_paths)
+    rm -f -- \
+        "$NETWORK_INITIAL_BACKUP" "$NETWORK_INITIAL_ABSENT" "$NETWORK_INITIAL_UNKNOWN" \
+        "$BBR_MODULES_INITIAL_BACKUP" "$BBR_MODULES_INITIAL_ABSENT" \
+        "$BBR_MODULES_INITIAL_UNKNOWN" "$ROUTE_HOOK_INITIAL_BACKUP" \
+        "$ROUTE_HOOK_INITIAL_ABSENT" "$ROUTE_INITIAL_BACKUP" \
+        "$ROUTE_INITIAL_ABSENT" "$ROUTE_INITIAL_UNKNOWN" "$ROUTE_INITIAL_OWNED"
+    mkdir -p \
+        "$(dirname "$NETWORK_CONF")" "$(dirname "$BBR_MODULES_FILE")" \
+        "$(dirname "$INITCWND_ROUTE_HOOK")" "$NETWORK_OPTIMIZE_STATE_DIR"
+    printf '%s\n' 'new network' > "$NETWORK_CONF"
+    printf '%s\n' 'new modules' > "$BBR_MODULES_FILE"
+    printf '%s\n' 'new hook' > "$INITCWND_ROUTE_HOOK"
+    printf '%s\n' 'old network previous' > "$NETWORK_PREVIOUS_BACKUP"
+    : > "$BBR_MODULES_PREVIOUS_ABSENT"
+    printf '%s\n' 'old runtime previous' > "$RUNTIME_PREVIOUS_BACKUP"
+    printf '%s\n' 'old route previous' > "$ROUTE_PREVIOUS_BACKUP"
+    printf '%s\n' owned > "$ROUTE_PREVIOUS_OWNED"
+    : > "$ROUTE_HOOK_PREVIOUS_ABSENT"
+    printf '%s\n' 'new runtime previous' > "$TEMP_DIR/new-runtime-snapshot"
+    CURRENT_ROUTE="default via 192.0.2.1 dev eth0 proto dhcp metric 100"
+    IP_QUERY_FAIL=false
+    ROUTE_MUTATION_CALLS=0
+    SYSTEM_MUTATION_CALLS=0
+}
+
+assert_previous_bundle_unchanged() {
+    local name="$1"
+
+    assert_eq 'old network previous' "$(cat "$NETWORK_PREVIOUS_BACKUP")" \
+        "$name preserves network previous content"
+    [[ ! -e "$NETWORK_PREVIOUS_ABSENT" ]] || fail "$name changed network absent state"
+    [[ -e "$BBR_MODULES_PREVIOUS_ABSENT" && ! -e "$BBR_MODULES_PREVIOUS_BACKUP" ]] ||
+        fail "$name changed modules absent state"
+    assert_eq 'old runtime previous' "$(cat "$RUNTIME_PREVIOUS_BACKUP")" \
+        "$name preserves runtime previous content"
+    assert_eq 'old route previous' "$(cat "$ROUTE_PREVIOUS_BACKUP")" \
+        "$name preserves route previous content"
+    [[ -e "$ROUTE_PREVIOUS_OWNED" && ! -e "$ROUTE_PREVIOUS_ABSENT" ]] ||
+        fail "$name changed route marker state"
+    [[ -e "$ROUTE_HOOK_PREVIOUS_ABSENT" && ! -e "$ROUTE_HOOK_PREVIOUS_BACKUP" ]] ||
+        fail "$name changed hook absent state"
+    assert_eq 0 "$SYSTEM_MUTATION_CALLS" "$name performs no sysctl or module mutation"
+    assert_eq 0 "$ROUTE_MUTATION_CALLS" "$name performs no route mutation"
+}
+
+run_previous_failure_case() {
+    local failed_target="$1"
+    local query_failure="$2"
+    local name="$3"
+
+    seed_previous_bundle
+    FAIL_BACKUP_TARGET="$failed_target"
+    IP_QUERY_FAIL="$query_failure"
+    if backup_previous_state_set "$TEMP_DIR/new-runtime-snapshot" >/dev/null 2>&1; then
+        fail "$name unexpectedly succeeded"
+    fi
+    FAIL_BACKUP_TARGET=""
+    IP_QUERY_FAIL=false
+    assert_previous_bundle_unchanged "$name"
+}
+
+run_previous_failure_case "$NETWORK_CONF" false \
+    "network failure after runtime previous write"
+run_previous_failure_case "$BBR_MODULES_FILE" false \
+    "modules failure after network previous write"
+assert_eq 'new network' "$(cat "$NETWORK_INITIAL_BACKUP")" \
+    "previous rollback retains successful network initial backup"
+run_previous_failure_case "$INITCWND_ROUTE_HOOK" false \
+    "hook failure after modules previous write"
+[[ -f "$NETWORK_INITIAL_BACKUP" ]] ||
+    fail "previous rollback removed successful network initial backup"
+printf 'PASS: previous rollback retains successful initial backups\n'
+run_previous_failure_case "" true \
+    "route failure after hook previous write"
+
+# Restore failures roll every changed item back to the operation-before snapshot.
+apply_network_config() {
+    local config_file="$1"
+    local key value
+
+    ((SYSTEM_MUTATION_CALLS += 1))
+    while IFS='=' read -r key value; do
+        key="${key//[[:space:]]/}"
+        value=$(printf '%s\n' "$value" | normalize_sysctl_value)
+        [[ "$key" == "net.ipv4.tcp_ecn" ]] && SYSCTL_TCP_ECN="$value"
+    done < "$config_file"
+}
+
+reset_restore_fixture() {
+    local path
+
+    while IFS= read -r path; do rm -f -- "$path"; done < <(previous_state_paths)
+    rm -rf -- "$(dirname "$INITCWND_ROUTE_HOOK")"
+    mkdir -p \
+        "$(dirname "$NETWORK_CONF")" "$(dirname "$BBR_MODULES_FILE")" \
+        "$(dirname "$INITCWND_ROUTE_HOOK")" "$NETWORK_OPTIMIZE_STATE_DIR"
+    printf '%s\n' 'net.ipv4.tcp_ecn = 1' > "$NETWORK_CONF"
+    printf '%s\n' 'current modules' > "$BBR_MODULES_FILE"
+    printf '%s\n' 'current hook' > "$INITCWND_ROUTE_HOOK"
+    printf '%s\n' 'net.ipv4.tcp_ecn = 2' > "$NETWORK_PREVIOUS_BACKUP"
+    printf '%s\n' 'target modules' > "$BBR_MODULES_PREVIOUS_BACKUP"
+    printf '%s\n' 'net.ipv4.tcp_ecn=2' > "$RUNTIME_PREVIOUS_BACKUP"
+    printf '%s\n' "$TARGET_RESTORE_ROUTE" > "$ROUTE_PREVIOUS_BACKUP"
+    printf '%s\n' 'target hook' > "$ROUTE_HOOK_PREVIOUS_BACKUP"
+    SYSCTL_TCP_ECN=1
+    SYSCTL_WRITE_FAIL_KEY=''
+    CURRENT_ROUTE="$PRE_RESTORE_ROUTE"
+    ROUTE_REPLACE_FAIL_MATCH=""
+    INJECT_HOOK_TARGET_FAILURE=false
+    ROUTE_MUTATION_CALLS=0
+    SYSTEM_MUTATION_CALLS=0
+    rm -f "$ROUTE_OWNED_MARKER"
+}
+
+assert_restore_rolled_back() {
+    local name="$1"
+
+    assert_eq 'net.ipv4.tcp_ecn = 1' "$(cat "$NETWORK_CONF")" \
+        "$name restores current network file"
+    assert_eq 'current modules' "$(cat "$BBR_MODULES_FILE")" \
+        "$name restores current modules file"
+    assert_eq '1' "$SYSCTL_TCP_ECN" "$name restores current runtime sysctl"
+    assert_eq "$PRE_RESTORE_ROUTE" "$CURRENT_ROUTE" "$name restores current route"
+    assert_eq 'current hook' "$(cat "$INITCWND_ROUTE_HOOK")" \
+        "$name restores current hook"
+}
+
+reset_restore_fixture
+ROUTE_REPLACE_FAIL_MATCH="$TARGET_RESTORE_ROUTE"
+restore_log="$TEMP_DIR/restore-route-failure.log"
 if restore_optimization previous > "$restore_log" 2>&1; then
-    fail "route restore failure unexpectedly returned success"
+    fail "route target restore failure unexpectedly returned success"
 fi
+assert_restore_rolled_back "route target failure"
 grep -Fq '恢复项 route：失败' "$restore_log" ||
-    fail "route restore failure was not named"
-grep -Fq '部分恢复：失败项 route' "$restore_log" ||
-    fail "partial restore summary omitted route"
+    fail "route target failure was not named"
+grep -Fq '目标恢复失败，已回滚到操作前状态' "$restore_log" ||
+    fail "route target failure did not report successful rollback"
+! grep -Fq '部分恢复' "$restore_log" ||
+    fail "successful pre-restore rollback was described as partial"
 ! grep -Fq '网络配置已恢复到 previous 状态' "$restore_log" ||
-    fail "partial restore incorrectly reported overall success"
-printf 'PASS: route restore failure returns nonzero without overall success\n'
+    fail "route target failure incorrectly reported overall success"
+printf 'PASS: route target failure rolls all prior changes back\n'
+
+reset_restore_fixture
+INJECT_HOOK_TARGET_FAILURE=true
+restore_log="$TEMP_DIR/restore-hook-failure.log"
+if restore_optimization previous > "$restore_log" 2>&1; then
+    fail "hook target restore failure unexpectedly returned success"
+fi
+assert_restore_rolled_back "hook target failure"
+grep -Fq '恢复项 hook：失败' "$restore_log" ||
+    fail "hook target failure was not named"
+grep -Fq '目标恢复失败，已回滚到操作前状态' "$restore_log" ||
+    fail "hook target failure did not report successful rollback"
+! grep -Fq '部分恢复' "$restore_log" ||
+    fail "successful hook rollback was described as partial"
+! grep -Fq '网络配置已恢复到 previous 状态' "$restore_log" ||
+    fail "hook target failure incorrectly reported overall success"
+printf 'PASS: hook target failure rolls route and prior changes back\n'
+
+reset_restore_fixture
+ROUTE_REPLACE_FAIL_MATCH='*'
+restore_log="$TEMP_DIR/restore-rollback-failure.log"
+if restore_optimization previous > "$restore_log" 2>&1; then
+    fail "incomplete pre-restore rollback unexpectedly returned success"
+fi
+assert_eq 'net.ipv4.tcp_ecn = 1' "$(cat "$NETWORK_CONF")" \
+    "incomplete rollback still restores network file"
+assert_eq 'current modules' "$(cat "$BBR_MODULES_FILE")" \
+    "incomplete rollback still restores modules file"
+assert_eq '1' "$SYSCTL_TCP_ECN" "incomplete rollback still restores runtime sysctl"
+assert_eq 'current hook' "$(cat "$INITCWND_ROUTE_HOOK")" \
+    "incomplete rollback still restores hook"
+grep -Fq '目标恢复失败，且回滚不完整' "$restore_log" ||
+    fail "incomplete rollback summary was missing"
+grep -Fq '回滚失败项 route' "$restore_log" ||
+    fail "incomplete rollback did not name route"
+grep -Fq '部分恢复：回滚失败项 route' "$restore_log" ||
+    fail "partial final state was not reported"
+! grep -Fq '网络配置已恢复到 previous 状态' "$restore_log" ||
+    fail "incomplete rollback incorrectly reported overall success"
+printf 'PASS: incomplete pre-restore rollback reports exact failed item\n'
 
 if grep -Eq 'restore_legacy_limits|LIMITS_|/etc/security/limits|[.]conf[.]disabled' \
     "$ROOT_DIR/modules/network-optimize.sh"; then
