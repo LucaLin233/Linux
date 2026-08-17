@@ -1,6 +1,6 @@
 # Third-Party Notices
 
-## tcpfit
+## `tools/traffic-shape.sh`
 
 `tools/traffic-shape.sh` 包含从
 [Kylin010/tcpfit](https://github.com/Kylin010/tcpfit) 移植和修改的 Sweep、Shape、
@@ -15,7 +15,24 @@
 本项目只移植适合独立 `tcshape` 工具的 Sweep、Shape 和 qdisc 管理逻辑，不追求与 tcpfit
 全部命令、交互流程及 TCP/sysctl 调优功能完全一致。
 
-原项目采用 MIT License：
+## `modules/network-optimize.sh`
+
+`modules/network-optimize.sh` 移植或参考
+[Kylin010/tcpfit](https://github.com/Kylin010/tcpfit) `v0.5.6`（提交
+`67c0bdfb35dd98e86982600298237b6ecc08ebe4`）的以下 MIT 许可实现与策略：
+
+- 公共 iperf3 节点及多端口策略
+- 带宽探测思路
+- BDP 与 2 MiB 余量
+- 物理内存/cgroup 有效内存 cap
+- initcwnd 100 Mbps 策略
+- initcwnd ownership 与 owned-only 清理思路
+
+下游主要差异：tcpfit 被拆为基础调优与 `traffic-shape` 两部分；
+`network-optimize.sh` 仅做 IPv4 TCP 调优；自动 RTT 固定为 150 ms；备份、恢复和交互流程
+使用本仓库实现。本条目描述移植与参考范围，不代表对 tcpfit 的完整等价实现。
+
+上述上游代码采用 MIT License：
 
 ```text
 MIT License

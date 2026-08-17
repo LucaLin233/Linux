@@ -5,6 +5,8 @@ readonly ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 readonly TEMP_DIR=$(mktemp -d)
 trap 'rm -rf "$TEMP_DIR"' EXIT
 export NETWORK_OPTIMIZE_STATE_DIR="$TEMP_DIR/state"
+export NETWORK_OPTIMIZE_CONF="$TEMP_DIR/etc/sysctl.d/99-network-optimize.conf"
+export NETWORK_OPTIMIZE_IPV6_CONF_ROOT="$TEMP_DIR/proc/sys/net/ipv6/conf"
 export NETWORK_OPTIMIZE_INITCWND_HOOK="$TEMP_DIR/networkd-dispatcher/routable.d/50-network-optimize-initcwnd"
 
 # shellcheck source=../modules/network-optimize.sh
@@ -50,7 +52,6 @@ reset_selection() {
     MANUAL_UPLOAD_MBPS=""
     MANUAL_RTT_MS=""
     MANUAL_RTT_DEFAULTED=false
-    CUSTOM_RTT_TARGETS=()
     INITCWND_MODE=auto
     INITCWND_ENABLED=true
     INITCWND_POLICY=unknown
@@ -139,9 +140,7 @@ parse_arguments install --download-mbps 1000
 assert_eq true "$NO_PROBE" "manual bandwidth never triggers active probing"
 assert_eq 150 "$MANUAL_RTT_MS" "manual bandwidth defaults missing RTT to 150 ms"
 assert_eq true "$MANUAL_RTT_DEFAULTED" "manual bandwidth records default RTT source"
-assert_fail "custom target requires explicit probe consent" parse_arguments plan --target example.com
-reset_selection
-assert_ok "custom target accepts explicit probe consent" parse_arguments plan --probe --target example.com
+assert_fail "removed custom RTT target is rejected" parse_arguments plan --probe --target example.com
 
 prepare_dynamic_case() {
     TUNING_MODE=auto
@@ -154,7 +153,6 @@ prepare_dynamic_case() {
     DETECTED_DOWNLOAD_MBPS=""
     DETECTED_UPLOAD_MBPS=""
     DETECTED_RTT_MS=""
-    OBSERVED_RTT_MS=""
     RTT_SOURCE=unknown
     RTT_POLICY=unknown
     BANDWIDTH_SOURCE=unknown
@@ -169,46 +167,29 @@ probe_bandwidth() {
     DETECTED_DOWNLOAD_MBPS=1000
     DETECTED_UPLOAD_MBPS=500
 }
-detect_rtt() {
-    DETECTED_RTT_MS=40
-    RTT_SOURCE="test active probe"
-}
-prepare_dynamic_case
-resolve_tuning_values >/dev/null
-assert_eq 40 "$OBSERVED_RTT_MS" "active probe records RTT below 150 ms"
-assert_eq 150 "$DETECTED_RTT_MS" "active probe restores 150 ms coverage floor"
-assert_eq 'max(observed RTT, 150 ms coverage floor)' "$RTT_POLICY" \
-    "active probe records coverage-floor policy"
-assert_eq 39845888 "$RMEM_MAX_BYTES" "active probe uses coverage-floor RTT in calculation"
+for observed_rtt in 40 180 300; do
+    prepare_dynamic_case
+    DETECTED_RTT_MS="$observed_rtt"
+    resolve_tuning_values >/dev/null
+    assert_eq 150 "$DETECTED_RTT_MS" \
+        "automatic calculation ignores observed ${observed_rtt} ms and uses 150 ms"
+    assert_eq 'fixed 150 ms' "$RTT_POLICY" \
+        "automatic ${observed_rtt} ms case records fixed policy"
+done
+assert_eq 39845888 "$RMEM_MAX_BYTES" "automatic calculation uses fixed 150 ms for buffer max"
 
-detect_rtt() {
-    DETECTED_RTT_MS=180
-    RTT_SOURCE="test active probe"
-}
-prepare_dynamic_case
-resolve_tuning_values >/dev/null
-assert_eq 180 "$OBSERVED_RTT_MS" "active probe records RTT above 150 ms"
-assert_eq 180 "$DETECTED_RTT_MS" "active RTT above coverage floor is unchanged"
-
-prepare_dynamic_case
-NO_PROBE=true
-MANUAL_DOWNLOAD_MBPS=1000
-MANUAL_UPLOAD_MBPS=500
-MANUAL_RTT_MS=40
-resolve_tuning_values >/dev/null
-assert_eq '' "$OBSERVED_RTT_MS" "manual RTT is not reported as observed"
-assert_eq 40 "$DETECTED_RTT_MS" "manual RTT below 150 ms remains unchanged"
-assert_eq 'manual override (no automatic floor)' "$RTT_POLICY" \
-    "manual RTT records strict override policy"
-
-detect_rtt() { return 1; }
-prepare_dynamic_case
-resolve_tuning_values >/dev/null
-assert_eq 150 "$DETECTED_RTT_MS" "failed active probe falls back to 150 ms"
-assert_eq 'default after failed active probe' "$RTT_SOURCE" \
-    "failed active probe records fallback source"
-assert_eq '150 ms fallback' "$RTT_POLICY" "failed active probe records fallback policy"
-assert_eq 39845888 "$RMEM_MAX_BYTES" "failed active probe uses fallback RTT in calculation"
+for manual_rtt in 40 300; do
+    prepare_dynamic_case
+    NO_PROBE=true
+    MANUAL_DOWNLOAD_MBPS=1000
+    MANUAL_UPLOAD_MBPS=500
+    MANUAL_RTT_MS="$manual_rtt"
+    resolve_tuning_values >/dev/null
+    assert_eq "$manual_rtt" "$DETECTED_RTT_MS" \
+        "manual RTT ${manual_rtt} ms remains unchanged"
+    assert_eq 'manual override' "$RTT_POLICY" \
+        "manual RTT ${manual_rtt} ms records override policy"
+done
 
 INITCWND_MODE=auto
 DETECTED_UPLOAD_MBPS=100
@@ -220,10 +201,21 @@ INITCWND_MODE=auto
 DETECTED_UPLOAD_MBPS=101
 resolve_initcwnd_policy
 assert_eq true "$INITCWND_ENABLED" "auto initcwnd enables 32 above 100 Mbps"
+INITCWND_MODE=auto
+DETECTED_UPLOAD_MBPS=""
+resolve_initcwnd_policy
+assert_eq false "$INITCWND_ENABLED" "auto initcwnd keeps kernel default when upload is unknown"
+assert_eq 'auto: upload unknown, preserve kernel default' "$INITCWND_POLICY" \
+    "auto initcwnd explains unknown-upload policy"
 INITCWND_MODE=enabled
 DETECTED_UPLOAD_MBPS=10
-resolve_initcwnd_policy
+initcwnd_warning_log="$TEMP_DIR/initcwnd-warning.log"
+resolve_initcwnd_policy > "$initcwnd_warning_log"
+initcwnd_warning=$(<"$initcwnd_warning_log")
 assert_eq true "$INITCWND_ENABLED" "explicit initcwnd enable overrides low upload"
+grep -Fq '不高于 100 Mbps' <<< "$initcwnd_warning" ||
+    fail "explicit low-bandwidth initcwnd enable did not warn"
+printf 'PASS: explicit low-bandwidth initcwnd enable warns\n'
 INITCWND_MODE=disabled
 DETECTED_UPLOAD_MBPS=1000
 resolve_initcwnd_policy
@@ -249,7 +241,24 @@ NETWORK_TEST_TOTAL=85000000000
 assert_ok "active probe budget stops at reserved total threshold" \
     traffic_budget_reached upload
 
+ROUTE_GET_LOG="$TEMP_DIR/route-get-target"
+ip() {
+    [[ "$1 $2 $3" == '-4 route get' ]] || return 1
+    printf '%s\n' "$4" > "$ROUTE_GET_LOG"
+    printf '%s via 192.0.2.1 dev eth7 src 192.0.2.2\n' "$4"
+}
+read_iface_counter() {
+    [[ "$1" == eth7 ]] || return 1
+    case "$2" in rx) printf '%s\n' 100 ;; tx) printf '%s\n' 200 ;; *) return 1 ;; esac
+}
+traffic_mark 198.51.100.25
+assert_eq eth7 "$PROBE_IFACE" "traffic accounting uses actual target route interface"
+assert_eq 198.51.100.25 "$(cat "$ROUTE_GET_LOG")" "traffic accounting routes the real IPv4 target"
+unset -f ip read_iface_counter
+
 generated_config="$TEMP_DIR/generated.conf"
+prepare_dynamic_case
+resolve_tuning_values >/dev/null
 ECN_DISABLED=false
 create_network_config "$generated_config" false
 if grep -Eq '^net[.]ipv4[.]tcp_ecn[[:space:]]*=' "$generated_config"; then
@@ -269,18 +278,68 @@ for retired_key in \
         fail "generated config still owns $retired_key"
     fi
 done
-assert_eq '4096 4194304 39845888' \
+assert_eq '4096 2097152 39845888' \
     "$(read_saved_sysctl_value "$generated_config" net.ipv4.tcp_rmem)" \
-    "generated config uses BDP-derived receive start"
-assert_eq '4096 4194304 20971520' \
+    "generated config uses fixed 2 MiB receive default"
+assert_eq '4096 2097152 20971520' \
     "$(read_saved_sysctl_value "$generated_config" net.ipv4.tcp_wmem)" \
-    "generated config uses BDP-derived send start"
+    "generated config uses fixed 2 MiB send default"
 printf 'PASS: default generated config leaves retired global parameters unmanaged\n'
 
 ECN_DISABLED=true
 create_network_config "$generated_config" false
 assert_eq '0' "$(read_saved_sysctl_value "$generated_config" net.ipv4.tcp_ecn)" \
     "explicit disable writes tcp_ecn=0"
+
+mkdir -p "$IPV6_CONF_ROOT"/{all,default,eth0,eth1,br0,veth123}
+touch "$IPV6_CONF_ROOT/all/forwarding" "$IPV6_CONF_ROOT/all/accept_ra"
+for ra_iface in default eth0 eth1 br0 veth123; do
+    touch "$IPV6_CONF_ROOT/$ra_iface/accept_ra"
+done
+IPV6_ROUTE_GET_IFACE=eth1
+IPV6_DEFAULT_IFACE=eth0
+ip() {
+    case "$1 $2 $3" in
+        '-6 route get')
+            [[ -n "$IPV6_ROUTE_GET_IFACE" ]] &&
+                printf '2606:4700:4700::1111 via 2001:db8::1 dev %s src 2001:db8::2\n' \
+                    "$IPV6_ROUTE_GET_IFACE"
+            ;;
+        '-6 route show')
+            [[ -n "$IPV6_DEFAULT_IFACE" ]] &&
+                printf 'default via 2001:db8::1 dev %s proto ra metric 100\n' \
+                    "$IPV6_DEFAULT_IFACE"
+            ;;
+        *) return 1 ;;
+    esac
+}
+ra_config="$TEMP_DIR/ra.conf"
+: > "$ra_config"
+append_ipv6_forwarding_config "$ra_config"
+grep -Fq 'net.ipv6.conf.eth1.accept_ra = 2' "$ra_config" ||
+    fail "actual IPv6 route interface did not receive accept_ra=2"
+for excluded_iface in eth0 br0 veth123; do
+    ! grep -Fq "net.ipv6.conf.${excluded_iface}.accept_ra = 2" "$ra_config" ||
+        fail "non-egress interface $excluded_iface incorrectly received accept_ra=2"
+done
+printf 'PASS: multiple NICs select only actual IPv6 default egress and exclude bridge/veth\n'
+
+IPV6_ROUTE_GET_IFACE=""
+IPV6_DEFAULT_IFACE=eth0
+: > "$ra_config"
+append_ipv6_forwarding_config "$ra_config"
+grep -Fq 'net.ipv6.conf.eth0.accept_ra = 2' "$ra_config" ||
+    fail "IPv6 default-route fallback did not select eth0"
+printf 'PASS: IPv6 default-route fallback selects one egress\n'
+
+IPV6_ROUTE_GET_IFACE=""
+IPV6_DEFAULT_IFACE=""
+: > "$ra_config"
+append_ipv6_forwarding_config "$ra_config"
+! grep -Eq '^net[.]ipv6[.]conf[.].+[.]accept_ra = 2$' "$ra_config" ||
+    fail "accept_ra=2 was generated without an IPv6 default route"
+printf 'PASS: no IPv6 default route generates no per-interface accept_ra=2\n'
+unset -f ip
 
 managed_config="$TEMP_DIR/managed.conf"
 initial_runtime="$TEMP_DIR/initial-runtime"
@@ -484,5 +543,40 @@ if grep -Eq '^net[.]ipv4[.]ip_local_port_range[[:space:]]*=' \
     fail "generated sysctl configuration still owns ip_local_port_range"
 fi
 printf 'PASS: generated sysctl configuration no longer owns ip_local_port_range\n'
+
+# Failed staging must not destroy the prior previous-backup snapshot.
+mkdir -p "$(dirname "$NETWORK_CONF")"
+printf '%s\n' 'current config' > "$NETWORK_CONF"
+printf '%s\n' 'initial config' > "$NETWORK_INITIAL_BACKUP"
+printf '%s\n' 'old previous config' > "$NETWORK_PREVIOUS_BACKUP"
+cp() { return 1; }
+assert_fail "staging copy failure is reported" backup_managed_file \
+    "$NETWORK_CONF" "$NETWORK_INITIAL_BACKUP" "$NETWORK_PREVIOUS_BACKUP" \
+    "$NETWORK_INITIAL_ABSENT" "$NETWORK_PREVIOUS_ABSENT"
+unset -f cp
+assert_eq 'old previous config' "$(cat "$NETWORK_PREVIOUS_BACKUP")" \
+    "failed staging copy preserves old previous backup"
+
+# Restore must accumulate route failure and never report overall success.
+printf '%s\n' 'restored config' > "$NETWORK_PREVIOUS_BACKUP"
+apply_network_config() { return 0; }
+restore_default_route() { return 1; }
+restore_log="$TEMP_DIR/restore-failure.log"
+if restore_optimization previous > "$restore_log" 2>&1; then
+    fail "route restore failure unexpectedly returned success"
+fi
+grep -Fq '恢复项 route：失败' "$restore_log" ||
+    fail "route restore failure was not named"
+grep -Fq '部分恢复：失败项 route' "$restore_log" ||
+    fail "partial restore summary omitted route"
+! grep -Fq '网络配置已恢复到 previous 状态' "$restore_log" ||
+    fail "partial restore incorrectly reported overall success"
+printf 'PASS: route restore failure returns nonzero without overall success\n'
+
+if grep -Eq 'restore_legacy_limits|LIMITS_|/etc/security/limits|[.]conf[.]disabled' \
+    "$ROOT_DIR/modules/network-optimize.sh"; then
+    fail "legacy limits management code remains in network-optimize.sh"
+fi
+printf 'PASS: legacy limits functions, constants, calls, and paths are absent\n'
 
 printf 'All network-optimize entry tests passed.\n'

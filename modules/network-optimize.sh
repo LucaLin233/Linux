@@ -4,6 +4,8 @@
 # linux-setup:depends=
 # linux-setup:enabled=true
 # 网络优化模块
+# TCP 调优仅覆盖 IPv4；IPv6 forwarding/RA 仅维护转发正确性。
+# 部分策略参考 Kylin010/tcpfit v0.5.6（MIT，提交 67c0bdfb35dd98e86982600298237b6ecc08ebe4）。
 # 功能：配置 BBR、fq、TCP 缓冲区及 RA 安全的双栈转发；主动探测必须明确选择。
 # 无参数交互运行会选择静态、手填或自动探测；非交互运行默认使用静态缓冲区。
 #
@@ -21,7 +23,6 @@
 #   --download-mbps N            手动指定下载带宽
 #   --upload-mbps N              手动指定上传带宽
 #   --rtt-ms N                   手动指定 RTT
-#   --target HOST                自定义 RTT 目标，可重复指定；需配合 --probe
 #   --no-probe                   不发起网络探测；缺失数据时按内存保守配置
 #   --disable-ecn                禁用 ECN，回退到传统丢包信号
 #   --enable-initcwnd            强制设置初始拥塞窗口为 32
@@ -30,12 +31,12 @@
 set -euo pipefail
 
 # === 常量定义 ===
-readonly NETWORK_CONF="/etc/sysctl.d/99-network-optimize.conf"
-readonly NETWORK_INITIAL_BACKUP="/etc/sysctl.d/99-network-optimize.conf.initial-backup"
-readonly NETWORK_PREVIOUS_BACKUP="/etc/sysctl.d/99-network-optimize.conf.previous-backup"
-readonly NETWORK_INITIAL_ABSENT="/etc/sysctl.d/99-network-optimize.conf.initial-absent"
-readonly NETWORK_INITIAL_UNKNOWN="/etc/sysctl.d/99-network-optimize.conf.initial-unknown"
-readonly NETWORK_PREVIOUS_ABSENT="/etc/sysctl.d/99-network-optimize.conf.previous-absent"
+readonly NETWORK_CONF="${NETWORK_OPTIMIZE_CONF:-/etc/sysctl.d/99-network-optimize.conf}"
+readonly NETWORK_INITIAL_BACKUP="${NETWORK_CONF}.initial-backup"
+readonly NETWORK_PREVIOUS_BACKUP="${NETWORK_CONF}.previous-backup"
+readonly NETWORK_INITIAL_ABSENT="${NETWORK_CONF}.initial-absent"
+readonly NETWORK_INITIAL_UNKNOWN="${NETWORK_CONF}.initial-unknown"
+readonly NETWORK_PREVIOUS_ABSENT="${NETWORK_CONF}.previous-absent"
 readonly BBR_MODULES_FILE="/etc/modules-load.d/network-optimize-bbr.conf"
 readonly BBR_MODULES_INITIAL_BACKUP="${BBR_MODULES_FILE}.initial-backup"
 readonly BBR_MODULES_PREVIOUS_BACKUP="${BBR_MODULES_FILE}.previous-backup"
@@ -96,24 +97,12 @@ speedtest.nyc1.us.leaseweb.net|纽约|Leaseweb
 speedtest.mia11.us.leaseweb.net|迈阿密|Leaseweb
 speedtest.mtl2.ca.leaseweb.net|蒙特利尔|Leaseweb'
 
-# 中国大陆目标参考 tcpfit，刻意排除可能在海外命中 Anycast 的 223.5.5.5。
-readonly -a CHINA_PING_TARGETS=(
-    119.29.29.29
-    180.76.76.76
-    202.96.128.86
-    1.2.4.8
-    101.226.4.6
-)
-readonly -a GLOBAL_PING_TARGETS=(1.1.1.1 8.8.8.8 9.9.9.9)
-readonly -a CHINA_TCP_TARGETS=(www.baidu.com www.qq.com www.163.com)
-readonly -a GLOBAL_TCP_TARGETS=(www.cloudflare.com www.google.com www.wikipedia.org)
-readonly AUTO_RTT_MIN_MS=10
-readonly AUTO_RTT_MAX_MS=300
 readonly DEFAULT_RTT_MS=150
 readonly INITCWND_AUTO_UPLOAD_LIMIT_MBPS=100
-readonly TCP_BUFFER_DEFAULT_MIN_BYTES=$((1 * 1024 * 1024))
-readonly TCP_BUFFER_DEFAULT_FALLBACK_BYTES=$((2 * 1024 * 1024))
-readonly TCP_BUFFER_DEFAULT_MAX_BYTES=$((4 * 1024 * 1024))
+readonly TCP_BUFFER_DEFAULT_BYTES=$((2 * 1024 * 1024))
+readonly IPERF_DEADLINE_GRACE_SECONDS=15
+readonly IPERF_KILL_AFTER_SECONDS=3
+readonly IPV6_CONF_ROOT="${NETWORK_OPTIMIZE_IPV6_CONF_ROOT:-/proc/sys/net/ipv6/conf}"
 
 # 仅用于从旧版受管配置迁移；新配置不再写入这些全局参数。
 readonly -a RETIRED_SYSCTL_KEYS=(
@@ -142,20 +131,12 @@ MANUAL_DOWNLOAD_MBPS=""
 MANUAL_UPLOAD_MBPS=""
 MANUAL_RTT_MS=""
 MANUAL_RTT_DEFAULTED="false"
-declare -a CUSTOM_RTT_TARGETS=()
 
 DETECTED_DOWNLOAD_MBPS=""
 DETECTED_UPLOAD_MBPS=""
 DETECTED_RTT_MS=""
-OBSERVED_RTT_MS=""
 RTT_SOURCE="unknown"
 RTT_POLICY="unknown"
-CHINA_RTT_MS=""
-GLOBAL_RTT_MS=""
-CHINA_RTT_METHOD=""
-GLOBAL_RTT_METHOD=""
-CHINA_RTT_SAMPLES=""
-GLOBAL_RTT_SAMPLES=""
 BANDWIDTH_SOURCE="unknown"
 PHYSICAL_RAM_MB=0
 RAM_MB=0
@@ -164,15 +145,19 @@ RX_BDP_BYTES=0
 TX_BDP_BYTES=0
 RMEM_MAX_BYTES=33554432
 WMEM_MAX_BYTES=33554432
-RMEM_DEFAULT_BYTES=$TCP_BUFFER_DEFAULT_FALLBACK_BYTES
-WMEM_DEFAULT_BYTES=$TCP_BUFFER_DEFAULT_FALLBACK_BYTES
+RMEM_DEFAULT_BYTES=$TCP_BUFFER_DEFAULT_BYTES
+WMEM_DEFAULT_BYTES=$TCP_BUFFER_DEFAULT_BYTES
 CALCULATION_REASON="static 32 MiB"
 RMEM_REASON="static 32 MiB"
 WMEM_REASON="static 32 MiB"
 PROBE_IFACE=""
-TRAFFIC_RX_START=0
-TRAFFIC_TX_START=0
+PROBE_ENVIRONMENT_SHOWN="false"
+declare -a TRAFFIC_IFACES=()
+declare -A TRAFFIC_RX_START_BY_IFACE=()
+declare -A TRAFFIC_TX_START_BY_IFACE=()
+declare -a IPERF_RUNNER_PIDS=()
 PREFERRED_IPERF_PORT=""
+CLOUDFLARE_IPV4=""
 VERIFY_ASSUME_YES="false"
 VERIFY_CONFIRM_EXPLICIT="false"
 VERIFY_TEMP_DIR=""
@@ -185,12 +170,6 @@ readonly LEGACY_KERNEL_ARCHIVE="/etc/sysctl.d/99-kernel.conf.legacy"
 # 旧版脚本可能迁移过的主 sysctl 文件。
 readonly LEGACY_SYSCTL_CONF="/etc/sysctl.conf"
 readonly LEGACY_SYSCTL_BACKUP="/etc/sysctl.conf.bak"
-
-# 旧版脚本写入 limits.conf 的标记与备份。
-readonly LIMITS_CONF="/etc/security/limits.conf"
-readonly LIMITS_BACKUP="/etc/security/limits.conf.bak"
-readonly LIMITS_LEGACY_ARCHIVE="/etc/security/limits.conf.network-optimize.before-restore"
-readonly LEGACY_LIMITS_MARKER="# Network Optimizer - 系统资源限制"
 
 # === 日志函数 ===
 log() {
@@ -237,6 +216,75 @@ detail() {
 }
 
 
+stage_managed_state() {
+    local target="$1"
+    local backup="$2"
+    local absent="$3"
+    local stage
+
+    install -d -m 0755 "$(dirname "$backup")" || return 1
+    if [[ -e "$target" || -L "$target" ]]; then
+        stage=$(mktemp "${backup}.new.XXXXXX") || return 1
+        rm -f "$stage"
+        if ! cp -a -- "$target" "$stage"; then
+            rm -f "$stage"
+            return 1
+        fi
+        if ! mv -f -- "$stage" "$backup"; then
+            rm -f "$stage"
+            return 1
+        fi
+        rm -f "$absent"
+    else
+        stage=$(mktemp "${absent}.new.XXXXXX") || return 1
+        chmod 600 "$stage" || {
+            rm -f "$stage"
+            return 1
+        }
+        if ! mv -f -- "$stage" "$absent"; then
+            rm -f "$stage"
+            return 1
+        fi
+        rm -f "$backup"
+    fi
+}
+
+atomic_install_file() {
+    local source_file="$1"
+    local destination="$2"
+    local mode="${3:-0600}"
+    local stage
+
+    install -d -m 0755 "$(dirname "$destination")" || return 1
+    stage=$(mktemp "${destination}.new.XXXXXX") || return 1
+    if ! install -m "$mode" "$source_file" "$stage"; then
+        rm -f "$stage"
+        return 1
+    fi
+    if ! mv -f -- "$stage" "$destination"; then
+        rm -f "$stage"
+        return 1
+    fi
+}
+
+atomic_write_file() {
+    local destination="$1"
+    local content="$2"
+    local mode="${3:-0600}"
+    local stage
+
+    install -d -m 0755 "$(dirname "$destination")" || return 1
+    stage=$(mktemp "${destination}.new.XXXXXX") || return 1
+    if ! printf '%s\n' "$content" > "$stage" || ! chmod "$mode" "$stage"; then
+        rm -f "$stage"
+        return 1
+    fi
+    if ! mv -f -- "$stage" "$destination"; then
+        rm -f "$stage"
+        return 1
+    fi
+}
+
 backup_managed_file() {
     local target="$1"
     local initial_backup="$2"
@@ -247,19 +295,10 @@ backup_managed_file() {
     local initial_unknown="${initial_backup%.initial-backup}.initial-unknown"
 
     if [[ ! -e "$initial_backup" && ! -e "$initial_absent" && ! -e "$initial_unknown" ]]; then
-        if [[ -e "$target" || -L "$target" ]]; then
-            cp -a "$target" "$initial_backup" || return 1
-        else
-            install -D -m 0600 /dev/null "$initial_absent" || return 1
-        fi
+        stage_managed_state "$target" "$initial_backup" "$initial_absent" || return 1
     fi
 
-    rm -f "$previous_backup" "$previous_absent"
-    if [[ -e "$target" || -L "$target" ]]; then
-        cp -a "$target" "$previous_backup" || return 1
-    else
-        install -D -m 0600 /dev/null "$previous_absent" || return 1
-    fi
+    stage_managed_state "$target" "$previous_backup" "$previous_absent"
 }
 
 restore_managed_file() {
@@ -379,53 +418,6 @@ migrate_legacy_sysctl_conf() {
     warn "检测到 $LEGACY_SYSCTL_CONF；为保留现有系统配置，不自动迁移或覆盖"
 }
 
-restore_legacy_limits() {
-    local restored=false
-    local disabled_file
-    local original_file
-
-    # 仅当当前 limits.conf 明确包含旧脚本标记时才恢复，
-    # 避免影响非本脚本管理的资源限制。
-    if [[ -f "$LIMITS_CONF" ]] &&
-        grep -Fq "$LEGACY_LIMITS_MARKER" "$LIMITS_CONF"; then
-        if [[ -f "$LIMITS_BACKUP" ]]; then
-            cp -a "$LIMITS_CONF" "$LIMITS_LEGACY_ARCHIVE"
-            cp -a "$LIMITS_BACKUP" "$LIMITS_CONF"
-            chmod 644 "$LIMITS_CONF" 2>/dev/null || true
-
-            info "已恢复 limits.conf 到旧脚本运行前的备份状态"
-            info "恢复前的旧优化配置已保存至：$LIMITS_LEGACY_ARCHIVE"
-            restored=true
-        else
-            warn "检测到旧版 limits 配置，但未找到 $LIMITS_BACKUP，无法安全恢复"
-        fi
-    fi
-
-    # 恢复旧脚本禁用的 nproc 配置文件。
-    # 新版不再管理 nproc；恢复后交由系统默认规则处理。
-    for disabled_file in /etc/security/limits.d/*.conf.disabled; do
-        [[ -f "$disabled_file" ]] || continue
-
-        original_file="${disabled_file%.disabled}"
-
-        if [[ -e "$original_file" ]]; then
-            warn "跳过恢复 $disabled_file：目标文件已存在"
-            continue
-        fi
-
-        if mv "$disabled_file" "$original_file"; then
-            info "已恢复资源限制文件：$original_file"
-            restored=true
-        else
-            warn "恢复资源限制文件失败：$disabled_file"
-        fi
-    done
-
-    if [[ "$restored" == "false" ]]; then
-        info "未检测到需要恢复的旧版资源限制配置"
-    fi
-}
-
 # === 一次性动态探测与计算 ===
 is_positive_integer() {
     [[ "$1" =~ ^[0-9]+$ ]] && (( 10#$1 >= $2 && 10#$1 <= $3 ))
@@ -452,7 +444,7 @@ parse_arguments() {
                 TUNING_SELECTION_EXPLICIT="true"
                 shift
                 ;;
-            --bandwidth-mbps|--download-mbps|--upload-mbps|--rtt-ms|--target)
+            --bandwidth-mbps|--download-mbps|--upload-mbps|--rtt-ms)
                 if (( $# < 2 )); then
                     error "参数 $1 缺少值"
                     return 1
@@ -463,7 +455,6 @@ parse_arguments() {
                     --download-mbps) MANUAL_DOWNLOAD_MBPS="$2" ;;
                     --upload-mbps) MANUAL_UPLOAD_MBPS="$2" ;;
                     --rtt-ms) MANUAL_RTT_MS="$2" ;;
-                    --target) CUSTOM_RTT_TARGETS+=("$2") ;;
                 esac
                 shift 2
                 ;;
@@ -545,23 +536,9 @@ parse_arguments() {
         return 1
     fi
 
-    local target
-    for target in "${CUSTOM_RTT_TARGETS[@]}"; do
-        if [[ ! "$target" =~ ^[A-Za-z0-9._-]+$ ]]; then
-            error "无效 RTT 目标: $target"
-            return 1
-        fi
-    done
-
     if [[ "$TUNING_MODE" == "static" ]] &&
-        [[ -n "$MANUAL_BANDWIDTH_MBPS$MANUAL_DOWNLOAD_MBPS$MANUAL_UPLOAD_MBPS$MANUAL_RTT_MS" ||
-            ${#CUSTOM_RTT_TARGETS[@]} -gt 0 ]]; then
-        error "--static 不能与动态带宽、RTT 或目标参数同时使用"
-        return 1
-    fi
-
-    if (( ${#CUSTOM_RTT_TARGETS[@]} > 0 )) && [[ "$ACTIVE_PROBE_REQUESTED" != "true" ]]; then
-        error "--target 必须与 --probe 或 --auto 一起使用"
+        [[ -n "$MANUAL_BANDWIDTH_MBPS$MANUAL_DOWNLOAD_MBPS$MANUAL_UPLOAD_MBPS$MANUAL_RTT_MS" ]]; then
+        error "--static 不能与动态带宽或 RTT 参数同时使用"
         return 1
     fi
 
@@ -583,7 +560,7 @@ parse_arguments() {
     fi
     if [[ "$COMMAND" == "verify" ]] &&
         [[ -n "$MANUAL_BANDWIDTH_MBPS$MANUAL_DOWNLOAD_MBPS$MANUAL_UPLOAD_MBPS$MANUAL_RTT_MS" ||
-            ${#CUSTOM_RTT_TARGETS[@]} -gt 0 || "$TUNING_SELECTION_EXPLICIT" == "true" ||
+            "$TUNING_SELECTION_EXPLICIT" == "true" ||
             "$ECN_DISABLED" == "true" || "$INITCWND_MODE" != "auto" ]]; then
         error "verify 仅接受 --yes；不会安装或应用网络优化"
         return 1
@@ -597,7 +574,8 @@ is_interactive_terminal() {
 show_active_probe_warning() {
     warn "主动探测会安装缺失的 curl、ping、iperf3、jq 等工具"
     warn "典型流量约等于 32 秒线速传输：1 Gbps 约 4 GB，2.5 Gbps 约 10 GB，10 Gbps 约 40 GB"
-    warn "安全上限为单方向 45 GB、合计 90 GB；达到 40/85 GB 时提前终止测速"
+    warn "安全硬上限为单方向 45 GB、合计 90 GB；达到 40/85 GB 时提前终止测速"
+    warn "流量按实际 IPv4 目标的路由接口分别计量并汇总；接口计数含后台流量，属于保守预算"
 }
 
 select_tuning_mode() {
@@ -771,17 +749,6 @@ calculate_memory_cap() {
     echo "$cap"
 }
 
-median_values() {
-    sort -n | awk '
-        { values[NR] = $1 }
-        END {
-            if (NR == 0) exit 1
-            if (NR % 2) print values[(NR + 1) / 2]
-            else printf "%.0f\n", (values[NR / 2] + values[NR / 2 + 1]) / 2
-        }
-    '
-}
-
 cleanup_temp_dir() {
     local directory="$1"
     local file
@@ -797,167 +764,6 @@ measure_ping_target() {
     local target="$1"
     ping -4 -c 3 -q -W 2 "$target" 2>/dev/null |
         awk -F/ '/rtt|round-trip/ {printf "%.0f\n", $5}'
-}
-
-measure_ping_group() {
-    local temp_dir
-    local target
-    local index=0
-    local value
-    local values=()
-
-    command -v ping >/dev/null 2>&1 || return 1
-    temp_dir=$(mktemp -d) || return 1
-
-    for target in "$@"; do
-        ((index += 1))
-        (measure_ping_target "$target" > "$temp_dir/$index" 2>/dev/null) &
-    done
-    wait || true
-
-    for value in "$temp_dir"/*; do
-        [[ -s "$value" ]] || continue
-        values+=("$(cat "$value")")
-    done
-    cleanup_temp_dir "$temp_dir"
-
-    (( ${#values[@]} > 0 )) || return 1
-    printf '%s %s %s\n' \
-        "$(printf '%s\n' "${values[@]}" | median_values)" \
-        "${#values[@]}" "$#"
-}
-
-measure_tcp_target() {
-    local target="$1"
-    local result
-    local lookup
-    local connected
-    local milliseconds
-    local values=()
-
-    for _ in 1 2 3; do
-        result=$(curl -4 --noproxy '*' --head --silent --output /dev/null \
-            --connect-timeout 3 --max-time 5 \
-            --write-out '%{time_namelookup} %{time_connect}' \
-            "https://$target/" 2>/dev/null) || continue
-        read -r lookup connected <<< "$result"
-        milliseconds=$(awk -v lookup="$lookup" -v connected="$connected" '
-            BEGIN {
-                value = (connected - lookup) * 1000
-                if (value > 0 && value <= 5000) printf "%.0f", value
-            }
-        ')
-        [[ -n "$milliseconds" ]] && values+=("$milliseconds")
-    done
-
-    (( ${#values[@]} > 0 )) || return 1
-    printf '%s\n' "${values[@]}" | median_values
-}
-
-measure_tcp_group() {
-    local temp_dir
-    local target
-    local index=0
-    local value
-    local values=()
-
-    command -v curl >/dev/null 2>&1 || return 1
-    temp_dir=$(mktemp -d) || return 1
-
-    for target in "$@"; do
-        ((index += 1))
-        (measure_tcp_target "$target" > "$temp_dir/$index" 2>/dev/null) &
-    done
-    wait || true
-
-    for value in "$temp_dir"/*; do
-        [[ -s "$value" ]] || continue
-        values+=("$(cat "$value")")
-    done
-    cleanup_temp_dir "$temp_dir"
-
-    (( ${#values[@]} > 0 )) || return 1
-    printf '%s %s %s\n' \
-        "$(printf '%s\n' "${values[@]}" | median_values)" \
-        "${#values[@]}" "$#"
-}
-
-clamp_auto_rtt() {
-    local value="$1"
-    (( value < AUTO_RTT_MIN_MS )) && value=$AUTO_RTT_MIN_MS
-    (( value > AUTO_RTT_MAX_MS )) && value=$AUTO_RTT_MAX_MS
-    echo "$value"
-}
-
-detect_rtt() {
-    local china_result=""
-    local global_result=""
-    local custom_result=""
-    local custom_rtt=""
-    local custom_success=""
-    local custom_total=""
-
-    if (( ${#CUSTOM_RTT_TARGETS[@]} > 0 )); then
-        custom_result=$(measure_ping_group "${CUSTOM_RTT_TARGETS[@]}" || true)
-        if [[ -n "$custom_result" ]]; then
-            RTT_SOURCE="custom ICMP"
-        else
-            custom_result=$(measure_tcp_group "${CUSTOM_RTT_TARGETS[@]}" || true)
-            [[ -n "$custom_result" ]] && RTT_SOURCE="custom TCP/443"
-        fi
-        [[ -n "$custom_result" ]] || return 1
-        read -r custom_rtt custom_success custom_total <<< "$custom_result"
-        DETECTED_RTT_MS=$(clamp_auto_rtt "$custom_rtt")
-        RTT_SOURCE="$RTT_SOURCE, ${custom_success}/${custom_total} targets"
-        return 0
-    fi
-
-    china_result=$(measure_ping_group "${CHINA_PING_TARGETS[@]}" || true)
-    if [[ -n "$china_result" ]]; then
-        CHINA_RTT_METHOD="ICMP"
-    else
-        china_result=$(measure_tcp_group "${CHINA_TCP_TARGETS[@]}" || true)
-        [[ -n "$china_result" ]] && CHINA_RTT_METHOD="TCP/443"
-    fi
-    if [[ -n "$china_result" ]]; then
-        read -r CHINA_RTT_MS CHINA_RTT_SAMPLES _ <<< "$china_result"
-        CHINA_RTT_SAMPLES="$CHINA_RTT_SAMPLES/${#CHINA_PING_TARGETS[@]}"
-        [[ "$CHINA_RTT_METHOD" == "TCP/443" ]] &&
-            CHINA_RTT_SAMPLES="${CHINA_RTT_SAMPLES%/*}/${#CHINA_TCP_TARGETS[@]}"
-    fi
-
-    global_result=$(measure_ping_group "${GLOBAL_PING_TARGETS[@]}" || true)
-    if [[ -n "$global_result" ]]; then
-        GLOBAL_RTT_METHOD="ICMP"
-    else
-        global_result=$(measure_tcp_group "${GLOBAL_TCP_TARGETS[@]}" || true)
-        [[ -n "$global_result" ]] && GLOBAL_RTT_METHOD="TCP/443"
-    fi
-    if [[ -n "$global_result" ]]; then
-        read -r GLOBAL_RTT_MS GLOBAL_RTT_SAMPLES _ <<< "$global_result"
-        GLOBAL_RTT_SAMPLES="$GLOBAL_RTT_SAMPLES/${#GLOBAL_PING_TARGETS[@]}"
-        [[ "$GLOBAL_RTT_METHOD" == "TCP/443" ]] &&
-            GLOBAL_RTT_SAMPLES="${GLOBAL_RTT_SAMPLES%/*}/${#GLOBAL_TCP_TARGETS[@]}"
-    fi
-
-    if [[ -n "$CHINA_RTT_MS" && -n "$GLOBAL_RTT_MS" ]]; then
-        if (( CHINA_RTT_MS >= GLOBAL_RTT_MS )); then
-            DETECTED_RTT_MS="$CHINA_RTT_MS"
-        else
-            DETECTED_RTT_MS="$GLOBAL_RTT_MS"
-        fi
-        RTT_SOURCE="max(CN, global)"
-    elif [[ -n "$CHINA_RTT_MS" ]]; then
-        DETECTED_RTT_MS="$CHINA_RTT_MS"
-        RTT_SOURCE="CN targets"
-    elif [[ -n "$GLOBAL_RTT_MS" ]]; then
-        DETECTED_RTT_MS="$GLOBAL_RTT_MS"
-        RTT_SOURCE="global targets"
-    else
-        return 1
-    fi
-
-    DETECTED_RTT_MS=$(clamp_auto_rtt "$DETECTED_RTT_MS")
 }
 
 classify_active_qdisc() {
@@ -1079,16 +885,23 @@ backup_default_route() {
     local route
 
     route=$(default_ipv4_route)
-    rm -f "$ROUTE_PREVIOUS_BACKUP" "$ROUTE_PREVIOUS_OWNED"
-    [[ -n "$route" ]] || return 0
-    install -d -m 0755 "$NETWORK_OPTIMIZE_STATE_DIR"
-    printf '%s\n' "$route" > "$ROUTE_PREVIOUS_BACKUP"
-    chmod 600 "$ROUTE_PREVIOUS_BACKUP"
-    [[ ! -e "$ROUTE_OWNED_MARKER" ]] || install -m 0600 /dev/null "$ROUTE_PREVIOUS_OWNED"
-    if [[ ! -e "$ROUTE_INITIAL_BACKUP" && ! -e "$ROUTE_INITIAL_UNKNOWN" ]]; then
-        printf '%s\n' "$route" > "$ROUTE_INITIAL_BACKUP"
-        chmod 600 "$ROUTE_INITIAL_BACKUP"
-        [[ ! -e "$ROUTE_OWNED_MARKER" ]] || install -m 0600 /dev/null "$ROUTE_INITIAL_OWNED"
+    install -d -m 0755 "$NETWORK_OPTIMIZE_STATE_DIR" || return 1
+    if [[ -n "$route" ]]; then
+        atomic_write_file "$ROUTE_PREVIOUS_BACKUP" "$route" 0600 || return 1
+        if [[ -e "$ROUTE_OWNED_MARKER" ]]; then
+            atomic_write_file "$ROUTE_PREVIOUS_OWNED" "owned" 0600 || return 1
+        else
+            rm -f "$ROUTE_PREVIOUS_OWNED"
+        fi
+    else
+        rm -f "$ROUTE_PREVIOUS_BACKUP" "$ROUTE_PREVIOUS_OWNED"
+    fi
+
+    if [[ ! -e "$ROUTE_INITIAL_BACKUP" && ! -e "$ROUTE_INITIAL_UNKNOWN" && -n "$route" ]]; then
+        atomic_write_file "$ROUTE_INITIAL_BACKUP" "$route" 0600 || return 1
+        if [[ -e "$ROUTE_OWNED_MARKER" ]]; then
+            atomic_write_file "$ROUTE_INITIAL_OWNED" "owned" 0600 || return 1
+        fi
     fi
 }
 
@@ -1097,6 +910,10 @@ resolve_initcwnd_policy() {
         enabled)
             INITCWND_ENABLED="true"
             INITCWND_POLICY="explicit enabled"
+            if [[ "$DETECTED_UPLOAD_MBPS" =~ ^[0-9]+$ ]] &&
+                (( DETECTED_UPLOAD_MBPS <= INITCWND_AUTO_UPLOAD_LIMIT_MBPS )); then
+                warn "上传带宽不高于 100 Mbps；--enable-initcwnd 仍将强制设置 initcwnd/initrwnd=32"
+            fi
             ;;
         disabled)
             INITCWND_ENABLED="false"
@@ -1104,16 +921,15 @@ resolve_initcwnd_policy() {
             ;;
         auto)
             if [[ "$DETECTED_UPLOAD_MBPS" =~ ^[0-9]+$ ]] &&
-                (( DETECTED_UPLOAD_MBPS <= INITCWND_AUTO_UPLOAD_LIMIT_MBPS )); then
+                (( DETECTED_UPLOAD_MBPS > INITCWND_AUTO_UPLOAD_LIMIT_MBPS )); then
+                INITCWND_ENABLED="true"
+                INITCWND_POLICY="auto: upload > 100 Mbps, set 32"
+            elif [[ "$DETECTED_UPLOAD_MBPS" =~ ^[0-9]+$ ]]; then
                 INITCWND_ENABLED="false"
                 INITCWND_POLICY="auto: upload <= 100 Mbps, preserve kernel default"
             else
-                INITCWND_ENABLED="true"
-                if [[ "$DETECTED_UPLOAD_MBPS" =~ ^[0-9]+$ ]]; then
-                    INITCWND_POLICY="auto: upload > 100 Mbps, set 32"
-                else
-                    INITCWND_POLICY="auto: upload unknown, set 32"
-                fi
+                INITCWND_ENABLED="false"
+                INITCWND_POLICY="auto: upload unknown, preserve kernel default"
             fi
             ;;
     esac
@@ -1136,9 +952,65 @@ detect_initcwnd_state() {
     fi
 }
 
+render_initcwnd_hook() {
+    cat <<EOF
+#!/usr/bin/env bash
+# Managed by network-optimize.sh
+# network-optimize:initcwnd-hook:v1
+set -euo pipefail
+
+[[ -e "$ROUTE_OWNED_MARKER" ]] || exit 0
+routes=\$(ip -4 route show default 2>/dev/null || true)
+route=\${routes%%\$'\\n'*}
+[[ -n "\$route" ]] || exit 0
+read -r -a fields <<< "\$route"
+skip=false
+clean=()
+for token in "\${fields[@]}"; do
+    if [[ "\$skip" == "true" ]]; then
+        skip=false
+        continue
+    fi
+    case "\$token" in
+        initcwnd|initrwnd) skip=true ;;
+        *) clean+=("\$token") ;;
+    esac
+done
+(( \${#clean[@]} > 0 )) || exit 0
+ip -4 route replace "\${clean[@]}" initcwnd 32 initrwnd 32
+EOF
+}
+
 is_managed_initcwnd_hook() {
-    [[ -f "$INITCWND_ROUTE_HOOK" ]] &&
-        grep -Fq '# Managed by network-optimize.sh' "$INITCWND_ROUTE_HOOK"
+    local actual expected
+
+    [[ -f "$INITCWND_ROUTE_HOOK" ]] || return 1
+    actual=$(<"$INITCWND_ROUTE_HOOK")
+    expected=$(render_initcwnd_hook)
+    [[ "$actual" == "$expected" ]]
+}
+
+route_snapshot_proves_no_windows() {
+    local route_file="$1"
+    local unknown_marker="${2:-}"
+    local current_route snapshot_route
+
+    [[ -f "$route_file" ]] || return 1
+    [[ -z "$unknown_marker" || ! -e "$unknown_marker" ]] || return 1
+    snapshot_route=$(<"$route_file")
+    [[ -n "$snapshot_route" ]] || return 1
+    ! grep -Eq '(^| )(initcwnd|initrwnd) [0-9]+( |$)' <<< "$snapshot_route" || return 1
+
+    current_route=$(default_ipv4_route)
+    [[ -n "$current_route" ]] || return 1
+    [[ "$(strip_route_window_fields "$current_route")" == "$snapshot_route" ]]
+}
+
+initcwnd_settings_owned() {
+    [[ -e "$ROUTE_OWNED_MARKER" ]] && return 0
+    is_managed_initcwnd_hook && return 0
+    route_snapshot_proves_no_windows "$ROUTE_PREVIOUS_BACKUP" && return 0
+    route_snapshot_proves_no_windows "$ROUTE_INITIAL_BACKUP" "$ROUTE_INITIAL_UNKNOWN"
 }
 
 initcwnd_hook_status() {
@@ -1178,56 +1050,49 @@ write_initcwnd_hook() {
     fi
 
     temp_hook=$(mktemp "${INITCWND_ROUTE_HOOK}.new.XXXXXX") || return 1
-    cat > "$temp_hook" <<EOF
-#!/usr/bin/env bash
-# Managed by network-optimize.sh
-set -euo pipefail
-
-[[ -e "$ROUTE_OWNED_MARKER" ]] || exit 0
-routes=\$(ip -4 route show default 2>/dev/null || true)
-route=\${routes%%\$'\\n'*}
-[[ -n "\$route" ]] || exit 0
-read -r -a fields <<< "\$route"
-skip=false
-clean=()
-for token in "\${fields[@]}"; do
-    if [[ "\$skip" == "true" ]]; then
-        skip=false
-        continue
-    fi
-    case "\$token" in
-        initcwnd|initrwnd) skip=true ;;
-        *) clean+=("\$token") ;;
-    esac
-done
-(( \${#clean[@]} > 0 )) || exit 0
-ip -4 route replace "\${clean[@]}" initcwnd 32 initrwnd 32
-EOF
-    if ! install -m 0755 "$temp_hook" "$INITCWND_ROUTE_HOOK"; then
+    if ! render_initcwnd_hook > "$temp_hook" || ! chmod 0755 "$temp_hook"; then
         rm -f "$temp_hook"
         return 1
     fi
-    rm -f "$temp_hook"
+    if ! mv -f -- "$temp_hook" "$INITCWND_ROUTE_HOOK"; then
+        rm -f "$temp_hook"
+        return 1
+    fi
 }
 
 apply_initcwnd() {
     local route clean
+    local owned="false"
     local -a route_args=()
 
     if [[ "$INITCWND_ENABLED" != "true" ]]; then
-        remove_initcwnd_hook || return 1
-        [[ -e "$ROUTE_OWNED_MARKER" ]] || return 0
-        route=$(default_ipv4_route)
-        if [[ -z "$route" ]]; then
-            rm -f "$ROUTE_OWNED_MARKER"
-            success "已移除 initcwnd 持久化状态；当前没有 IPv4 默认路由需要清理"
+        initcwnd_settings_owned && owned="true"
+        if [[ "$owned" != "true" ]]; then
+            warn "当前默认路由的 initcwnd/initrwnd 无本脚本 ownership 证据，保留不动"
             return 0
         fi
-        clean=$(strip_route_window_fields "$route")
-        read -r -a route_args <<< "$clean"
-        ip -4 route replace "${route_args[@]}" || return 1
+        route=$(default_ipv4_route)
+        if [[ -n "$route" ]] &&
+            grep -Eq '(^| )(initcwnd|initrwnd) [0-9]+( |$)' <<< "$route"; then
+            clean=$(strip_route_window_fields "$route")
+            read -r -a route_args <<< "$clean"
+            ip -4 route replace "${route_args[@]}" || {
+                error "清理本脚本拥有的 initcwnd/initrwnd 失败"
+                return 1
+            }
+        fi
         rm -f "$ROUTE_OWNED_MARKER"
-        success "已移除本脚本设置的 initcwnd/initrwnd，恢复内核默认值"
+        if ! remove_initcwnd_hook; then
+            error "移除本脚本 initcwnd 持久化钩子失败"
+            return 1
+        fi
+        if [[ -z "$route" ]]; then
+            success "已移除 initcwnd 持久化状态；当前没有 IPv4 默认路由需要清理"
+        elif [[ -n "$clean" ]]; then
+            success "已移除本脚本设置的 initcwnd/initrwnd，恢复内核默认值"
+        else
+            success "已清理本脚本 initcwnd ownership 状态；路由已使用内核默认值"
+        fi
         return 0
     fi
     route=$(default_ipv4_route)
@@ -1261,9 +1126,12 @@ restore_default_route() {
     local -a route_args=()
 
     [[ -f "$route_file" ]] || {
-        [[ -e "$ROUTE_OWNED_MARKER" ]] || return 0
+        initcwnd_settings_owned || return 0
         route=$(default_ipv4_route)
-        [[ -n "$route" ]] || return 0
+        if [[ -z "$route" ]]; then
+            rm -f "$ROUTE_OWNED_MARKER"
+            return 0
+        fi
         route=$(strip_route_window_fields "$route")
     }
     [[ -n "$route" ]] || route=$(<"$route_file")
@@ -1277,40 +1145,78 @@ restore_default_route() {
     fi
 }
 
+detect_ipv4_iface_for_target() {
+    local target="$1"
+    local iface
+
+    iface=$(ip -4 route get "$target" 2>/dev/null | route_value_after dev)
+    [[ -n "$iface" ]] || return 1
+    printf '%s\n' "$iface"
+}
+
 read_iface_counter() {
-    local direction="$1"
-    cat "/sys/class/net/$PROBE_IFACE/statistics/${direction}_bytes" 2>/dev/null
+    local iface="$1"
+    local direction="$2"
+    cat "/sys/class/net/$iface/statistics/${direction}_bytes" 2>/dev/null
+}
+
+traffic_reset() {
+    PROBE_IFACE=""
+    PROBE_ENVIRONMENT_SHOWN="false"
+    TRAFFIC_IFACES=()
+    TRAFFIC_RX_START_BY_IFACE=()
+    TRAFFIC_TX_START_BY_IFACE=()
+}
+
+traffic_add_target() {
+    local target="$1"
+    local iface rx tx
+
+    iface=$(detect_ipv4_iface_for_target "$target") || return 1
+    [[ -n "$PROBE_IFACE" ]] || PROBE_IFACE="$iface"
+    if [[ -n "${TRAFFIC_RX_START_BY_IFACE[$iface]+x}" ]]; then
+        return 0
+    fi
+
+    rx=$(read_iface_counter "$iface" rx) || return 1
+    tx=$(read_iface_counter "$iface" tx) || return 1
+    is_positive_integer "$rx" 0 9223372036854775807 || return 1
+    is_positive_integer "$tx" 0 9223372036854775807 || return 1
+    TRAFFIC_IFACES+=("$iface")
+    TRAFFIC_RX_START_BY_IFACE["$iface"]="$rx"
+    TRAFFIC_TX_START_BY_IFACE["$iface"]="$tx"
 }
 
 traffic_mark() {
-    PROBE_IFACE=$(detect_default_iface)
-    [[ -n "$PROBE_IFACE" ]] || return 1
-    TRAFFIC_RX_START=$(read_iface_counter rx)
-    TRAFFIC_TX_START=$(read_iface_counter tx)
-    is_positive_integer "$TRAFFIC_RX_START" 0 9223372036854775807 || return 1
-    is_positive_integer "$TRAFFIC_TX_START" 0 9223372036854775807 || return 1
+    local target="${1:-}"
+
+    traffic_reset
+    [[ -z "$target" ]] || traffic_add_target "$target"
 }
 
 traffic_used_bytes() {
     local direction="${1:-total}"
-    local rx
-    local tx
-    local rx_used
-    local tx_used
+    local iface rx tx rx_used tx_used
+    local total_rx=0
+    local total_tx=0
 
-    rx=$(read_iface_counter rx)
-    tx=$(read_iface_counter tx)
-    [[ "$rx" =~ ^[0-9]+$ && "$tx" =~ ^[0-9]+$ ]] || return 1
-
-    rx_used=$((rx - TRAFFIC_RX_START))
-    tx_used=$((tx - TRAFFIC_TX_START))
-    (( rx_used < 0 )) && rx_used=0
-    (( tx_used < 0 )) && tx_used=0
+    (( ${#TRAFFIC_IFACES[@]} > 0 )) || return 1
+    for iface in "${TRAFFIC_IFACES[@]}"; do
+        rx=$(read_iface_counter "$iface" rx) || return 1
+        tx=$(read_iface_counter "$iface" tx) || return 1
+        [[ "$rx" =~ ^[0-9]+$ && "$tx" =~ ^[0-9]+$ ]] || return 1
+        rx_used=$((rx - TRAFFIC_RX_START_BY_IFACE[$iface]))
+        tx_used=$((tx - TRAFFIC_TX_START_BY_IFACE[$iface]))
+        (( rx_used < 0 )) && rx_used=0
+        (( tx_used < 0 )) && tx_used=0
+        total_rx=$((total_rx + rx_used))
+        total_tx=$((total_tx + tx_used))
+    done
 
     case "$direction" in
-        download) echo "$rx_used" ;;
-        upload) echo "$tx_used" ;;
-        total) echo $((rx_used + tx_used)) ;;
+        download) echo "$total_rx" ;;
+        upload) echo "$total_tx" ;;
+        total) echo $((total_rx + total_tx)) ;;
         *) return 1 ;;
     esac
 }
@@ -1323,15 +1229,14 @@ format_bytes() {
 }
 
 traffic_report() {
-    local rx
-    local tx
-    local total
+    local rx tx total interfaces
 
-    [[ -n "$PROBE_IFACE" ]] || return 0
+    (( ${#TRAFFIC_IFACES[@]} > 0 )) || return 0
     rx=$(traffic_used_bytes download || echo 0)
     tx=$(traffic_used_bytes upload || echo 0)
     total=$((rx + tx))
-    echo "流量：上传 $(format_bytes "$tx") / 下载 $(format_bytes "$rx") / 合计 $(format_bytes "$total")"
+    interfaces=$(IFS=,; echo "${TRAFFIC_IFACES[*]}")
+    echo "流量（接口 $interfaces；含测试期间后台流量，按保守安全预算累计）：上传 $(format_bytes "$tx") / 下载 $(format_bytes "$rx") / 合计 $(format_bytes "$total")"
 }
 
 traffic_budget_reached() {
@@ -1346,19 +1251,87 @@ traffic_budget_reached() {
     (( total >= total_stop || directional >= direction_stop ))
 }
 
-kill_process_tree() {
+register_iperf_runner() {
+    IPERF_RUNNER_PIDS+=("$1")
+}
+
+unregister_iperf_runner() {
+    local wanted="$1" pid
+    local -a remaining=()
+
+    for pid in "${IPERF_RUNNER_PIDS[@]}"; do
+        [[ "$pid" == "$wanted" ]] || remaining+=("$pid")
+    done
+    IPERF_RUNNER_PIDS=("${remaining[@]}")
+}
+
+terminate_recorded_pid() {
     local pid="$1"
-    pkill -TERM -P "$pid" 2>/dev/null || true
+    local attempt
+
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 0
     kill -TERM "$pid" 2>/dev/null || true
-    sleep 0.2
-    pkill -KILL -P "$pid" 2>/dev/null || true
+    for ((attempt = 0; attempt < IPERF_KILL_AFTER_SECONDS * 10; attempt++)); do
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 0.1
+    done
+    kill -KILL "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+}
+
+cleanup_iperf_runners() {
+    local pid
+    local -a pids=("${IPERF_RUNNER_PIDS[@]}")
+
+    for pid in "${pids[@]}"; do
+        terminate_recorded_pid "$pid"
+        unregister_iperf_runner "$pid"
+    done
+}
+
+terminate_pid_now() {
+    local pid="$1"
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 0
     kill -KILL "$pid" 2>/dev/null || true
 }
 
-kill_process_tree_now() {
-    local pid="$1"
-    pkill -KILL -P "$pid" 2>/dev/null || true
-    kill -KILL "$pid" 2>/dev/null || true
+run_iperf_runner() {
+    local output_file="$1"
+    local host="$2"
+    local port="$3"
+    local duration="$4"
+    local streams="$5"
+    local direction="$6"
+    local reverse_mode="${7:-false}"
+    local deadline=$((duration + IPERF_DEADLINE_GRACE_SECONDS))
+    local pid rc=0 limited="false"
+    local -a reverse=()
+
+    [[ "$reverse_mode" == "true" ]] && reverse=(-R)
+    traffic_add_target "$host" || return 1
+    traffic_budget_reached "$direction" && return 75
+
+    timeout --foreground --signal=TERM --kill-after="${IPERF_KILL_AFTER_SECONDS}s" \
+        "${deadline}s" iperf3 -4 -c "$host" -p "$port" -t "$duration" \
+        -P "$streams" "${reverse[@]}" -J > "$output_file" 2>&1 &
+    pid=$!
+    register_iperf_runner "$pid"
+
+    while kill -0 "$pid" 2>/dev/null; do
+        if traffic_budget_reached "$direction"; then
+            limited="true"
+            terminate_recorded_pid "$pid"
+            break
+        fi
+        sleep 0.05
+    done
+    if [[ "$limited" != "true" ]]; then
+        wait "$pid" || rc=$?
+    else
+        rc=75
+    fi
+    unregister_iperf_runner "$pid"
+    return "$rc"
 }
 
 resolve_ipv4() {
@@ -1423,85 +1396,27 @@ run_iperf_test() {
     local host="$1"
     local port="$2"
     local direction="$3"
-    local output
-    local pid
-    local started
-    local ended
-    local elapsed
-    local start_bytes
-    local end_bytes
-    local transferred
-    local bps=""
-    local cpu=""
-    local retransmits=""
-    local sent_bytes=""
-    local retransmit_percent=""
-    local stats=""
-    local limited="false"
-    local reverse=()
+    local output stats rc=0 reverse_mode="false"
+    local sender receiver retransmits retransmit_percent cpu remote_cpu
 
-    [[ "$direction" == "download" ]] && reverse=(-R)
-    traffic_budget_reached "$direction" && return 1
-
+    [[ "$direction" == "download" ]] && reverse_mode="true"
     output=$(mktemp) || return 1
-    start_bytes=$(traffic_used_bytes "$direction") || {
+    run_iperf_runner "$output" "$host" "$port" "$IPERF_DURATION" \
+        "$IPERF_PARALLEL" "$direction" "$reverse_mode" || rc=$?
+    if (( rc != 0 )); then
+        rm -f "$output"
+        return "$rc"
+    fi
+    stats=$(parse_iperf_metrics "$output") || {
         rm -f "$output"
         return 1
     }
-    started=$(date +%s%N)
-
-    iperf3 -4 -c "$host" -p "$port" -t "$IPERF_DURATION" -P "$IPERF_PARALLEL" \
-        "${reverse[@]}" -J > "$output" 2>&1 &
-    pid=$!
-
-    while kill -0 "$pid" 2>/dev/null; do
-        if traffic_budget_reached "$direction"; then
-            limited="true"
-            kill_process_tree_now "$pid"
-            break
-        fi
-        sleep 0.05
-    done
-    wait "$pid" 2>/dev/null || true
-
-    ended=$(date +%s%N)
-    end_bytes=$(traffic_used_bytes "$direction" || echo "$start_bytes")
-    transferred=$((end_bytes - start_bytes))
-    elapsed=$(awk -v start="$started" -v end="$ended" \
-        'BEGIN {printf "%.3f", (end - start) / 1000000000}')
-
-    if [[ "$limited" != "true" ]]; then
-        stats=$(jq -r '
-            [
-                (.end.sum_received.bits_per_second //
-                    .end.sum_sent.bits_per_second // ""),
-                (.end.cpu_utilization_percent.host_total // ""),
-                (.end.sum_sent.retransmits // ""),
-                (.end.sum_sent.bytes // "")
-            ] | join("|")
-        ' "$output" 2>/dev/null || true)
-        IFS='|' read -r bps cpu retransmits sent_bytes <<< "$stats"
-    fi
     rm -f "$output"
+    IFS='|' read -r sender receiver retransmits retransmit_percent cpu remote_cpu <<< "$stats"
 
-    if [[ -z "$bps" && "$transferred" -ge 33554432 ]]; then
-        bps=$(awk -v bytes="$transferred" -v seconds="$elapsed" \
-            'BEGIN {if (seconds > 0) printf "%.0f", bytes * 8 / seconds}')
-    fi
-    [[ "$bps" =~ ^[0-9]+([.][0-9]+)?$ ]] || return 1
-    if [[ "$retransmits" =~ ^[0-9]+$ && "$sent_bytes" =~ ^[0-9]+$ ]] &&
-        (( sent_bytes > 0 )); then
-        retransmit_percent=$(awk -v retransmits="$retransmits" -v bytes="$sent_bytes" '
-            BEGIN {
-                packets = bytes / 1448
-                if (packets > 0) printf "%.4f", retransmits * 100 / packets
-            }
-        ')
-    fi
-
+    # goodput、CPU、重传与 loss 全部取自同一份完整 JSON 结果。
     printf '%s|%s|%s|%s\n' \
-        "$(awk -v bps="$bps" 'BEGIN {printf "%.0f", bps / 1000000}')" \
-        "${cpu:-?}" "${retransmits:-?}" "${retransmit_percent:-?}"
+        "$receiver" "$cpu" "$retransmits" "$retransmit_percent"
 }
 
 format_cpu_percent() {
@@ -1553,7 +1468,7 @@ verify_dependencies_available() {
     local command_name
     local -a missing=()
 
-    for command_name in ip iperf3 jq ping timeout pkill tc getent; do
+    for command_name in ip iperf3 jq ping timeout tc getent; do
         command -v "$command_name" >/dev/null 2>&1 || missing+=("$command_name")
     done
     (( ${#missing[@]} == 0 )) || {
@@ -1566,31 +1481,17 @@ run_verify_iperf() {
     local host="$1" port="$2" streams="$3"
     local output_file rc=0
 
-    traffic_budget_reached upload && {
-        error "verify 已达到上传或总流量停止阈值"
-        return 75
-    }
     output_file="$VERIFY_TEMP_DIR/iperf-${streams}.json"
-    iperf3 -4 -c "$host" -p "$port" -t "$IPERF_DURATION" -P "$streams" -J \
-        > "$output_file" 2>&1 &
-    VERIFY_PID=$!
-
-    while kill -0 "$VERIFY_PID" 2>/dev/null; do
-        if traffic_budget_reached upload; then
-            kill_process_tree_now "$VERIFY_PID"
-            wait "$VERIFY_PID" 2>/dev/null || true
-            VERIFY_PID=""
-            error "verify 达到上传或总流量停止阈值，已终止 iperf3"
-            return 75
-        fi
-        sleep 0.05
-    done
-    wait "$VERIFY_PID" || rc=$?
-    VERIFY_PID=""
-    (( rc == 0 )) || {
-        error "iperf3 ${streams} 流测试失败"
+    run_iperf_runner "$output_file" "$host" "$port" "$IPERF_DURATION" \
+        "$streams" upload false || rc=$?
+    if (( rc == 75 )); then
+        error "verify 达到上传或总流量停止阈值，已终止 iperf3"
+        return 75
+    fi
+    if (( rc != 0 )); then
+        error "iperf3 ${streams} 流测试失败（退出码 $rc）"
         return 1
-    }
+    fi
     VERIFY_RESULT=$(parse_iperf_metrics "$output_file") || {
         error "无法解析 iperf3 ${streams} 流结果"
         return 1
@@ -1598,18 +1499,7 @@ run_verify_iperf() {
 }
 
 cleanup_verify() {
-    local child_pid
-
-    if [[ -n "${VERIFY_PID:-}" ]]; then
-        kill_process_tree_now "$VERIFY_PID"
-        wait "$VERIFY_PID" 2>/dev/null || true
-        VERIFY_PID=""
-    fi
-    while IFS= read -r child_pid; do
-        [[ "$child_pid" =~ ^[0-9]+$ ]] || continue
-        kill_process_tree_now "$child_pid"
-        wait "$child_pid" 2>/dev/null || true
-    done < <(jobs -pr)
+    cleanup_iperf_runners
     [[ -z "${VERIFY_TEMP_DIR:-}" ]] || rm -rf "$VERIFY_TEMP_DIR"
     VERIFY_TEMP_DIR=""
 }
@@ -1626,8 +1516,9 @@ verify_impl() {
     echo "每个候选先测 1 流再测 4 流；任一步失败则整组作废并轮换，最多尝试 ${VERIFY_MAX_GROUP_ATTEMPTS} 组。"
     echo "正常完成约为 10 秒实际发送速率；若 1 流成功后 4 流失败，重试会重复单流并产生额外流量。"
     echo "最坏最多约 30 秒实际发送速率：1 Gbps 约 3.75 GB，10 Gbps 约 37.5 GB。"
-    echo "沿用安全阈值：上传 40 GB 或合计 85 GB 时提前停止；不会修改 sysctl、路由或 qdisc。"
-    echo "同时读取测试前后内核与网卡计数器；ethtool 可用时附加驱动 allowance 增量。"
+    echo "沿用硬上限：单方向 45 GB、合计 90 GB；在 40/85 GB 提前停止。"
+    echo "按每个实际 IPv4 测速目标的路由接口分别计量并汇总；接口计数包含测试期间后台流量，作为保守安全预算。"
+    echo "不会修改 sysctl、路由或 qdisc；同时读取测试前后内核与网卡计数器。"
     if [[ "$VERIFY_ASSUME_YES" != "true" ]]; then
         if ! is_interactive_terminal; then
             error "非交互环境拒绝产生流量；显式传入 verify --yes 后重试"
@@ -1641,18 +1532,19 @@ verify_impl() {
     fi
 
     verify_dependencies_available || return 1
-    traffic_mark || {
-        error "无法读取默认网卡流量计数器，拒绝测速"
-        return 1
-    }
-    health_before=$(network_health_snapshot "$PROBE_IFACE")
-    allowance_before=$(nic_allowance_snapshot "$PROBE_IFACE")
     VERIFY_TEMP_DIR=$(mktemp -d) || return 1
     ranked=$(rank_iperf_peers || true)
     [[ -n "$ranked" ]] || {
         error "无法找到可用的附近公共 iperf3 对端"
         return 1
     }
+    peer_ip=$(awk -F'|' 'NF >= 3 {print $3; exit}' <<< "$ranked")
+    traffic_mark "$peer_ip" || {
+        error "无法按实际 IPv4 测速目标读取路由接口流量计数器，拒绝测速"
+        return 1
+    }
+    health_before=$(network_health_snapshot "$PROBE_IFACE")
+    allowance_before=$(nic_allowance_snapshot "$PROBE_IFACE")
 
     while IFS='|' read -r rtt host peer_ip location provider; do
         [[ -n "$peer_ip" ]] || continue
@@ -1723,16 +1615,23 @@ verify_impl() {
 
 run_verify_command() {
     local rc=0
-    local previous_hup_trap previous_int_trap previous_term_trap
+    local previous_exit_trap previous_hup_trap previous_int_trap previous_term_trap
 
+    previous_exit_trap=$(trap -p EXIT)
     previous_hup_trap=$(trap -p HUP)
     previous_int_trap=$(trap -p INT)
     previous_term_trap=$(trap -p TERM)
+    trap 'cleanup_verify' EXIT
     trap 'cleanup_verify; exit 129' HUP
     trap 'cleanup_verify; exit 130' INT
     trap 'cleanup_verify; exit 143' TERM
     verify_impl || rc=$?
     cleanup_verify
+    if [[ -n "$previous_exit_trap" ]]; then
+        eval "$previous_exit_trap"
+    else
+        trap - EXIT
+    fi
     if [[ -n "$previous_hup_trap" ]]; then
         eval "$previous_hup_trap"
     else
@@ -1786,6 +1685,8 @@ probe_iperf_bandwidth() {
         traffic_budget_reached upload && traffic_budget_reached download && break
 
         while IFS= read -r port; do
+            traffic_add_target "$peer_ip" || continue
+            show_probe_environment_once
             tcp_port_open "$peer_ip" "$port" || continue
             upload_result=$(run_iperf_test "$peer_ip" "$port" upload || true)
             download_result=$(run_iperf_test "$peer_ip" "$port" download || true)
@@ -1831,11 +1732,13 @@ cloudflare_worker() {
 
         if [[ "$direction" == "download" ]]; then
             curl -4 --noproxy '*' --fail --silent --output /dev/null \
+                --resolve "speed.cloudflare.com:443:$CLOUDFLARE_IPV4" \
                 --header 'Accept-Encoding: identity' \
                 --connect-timeout 4 --max-time "$remaining" \
                 "$SPEED_DOWNLOAD_URL?bytes=$CLOUDFLARE_DOWNLOAD_BYTES" || break
         else
             curl -4 --noproxy '*' --fail --silent --output /dev/null \
+                --resolve "speed.cloudflare.com:443:$CLOUDFLARE_IPV4" \
                 --header 'Content-Type: application/octet-stream' \
                 --header 'Expect:' \
                 --connect-timeout 4 --max-time "$remaining" \
@@ -1891,7 +1794,7 @@ probe_cloudflare_direction() {
 
         if traffic_budget_reached "$direction"; then
             for pid in "${pids[@]}"; do
-                kill_process_tree_now "$pid"
+                terminate_pid_now "$pid"
             done
             break
         fi
@@ -1931,6 +1834,13 @@ probe_cloudflare_bandwidth() {
     local crosscheck=""
 
     command -v curl >/dev/null 2>&1 || return 1
+    CLOUDFLARE_IPV4=$(resolve_ipv4 speed.cloudflare.com || true)
+    [[ -n "$CLOUDFLARE_IPV4" ]] || return 1
+    traffic_add_target "$CLOUDFLARE_IPV4" || {
+        warn "无法按 Cloudflare 实际 IPv4 目标读取路由接口计数器"
+        return 1
+    }
+    show_probe_environment_once
     detail "使用 8 流 Cloudflare 交叉验证；iperf3 不可用时同时作为回退..."
 
     download=$(probe_cloudflare_direction download || true)
@@ -1998,18 +1908,20 @@ show_probe_environment() {
     detail "测速前网络栈：CC $current_cc / default_qdisc $default_qdisc / root_qdisc ${root_qdisc:-unknown}"
 }
 
+show_probe_environment_once() {
+    [[ "$PROBE_ENVIRONMENT_SHOWN" != "true" && -n "$PROBE_IFACE" ]] || return 0
+    show_probe_environment
+    PROBE_ENVIRONMENT_SHOWN="true"
+}
+
 probe_bandwidth() {
     local raw_download
     local raw_upload
 
     command -v ip >/dev/null 2>&1 || return 1
-    traffic_mark || {
-        warn "无法读取默认网卡流量计数器，跳过主动测速以确保流量上限"
-        return 1
-    }
+    traffic_mark
 
-    show_probe_environment
-    info "自动测量公网带宽（40/85 GB 提前停止，安全上限 45/90 GB）..."
+    info "自动测量公网带宽（40/85 GB 提前停止，硬上限 45/90 GB；按实际目标接口汇总）..."
     probe_iperf_bandwidth || true
     # 公共 iperf3 节点可能忙碌或单向限速；只要预算允许，再用并行 Cloudflare
     # 交叉验证，并对每个方向保留较高结果。
@@ -2051,38 +1963,6 @@ calculate_buffer_max() {
     echo "$desired"
 }
 
-calculate_buffer_default() {
-    local bandwidth_mbps="$1"
-    local rtt_ms="$2"
-    local buffer_max="$3"
-    local mib=$((1024 * 1024))
-    local desired
-    local default_cap=$((buffer_max / 4))
-
-    # 半个 BDP 缩短高 RTT 大流的爬升时间，同时限制每个新连接的排队空间。
-    desired=$(((bandwidth_mbps * rtt_ms * 125 + 1) / 2))
-    desired=$((((desired + mib - 1) / mib) * mib))
-    (( default_cap > TCP_BUFFER_DEFAULT_MAX_BYTES )) &&
-        default_cap=$TCP_BUFFER_DEFAULT_MAX_BYTES
-    (( default_cap < TCP_BUFFER_DEFAULT_MIN_BYTES )) &&
-        default_cap=$TCP_BUFFER_DEFAULT_MIN_BYTES
-    (( desired < TCP_BUFFER_DEFAULT_MIN_BYTES )) &&
-        desired=$TCP_BUFFER_DEFAULT_MIN_BYTES
-    (( desired > default_cap )) && desired=$default_cap
-    echo "$desired"
-}
-
-calculate_buffer_fallback() {
-    local buffer_max="$1"
-    local fallback="$TCP_BUFFER_DEFAULT_FALLBACK_BYTES"
-    local default_cap=$((buffer_max / 4))
-
-    (( default_cap < TCP_BUFFER_DEFAULT_MIN_BYTES )) &&
-        default_cap=$TCP_BUFFER_DEFAULT_MIN_BYTES
-    (( fallback > default_cap )) && fallback=$default_cap
-    echo "$fallback"
-}
-
 buffer_limit_reason() {
     local bandwidth_mbps="$1"
     local rtt_ms="$2"
@@ -2105,9 +1985,8 @@ buffer_limit_reason() {
 
 needs_automatic_probe() {
     [[ "$TUNING_MODE" == "auto" && "$NO_PROBE" != "true" ]] || return 1
-    [[ -z "$MANUAL_RTT_MS" ||
-        ( -z "$MANUAL_BANDWIDTH_MBPS" &&
-          ( -z "$MANUAL_DOWNLOAD_MBPS" || -z "$MANUAL_UPLOAD_MBPS" ) ) ]]
+    [[ -z "$MANUAL_BANDWIDTH_MBPS" &&
+       ( -z "$MANUAL_DOWNLOAD_MBPS" || -z "$MANUAL_UPLOAD_MBPS" ) ]]
 }
 
 install_probe_dependencies() {
@@ -2117,7 +1996,6 @@ install_probe_dependencies() {
     command -v ping >/dev/null 2>&1 || packages+=(iputils-ping)
     command -v iperf3 >/dev/null 2>&1 || packages+=(iperf3)
     command -v jq >/dev/null 2>&1 || packages+=(jq)
-    command -v pkill >/dev/null 2>&1 || packages+=(procps)
     command -v timeout >/dev/null 2>&1 || packages+=(coreutils)
     [[ -s /etc/ssl/certs/ca-certificates.crt ]] || packages+=(ca-certificates)
     (( ${#packages[@]} > 0 )) || return 0
@@ -2160,8 +2038,8 @@ resolve_tuning_values() {
         WMEM_MAX_BYTES=$((32 * 1024 * 1024))
         (( RMEM_MAX_BYTES > MEMORY_CAP_BYTES )) && RMEM_MAX_BYTES=$MEMORY_CAP_BYTES
         (( WMEM_MAX_BYTES > MEMORY_CAP_BYTES )) && WMEM_MAX_BYTES=$MEMORY_CAP_BYTES
-        RMEM_DEFAULT_BYTES=$(calculate_buffer_fallback "$RMEM_MAX_BYTES")
-        WMEM_DEFAULT_BYTES=$(calculate_buffer_fallback "$WMEM_MAX_BYTES")
+        RMEM_DEFAULT_BYTES=$TCP_BUFFER_DEFAULT_BYTES
+        WMEM_DEFAULT_BYTES=$TCP_BUFFER_DEFAULT_BYTES
         if (( MEMORY_CAP_BYTES < 32 * 1024 * 1024 )); then
             RMEM_REASON="static 32 MiB capped by effective RAM / 32"
             WMEM_REASON="static 32 MiB capped by effective RAM / 32"
@@ -2187,25 +2065,16 @@ resolve_tuning_values() {
     if [[ -n "$MANUAL_RTT_MS" ]]; then
         rtt_ms="$MANUAL_RTT_MS"
         if [[ "$MANUAL_RTT_DEFAULTED" == "true" ]]; then
-            RTT_SOURCE="default"
-            RTT_POLICY="150 ms fallback for manual bandwidth"
+            RTT_SOURCE="default for manual bandwidth"
+            RTT_POLICY="fixed 150 ms default"
         else
             RTT_SOURCE="command line"
-            RTT_POLICY="manual override (no automatic floor)"
+            RTT_POLICY="manual override"
         fi
-    elif [[ "$NO_PROBE" != "true" ]]; then
-        info "自动探测中国大陆与全球 RTT..."
-        if detect_rtt; then
-            OBSERVED_RTT_MS="$DETECTED_RTT_MS"
-            rtt_ms="$OBSERVED_RTT_MS"
-            (( rtt_ms < DEFAULT_RTT_MS )) && rtt_ms="$DEFAULT_RTT_MS"
-            RTT_POLICY="max(observed RTT, 150 ms coverage floor)"
-        else
-            warn "RTT 探测失败，将按默认 150 ms 计算"
-            rtt_ms="$DEFAULT_RTT_MS"
-            RTT_SOURCE="default after failed active probe"
-            RTT_POLICY="150 ms fallback"
-        fi
+    else
+        rtt_ms="$DEFAULT_RTT_MS"
+        RTT_SOURCE="automatic policy"
+        RTT_POLICY="fixed 150 ms"
     fi
 
     if [[ -z "$download_mbps" || -z "$upload_mbps" ]]; then
@@ -2237,10 +2106,8 @@ resolve_tuning_values() {
         TX_BDP_BYTES=$((upload_mbps * rtt_ms * 125))
         RMEM_MAX_BYTES=$(calculate_buffer_max "$download_mbps" "$rtt_ms" "$MEMORY_CAP_BYTES")
         WMEM_MAX_BYTES=$(calculate_buffer_max "$upload_mbps" "$rtt_ms" "$MEMORY_CAP_BYTES")
-        RMEM_DEFAULT_BYTES=$(calculate_buffer_default \
-            "$download_mbps" "$rtt_ms" "$RMEM_MAX_BYTES")
-        WMEM_DEFAULT_BYTES=$(calculate_buffer_default \
-            "$upload_mbps" "$rtt_ms" "$WMEM_MAX_BYTES")
+        RMEM_DEFAULT_BYTES=$TCP_BUFFER_DEFAULT_BYTES
+        WMEM_DEFAULT_BYTES=$TCP_BUFFER_DEFAULT_BYTES
         RMEM_REASON=$(buffer_limit_reason "$download_mbps" "$rtt_ms" "$MEMORY_CAP_BYTES")
         WMEM_REASON=$(buffer_limit_reason "$upload_mbps" "$rtt_ms" "$MEMORY_CAP_BYTES")
         CALCULATION_REASON="rmem: $RMEM_REASON; wmem: $WMEM_REASON"
@@ -2249,8 +2116,8 @@ resolve_tuning_values() {
         WMEM_MAX_BYTES=$((32 * 1024 * 1024))
         (( RMEM_MAX_BYTES > MEMORY_CAP_BYTES )) && RMEM_MAX_BYTES=$MEMORY_CAP_BYTES
         (( WMEM_MAX_BYTES > MEMORY_CAP_BYTES )) && WMEM_MAX_BYTES=$MEMORY_CAP_BYTES
-        RMEM_DEFAULT_BYTES=$(calculate_buffer_fallback "$RMEM_MAX_BYTES")
-        WMEM_DEFAULT_BYTES=$(calculate_buffer_fallback "$WMEM_MAX_BYTES")
+        RMEM_DEFAULT_BYTES=$TCP_BUFFER_DEFAULT_BYTES
+        WMEM_DEFAULT_BYTES=$TCP_BUFFER_DEFAULT_BYTES
         if (( MEMORY_CAP_BYTES < 32 * 1024 * 1024 )); then
             RMEM_REASON="fallback 32 MiB capped by effective RAM / 32"
             WMEM_REASON="fallback 32 MiB capped by effective RAM / 32"
@@ -2284,9 +2151,6 @@ show_tuning_plan() {
     echo "下载带宽: ${DETECTED_DOWNLOAD_MBPS:-未知} Mbps"
     echo "上传带宽: ${DETECTED_UPLOAD_MBPS:-未知} Mbps"
     echo "带宽来源: $BANDWIDTH_SOURCE"
-    [[ -n "$CHINA_RTT_MS" ]] && echo "中国组 RTT: ${CHINA_RTT_MS} ms（$CHINA_RTT_METHOD，$CHINA_RTT_SAMPLES）"
-    [[ -n "$GLOBAL_RTT_MS" ]] && echo "全球组 RTT: ${GLOBAL_RTT_MS} ms（$GLOBAL_RTT_METHOD，$GLOBAL_RTT_SAMPLES）"
-    [[ -n "$OBSERVED_RTT_MS" ]] && echo "观测 RTT: ${OBSERVED_RTT_MS} ms"
     echo "计算 RTT: ${DETECTED_RTT_MS:-未知} ms"
     echo "RTT 来源: $RTT_SOURCE"
     echo "RTT 策略: $RTT_POLICY"
@@ -2489,10 +2353,8 @@ format_rtt_selection_summary() {
         return
     fi
 
-    printf 'RTT：观测 %s / 计算 %s ms（来源 %s；策略 %s）\n' \
-        "${OBSERVED_RTT_MS:+${OBSERVED_RTT_MS} ms}" \
-        "${DETECTED_RTT_MS:-未知}" "${RTT_SOURCE:-unknown}" "${RTT_POLICY:-unknown}" |
-        sed 's/RTT：观测  /RTT：观测 未获得 /'
+    printf 'RTT：计算 %s ms（来源 %s；策略 %s）\n' \
+        "${DETECTED_RTT_MS:-未知}" "${RTT_SOURCE:-unknown}" "${RTT_POLICY:-unknown}"
 }
 
 show_install_summary() {
@@ -2583,7 +2445,7 @@ capture_virtual_ipv6_ra_values() {
     local accept_ra_path
     local interface
 
-    for accept_ra_path in /proc/sys/net/ipv6/conf/*/accept_ra; do
+    for accept_ra_path in "$IPV6_CONF_ROOT"/*/accept_ra; do
         [[ -e "$accept_ra_path" ]] || continue
         interface=$(basename "$(dirname "$accept_ra_path")")
         [[ "$interface" =~ ^[A-Za-z0-9_-]+$ ]] || continue
@@ -2604,7 +2466,7 @@ normalize_virtual_ipv6_ra() {
         [[ "$key" =~ ^net\.ipv6\.conf\.([A-Za-z0-9_-]+)\.accept_ra$ ]] || continue
         interface="${BASH_REMATCH[1]}"
         is_virtual_ipv6_ra_interface "$interface" || continue
-        [[ -e "/proc/sys/net/ipv6/conf/$interface/accept_ra" ]] || continue
+        [[ -e "$IPV6_CONF_ROOT/$interface/accept_ra" ]] || continue
 
         if ! sysctl -w "$key=0" >/dev/null 2>&1; then
             error "无法禁用虚拟接口 IPv6 RA: $interface"
@@ -2622,49 +2484,39 @@ normalize_virtual_ipv6_ra() {
     fi
 }
 
+detect_ipv6_default_iface() {
+    local interface
+
+    interface=$(ip -6 route get 2606:4700:4700::1111 2>/dev/null | route_value_after dev)
+    if [[ -z "$interface" ]]; then
+        interface=$(ip -6 route show default 2>/dev/null | route_value_after dev)
+    fi
+    [[ "$interface" =~ ^[A-Za-z0-9_-]+$ ]] || return 1
+    case "$interface" in all|default|lo) return 1 ;; esac
+    is_virtual_ipv6_ra_interface "$interface" && return 1
+    [[ -e "$IPV6_CONF_ROOT/$interface/accept_ra" ]] || return 1
+    printf '%s\n' "$interface"
+}
+
 append_ipv6_forwarding_config() {
     local target_file="$1"
-    local interface
-    local interface_path
-    local -a interfaces=()
+    local interface=""
 
-    [[ -e /proc/sys/net/ipv6/conf/all/forwarding ]] || return 0
-    [[ -e /proc/sys/net/ipv6/conf/all/accept_ra ]] || return 0
+    [[ -e "$IPV6_CONF_ROOT/all/forwarding" ]] || return 0
+    [[ -e "$IPV6_CONF_ROOT/all/accept_ra" ]] || return 0
 
-    # forwarding=1 时，accept_ra=1 不再接收 RA；只有云平台上联接口需要 2。
-    # 先把全局和新接口基线恢复为 1，避免 Docker bridge/veth 接受容器侧 RA。
+    # forwarding=1 时，accept_ra=1 不再接收 RA；只有实际 IPv6 默认出口需要 2。
     cat >> "$target_file" <<'EOF'
 
-# IPv6 转发；仅上联接口在转发模式下继续接收 Router Advertisement
+# IPv6 转发；仅实际默认出口在转发模式下继续接收 Router Advertisement
 net.ipv6.conf.all.accept_ra = 1
 net.ipv6.conf.default.accept_ra = 1
 EOF
 
-    # 上联候选：IPv4/IPv6 默认路由、已有全局 IPv6 地址，以及有硬件设备
-    # 后端的 NIC。IPv4 默认路由可覆盖尚未获得 IPv6 RA 的 AWS/Azure 网卡。
-    while IFS= read -r interface; do
-        [[ "$interface" =~ ^[A-Za-z0-9_-]+$ ]] || continue
-        case "$interface" in all|default|lo) continue ;; esac
-        is_virtual_ipv6_ra_interface "$interface" && continue
-        [[ -e "/proc/sys/net/ipv6/conf/$interface/accept_ra" ]] || continue
-        interfaces+=("$interface")
-    done < <(
-        {
-            ip -o route show default 2>/dev/null |
-                awk '{for (i=1; i<=NF; i++) if ($i == "dev") print $(i+1)}'
-            ip -o -6 route show default 2>/dev/null |
-                awk '{for (i=1; i<=NF; i++) if ($i == "dev") print $(i+1)}'
-            ip -o -6 address show scope global 2>/dev/null | awk '{print $2}'
-            for interface_path in /sys/class/net/*/device; do
-                [[ -e "$interface_path" ]] || continue
-                basename "$(dirname "$interface_path")"
-            done
-        } | sort -u
-    )
-
-    for interface in "${interfaces[@]}"; do
+    interface=$(detect_ipv6_default_iface || true)
+    if [[ -n "$interface" ]]; then
         echo "net.ipv6.conf.${interface}.accept_ra = 2" >> "$target_file"
-    done
+    fi
 
     cat >> "$target_file" <<'EOF'
 net.ipv6.conf.default.forwarding = 1
@@ -2684,9 +2536,6 @@ create_network_config() {
 # 下载带宽: ${DETECTED_DOWNLOAD_MBPS:-unknown} Mbps
 # 上传带宽: ${DETECTED_UPLOAD_MBPS:-unknown} Mbps
 # 带宽来源: $BANDWIDTH_SOURCE
-# 中国组 RTT: ${CHINA_RTT_MS:-unknown} ms (${CHINA_RTT_METHOD:-unknown}, ${CHINA_RTT_SAMPLES:-unknown})
-# 全球组 RTT: ${GLOBAL_RTT_MS:-unknown} ms (${GLOBAL_RTT_METHOD:-unknown}, ${GLOBAL_RTT_SAMPLES:-unknown})
-# 观测 RTT: ${OBSERVED_RTT_MS:-unknown} ms
 # 计算 RTT: ${DETECTED_RTT_MS:-unknown} ms
 # RTT 来源: $RTT_SOURCE
 # RTT 策略: $RTT_POLICY
@@ -2714,7 +2563,7 @@ net.ipv4.tcp_max_syn_backlog = 16384
 net.core.netdev_max_backlog = 16384
 net.core.optmem_max = 65536
 
-# 6. TCP/UDP 缓冲区；TCP 起点按半个 BDP 取 1-4 MiB，长流继续依赖 autotuning
+# 6. TCP/UDP 缓冲区；TCP 初始默认固定 2 MiB，长流继续依赖 autotuning
 # core default 与全局 tcp_mem 保留内核或发行版值，避免放大所有 socket 的内存承诺
 net.core.rmem_max = $RMEM_MAX_BYTES
 net.core.wmem_max = $WMEM_MAX_BYTES
@@ -2790,7 +2639,7 @@ merge_initial_runtime_values() {
     [[ ! -e "$RUNTIME_INITIAL_UNKNOWN" ]] || return 0
 
     if [[ ! -f "$RUNTIME_INITIAL_BACKUP" ]]; then
-        install -m 0600 "$current_snapshot" "$RUNTIME_INITIAL_BACKUP"
+        atomic_install_file "$current_snapshot" "$RUNTIME_INITIAL_BACKUP" 0600
         return $?
     fi
 
@@ -2807,7 +2656,10 @@ merge_initial_runtime_values() {
         fi
     done < "$current_snapshot"
 
-    install -m 0600 "$temp_file" "$RUNTIME_INITIAL_BACKUP"
+    if ! atomic_install_file "$temp_file" "$RUNTIME_INITIAL_BACKUP" 0600; then
+        rm -f "$temp_file"
+        return 1
+    fi
     rm -f "$temp_file"
 }
 
@@ -3174,17 +3026,14 @@ install_optimization() {
         show_tuning_plan
     fi
 
-    if ensure_bbr_available; then
-        bbr_enabled="true"
-        info "BBR 支持：可用"
-    fi
-
     if ! temp_config=$(mktemp /etc/sysctl.d/99-network-optimize.conf.new.XXXXXX); then
         error "无法创建网络配置临时文件"
         return 1
     fi
 
-    create_network_config "$temp_config" "$bbr_enabled"
+    # 先按 BBR 可用生成候选配置，确保修改前快照包含拥塞控制键。
+    # 完成全部备份后再尝试加载模块；不可用时重生成不接管拥塞控制的配置。
+    create_network_config "$temp_config" true
 
     runtime_backup=$(mktemp) || {
         rm -f "$temp_config"
@@ -3240,7 +3089,7 @@ install_optimization() {
             return 1
         fi
     done
-    install -m 0600 "$runtime_backup" "$RUNTIME_PREVIOUS_BACKUP" || {
+    atomic_install_file "$runtime_backup" "$RUNTIME_PREVIOUS_BACKUP" 0600 || {
         rm -f "$temp_config" "$runtime_backup"
         return 1
     }
@@ -3253,6 +3102,13 @@ install_optimization() {
         rm -f "$temp_config" "$runtime_backup"
         return 1
     }
+
+    if ensure_bbr_available; then
+        bbr_enabled="true"
+        info "BBR 支持：可用"
+    else
+        create_network_config "$temp_config" false
+    fi
 
     # 应用前已保存全部涉及参数的运行值，失败时逐项回滚。
     if ! apply_network_config "$temp_config"; then
@@ -3316,7 +3172,6 @@ install_optimization() {
         warn "新版网络配置已生效，但旧配置归档失败；请检查 $LEGACY_KERNEL_CONF"
     fi
     migrate_legacy_sysctl_conf || true
-    restore_legacy_limits
 
     rm -f "$runtime_backup"
     success "网络优化配置已写入：$NETWORK_CONF"
@@ -3334,52 +3189,12 @@ install_optimization() {
     show_install_summary "$health_before" "$bbr_enabled"
 }
 
-snapshot_managed_file_state() {
-    local target="$1"
-    local backup="$2"
-    local absent="$3"
-
-    rm -f "$backup" "$absent"
-    if [[ -e "$target" || -L "$target" ]]; then
-        cp -a "$target" "$backup"
-    else
-        : > "$absent"
-    fi
-}
-
-rollback_restore_transaction() {
-    local config_backup="$1"
-    local config_absent="$2"
-    local modules_backup="$3"
-    local modules_absent="$4"
-    local hook_backup="$5"
-    local hook_absent="$6"
-    local runtime_backup="$7"
-
-    restore_managed_file "$NETWORK_CONF" "$config_backup" "$config_absent" ||
-        warn "恢复失败后无法还原原网络配置文件"
-    restore_managed_file "$BBR_MODULES_FILE" "$modules_backup" "$modules_absent" ||
-        warn "恢复失败后无法还原原 BBR 模块配置"
-    restore_managed_file "$INITCWND_ROUTE_HOOK" "$hook_backup" "$hook_absent" ||
-        warn "恢复失败后无法还原 initcwnd 持久化钩子"
-    restore_runtime_values "$runtime_backup"
-}
-
 restore_optimization() {
     local scope="${1:-previous}"
-    local config_backup
-    local config_absent
-    local modules_backup
-    local modules_absent
-    local hook_backup
-    local hook_absent
-    local runtime_backup
-    local route_backup
-    local route_owned
-    local transaction_dir
-    local current_runtime
-    local restore_modules=false
-    local restore_hook=false
+    local config_backup config_absent modules_backup modules_absent
+    local hook_backup hook_absent runtime_backup route_backup route_owned
+    local sysctl_failed="false"
+    local -a failed_items=()
 
     case "$scope" in
         previous)
@@ -3414,82 +3229,70 @@ restore_optimization() {
         error "未找到可信的 $scope 网络配置状态，拒绝推测"
         return 1
     fi
-    if [[ -e "$modules_backup" || -e "$modules_absent" ]]; then
-        restore_modules=true
-    fi
-    if [[ -e "$hook_backup" || -e "$hook_absent" ]]; then
-        restore_hook=true
-    fi
-
-    transaction_dir=$(mktemp -d) || return 1
-    current_runtime="$transaction_dir/current-runtime"
-    snapshot_managed_file_state "$NETWORK_CONF" \
-        "$transaction_dir/current-config" "$transaction_dir/current-config-absent" || {
-        rm -rf "$transaction_dir"
-        return 1
-    }
-    snapshot_managed_file_state "$BBR_MODULES_FILE" \
-        "$transaction_dir/current-modules" "$transaction_dir/current-modules-absent" || {
-        rm -rf "$transaction_dir"
-        return 1
-    }
-    snapshot_managed_file_state "$INITCWND_ROUTE_HOOK" \
-        "$transaction_dir/current-hook" "$transaction_dir/current-hook-absent" || {
-        rm -rf "$transaction_dir"
-        return 1
-    }
-    capture_runtime_values_from_files "$current_runtime" "$config_backup" "$runtime_backup" || {
-        rm -rf "$transaction_dir"
-        return 1
-    }
 
     info "开始恢复网络优化配置（$scope）..."
 
     if [[ -e "$config_backup" ]] && ! apply_network_config "$config_backup"; then
-        error "目标网络配置应用失败，正在恢复原运行值"
-        restore_runtime_values "$current_runtime"
-        rm -rf "$transaction_dir"
-        return 1
+        error "恢复项 sysctl：目标配置应用失败"
+        sysctl_failed="true"
     fi
-    if [[ -f "$runtime_backup" ]]; then
-        if ! apply_runtime_values_strict "$runtime_backup"; then
-            error "目标运行值恢复失败，正在回滚"
-            restore_runtime_values "$current_runtime"
-            rm -rf "$transaction_dir"
-            return 1
-        fi
+    if ! restore_managed_file "$NETWORK_CONF" "$config_backup" "$config_absent"; then
+        error "恢复项 sysctl：持久配置文件恢复失败"
+        sysctl_failed="true"
+    fi
+    if [[ "$sysctl_failed" == "true" ]]; then
+        failed_items+=(sysctl)
     else
-        warn "没有 $scope 运行值快照；部分已移除参数可能需重启后还原"
+        info "恢复项 sysctl：成功"
     fi
 
-    if ! restore_managed_file "$NETWORK_CONF" "$config_backup" "$config_absent" ||
-        { [[ "$restore_modules" == "true" ]] &&
-          ! restore_managed_file "$BBR_MODULES_FILE" "$modules_backup" "$modules_absent"; } ||
-        { [[ "$restore_hook" == "true" ]] &&
-          ! restore_managed_file "$INITCWND_ROUTE_HOOK" "$hook_backup" "$hook_absent"; }; then
-        error "提交恢复后的持久配置失败，正在回滚"
-        rollback_restore_transaction \
-            "$transaction_dir/current-config" "$transaction_dir/current-config-absent" \
-            "$transaction_dir/current-modules" "$transaction_dir/current-modules-absent" \
-            "$transaction_dir/current-hook" "$transaction_dir/current-hook-absent" \
-            "$current_runtime"
-        rm -rf "$transaction_dir"
-        return 1
+    if [[ -e "$modules_backup" || -e "$modules_absent" ]]; then
+        if restore_managed_file "$BBR_MODULES_FILE" "$modules_backup" "$modules_absent"; then
+            info "恢复项 modules：成功"
+        else
+            error "恢复项 modules：失败"
+            failed_items+=(modules)
+        fi
+    else
+        warn "恢复项 modules：无可信快照，保留当前文件"
     fi
-    if [[ "$restore_modules" != "true" ]]; then
-        warn "未找到可信的 $scope BBR 模块配置状态，保留当前文件"
-    fi
-    if [[ "$restore_hook" != "true" ]]; then
-        warn "未找到可信的 $scope initcwnd 钩子状态，保留当前文件"
+
+    if [[ -f "$runtime_backup" ]]; then
+        if apply_runtime_values_strict "$runtime_backup"; then
+            info "恢复项 runtime：成功"
+        else
+            error "恢复项 runtime：失败"
+            failed_items+=(runtime)
+        fi
+    else
+        warn "恢复项 runtime：无可信快照，已跳过"
     fi
 
     if [[ "$scope" == "initial" && -e "$ROUTE_INITIAL_UNKNOWN" ]]; then
-        warn "初始默认路由状态由旧版脚本留下且不可知，保留当前路由"
-    elif ! restore_default_route "$route_backup" "$route_owned"; then
-        warn "无法恢复 $scope 默认路由属性；请检查 IPv4 默认路由"
+        warn "恢复项 route：初始状态未知，保留当前路由"
+    elif restore_default_route "$route_backup" "$route_owned"; then
+        info "恢复项 route：成功"
+    else
+        error "恢复项 route：失败"
+        failed_items+=(route)
     fi
 
-    rm -rf "$transaction_dir"
+    if [[ -e "$hook_backup" || -e "$hook_absent" ]]; then
+        if restore_managed_file "$INITCWND_ROUTE_HOOK" "$hook_backup" "$hook_absent"; then
+            info "恢复项 hook：成功"
+        else
+            error "恢复项 hook：失败"
+            failed_items+=(hook)
+        fi
+    else
+        warn "恢复项 hook：无可信快照，保留当前文件"
+    fi
+
+    if (( ${#failed_items[@]} > 0 )); then
+        error "部分恢复：失败项 ${failed_items[*]}"
+        return 1
+    fi
+
     success "网络配置已恢复到 $scope 状态"
 }
 
@@ -3555,7 +3358,7 @@ show_status() {
     echo "配置文件: $NETWORK_CONF"
     [[ -f "$NETWORK_CONF" ]] && echo "配置状态: 已存在" || echo "配置状态: 未创建"
     if [[ -f "$NETWORK_CONF" ]]; then
-        grep -E '^# (模式|内存|物理内存|有效内存|下载带宽|上传带宽|带宽来源|中国组 RTT|全球组 RTT|观测 RTT|计算 RTT|RTT 来源|RTT 策略|initcwnd 模式|initcwnd 策略|缓冲区依据):' "$NETWORK_CONF" | sed 's/^# /  /'
+        grep -E '^# (模式|内存|物理内存|有效内存|下载带宽|上传带宽|带宽来源|计算 RTT|RTT 来源|RTT 策略|initcwnd 模式|initcwnd 策略|缓冲区依据):' "$NETWORK_CONF" | sed 's/^# /  /'
     fi
     [[ -f "$NETWORK_INITIAL_BACKUP" ]] && echo "初始备份: $NETWORK_INITIAL_BACKUP"
     [[ -f "$NETWORK_INITIAL_ABSENT" ]] && echo "初始状态: 配置文件原本不存在"
@@ -3650,9 +3453,6 @@ show_status() {
     [[ -f "$LEGACY_SYSCTL_BACKUP" ]] &&
         echo "  旧 sysctl.conf 备份: $LEGACY_SYSCTL_BACKUP"
 
-    [[ -f "$LIMITS_LEGACY_ARCHIVE" ]] &&
-        echo "  旧 limits 优化配置归档: $LIMITS_LEGACY_ARCHIVE"
-
     return 0
 }
 
@@ -3674,7 +3474,6 @@ install/plan 选项：
   --download-mbps N       指定下载带宽，单位 Mbps
   --upload-mbps N         指定上传带宽，单位 Mbps
   --rtt-ms N              指定 RTT，单位 ms
-  --target HOST           自定义 RTT 目标，可重复指定；需配合 --probe
   --no-probe              禁止外部探测，缺失数据时按内存保守配置
   --disable-ecn           禁用 ECN，兼容存在 ECN 黑洞的旧链路
   --enable-initcwnd       强制把默认路由 initcwnd/initrwnd 设置为 32
@@ -3689,25 +3488,27 @@ verify 选项：
   network-optimize.sh install --probe # 明确执行主动探测
   network-optimize.sh install --bandwidth-mbps 1000 --rtt-ms 180
   network-optimize.sh install --download-mbps 1000 --upload-mbps 500 --rtt-ms 180
-  network-optimize.sh plan --probe --target example.com --target 203.0.113.10
   network-optimize.sh install --static
   network-optimize.sh verify --yes
 
 默认行为：
   - 交互终端无参数运行时选择静态、手填或自动探测；默认静态 32 MiB
   - 非交互终端无参数运行时自动使用静态模式，不安装探测依赖、不产生测速流量
-  - 手填带宽缺少 RTT 时按 150 ms 计算；显式 --rtt-ms 严格采用用户值，不应用 floor
-  - 主动探测成功按 max(观测 RTT, 150 ms) 计算，失败回退到 150 ms
+  - 手填带宽缺少 RTT 时按 150 ms 计算；显式 --rtt-ms 严格采用用户值
+  - 自动模式固定按 150 ms 计算 BDP，不进行中国/全球 RTT 探测
   - 只有 --auto、--probe 或交互确认后才主动探测并安装缺失依赖
-  - 自动探测测量中国大陆与全球 RTT，并使用公共 iperf3 与 Cloudflare
-  - 自动测速在单方向 40 GB 或合计 85 GB 时提前停止，保留 5 GB 终止余量
+  - 自动探测仅测量 IPv4 公网带宽，使用公共 iperf3 与 Cloudflare
+  - TCP 调优仅覆盖 IPv4；IPv6 forwarding/RA 是独立网络正确性配置
+  - 自动测速在单方向 40 GB 或合计 85 GB 时提前停止，硬上限仍为 45/90 GB
+  - 流量按实际 IPv4 测速目标的路由接口分别计量并汇总，接口计数包含后台流量
   - 默认不持久管理 ECN；只在传入 --disable-ecn 时写入 tcp_ecn=0
-  - initcwnd 默认 auto：已知上传 <= 100 Mbps 保留内核默认，否则设置为 32
+  - initcwnd 默认 auto：已知上传 > 100 Mbps 设置 32，低于等于 100 Mbps或未知时保留内核默认
+  - 仅凭本脚本 marker、受管 hook 或可信路由快照清理旧 initcwnd/initrwnd
   - 检测到 networkd-dispatcher 时持久化 IPv4 默认路由的 initcwnd/initrwnd；不扩展 IPv6
   - --enable-initcwnd/--disable-initcwnd 显式覆盖 auto，冲突参数会被拒绝
-  - 根据 2 x BDP + 2 MiB 余量动态设置缓冲区上限，TCP 起点按半个 BDP 取 1-4 MiB
-  - 静态或带宽未知时 TCP 起点回退到 2 MiB，并且不超过 socket 最大值的四分之一
-  - RTT 探测失败回退到 150 ms；带宽探测失败时最大值回退到 32 MiB
+  - 根据 2 x BDP + 2 MiB 余量动态设置缓冲区上限，TCP 初始默认固定 2 MiB
+  - 静态或带宽未知时 TCP 初始默认仍为 2 MiB，socket 最大值保持原有 32 MiB 回退语义
+  - 带宽探测失败时最大值回退到 32 MiB
   - RAM cap 为有效 RAM / 32，最低 8 MiB、最高 256 MiB，并识别有限 cgroup memory limit
   - 动态 socket 最大值保留 4 MiB 绝对下限；core socket 默认值和全局 tcp_mem 保留系统值
   - 只在本次运行计算和应用，不创建定时任务
@@ -3783,5 +3584,6 @@ main() {
 trap 'error "网络优化脚本在第 $LINENO 行执行失败"' ERR
 
 if [[ "${BASH_SOURCE[0]:-$0}" == "$0" ]]; then
+    trap 'cleanup_iperf_runners' EXIT
     main "$@"
 fi

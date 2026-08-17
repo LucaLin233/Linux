@@ -5,6 +5,8 @@ readonly ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 readonly TEMP_DIR=$(mktemp -d)
 trap 'rm -rf "$TEMP_DIR"' EXIT
 export NETWORK_OPTIMIZE_STATE_DIR="$TEMP_DIR/state"
+export NETWORK_OPTIMIZE_CONF="$TEMP_DIR/etc/sysctl.d/99-network-optimize.conf"
+export NETWORK_OPTIMIZE_IPV6_CONF_ROOT="$TEMP_DIR/proc/sys/net/ipv6/conf"
 export NETWORK_OPTIMIZE_INITCWND_HOOK="$TEMP_DIR/networkd-dispatcher/routable.d/50-network-optimize-initcwnd"
 # shellcheck source=../modules/network-optimize.sh
 source "$ROOT_DIR/modules/network-optimize.sh"
@@ -40,16 +42,8 @@ assert_eq "268435456" "$(calculate_memory_cap 16384)" \
     "large-memory cap keeps 256 MiB ceiling"
 assert_eq "effective RAM / 32 cap" "$(buffer_limit_reason 10000 150 67108864)" \
     "buffer reason reports the memory-derived cap"
-assert_eq "1048576" "$(calculate_buffer_default 100 20 33554432)" \
-    "small BDP keeps the 1 MiB default floor"
-assert_eq "2097152" "$(calculate_buffer_default 600 50 33554432)" \
-    "medium BDP rounds the default to 2 MiB"
-assert_eq "4194304" "$(calculate_buffer_default 600 100 33554432)" \
-    "high RTT flow reaches the 4 MiB default ceiling"
-assert_eq "2097152" "$(calculate_buffer_default 10000 250 8388608)" \
-    "small socket maximum caps the default at one quarter"
-assert_eq "2097152" "$(calculate_buffer_fallback 33554432)" \
-    "unknown bandwidth falls back to a 2 MiB default"
+assert_eq "2097152" "$TCP_BUFFER_DEFAULT_BYTES" \
+    "TCP receive and send defaults stay fixed at 2 MiB"
 assert_eq 'netdev_budget' "$(removed_sysctl_display_name net.core.netdev_budget)" \
     "display known retired sysctl by short name"
 assert_eq 'net.test.unknown' "$(removed_sysctl_display_name net.test.unknown)" \
@@ -121,34 +115,30 @@ show_status >/dev/null || fail "status fails when optional diagnostics are unava
 printf 'PASS: status succeeds when optional diagnostics are unavailable\n'
 
 TUNING_MODE=auto
-OBSERVED_RTT_MS=69
 DETECTED_RTT_MS=150
-RTT_SOURCE='max(CN, global)'
-RTT_POLICY='max(observed RTT, 150 ms coverage floor)'
-assert_eq 'RTT：观测 69 ms / 计算 150 ms（来源 max(CN, global)；策略 max(observed RTT, 150 ms coverage floor)）' \
-    "$(format_rtt_selection_summary)" "summary distinguishes observed and calculation RTT"
-OBSERVED_RTT_MS=''
-DETECTED_RTT_MS=150
-RTT_SOURCE='default after failed active probe'
-RTT_POLICY='150 ms fallback'
-assert_eq 'RTT：观测 未获得 / 计算 150 ms（来源 default after failed active probe；策略 150 ms fallback）' \
-    "$(format_rtt_selection_summary)" "summary shows the selected fallback RTT"
+RTT_SOURCE='automatic policy'
+RTT_POLICY='fixed 150 ms'
+assert_eq 'RTT：计算 150 ms（来源 automatic policy；策略 fixed 150 ms）' \
+    "$(format_rtt_selection_summary)" "summary reports fixed automatic calculation RTT"
 TUNING_MODE=static
 assert_eq 'RTT：未使用（静态 32 MiB 缓冲区）' \
     "$(format_rtt_selection_summary)" "summary explains static RTT handling"
 
 PROBE_IFACE=eth0
-TRAFFIC_RX_START=100000000
-TRAFFIC_TX_START=200000000
+TRAFFIC_IFACES=(eth0 eth1)
+TRAFFIC_RX_START_BY_IFACE=([eth0]=100000000 [eth1]=50000000)
+TRAFFIC_TX_START_BY_IFACE=([eth0]=200000000 [eth1]=100000000)
 read_iface_counter() {
-    case "$1" in
-        rx) echo 1600000000 ;;
-        tx) echo 2450000000 ;;
+    case "$1:$2" in
+        eth0:rx) echo 1600000000 ;;
+        eth0:tx) echo 2450000000 ;;
+        eth1:rx) echo 300000000 ;;
+        eth1:tx) echo 600000000 ;;
         *) return 1 ;;
     esac
 }
-assert_eq '流量：上传 2.25 GB / 下载 1.50 GB / 合计 3.75 GB' \
-    "$(traffic_report)" "traffic report shows upload, download, and total usage"
+assert_eq '流量（接口 eth0,eth1；含测试期间后台流量，按保守安全预算累计）：上传 2.75 GB / 下载 1.75 GB / 合计 4.50 GB' \
+    "$(traffic_report)" "traffic report sums actual target interfaces conservatively"
 
 assert_eq "default via 192.0.2.1 dev eth0 proto dhcp metric 100" \
     "$(strip_route_window_fields 'default via 192.0.2.1 dev eth0 proto dhcp metric 100 initcwnd 32 initrwnd 32')" \
@@ -275,6 +265,10 @@ printf 'PASS: apply initcwnd records ownership\n'
 [[ -x "$INITCWND_ROUTE_HOOK" ]] || fail "apply initcwnd installs executable route hook"
 grep -Fq '# Managed by network-optimize.sh' "$INITCWND_ROUTE_HOOK" ||
     fail "initcwnd route hook lacks ownership marker"
+grep -Fq '# network-optimize:initcwnd-hook:v1' "$INITCWND_ROUTE_HOOK" ||
+    fail "initcwnd route hook lacks verifiable version marker"
+initcwnd_settings_owned || fail "ownership marker is not accepted as ownership evidence"
+printf 'PASS: marker ownership evidence is accepted\n'
 bash -n "$INITCWND_ROUTE_HOOK" || fail "generated initcwnd route hook has invalid syntax"
 printf 'PASS: apply initcwnd installs managed persistence hook\n'
 
@@ -313,6 +307,93 @@ assert_eq "default via 192.0.2.1 dev eth0 proto dhcp metric 100" "$CURRENT_ROUTE
     "failed initcwnd application leaves route unchanged"
 [[ ! -e "$ROUTE_OWNED_MARKER" ]] || fail "failed initcwnd application does not claim ownership"
 printf 'PASS: failed initcwnd application does not claim ownership\n'
+
+# A verifiable managed hook is sufficient ownership evidence without the marker.
+rm -f "$ROUTE_OWNED_MARKER" "$ROUTE_PREVIOUS_BACKUP" "$ROUTE_INITIAL_BACKUP"
+CURRENT_ROUTE="default via 192.0.2.1 dev eth0 proto dhcp src 192.0.2.10 metric 100 onlink initcwnd 32 initrwnd 32"
+write_initcwnd_hook
+INITCWND_ENABLED=false
+apply_initcwnd >/dev/null
+assert_eq "default via 192.0.2.1 dev eth0 proto dhcp src 192.0.2.10 metric 100 onlink" \
+    "$CURRENT_ROUTE" "managed hook ownership allows route-window cleanup"
+printf 'PASS: hook ownership evidence is accepted\n'
+
+# A trusted snapshot proving the pre-script route had no windows is also sufficient.
+rm -f "$ROUTE_OWNED_MARKER" "$INITCWND_ROUTE_HOOK"
+printf '%s\n' 'default via 192.0.2.1 dev eth0 proto dhcp src 192.0.2.10 metric 100 onlink' \
+    > "$ROUTE_PREVIOUS_BACKUP"
+CURRENT_ROUTE="default via 192.0.2.1 dev eth0 proto dhcp src 192.0.2.10 metric 100 onlink initcwnd 32 initrwnd 32"
+apply_initcwnd >/dev/null
+assert_eq "default via 192.0.2.1 dev eth0 proto dhcp src 192.0.2.10 metric 100 onlink" \
+    "$CURRENT_ROUTE" "trusted route snapshot allows owned cleanup"
+printf 'PASS: snapshot ownership evidence is accepted\n'
+
+# A stale snapshot for another default route must not authorize cleanup.
+printf '%s\n' 'default via 192.0.2.1 dev eth0 proto dhcp metric 100' \
+    > "$ROUTE_PREVIOUS_BACKUP"
+CURRENT_ROUTE="default via 203.0.113.1 dev eth9 proto static metric 77 initcwnd 16 initrwnd 20"
+LAST_ROUTE_ARGS="not-called"
+apply_initcwnd >/dev/null
+assert_eq "default via 203.0.113.1 dev eth9 proto static metric 77 initcwnd 16 initrwnd 20" \
+    "$CURRENT_ROUTE" "stale snapshot cannot claim a different route"
+assert_eq "not-called" "$LAST_ROUTE_ARGS" "stale snapshot does not replace third-party route"
+printf 'PASS: stale route snapshot is not ownership evidence\n'
+
+# Marker-like content with extra commands is not a verifiable managed hook.
+rm -f "$ROUTE_PREVIOUS_BACKUP" "$ROUTE_INITIAL_BACKUP"
+render_initcwnd_hook > "$INITCWND_ROUTE_HOOK"
+printf '%s\n' 'echo external-command' >> "$INITCWND_ROUTE_HOOK"
+if is_managed_initcwnd_hook; then
+    fail "modified initcwnd hook was accepted as managed"
+fi
+CURRENT_ROUTE="default via 203.0.113.1 dev eth9 proto static metric 77 initcwnd 16 initrwnd 20"
+LAST_ROUTE_ARGS="not-called"
+apply_initcwnd >/dev/null
+assert_eq "not-called" "$LAST_ROUTE_ARGS" "modified hook cannot authorize route cleanup"
+printf 'PASS: only exact generated hook is ownership evidence\n'
+
+# Unowned third-party route windows must remain untouched.
+rm -f "$ROUTE_OWNED_MARKER" "$INITCWND_ROUTE_HOOK" \
+    "$ROUTE_PREVIOUS_BACKUP" "$ROUTE_INITIAL_BACKUP" "$ROUTE_INITIAL_UNKNOWN"
+CURRENT_ROUTE="default via 203.0.113.1 dev eth9 proto static src 203.0.113.2 metric 77 onlink initcwnd 16 initrwnd 20"
+LAST_ROUTE_ARGS="not-called"
+apply_initcwnd >/dev/null
+assert_eq "default via 203.0.113.1 dev eth9 proto static src 203.0.113.2 metric 77 onlink initcwnd 16 initrwnd 20" \
+    "$CURRENT_ROUTE" "unowned third-party route windows remain unchanged"
+assert_eq "not-called" "$LAST_ROUTE_ARGS" "unowned cleanup does not replace route"
+
+# Owned cleanup failure must propagate and retain ownership for retry.
+CURRENT_ROUTE="default via 192.0.2.1 dev eth0 proto dhcp metric 100 initcwnd 32 initrwnd 32"
+install -D -m 0600 /dev/null "$ROUTE_OWNED_MARKER"
+IP_FAIL=true
+if apply_initcwnd >/dev/null 2>&1; then
+    fail "failed owned initcwnd cleanup unexpectedly succeeded"
+fi
+IP_FAIL=false
+assert_eq "default via 192.0.2.1 dev eth0 proto dhcp metric 100 initcwnd 32 initrwnd 32" \
+    "$CURRENT_ROUTE" "failed owned cleanup preserves route attributes"
+[[ -e "$ROUTE_OWNED_MARKER" ]] || fail "failed owned cleanup dropped ownership marker"
+printf 'PASS: owned cleanup failure propagates\n'
+
+# Hook deletion failure must return nonzero and leave the now-inert hook for retry.
+CURRENT_ROUTE="default via 192.0.2.1 dev eth0 proto dhcp metric 100 initcwnd 32 initrwnd 32"
+write_initcwnd_hook
+rm() {
+    if [[ "$*" == *"$INITCWND_ROUTE_HOOK"* ]]; then
+        return 1
+    fi
+    command rm "$@"
+}
+if apply_initcwnd >/dev/null 2>&1; then
+    fail "failed managed hook deletion unexpectedly succeeded"
+fi
+unset -f rm
+assert_eq "default via 192.0.2.1 dev eth0 proto dhcp metric 100" \
+    "$CURRENT_ROUTE" "hook deletion failure does not undo completed route cleanup"
+[[ -e "$INITCWND_ROUTE_HOOK" ]] || fail "failed hook deletion removed the hook"
+[[ ! -e "$ROUTE_OWNED_MARKER" ]] || fail "failed hook deletion left hook active"
+rm -f "$INITCWND_ROUTE_HOOK"
+printf 'PASS: managed hook deletion failure propagates without success\n'
 
 CURRENT_ROUTE="default via 192.0.2.1 dev eth0 proto dhcp metric 100"
 install -D -m 0600 /dev/null "$ROUTE_OWNED_MARKER"

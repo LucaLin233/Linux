@@ -5,6 +5,8 @@ readonly ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 readonly TEMP_DIR=$(mktemp -d)
 trap 'rm -rf "$TEMP_DIR"' EXIT
 export NETWORK_OPTIMIZE_STATE_DIR="$TEMP_DIR/state"
+export NETWORK_OPTIMIZE_CONF="$TEMP_DIR/etc/sysctl.d/99-network-optimize.conf"
+export NETWORK_OPTIMIZE_IPV6_CONF_ROOT="$TEMP_DIR/proc/sys/net/ipv6/conf"
 
 # shellcheck source=../modules/network-optimize.sh
 source "$ROOT_DIR/modules/network-optimize.sh"
@@ -196,6 +198,66 @@ assert_fail "verify fails when no candidate port is reachable" \
 grep -Fq '0 组公共 iperf3 候选均未得到完整的 1 流和 4 流结果' "$all_closed_log" ||
     fail "all-closed failure does not explain missing complete group"
 
+traffic_add_target() { return 0; }
+traffic_budget_reached() { return 1; }
+deadline_args="$TEMP_DIR/timeout.args"
+timeout() {
+    printf '%s\n' "$*" > "$deadline_args"
+    return 124
+}
+deadline_rc=0
+run_iperf_runner "$TEMP_DIR/deadline.json" 192.0.2.40 5201 5 4 upload false ||
+    deadline_rc=$?
+unset -f timeout
+assert_eq 124 "$deadline_rc" "iperf runner propagates deadline timeout"
+grep -Fq -- '--foreground --signal=TERM --kill-after=3s 20s iperf3 -4' "$deadline_args" ||
+    fail "iperf runner deadline lacks foreground TERM, 3s kill-after, or duration+15"
+printf 'PASS: iperf runner enforces duration plus 15 second deadline\n'
+
+# Exercise GNU timeout against a child that ignores TERM; kill-after must reap it.
+stuck_bin="$TEMP_DIR/stuck-bin"
+stuck_pid_file="$TEMP_DIR/stuck-iperf.pid"
+mkdir -p "$stuck_bin"
+cat > "$stuck_bin/iperf3" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$$" > "$TEST_STUCK_PID_FILE"
+trap '' TERM
+exec sleep 30
+EOF
+chmod +x "$stuck_bin/iperf3"
+ORIGINAL_PATH="$PATH"
+PATH="$stuck_bin:$PATH"
+export PATH TEST_STUCK_PID_FILE="$stuck_pid_file"
+stuck_rc=0
+stuck_started=$SECONDS
+run_iperf_runner "$TEMP_DIR/stuck.json" 192.0.2.41 5201 -14 1 upload false ||
+    stuck_rc=$?
+stuck_elapsed=$((SECONDS - stuck_started))
+PATH="$ORIGINAL_PATH"
+export PATH
+(( stuck_rc != 0 )) || fail "stuck iperf runner unexpectedly succeeded"
+(( stuck_elapsed <= 8 )) || fail "stuck iperf runner exceeded deadline and kill grace"
+stuck_pid=$(<"$stuck_pid_file")
+! kill -0 "$stuck_pid" 2>/dev/null || fail "deadline left stuck iperf process running"
+printf 'PASS: deadline reaps an iperf process that ignores TERM\n'
+
+if grep -Eq 'pkill([[:space:]]|$)' "$ROOT_DIR/modules/network-optimize.sh"; then
+    fail "network-optimize still uses broad pkill cleanup"
+fi
+printf 'PASS: iperf cleanup contains no pkill\n'
+
+fake_bin="$TEMP_DIR/fake-bin"
+mkdir -p "$fake_bin"
+cat > "$fake_bin/timeout" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$$" > "$TEST_TIMEOUT_PID_FILE"
+exec sleep 30
+EOF
+chmod +x "$fake_bin/timeout"
+ORIGINAL_PATH="$PATH"
+PATH="$fake_bin:$PATH"
+export PATH
+
 assert_signal_cleanup() {
     local signal="$1" expected_rc="$2"
     local signal_name=${signal,,}
@@ -207,10 +269,8 @@ assert_signal_cleanup() {
     verify_impl() {
         VERIFY_TEMP_DIR="$interrupt_dir"
         mkdir -p "$VERIFY_TEMP_DIR"
-        sleep 30 &
-        VERIFY_PID=$!
-        printf '%s\n' "$VERIFY_PID" > "$interrupt_pid_file"
-        wait "$VERIFY_PID"
+        export TEST_TIMEOUT_PID_FILE="$interrupt_pid_file"
+        run_iperf_runner "$VERIFY_TEMP_DIR/iperf.json" 192.0.2.50 5201 5 1 upload false
     }
 
     run_verify_command > "$interrupt_log" 2>&1 &
