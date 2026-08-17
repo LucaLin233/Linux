@@ -40,10 +40,20 @@ assert_eq "268435456" "$(calculate_memory_cap 16384)" \
     "large-memory cap keeps 256 MiB ceiling"
 assert_eq "effective RAM / 32 cap" "$(buffer_limit_reason 10000 150 67108864)" \
     "buffer reason reports the memory-derived cap"
-assert_eq "131072" "$TCP_RMEM_DEFAULT_BYTES" \
-    "TCP receive default uses the unified 128 KiB start"
-assert_eq "16384" "$TCP_WMEM_DEFAULT_BYTES" \
-    "TCP send default uses the unified 16 KiB start"
+assert_eq "1048576" "$(calculate_buffer_default 100 20 33554432)" \
+    "small BDP keeps the 1 MiB default floor"
+assert_eq "2097152" "$(calculate_buffer_default 600 50 33554432)" \
+    "medium BDP rounds the default to 2 MiB"
+assert_eq "4194304" "$(calculate_buffer_default 600 100 33554432)" \
+    "high RTT flow reaches the 4 MiB default ceiling"
+assert_eq "2097152" "$(calculate_buffer_default 10000 250 8388608)" \
+    "small socket maximum caps the default at one quarter"
+assert_eq "2097152" "$(calculate_buffer_fallback 33554432)" \
+    "unknown bandwidth falls back to a 2 MiB default"
+assert_eq 'netdev_budget' "$(removed_sysctl_display_name net.core.netdev_budget)" \
+    "display known retired sysctl by short name"
+assert_eq 'net.test.unknown' "$(removed_sysctl_display_name net.test.unknown)" \
+    "preserve the full name of an unknown retired sysctl"
 detect_cgroup_memory_limit_mb() { printf '%s\n' 512; }
 assert_eq '512' "$(detect_effective_memory_mb 1024)" \
     "effective memory honors a smaller cgroup limit"
@@ -72,6 +82,43 @@ journalctl() {
 }
 assert_eq '2' "$(recent_oom_event_count)" "count canonical OOM events once"
 unset -f journalctl
+
+sysctl() {
+    [[ "$1" == "-n" ]] || return 1
+    case "$2" in
+        net.test.present) printf '%s\n' '42' ;;
+        net.test.empty) printf '\n' ;;
+        *) return 1 ;;
+    esac
+}
+assert_eq '42' "$(read_sysctl_or net.test.present)" "read available sysctl value"
+assert_eq 'none' "$(read_sysctl_or net.test.empty none)" \
+    "use fallback for an empty sysctl value"
+assert_eq 'fallback' "$(read_sysctl_or net.test.missing fallback)" \
+    "use explicit fallback for unavailable sysctl"
+assert_eq $'  Present: 42\n  Missing: unavailable' \
+    "$(print_sysctl_rows \
+        'Present|net.test.present|unavailable' \
+        'Missing|net.test.missing|unavailable')" \
+    "format table-driven sysctl status rows"
+unset -f sysctl
+
+file_nr_fixture="$TEMP_DIR/file-nr"
+printf '%s\n' '120 0 100000' > "$file_nr_fixture"
+assert_eq '120 allocated / 0 unused / 100000 max' \
+    "$(file_handle_status "$file_nr_fixture")" "format file handle status"
+assert_eq '不可用' "$(file_handle_status "$TEMP_DIR/missing-file-nr")" \
+    "handle unavailable file handle status"
+status_function=$(declare -f show_status)
+for diagnostic_key in \
+    vm.min_free_kbytes fs.file-max fs.nr_open net.ipv4.tcp_tw_reuse \
+    net.core.netdev_budget net.core.netdev_budget_usecs; do
+    grep -Fq "$diagnostic_key" <<< "$status_function" ||
+        fail "status omits read-only diagnostic $diagnostic_key"
+done
+printf 'PASS: status includes read-only kernel capacity diagnostics\n'
+show_status >/dev/null || fail "status fails when optional diagnostics are unavailable"
+printf 'PASS: status succeeds when optional diagnostics are unavailable\n'
 
 TUNING_MODE=auto
 OBSERVED_RTT_MS=69

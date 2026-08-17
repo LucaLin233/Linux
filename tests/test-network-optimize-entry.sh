@@ -269,12 +269,12 @@ for retired_key in \
         fail "generated config still owns $retired_key"
     fi
 done
-assert_eq '4096 131072 39845888' \
+assert_eq '4096 4194304 39845888' \
     "$(read_saved_sysctl_value "$generated_config" net.ipv4.tcp_rmem)" \
-    "generated config uses unified receive start"
-assert_eq '4096 16384 20971520' \
+    "generated config uses BDP-derived receive start"
+assert_eq '4096 4194304 20971520' \
     "$(read_saved_sysctl_value "$generated_config" net.ipv4.tcp_wmem)" \
-    "generated config uses unified send start"
+    "generated config uses BDP-derived send start"
 printf 'PASS: default generated config leaves retired global parameters unmanaged\n'
 
 ECN_DISABLED=true
