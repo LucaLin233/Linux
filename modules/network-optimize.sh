@@ -1150,6 +1150,8 @@ write_initcwnd_hook() {
     fi
 }
 
+# Generated hook uses clean as an array; apply path intentionally shadows it as a string.
+# shellcheck disable=SC2128,SC2178
 apply_initcwnd() {
     local route="" clean=""
     local owned="false"
