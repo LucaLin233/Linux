@@ -144,6 +144,7 @@ declare -a TRAFFIC_IFACES=()
 declare -A TRAFFIC_RX_START_BY_IFACE=()
 declare -A TRAFFIC_TX_START_BY_IFACE=()
 declare -a IPERF_RUNNER_PIDS=()
+declare -a INITCWND_ROLLBACK_FAILED_ITEMS=()
 PREFERRED_IPERF_PORT=""
 CLOUDFLARE_IPV4=""
 VERIFY_ASSUME_YES="false"
@@ -453,12 +454,7 @@ bbr_available() {
 }
 
 persist_bbr_module() {
-    local temp_file
-
-    temp_file=$(mktemp "${BBR_MODULES_FILE}.new.XXXXXX") || return 1
-    printf '%s\n' tcp_bbr > "$temp_file"
-    chmod 644 "$temp_file"
-    mv "$temp_file" "$BBR_MODULES_FILE"
+    atomic_write_file "$BBR_MODULES_FILE" "tcp_bbr" 0644 || return 1
 }
 
 ensure_bbr_available() {
@@ -928,6 +924,14 @@ strip_route_window_fields() {
     printf '%s\n' "${clean[*]}"
 }
 
+create_initcwnd_ownership_marker() {
+    atomic_install_file /dev/null "$ROUTE_OWNED_MARKER" 0600 || return 1
+}
+
+remove_initcwnd_ownership_marker() {
+    rm -f -- "$ROUTE_OWNED_MARKER" || return 1
+}
+
 backup_default_route() {
     local route=""
     local query_status=0
@@ -1146,7 +1150,7 @@ write_initcwnd_hook() {
 }
 
 apply_initcwnd() {
-    local route clean
+    local route="" clean=""
     local owned="false"
     local -a route_args=()
 
@@ -1169,7 +1173,10 @@ apply_initcwnd() {
                 return 1
             }
         fi
-        rm -f "$ROUTE_OWNED_MARKER"
+        if ! remove_initcwnd_ownership_marker; then
+            error "删除 initcwnd ownership marker 失败"
+            return 1
+        fi
         if ! remove_initcwnd_hook; then
             error "移除本脚本 initcwnd 持久化钩子失败"
             return 1
@@ -1194,7 +1201,10 @@ apply_initcwnd() {
     clean=$(strip_route_window_fields "$route")
     read -r -a route_args <<< "$clean"
     if ip -4 route replace "${route_args[@]}" initcwnd 32 initrwnd 32; then
-        install -D -m 0600 /dev/null "$ROUTE_OWNED_MARKER"
+        if ! create_initcwnd_ownership_marker; then
+            error "创建 initcwnd ownership marker 失败"
+            return 1
+        fi
         if ! write_initcwnd_hook; then
             error "无法写入 initcwnd 持久化钩子"
             return 1
@@ -1222,7 +1232,7 @@ restore_default_route() {
         initcwnd_settings_owned || return 0
         route=$(default_ipv4_route) || return 1
         if [[ -z "$route" ]]; then
-            rm -f "$ROUTE_OWNED_MARKER"
+            remove_initcwnd_ownership_marker || return 1
             return 0
         fi
         if grep -Eq '(^| )(initcwnd|initrwnd) [0-9]+( |$)' <<< "$route"; then
@@ -1231,7 +1241,7 @@ restore_default_route() {
             (( ${#route_args[@]} > 0 )) || return 1
             ip -4 route replace "${route_args[@]}" || return 1
         fi
-        rm -f "$ROUTE_OWNED_MARKER"
+        remove_initcwnd_ownership_marker || return 1
         return 0
     fi
 
@@ -1239,7 +1249,7 @@ restore_default_route() {
         initcwnd_settings_owned || return 0
         route=$(default_ipv4_route) || return 1
         if [[ -z "$route" ]]; then
-            rm -f "$ROUTE_OWNED_MARKER"
+            remove_initcwnd_ownership_marker || return 1
             return 0
         fi
         route=$(strip_route_window_fields "$route")
@@ -1249,9 +1259,9 @@ restore_default_route() {
     (( ${#route_args[@]} > 0 )) || return 1
     ip -4 route replace "${route_args[@]}" || return 1
     if [[ -n "$owned_file" && -e "$owned_file" ]]; then
-        install -D -m 0600 /dev/null "$ROUTE_OWNED_MARKER"
+        create_initcwnd_ownership_marker || return 1
     else
-        rm -f "$ROUTE_OWNED_MARKER"
+        remove_initcwnd_ownership_marker || return 1
     fi
 }
 
@@ -2805,6 +2815,29 @@ verify_network_config() {
     success "运行时 sysctl 已与生成配置一致"
 }
 
+rollback_initcwnd_install() {
+    INITCWND_ROLLBACK_FAILED_ITEMS=()
+
+    if ! restore_default_route \
+        "$ROUTE_PREVIOUS_BACKUP" "$ROUTE_PREVIOUS_OWNED" "$ROUTE_PREVIOUS_ABSENT"; then
+        INITCWND_ROLLBACK_FAILED_ITEMS+=(route)
+    fi
+    if ! restore_managed_file \
+        "$INITCWND_ROUTE_HOOK" "$ROUTE_HOOK_PREVIOUS_BACKUP" \
+        "$ROUTE_HOOK_PREVIOUS_ABSENT"; then
+        INITCWND_ROLLBACK_FAILED_ITEMS+=(hook)
+    fi
+    if ! apply_runtime_values_strict "$RUNTIME_PREVIOUS_BACKUP"; then
+        INITCWND_ROLLBACK_FAILED_ITEMS+=(runtime)
+    fi
+    if ! restore_managed_file \
+        "$NETWORK_CONF" "$NETWORK_PREVIOUS_BACKUP" "$NETWORK_PREVIOUS_ABSENT"; then
+        INITCWND_ROLLBACK_FAILED_ITEMS+=(config)
+    fi
+
+    (( ${#INITCWND_ROLLBACK_FAILED_ITEMS[@]} == 0 ))
+}
+
 install_optimization() {
     local temp_config
     local runtime_backup
@@ -2893,15 +2926,10 @@ install_optimization() {
     fi
 
     if ! apply_initcwnd; then
-        restore_default_route \
-            "$ROUTE_PREVIOUS_BACKUP" "$ROUTE_PREVIOUS_OWNED" "$ROUTE_PREVIOUS_ABSENT" || true
-        restore_managed_file \
-            "$INITCWND_ROUTE_HOOK" "$ROUTE_HOOK_PREVIOUS_BACKUP" \
-            "$ROUTE_HOOK_PREVIOUS_ABSENT" || true
-        restore_runtime_values "$RUNTIME_PREVIOUS_BACKUP"
-        if ! restore_managed_file \
-            "$NETWORK_CONF" "$NETWORK_PREVIOUS_BACKUP" "$NETWORK_PREVIOUS_ABSENT"; then
-            warn "路由优化失败后无法恢复上次持久网络配置"
+        if rollback_initcwnd_install; then
+            error "initcwnd 应用失败，已回滚 route、hook、runtime、config"
+        else
+            error "initcwnd 应用失败，且回滚不完整：失败项 ${INITCWND_ROLLBACK_FAILED_ITEMS[*]}"
         fi
         rm -f "$temp_config" "$runtime_backup"
         return 1
@@ -2996,9 +3024,9 @@ restore_captured_default_route() {
     current_route=$(query_default_ipv4_route) || query_status=$?
     if (( query_status == 2 )); then
         if [[ -e "$transaction_dir/route-owned" ]]; then
-            install -D -m 0600 /dev/null "$ROUTE_OWNED_MARKER"
+            create_initcwnd_ownership_marker || return 1
         else
-            rm -f "$ROUTE_OWNED_MARKER"
+            remove_initcwnd_ownership_marker || return 1
         fi
         return $?
     fi
@@ -3011,9 +3039,9 @@ restore_captured_default_route() {
     (( ${#route_args[@]} > 0 )) || return 1
     ip -4 route del "${route_args[@]}" || return 1
     if [[ -e "$transaction_dir/route-owned" ]]; then
-        install -D -m 0600 /dev/null "$ROUTE_OWNED_MARKER"
+        create_initcwnd_ownership_marker || return 1
     else
-        rm -f "$ROUTE_OWNED_MARKER"
+        remove_initcwnd_ownership_marker || return 1
     fi
 }
 

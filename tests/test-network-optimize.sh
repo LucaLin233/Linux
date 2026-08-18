@@ -489,11 +489,13 @@ printf 'PASS: owned cleanup failure propagates\n'
 # Hook deletion failure must return nonzero and leave the now-inert hook for retry.
 CURRENT_ROUTE="default via 192.0.2.1 dev eth0 proto dhcp metric 100 initcwnd 32 initrwnd 32"
 write_initcwnd_hook
+eval "$(declare -f remove_initcwnd_hook | sed '1s/remove_initcwnd_hook/remove_initcwnd_hook_real/')"
 remove_initcwnd_hook() { return 1; }
 if apply_initcwnd >/dev/null 2>&1; then
     fail "failed managed hook deletion unexpectedly succeeded"
 fi
-unset -f remove_initcwnd_hook
+eval "$(declare -f remove_initcwnd_hook_real | sed '1s/remove_initcwnd_hook_real/remove_initcwnd_hook/')"
+unset -f remove_initcwnd_hook_real
 assert_eq "default via 192.0.2.1 dev eth0 proto dhcp metric 100" \
     "$CURRENT_ROUTE" "hook deletion failure does not undo completed route cleanup"
 [[ -e "$INITCWND_ROUTE_HOOK" ]] || fail "failed hook deletion removed the hook"
@@ -501,10 +503,70 @@ assert_eq "default via 192.0.2.1 dev eth0 proto dhcp metric 100" \
 rm -f "$INITCWND_ROUTE_HOOK"
 printf 'PASS: managed hook deletion failure propagates without success\n'
 
+# Marker creation and deletion failures must be observable to callers.
+remove_initcwnd_ownership_marker
 CURRENT_ROUTE="default via 192.0.2.1 dev eth0 proto dhcp metric 100"
-install -D -m 0600 /dev/null "$ROUTE_OWNED_MARKER"
+INITCWND_ENABLED=true
+(
+    create_initcwnd_ownership_marker() { return 1; }
+    if apply_initcwnd >/dev/null 2>&1; then
+        fail "failed ownership marker creation unexpectedly succeeded"
+    fi
+    [[ ! -e "$ROUTE_OWNED_MARKER" ]] ||
+        fail "failed ownership marker creation left a marker"
+)
+printf 'PASS: ownership marker creation failure propagates\n'
+
+create_initcwnd_ownership_marker
+CURRENT_ROUTE="default via 192.0.2.1 dev eth0 proto dhcp metric 100"
+INITCWND_ENABLED=false
+(
+    remove_initcwnd_ownership_marker() { return 1; }
+    if apply_initcwnd >/dev/null 2>&1; then
+        fail "failed ownership marker deletion unexpectedly succeeded"
+    fi
+)
+[[ -e "$ROUTE_OWNED_MARKER" ]] ||
+    fail "failed ownership marker deletion removed the marker"
+remove_initcwnd_ownership_marker
+printf 'PASS: ownership marker deletion failure propagates\n'
+
+# BBR persistence must use checked atomic writes even when called in a condition.
+(
+    atomic_write_file() { return 1; }
+    if persist_bbr_module; then
+        fail "failed BBR atomic write unexpectedly succeeded"
+    fi
+)
+rm -f "$BBR_MODULES_FILE"
+persist_bbr_module
+assert_eq tcp_bbr "$(cat "$BBR_MODULES_FILE")" "persist BBR module atomically"
+assert_eq 644 "$(stat -c '%a' "$BBR_MODULES_FILE")" "persist BBR module mode"
+
+# Rollback collects every failed initcwnd recovery item in execution order.
+(
+    restore_default_route() { return 1; }
+    restore_managed_file() { return 1; }
+    apply_runtime_values_strict() { return 1; }
+    if rollback_initcwnd_install; then
+        fail "incomplete initcwnd rollback unexpectedly succeeded"
+    fi
+    assert_eq 'route hook runtime config' "${INITCWND_ROLLBACK_FAILED_ITEMS[*]}" \
+        "summarize all initcwnd rollback failures"
+)
+printf 'PASS: initcwnd rollback reports route, hook, runtime, and config failures\n'
+
+CURRENT_ROUTE="default via 192.0.2.1 dev eth0 proto dhcp metric 100"
+create_initcwnd_ownership_marker
 assert_eq 'drift|ownership marker exists but default route lacks initcwnd/initrwnd 32' \
     "$(detect_initcwnd_state)" "detect marker and route drift"
+INITCWND_ENABLED=false
+apply_initcwnd >/dev/null
+assert_eq "default via 192.0.2.1 dev eth0 proto dhcp metric 100" "$CURRENT_ROUTE" \
+    "stale marker cleanup preserves route without window fields"
+[[ ! -e "$ROUTE_OWNED_MARKER" ]] || fail "stale marker cleanup retained ownership"
+printf 'PASS: stale initcwnd marker does not trigger nounset\n'
+create_initcwnd_ownership_marker
 CURRENT_ROUTE="default via 192.0.2.1 dev eth0 proto dhcp metric 100 initcwnd 32 initrwnd 32"
 assert_eq 'effective|owned default route has initcwnd/initrwnd 32' \
     "$(detect_initcwnd_state)" "detect owned initcwnd route as effective"
