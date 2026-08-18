@@ -40,14 +40,19 @@ assert_eq "4000" "$(calc_fq_limit 500)" "fq limit preserves target backlog"
 assert_eq "10000" "$(calc_fq_limit 1250)" "fq limit reaches kernel default ceiling"
 assert_eq "10000" "$(calc_fq_limit 100000)" "fq limit keeps high-rate ceiling"
 
-# verify_qdisc_rate 通过 tc JSON 读取模拟输出，不修改实际 qdisc。
+# verify_qdisc_rate 优先读取新版 tc JSON，并兼容 Debian 12 的文本输出。
+TC_CLASS_OUTPUT='[{"class":"htb","handle":"1:10","rate":1000000000}]'
 tc() {
     [[ "$*" == "-j class show dev test0" ]] || return 1
-    printf '%s\n' '[{"kind":"htb","handle":"1:10","options":{"rate":1000000000}}]'
+    printf '%s\n' "$TC_CLASS_OUTPUT"
 }
 assert_ok "verify exact shaping rate from JSON" verify_qdisc_rate test0 1000
 assert_fail "reject mismatched shaping rate from JSON" verify_qdisc_rate test0 999
+TC_CLASS_OUTPUT='class htb 1:10 root rate 12345Mbit ceil 12345Mbit burst 32Kb cburst 32Kb'
+assert_ok "verify legacy Debian 12 tc class output" verify_qdisc_rate test0 12345
+assert_fail "reject mismatched legacy tc class output" verify_qdisc_rate test0 12000
 unset -f tc
+unset TC_CLASS_OUTPUT
 
 TC_APPLY_LOG=$(mktemp)
 qdisc_remove_root() { return 1; }

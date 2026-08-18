@@ -892,16 +892,46 @@ apply_qdisc() {
         limit "$fq_limit" || return 1
 }
 
+tc_rate_mbit() {
+    local output="${1:-}"
+    local raw
+
+    raw=$(grep -oE 'rate [0-9.]+[KMGTkmgt]?bit' <<< "$output" 2>/dev/null | head -n 1 || true)
+    raw="${raw#rate }"
+    [[ -n "$raw" ]] || return 1
+
+    awk -v value="$raw" 'BEGIN {
+        unit=value
+        sub(/^[0-9.]+/, "", unit)
+        sub(/bit$/, "", unit)
+        number=value+0
+        if (unit=="K" || unit=="k") number/=1000
+        else if (unit=="G" || unit=="g") number*=1000
+        else if (unit=="T" || unit=="t") number*=1000000
+        else if (unit=="") number/=1000000
+        if (number==int(number)) printf "%d", number
+        else printf "%g", number
+    }'
+}
+
 verify_qdisc_rate() {
     local iface="$1"
     local rate="$2"
+    local output
     local applied
 
-    applied=$(tc -j class show dev "$iface" 2>/dev/null |
-        jq -er '[.[] | select(.kind == "htb" and .handle == "1:10") | .options.rate][0]' \
-            2>/dev/null) || return 1
-    [[ "$applied" =~ ^[0-9]+$ ]] || return 1
-    (( applied == rate * 1000000 ))
+    output=$(tc -j class show dev "$iface" 2>/dev/null) || return 1
+    if applied=$(jq -er \
+        '[.[] | select(.class == "htb" and .handle == "1:10") | .rate][0]' \
+        <<< "$output" 2>/dev/null); then
+        [[ "$applied" =~ ^[0-9]+$ ]] || return 1
+        (( applied == rate * 1000000 ))
+        return $?
+    fi
+
+    # Debian 12 的 iproute2 6.1 会忽略 tc class 的 -j；保留旧输出兼容路径。
+    applied=$(tc_rate_mbit "$output") || return 1
+    [[ "$applied" == "$rate" ]]
 }
 
 qdisc_save() {
