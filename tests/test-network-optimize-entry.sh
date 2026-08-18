@@ -517,7 +517,8 @@ printf '%s\n' \
     'net.ipv6.conf.eth0.accept_ra = 2' \
     'net.ipv6.conf.default.forwarding = 1' \
     'net.ipv6.conf.all.forwarding = 1' > "$NETWORK_CONF"
-cp "$NETWORK_CONF" "$old_managed_config"
+# shellcheck disable=SC2218
+command cp "$NETWORK_CONF" "$old_managed_config"
 migration_warning=$(warn_retired_forwarding_management)
 for warning_line in \
     '已停止持久管理 IPv4/IPv6 forwarding 与 RA；当前运行值保持不变。' \
@@ -528,7 +529,8 @@ done
 printf '%s\n' 'net.ipv4.ip_forward = 1' > "$NETWORK_CONF"
 assert_eq '' "$(warn_retired_forwarding_management)" \
     "unmarked config does not print forwarding migration warning"
-cp "$old_managed_config" "$NETWORK_CONF"
+# shellcheck disable=SC2218
+command cp "$old_managed_config" "$NETWORK_CONF"
 
 IP_FORWARD_RUNTIME=0
 IPV6_ALL_RA_RUNTIME=2
@@ -618,6 +620,8 @@ done
 printf 'PASS: upgrade runtime snapshot retains retired keys\n'
 
 rm -f "$NETWORK_PREVIOUS_BACKUP" "$NETWORK_PREVIOUS_ABSENT"
+# Sourced implementation is intentionally overridden by later failure-injection tests.
+# shellcheck disable=SC2218
 backup_managed_file \
     "$NETWORK_CONF" "$NETWORK_INITIAL_BACKUP" "$NETWORK_PREVIOUS_BACKUP" \
     "$NETWORK_INITIAL_ABSENT" "$NETWORK_PREVIOUS_ABSENT"
@@ -626,6 +630,7 @@ cmp -s "$old_managed_config" "$NETWORK_PREVIOUS_BACKUP" ||
 printf 'PASS: previous backup preserves legacy config byte-for-byte\n'
 atomic_install_file "$generated_config" "$NETWORK_CONF" 0644
 DEBUG=1
+# shellcheck disable=SC2218
 apply_network_config "$NETWORK_CONF"
 assert_eq 0 "$RETIRED_SYSCTL_WRITES" \
     "upgraded config applies no forwarding or RA runtime writes"
@@ -639,6 +644,7 @@ IPV6_DEFAULT_RA_RUNTIME=9
 IPV6_ETH0_RA_RUNTIME=9
 IPV6_DEFAULT_FORWARD_RUNTIME=9
 IPV6_ALL_FORWARD_RUNTIME=9
+# shellcheck disable=SC2218
 apply_network_config "$NETWORK_PREVIOUS_BACKUP"
 restore_managed_file \
     "$NETWORK_CONF" "$NETWORK_PREVIOUS_BACKUP" "$NETWORK_PREVIOUS_ABSENT"
