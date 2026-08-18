@@ -198,6 +198,7 @@ assert_eq 39845888 "$RMEM_MAX_BYTES" "automatic calculation uses fixed 150 ms fo
 PROBE_SHOULD_FAIL=true
 is_interactive_terminal() { return 0; }
 prepare_dynamic_case
+BANDWIDTH_PROBE_NOTE='tcshape HTB 整形状态下测得（可能偏低）'
 resolve_tuning_values >/dev/null <<'EOF'
 1200
 600
@@ -206,6 +207,7 @@ assert_eq manual "$TUNING_MODE" "interactive probe failure switches to manual mo
 assert_eq 1200 "$DETECTED_DOWNLOAD_MBPS" "probe failure fallback records download"
 assert_eq 600 "$DETECTED_UPLOAD_MBPS" "probe failure fallback records upload"
 assert_eq 150 "$DETECTED_RTT_MS" "probe failure fallback keeps 150 ms default RTT"
+assert_eq '' "$BANDWIDTH_PROBE_NOTE" "manual fallback clears shaped probe note"
 
 prepare_dynamic_case
 MANUAL_RTT_MS=180

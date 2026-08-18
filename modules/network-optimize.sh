@@ -658,6 +658,7 @@ prompt_manual_bandwidth() {
         MANUAL_RTT_DEFAULTED="true"
     fi
     BANDWIDTH_SOURCE="$source"
+    BANDWIDTH_PROBE_NOTE=""
 }
 
 select_tuning_mode() {
