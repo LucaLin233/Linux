@@ -60,11 +60,11 @@ printf '%s\n' \
     'SwapTotal:        524288 kB' \
     'SwapFree:         393216 kB' > "$meminfo_fixture"
 assert_eq '已用 768 MiB / 可用 256 MiB / 总计 1024 MiB' \
-    "$(memory_status_summary "$meminfo_fixture")" "format RAM status"
+    "$(NETWORK_OPTIMIZE_MEMINFO_FILE="$meminfo_fixture" memory_status_summary)" "format RAM status"
 assert_eq '已用 128 MiB / 总计 512 MiB' \
-    "$(swap_status_summary "$meminfo_fixture")" "format Swap status"
+    "$(NETWORK_OPTIMIZE_MEMINFO_FILE="$meminfo_fixture" swap_status_summary)" "format Swap status"
 printf '%s\n' 'SwapTotal: 0 kB' 'SwapFree: 0 kB' > "$meminfo_fixture"
-assert_eq '未配置' "$(swap_status_summary "$meminfo_fixture")" "report absent Swap"
+assert_eq '未配置' "$(NETWORK_OPTIMIZE_MEMINFO_FILE="$meminfo_fixture" swap_status_summary)" "report absent Swap"
 journalctl() {
     printf '%s\n' \
         'oom-kill:constraint=CONSTRAINT_NONE' \
@@ -97,9 +97,36 @@ unset -f sysctl
 file_nr_fixture="$TEMP_DIR/file-nr"
 printf '%s\n' '120 0 100000' > "$file_nr_fixture"
 assert_eq '120 allocated / 0 unused / 100000 max' \
-    "$(file_handle_status "$file_nr_fixture")" "format file handle status"
-assert_eq '不可用' "$(file_handle_status "$TEMP_DIR/missing-file-nr")" \
+    "$(NETWORK_OPTIMIZE_FILE_NR="$file_nr_fixture" file_handle_status)" "format file handle status"
+assert_eq '不可用' "$(NETWORK_OPTIMIZE_FILE_NR="$TEMP_DIR/missing-file-nr" file_handle_status)" \
     "handle unavailable file handle status"
+
+tcshape_config="$TEMP_DIR/etc/tcshape.conf"
+tcshape_probe_log="$TEMP_DIR/tcshape-probe.log"
+mkdir -p "$(dirname "$tcshape_config")"
+printf '%s\n' 'RATE_MBIT=500' > "$tcshape_config"
+PROBE_IFACE=eth0
+BANDWIDTH_PROBE_NOTE=""
+NETWORK_OPTIMIZE_TCSHAPE_CONFIG_FILE="$tcshape_config"
+tc() { printf '%s\n' 'qdisc htb 1: root refcnt 2 default 10'; }
+sysctl() {
+    case "${2:-}" in
+        net.ipv4.tcp_congestion_control) printf '%s\n' bbr ;;
+        net.core.default_qdisc) printf '%s\n' fq ;;
+        *) return 1 ;;
+    esac
+}
+readlink() { return 1; }
+find() { return 0; }
+show_probe_environment > "$tcshape_probe_log" 2>&1
+assert_eq 'tcshape HTB 整形状态下测得（可能偏低）' "$BANDWIDTH_PROBE_NOTE" \
+    "mark bandwidth measured under tcshape"
+grep -Fq '建议先执行 tcshape off' "$tcshape_probe_log" ||
+    fail "active tcshape probe warning omits recovery guidance"
+printf 'PASS: warn before probing through active tcshape\n'
+unset NETWORK_OPTIMIZE_TCSHAPE_CONFIG_FILE
+unset -f tc sysctl readlink find
+
 status_function=$(declare -f show_status)
 for diagnostic_key in \
     vm.min_free_kbytes fs.file-max fs.nr_open net.ipv4.tcp_tw_reuse \

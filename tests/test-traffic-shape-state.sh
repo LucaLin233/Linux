@@ -36,17 +36,22 @@ SYSTEMD_ENABLED=false
 SYSTEMD_ACTIVE=false
 SYSTEMD_FAIL_ENABLE=false
 SYSTEMD_FAIL_RESTART=false
+SYSTEMD_FAIL_RESTART_ONCE=false
 SYSTEMD_FAIL_DAEMON_RELOAD_ONCE=false
 CURRENT_SERVICE_IFACE=""
 declare -A QDISC_KIND=([eth0]=fq [lo]=fq)
 declare -A QDISC_RATE=([eth0]="" [lo]="")
 
 root_qdisc_kind() { printf '%s\n' "${QDISC_KIND[$1]:-}"; }
+require_root() { return 0; }
 check_external_conflicts() { return 0; }
 qdisc_has_custom_parameters() { return 1; }
 
 apply_qdisc() {
     local iface="$1" rate="$2"
+    if flock -n "$LOCK_FILE" -c true; then
+        fail "service apply ran without the tcshape lock"
+    fi
     QDISC_KIND[$iface]=htb
     QDISC_RATE[$iface]="$rate"
 }
@@ -75,6 +80,9 @@ restore_simple_qdisc() {
 tc() {
     local action="${1:-}"
     shift || true
+    if [[ "$action" == "class" && "${1:-}" == "show" ]]; then
+        return 0
+    fi
     if [[ "$action" == "qdisc" && "${1:-}" == "del" ]]; then
         local iface=""
         while (( $# > 0 )); do
@@ -107,8 +115,12 @@ systemctl() {
             ;;
         restart)
             [[ "$SYSTEMD_FAIL_RESTART" == false ]] || return 1
+            if [[ "$SYSTEMD_FAIL_RESTART_ONCE" == true ]]; then
+                SYSTEMD_FAIL_RESTART_ONCE=false
+                return 1
+            fi
             CURRENT_SERVICE_IFACE=$(read_config_value INTERFACE)
-            apply_saved_config || return 1
+            main _apply || return 1
             SYSTEMD_ACTIVE=true
             return 0
             ;;
@@ -132,11 +144,26 @@ move_managed_file() {
     mv -f "$source" "$destination"
 }
 
+take_lock
+
 # First enable on eth0.
 cmd_set 500 eth0 >/dev/null
 assert_eq htb "${QDISC_KIND[eth0]}" "first enable applies eth0"
 assert_file_value "$CONFIG_FILE" INTERFACE eth0 "first enable stores eth0"
 assert_eq true "$SYSTEMD_ENABLED" "first enable persists service"
+
+# Restart failure must reacquire the lock and restore the previous service state.
+restart_failure_log="$TEMP_DIR/restart-failure.log"
+SYSTEMD_FAIL_RESTART_ONCE=true
+if cmd_set 550 eth0 >/dev/null 2> "$restart_failure_log"; then
+    fail "one-shot service restart failure unexpectedly succeeded"
+fi
+assert_eq 500 "${QDISC_RATE[eth0]}" "restart failure restores previous shaping rate"
+assert_file_value "$CONFIG_FILE" RATE_MBIT 500 "restart failure restores previous config"
+if grep -Fq '自动回滚失败' "$restart_failure_log"; then
+    fail "restart failure could not reacquire the lock for rollback"
+fi
+printf 'PASS: restart failure rolls back without lock recursion\n'
 
 # Migrate to lo: old HTB must be removed and the new baseline promoted.
 cmd_set 800 lo >/dev/null
@@ -185,6 +212,8 @@ assert_eq fq "${QDISC_KIND[eth0]}" "daemon-reload failure restores baseline"
 printf 'PASS: daemon-reload failure removes managed files\n'
 
 cmd_set 650 lo >/dev/null
+cmd_status >/dev/null
+printf 'PASS: tcshape on-status path keeps service lock healthy\n'
 cmd_off >/dev/null
 assert_eq fq "${QDISC_KIND[lo]}" "retry on another interface restores its own baseline"
 printf 'PASS: failed first setup does not leak a cross-interface baseline\n'

@@ -132,9 +132,16 @@ is_positive_integer() {
 }
 
 take_lock() {
+    local timeout="${1:-}"
+
     mkdir -p "$(dirname "$LOCK_FILE")"
     exec 9>"$LOCK_FILE"
-    if ! flock -n 9; then
+    if [[ -n "$timeout" ]]; then
+        if ! flock -w "$timeout" 9; then
+            error "另一个 tcshape 实例正在运行"
+            exit 1
+        fi
+    elif ! flock -n 9; then
         error "另一个 tcshape 实例正在运行"
         exit 1
     fi
@@ -375,7 +382,7 @@ version_at_least() {
 }
 
 check_supported_system() {
-    local os_release="${1:-/etc/os-release}"
+    local os_release="${TCSHAPE_OS_RELEASE_FILE:-/etc/os-release}"
 
     [[ -r "$os_release" ]] || {
         error "无法读取系统信息：$os_release"
@@ -618,6 +625,16 @@ calc_burst() {
     awk -v rate="$1" 'BEGIN {burst=rate*500; if (burst<32768) burst=32768; printf "%d", burst}'
 }
 
+# fq 叶子队列按速率缩放，恒定约 96 ms 积压；避免固定大 limit 造成 bufferbloat。
+calc_fq_limit() {
+    local rate="$1"
+    local limit=$((rate * 8))
+
+    (( limit < 128 )) && limit=128
+    (( limit > 10000 )) && limit=10000
+    printf '%d\n' "$limit"
+}
+
 default_qdisc_options() {
     local kind="$1"
     local baseline_json
@@ -653,13 +670,13 @@ qdisc_has_custom_parameters() {
 
     current_json=$(tc -j qdisc show dev "$iface" 2>/dev/null) || {
         error "无法读取 $iface 的 qdisc 参数，拒绝覆盖"
-        return 0
+        return 2
     }
     current_options=$(normalize_qdisc_options "$current_json" "$kind") || {
         error "无法解析 $iface 的 $kind qdisc 参数，拒绝覆盖"
-        return 0
+        return 2
     }
-    baseline_options=$(default_qdisc_options "$kind") || return 0
+    baseline_options=$(default_qdisc_options "$kind") || return 2
     [[ "$current_options" != "$baseline_options" ]]
 }
 
@@ -765,6 +782,7 @@ is_own_shaper() {
 check_external_conflicts() {
     local iface="$1"
     local kind
+    local custom_status
 
     if systemctl is-active --quiet tcpfit-qdisc.service 2>/dev/null ||
         systemctl is-enabled --quiet tcpfit-qdisc.service 2>/dev/null; then
@@ -790,9 +808,20 @@ check_external_conflicts() {
             ;;
     esac
 
-    if [[ "$kind" =~ ^(fq|fq_codel)$ ]] && qdisc_has_custom_parameters "$iface" "$kind"; then
-        error "当前 $kind 根 qdisc 包含自定义参数，无法保证原样恢复，拒绝覆盖"
-        return 1
+    if [[ "$kind" =~ ^(fq|fq_codel)$ ]]; then
+        if qdisc_has_custom_parameters "$iface" "$kind"; then
+            custom_status=0
+        else
+            custom_status=$?
+        fi
+        case "$custom_status" in
+            0)
+                error "当前 $kind 根 qdisc 包含自定义参数，无法保证原样恢复，拒绝覆盖"
+                return 1
+                ;;
+            1) ;;
+            *) return 1 ;;
+        esac
     fi
 
     if ! is_own_shaper "$iface"; then
@@ -849,8 +878,10 @@ apply_qdisc() {
     local iface="$1"
     local rate="$2"
     local burst
+    local fq_limit
 
     burst=$(calc_burst "$rate")
+    fq_limit=$(calc_fq_limit "$rate")
     # fq 0:、mq 0: 或驱动自动重建的根 qdisc 可能无法删除；replace 才是最终应用动作。
     qdisc_remove_root "$iface" >/dev/null 2>&1 || true
     tc qdisc replace dev "$iface" root handle 1: htb default 10 || return 1
@@ -858,15 +889,14 @@ apply_qdisc() {
         rate "${rate}mbit" ceil "${rate}mbit" \
         burst "$burst" cburst "$burst" quantum 1514 || return 1
     tc qdisc replace dev "$iface" parent 1:10 handle 10: fq \
-        limit 40960 flow_limit 8192 maxrate "${rate}mbit" || return 1
+        limit "$fq_limit" || return 1
 }
 
 tc_rate_mbit() {
     local output="${1:-}"
     local raw
 
-    raw=$(grep -oE 'rate [0-9.]+[KMGTkmgt]?bit' <<< "$output" 2>/dev/null || true)
-    raw="${raw%%$'\n'*}"
+    raw=$(grep -oE 'rate [0-9.]+[KMGTkmgt]?bit' <<< "$output" 2>/dev/null | head -n 1 || true)
     raw="${raw#rate }"
     [[ -n "$raw" ]] || return 1
 
@@ -887,11 +917,21 @@ tc_rate_mbit() {
 verify_qdisc_rate() {
     local iface="$1"
     local rate="$2"
+    local output
     local applied
 
-    applied=$(tc_rate_mbit "$(tc class show dev "$iface" 2>/dev/null)") || return 1
-    awk -v applied="$applied" -v expected="$rate" \
-        'BEGIN {exit !(applied > expected*0.99 && applied < expected*1.01)}'
+    output=$(tc -j class show dev "$iface" 2>/dev/null) || return 1
+    if applied=$(jq -er \
+        '[.[] | select(.class == "htb" and .handle == "1:10") | .rate][0]' \
+        <<< "$output" 2>/dev/null); then
+        [[ "$applied" =~ ^[0-9]+$ ]] || return 1
+        (( applied == rate * 1000000 ))
+        return $?
+    fi
+
+    # Debian 12 的 iproute2 6.1 会忽略 tc class 的 -j；保留旧输出兼容路径。
+    applied=$(tc_rate_mbit "$output") || return 1
+    [[ "$applied" == "$rate" ]]
 }
 
 qdisc_save() {
@@ -932,12 +972,12 @@ restore_simple_qdisc() {
         mq)
             sleep 1
             [[ "$(root_qdisc_kind "$iface")" == "mq" ]] ||
-                tc qdisc add dev "$iface" root mq 2>/dev/null || return 1
+                tc qdisc replace dev "$iface" root mq 2>/dev/null || return 1
             [[ -z "$leaf_kind" ]] || qdisc_set_mq_leaves "$iface" "$leaf_kind" || return 1
             [[ "$(root_qdisc_kind "$iface")" == "mq" ]] || return 1
             ;;
         pfifo_fast|fq|fq_codel)
-            tc qdisc add dev "$iface" root "$kind" 2>/dev/null || return 1
+            tc qdisc replace dev "$iface" root "$kind" 2>/dev/null || return 1
             [[ "$(root_qdisc_kind "$iface")" == "$kind" ]] || return 1
             ;;
         *)
@@ -982,7 +1022,7 @@ save_baseline_to() {
     local iface="$1"
     local baseline="$2"
     local json_prefix="$3"
-    local kind leaf_kind=""
+    local kind leaf_kind="" custom_status
 
     if ! kind=$(root_qdisc_kind "$iface"); then
         error "无法读取 $iface 的根 qdisc，拒绝保存基线"
@@ -995,9 +1035,20 @@ save_baseline_to() {
         ""|noqueue|mq|pfifo_fast|fq|fq_codel) ;;
         *) error "无法保存可自动恢复的 qdisc 基线：$kind"; return 1 ;;
     esac
-    if [[ "$kind" =~ ^(fq|fq_codel)$ ]] && qdisc_has_custom_parameters "$iface" "$kind"; then
-        error "当前 $kind 根 qdisc 包含自定义参数，无法保存可自动恢复的基线"
-        return 1
+    if [[ "$kind" =~ ^(fq|fq_codel)$ ]]; then
+        if qdisc_has_custom_parameters "$iface" "$kind"; then
+            custom_status=0
+        else
+            custom_status=$?
+        fi
+        case "$custom_status" in
+            0)
+                error "当前 $kind 根 qdisc 包含自定义参数，无法保存可自动恢复的基线"
+                return 1
+                ;;
+            1) ;;
+            *) return 1 ;;
+        esac
     fi
 
     {
@@ -1094,6 +1145,22 @@ restore_qdisc_from_file() {
     [[ "$(root_qdisc_kind "$iface")" == "$kind" ]]
 }
 
+restart_service_unlocked() {
+    local rc=0
+
+    exec 9>&-
+    systemctl restart tcshape.service >/dev/null 2>&1 || rc=$?
+    if ! exec 9>"$LOCK_FILE"; then
+        error "无法重新打开 tcshape 锁文件"
+        return 1
+    fi
+    if ! flock -w 10 9; then
+        error "无法在服务重启后重新获取 tcshape 锁"
+        return 1
+    fi
+    return "$rc"
+}
+
 restore_previous_persistent_state() {
     local previous_config="$1"
     local previous_iface="$2"
@@ -1105,7 +1172,7 @@ restore_previous_persistent_state() {
 
     if [[ -n "$previous_config" && -f "$previous_config" ]]; then
         cp -a "$previous_config" "$CONFIG_FILE" || return 1
-        systemctl restart tcshape.service >/dev/null 2>&1 || return 1
+        restart_service_unlocked || return 1
         apply_saved_config || return 1
         systemctl is-enabled --quiet tcshape.service 2>/dev/null || return 1
         systemctl is-active --quiet tcshape.service 2>/dev/null || return 1
@@ -1131,7 +1198,7 @@ write_service_files() {
     local temp_config
     local temp_service
 
-    [[ "${TCSHAPE_TEST_MODE:-0}" == "1" ]] && service_exec="$BASH_SOURCE"
+    [[ "${TCSHAPE_TEST_MODE:-0}" == "1" ]] && service_exec="${BASH_SOURCE[0]}"
 
     temp_config=$(mktemp "$(dirname "$CONFIG_FILE")/.tcshape.conf.XXXXXX") || return 1
     temp_service=$(mktemp "$(dirname "$SERVICE_FILE")/.tcshape.service.XXXXXX") || {
@@ -1234,7 +1301,7 @@ cmd_set() {
 
     if ! write_service_files "$rate" "$iface" ||
         ! systemctl enable tcshape.service >/dev/null 2>&1 ||
-        ! systemctl restart tcshape.service >/dev/null 2>&1 ||
+        ! restart_service_unlocked ||
         ! verify_qdisc_rate "$iface" "$rate" ||
         ! systemctl is-enabled --quiet tcshape.service 2>/dev/null ||
         ! systemctl is-active --quiet tcshape.service 2>/dev/null; then
@@ -1695,10 +1762,6 @@ auto_pick_peer() {
     return 1
 }
 
-apply_test_shaper() {
-    apply_qdisc "$1" "$2"
-}
-
 save_sweep_result() {
     local status="$1"
     shift
@@ -1740,7 +1803,7 @@ validate_peer_path() {
 
     (( test_duration > 8 )) && test_duration=8
     rate=$(calc_validation_rate "$nominal")
-    apply_test_shaper "$iface" "$rate" || return 1
+    apply_qdisc "$iface" "$rate" || return 1
     result=$(run_iperf "$peer" "$test_duration" 2)
     rc=$?
     (( rc == 75 )) && return 75
@@ -1983,7 +2046,7 @@ cmd_scan() {
     [[ " ${points[*]} " == *" $hi "* ]] || points+=("$hi")
 
     for rate in "${points[@]}"; do
-        apply_test_shaper "$iface" "$rate" || { error "无法应用 ${rate} Mbit 临时整形"; return 1; }
+        apply_qdisc "$iface" "$rate" || { error "无法应用 ${rate} Mbit 临时整形"; return 1; }
         result=$(run_iperf "$peer" "$duration" 1)
         rc=$?
         if (( rc == 75 )); then
@@ -2051,7 +2114,7 @@ cmd_scan() {
             (( control < 1 )) && control=1
             (( control < known_broke )) || break
             info "首档有损，向下检查控制点 ${control} Mbit"
-            apply_test_shaper "$iface" "$control" || return 1
+            apply_qdisc "$iface" "$control" || return 1
             result=$(run_iperf "$peer" "$duration" 1); rc=$?
             (( rc == 75 )) && { save_sweep_result "BUDGET_EXCEEDED" "PEER=$peer"; return 2; }
             (( rc == 0 )) || break
@@ -2106,7 +2169,7 @@ cmd_scan() {
         info "细扫 ${last_ok}-${coarse_broke} Mbit，步长 ${fine}"
         broke_at=""
         for ((rate=last_ok+fine; rate<coarse_broke; rate+=fine)); do
-            apply_test_shaper "$iface" "$rate" || return 1
+            apply_qdisc "$iface" "$rate" || return 1
             result=$(run_iperf "$peer" "$duration" 1); rc=$?
             (( rc == 75 )) && { save_sweep_result "BUDGET_EXCEEDED" "PEER=$peer"; return 2; }
             (( rc == 0 )) || continue
@@ -2336,6 +2399,7 @@ main() {
     require_root
 
     if [[ "$command" == "_apply" ]]; then
+        take_lock 10
         apply_saved_config
         return $?
     fi

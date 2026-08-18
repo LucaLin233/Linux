@@ -71,6 +71,7 @@ reset_selection() {
     MANUAL_RTT_MS=""
     MANUAL_RTT_DEFAULTED=false
     BANDWIDTH_SOURCE=unknown
+    BANDWIDTH_PROBE_NOTE=""
     INITCWND_MODE=auto
     INITCWND_ENABLED=true
     INITCWND_POLICY=unknown
@@ -169,6 +170,7 @@ prepare_dynamic_case() {
     RTT_SOURCE=unknown
     RTT_POLICY=unknown
     BANDWIDTH_SOURCE=unknown
+    BANDWIDTH_PROBE_NOTE=""
     INITCWND_MODE=auto
     INITCWND_ENABLED=true
     INITCWND_POLICY=unknown
@@ -196,6 +198,7 @@ assert_eq 39845888 "$RMEM_MAX_BYTES" "automatic calculation uses fixed 150 ms fo
 PROBE_SHOULD_FAIL=true
 is_interactive_terminal() { return 0; }
 prepare_dynamic_case
+BANDWIDTH_PROBE_NOTE='tcshape HTB 整形状态下测得（可能偏低）'
 resolve_tuning_values >/dev/null <<'EOF'
 1200
 600
@@ -204,6 +207,7 @@ assert_eq manual "$TUNING_MODE" "interactive probe failure switches to manual mo
 assert_eq 1200 "$DETECTED_DOWNLOAD_MBPS" "probe failure fallback records download"
 assert_eq 600 "$DETECTED_UPLOAD_MBPS" "probe failure fallback records upload"
 assert_eq 150 "$DETECTED_RTT_MS" "probe failure fallback keeps 150 ms default RTT"
+assert_eq '' "$BANDWIDTH_PROBE_NOTE" "manual fallback clears shaped probe note"
 
 prepare_dynamic_case
 MANUAL_RTT_MS=180
@@ -333,7 +337,12 @@ generated_config="$TEMP_DIR/generated.conf"
 prepare_dynamic_case
 resolve_tuning_values >/dev/null
 ECN_DISABLED=false
+BANDWIDTH_PROBE_NOTE='tcshape HTB 整形状态下测得（可能偏低）'
 create_network_config "$generated_config" false
+grep -Fq '# 带宽测量环境: tcshape HTB 整形状态下测得（可能偏低）' "$generated_config" ||
+    fail "generated config omits active tcshape measurement warning"
+printf 'PASS: generated config records shaped bandwidth source\n'
+BANDWIDTH_PROBE_NOTE=""
 if grep -Eq '^net[.]ipv4[.]tcp_ecn[[:space:]]*=' "$generated_config"; then
     fail "default generated config still owns tcp_ecn"
 fi

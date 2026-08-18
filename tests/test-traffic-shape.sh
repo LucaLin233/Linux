@@ -34,19 +34,25 @@ assert_fail() {
     printf 'PASS: %s\n' "$name"
 }
 
-assert_eq "1000" "$(tc_rate_mbit 'class htb 1:10 root rate 1Gbit ceil 1Gbit')" \
-    "parse Gbit rate"
-assert_eq "2500" "$(tc_rate_mbit 'class htb 1:10 root rate 2500Mbit ceil 2500Mbit')" \
-    "parse Mbit rate"
-assert_eq "1000" "$(tc_rate_mbit 'class htb 1:10 root rate 1000000Kbit ceil 1000000Kbit')" \
-    "parse Kbit rate"
+assert_eq "128" "$(calc_fq_limit 1)" "fq limit keeps low-rate floor"
+assert_eq "800" "$(calc_fq_limit 100)" "fq limit scales with shaping rate"
+assert_eq "4000" "$(calc_fq_limit 500)" "fq limit preserves target backlog"
+assert_eq "10000" "$(calc_fq_limit 1250)" "fq limit reaches kernel default ceiling"
+assert_eq "10000" "$(calc_fq_limit 100000)" "fq limit keeps high-rate ceiling"
 
-# verify_qdisc_rate 通过 tc 函数读取模拟输出，不修改实际 qdisc。
+# verify_qdisc_rate 优先读取新版 tc JSON，并兼容 Debian 12 的文本输出。
+TC_CLASS_OUTPUT='[{"class":"htb","handle":"1:10","rate":1000000000}]'
 tc() {
-    printf '%s\n' 'class htb 1:10 root rate 1Gbit ceil 1Gbit burst 32Kb cburst 32Kb'
+    [[ "$*" == "-j class show dev test0" ]] || return 1
+    printf '%s\n' "$TC_CLASS_OUTPUT"
 }
-assert_ok "verify integer-Gbit shaping rate" verify_qdisc_rate test0 1000
+assert_ok "verify exact shaping rate from JSON" verify_qdisc_rate test0 1000
+assert_fail "reject mismatched shaping rate from JSON" verify_qdisc_rate test0 999
+TC_CLASS_OUTPUT='class htb 1:10 root rate 12345Mbit ceil 12345Mbit burst 32Kb cburst 32Kb'
+assert_ok "verify legacy Debian 12 tc class output" verify_qdisc_rate test0 12345
+assert_fail "reject mismatched legacy tc class output" verify_qdisc_rate test0 12000
 unset -f tc
+unset TC_CLASS_OUTPUT
 
 TC_APPLY_LOG=$(mktemp)
 qdisc_remove_root() { return 1; }
@@ -56,9 +62,13 @@ grep -Fqx "qdisc replace dev eth0 root handle 1: htb default 10" "$TC_APPLY_LOG"
     fail "HTB root was not applied with replace"
 grep -Fq "class replace dev eth0 parent 1: classid 1:10 htb" "$TC_APPLY_LOG" ||
     fail "HTB class was not applied with replace"
-grep -Fq "qdisc replace dev eth0 parent 1:10 handle 10: fq" "$TC_APPLY_LOG" ||
-    fail "fq leaf was not applied with replace"
+grep -Fqx "qdisc replace dev eth0 parent 1:10 handle 10: fq limit 8936" "$TC_APPLY_LOG" ||
+    fail "fq leaf did not use the rate-scaled limit"
+if grep -Eq 'flow_limit|maxrate' "$TC_APPLY_LOG"; then
+    fail "fq leaf still overrides flow_limit or maxrate"
+fi
 printf 'PASS: shaping restore tolerates non-deletable or auto-recreated root qdisc\n'
+printf 'PASS: fq leaf uses only the rate-scaled queue limit\n'
 unset -f tc
 # 恢复脚本原始函数，供后续 mq 删除测试使用。
 eval "$(sed -n '/^qdisc_remove_root() {/,/^}/p' "$ROOT_DIR/tools/traffic-shape.sh")"
@@ -117,6 +127,27 @@ assert_ok "accept default mq leaf options" mq_leaf_options_are_default \
 assert_fail "reject custom mq leaf options" mq_leaf_options_are_default \
     "$custom_mq_json" 1 fq "$default_leaf_options"
 
+QDISC_ERROR_LOG=$(mktemp)
+tc() {
+    case "$*" in
+        "qdisc show dev eth0") printf '%s\n' 'qdisc fq 0: root' ;;
+        "-j qdisc show dev eth0") return 1 ;;
+        *) return 0 ;;
+    esac
+}
+systemctl() { return 1; }
+is_own_shaper() { return 1; }
+if check_external_conflicts eth0 2> "$QDISC_ERROR_LOG"; then
+    fail "qdisc parameter read failure unexpectedly allowed overwrite"
+fi
+assert_eq "1" "$(grep -Fc '无法读取 eth0 的 qdisc 参数，拒绝覆盖' "$QDISC_ERROR_LOG" || true)" \
+    "report qdisc parameter read failure once"
+if grep -Fq '包含自定义参数' "$QDISC_ERROR_LOG"; then
+    fail "qdisc parameter read failure also reported custom parameters"
+fi
+printf 'PASS: distinguish qdisc read failure from custom parameters\n'
+unset -f tc systemctl is_own_shaper
+
 tc() { return 1; }
 systemctl() { return 1; }
 is_own_shaper() { return 1; }
@@ -143,7 +174,8 @@ tc() {
             return 0
             ;;
         "qdisc replace dev eth0 root handle 1: mq") MQ_ROOT="mq"; MQ_HANDLE="1:" ;;
-        "qdisc add dev eth0 root mq") MQ_ROOT="mq"; MQ_HANDLE="1:" ;;
+        "qdisc replace dev eth0 root mq") MQ_ROOT="mq"; MQ_HANDLE="1:" ;;
+        "qdisc replace dev eth0 root fq") MQ_ROOT="fq"; MQ_HANDLE="1:" ;;
         "qdisc replace dev eth0 parent 1:1 fq_codel"|\
         "qdisc replace dev eth0 parent 1:2 fq_codel") return 0 ;;
         *) return 1 ;;
@@ -157,10 +189,18 @@ MQ_ROOT="mq"
 MQ_HANDLE="1:"
 : > "$MQ_CALL_LOG"
 assert_ok "restore mq leaf qdisc kind" restore_simple_qdisc eth0 mq fq_codel
+grep -Fqx "qdisc replace dev eth0 root mq" "$MQ_CALL_LOG" ||
+    fail "mq root restore did not use replace"
 grep -Fqx "qdisc replace dev eth0 parent 1:1 fq_codel" "$MQ_CALL_LOG" &&
     grep -Fqx "qdisc replace dev eth0 parent 1:2 fq_codel" "$MQ_CALL_LOG" ||
     fail "mq leaf restore did not replace every leaf"
-printf 'PASS: mq leaf restore replaces every leaf\n'
+printf 'PASS: mq root and leaf restore use replace\n'
+MQ_ROOT="htb"
+: > "$MQ_CALL_LOG"
+assert_ok "restore simple fq qdisc" restore_simple_qdisc eth0 fq
+grep -Fqx "qdisc replace dev eth0 root fq" "$MQ_CALL_LOG" ||
+    fail "simple qdisc restore did not use replace"
+printf 'PASS: simple qdisc restore uses replace\n'
 unset -f tc root_qdisc_kind
 
 assert_eq "1.0.13" "$(script_version "$ROOT_DIR/tools/traffic-shape.sh")" \
@@ -197,7 +237,7 @@ assert_fail "reject unknown nonempty target" install_target_is_replaceable "$unk
 assert_fail "reject symlink target" install_target_is_replaceable "$empty_link"
 
 check_os_file() {
-    check_supported_system "$1" >/dev/null 2>&1
+    TCSHAPE_OS_RELEASE_FILE="$1" check_supported_system >/dev/null 2>&1
 }
 
 cat > "$temp_dir/debian12" <<'EOF'

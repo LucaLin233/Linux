@@ -37,7 +37,7 @@ show_current_shaping() { return 0; }
 qdisc_save() { QSAVE_IFACE="$1"; QSAVE_KIND=fq; }
 qdisc_restore() { return 0; }
 qdisc_set_fq() { return 0; }
-apply_test_shaper() { return 0; }
+apply_qdisc() { return 0; }
 traffic_report() { return 0; }
 sleep() { return 0; }
 validate_peer_path() { return "$VALIDATE_RC"; }
