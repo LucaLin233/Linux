@@ -132,9 +132,16 @@ is_positive_integer() {
 }
 
 take_lock() {
+    local timeout="${1:-}"
+
     mkdir -p "$(dirname "$LOCK_FILE")"
     exec 9>"$LOCK_FILE"
-    if ! flock -n 9; then
+    if [[ -n "$timeout" ]]; then
+        if ! flock -w "$timeout" 9; then
+            error "另一个 tcshape 实例正在运行"
+            exit 1
+        fi
+    elif ! flock -n 9; then
         error "另一个 tcshape 实例正在运行"
         exit 1
     fi
@@ -1108,6 +1115,22 @@ restore_qdisc_from_file() {
     [[ "$(root_qdisc_kind "$iface")" == "$kind" ]]
 }
 
+restart_service_unlocked() {
+    local rc=0
+
+    exec 9>&-
+    systemctl restart tcshape.service >/dev/null 2>&1 || rc=$?
+    if ! exec 9>"$LOCK_FILE"; then
+        error "无法重新打开 tcshape 锁文件"
+        return 1
+    fi
+    if ! flock -w 10 9; then
+        error "无法在服务重启后重新获取 tcshape 锁"
+        return 1
+    fi
+    return "$rc"
+}
+
 restore_previous_persistent_state() {
     local previous_config="$1"
     local previous_iface="$2"
@@ -1119,7 +1142,7 @@ restore_previous_persistent_state() {
 
     if [[ -n "$previous_config" && -f "$previous_config" ]]; then
         cp -a "$previous_config" "$CONFIG_FILE" || return 1
-        systemctl restart tcshape.service >/dev/null 2>&1 || return 1
+        restart_service_unlocked || return 1
         apply_saved_config || return 1
         systemctl is-enabled --quiet tcshape.service 2>/dev/null || return 1
         systemctl is-active --quiet tcshape.service 2>/dev/null || return 1
@@ -1248,7 +1271,7 @@ cmd_set() {
 
     if ! write_service_files "$rate" "$iface" ||
         ! systemctl enable tcshape.service >/dev/null 2>&1 ||
-        ! systemctl restart tcshape.service >/dev/null 2>&1 ||
+        ! restart_service_unlocked ||
         ! verify_qdisc_rate "$iface" "$rate" ||
         ! systemctl is-enabled --quiet tcshape.service 2>/dev/null ||
         ! systemctl is-active --quiet tcshape.service 2>/dev/null; then
@@ -2346,6 +2369,7 @@ main() {
     require_root
 
     if [[ "$command" == "_apply" ]]; then
+        take_lock 10
         apply_saved_config
         return $?
     fi
