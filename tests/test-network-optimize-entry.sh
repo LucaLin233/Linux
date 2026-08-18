@@ -317,6 +317,89 @@ NETWORK_TEST_TOTAL=85000000000
 assert_ok "active probe budget stops at reserved total threshold" \
     traffic_budget_reached upload
 
+cloudflare_fake_bin="$TEMP_DIR/cloudflare-fake-bin"
+mkdir -p "$cloudflare_fake_bin"
+cat > "$cloudflare_fake_bin/curl" <<'EOF'
+#!/usr/bin/env bash
+mkdir -p "$TEST_CURL_PID_DIR"
+printf '%s\n' "$BASHPID" > "$TEST_CURL_PID_DIR/$BASHPID"
+exec sleep 30
+EOF
+chmod +x "$cloudflare_fake_bin/curl"
+
+assert_cloudflare_curls_stopped() {
+    local pid_file pid found="false"
+
+    for pid_file in "$1"/*; do
+        [[ -f "$pid_file" ]] || continue
+        found="true"
+        pid=$(<"$pid_file")
+        ! kill -0 "$pid" 2>/dev/null || fail "Cloudflare cleanup left curl PID $pid running"
+    done
+    [[ "$found" == "true" ]] || fail "Cloudflare process test did not start curl"
+}
+
+cloudflare_budget_pid_dir="$TEMP_DIR/cloudflare-budget-pids"
+mkdir -p "$cloudflare_budget_pid_dir"
+(
+    trap - EXIT
+    PATH="$cloudflare_fake_bin:$PATH"
+    TEST_CURL_PID_DIR="$cloudflare_budget_pid_dir"
+    export PATH TEST_CURL_PID_DIR
+    CLOUDFLARE_IPV4=192.0.2.80
+    CLOUDFLARE_WORKER_PIDS=()
+    budget_checks=0
+    traffic_used_bytes() { printf '%s\n' 0; }
+    traffic_budget_reached() {
+        local curl_count
+
+        ((budget_checks += 1))
+        (( budget_checks > 1 )) || return 1
+        for _ in {1..200}; do
+            curl_count=$(find "$TEST_CURL_PID_DIR" -type f | wc -l)
+            (( curl_count >= CLOUDFLARE_PARALLEL )) && return 0
+            sleep 0.01
+        done
+        return 0
+    }
+
+    cloudflare_rc=0
+    probe_cloudflare_direction download >/dev/null 2>&1 || cloudflare_rc=$?
+    (( cloudflare_rc != 0 )) || fail "budget-stopped Cloudflare probe unexpectedly succeeded"
+    assert_eq 0 "${#CLOUDFLARE_WORKER_PIDS[@]}" \
+        "budget stop unregisters all Cloudflare workers"
+)
+assert_cloudflare_curls_stopped "$cloudflare_budget_pid_dir"
+printf 'PASS: Cloudflare budget stop reaps real curl children\n'
+
+cloudflare_signal_pid_dir="$TEMP_DIR/cloudflare-signal-pids"
+mkdir -p "$cloudflare_signal_pid_dir"
+(
+    trap - EXIT
+    PATH="$cloudflare_fake_bin:$PATH"
+    TEST_CURL_PID_DIR="$cloudflare_signal_pid_dir"
+    export PATH TEST_CURL_PID_DIR
+    CLOUDFLARE_IPV4=192.0.2.81
+    CLOUDFLARE_WORKER_PIDS=()
+    trap 'cleanup_cloudflare_workers; exit 143' TERM
+    cloudflare_worker download &
+    register_cloudflare_worker "$!"
+    while true; do sleep 0.1; done
+) &
+cloudflare_wrapper_pid=$!
+for _ in {1..200}; do
+    find "$cloudflare_signal_pid_dir" -type f -print -quit | grep -q . && break
+    sleep 0.01
+done
+find "$cloudflare_signal_pid_dir" -type f -print -quit | grep -q . ||
+    fail "signal cleanup test did not start curl"
+kill -TERM "$cloudflare_wrapper_pid"
+cloudflare_signal_rc=0
+wait "$cloudflare_wrapper_pid" 2>/dev/null || cloudflare_signal_rc=$?
+assert_eq 143 "$cloudflare_signal_rc" "Cloudflare wrapper returns signal-derived status"
+assert_cloudflare_curls_stopped "$cloudflare_signal_pid_dir"
+printf 'PASS: Cloudflare signal exit reaps real curl children\n'
+
 ROUTE_GET_LOG="$TEMP_DIR/route-get-target"
 ip() {
     [[ "$1 $2 $3" == '-4 route get' ]] || return 1
@@ -331,6 +414,59 @@ traffic_mark 198.51.100.25
 assert_eq eth7 "$PROBE_IFACE" "traffic accounting uses actual target route interface"
 assert_eq 198.51.100.25 "$(cat "$ROUTE_GET_LOG")" "traffic accounting routes the real IPv4 target"
 unset -f ip read_iface_counter
+
+multi_iface_qdisc_log="$TEMP_DIR/multi-iface-qdisc.log"
+multi_iface_tcshape_config="$TEMP_DIR/multi-iface-tcshape.conf"
+printf '%s\n' 'RATE_MBIT=500' > "$multi_iface_tcshape_config"
+(
+    traffic_reset
+    BANDWIDTH_PROBE_NOTE=""
+    NETWORK_OPTIMIZE_TCSHAPE_CONFIG_FILE="$multi_iface_tcshape_config"
+    ip() {
+        [[ "$1 $2 $3" == '-4 route get' ]] || return 1
+        case "$4" in
+            192.0.2.10) printf '%s dev eth0 src 192.0.2.1\n' "$4" ;;
+            198.51.100.20) printf '%s dev eth1 src 198.51.100.1\n' "$4" ;;
+            *) return 1 ;;
+        esac
+    }
+    read_iface_counter() {
+        case "$2" in rx) printf '%s\n' 100 ;; tx) printf '%s\n' 200 ;; *) return 1 ;; esac
+    }
+    tc() {
+        [[ "$1 $2 $3" == 'qdisc show dev' ]] || return 1
+        printf '%s\n' "$4" >> "$multi_iface_qdisc_log"
+        case "$4" in
+            eth0) printf '%s\n' 'qdisc fq 0: root' ;;
+            eth1) printf '%s\n' 'qdisc htb 1: root' ;;
+            *) return 1 ;;
+        esac
+    }
+    sysctl() {
+        case "${2:-}" in
+            net.ipv4.tcp_congestion_control) printf '%s\n' bbr ;;
+            net.core.default_qdisc) printf '%s\n' fq ;;
+            *) return 1 ;;
+        esac
+    }
+    readlink() { return 1; }
+    find() { return 0; }
+
+    traffic_add_target 192.0.2.10
+    show_probe_environment_once >/dev/null
+    traffic_add_target 198.51.100.20
+    show_probe_environment_once >/dev/null
+    traffic_add_target 192.0.2.10
+    show_probe_environment_once >/dev/null
+
+    expected_qdisc_ifaces=$(printf 'eth0\neth1\n')
+    assert_eq eth0 "$PROBE_IFACE" "probe interface follows latest actual target route"
+    assert_eq "$expected_qdisc_ifaces" "$(cat "$multi_iface_qdisc_log")" \
+        "probe checks qdisc once for every actual egress interface"
+    assert_eq 'tcshape HTB 整形状态下测得（可能偏低）' "$BANDWIDTH_PROBE_NOTE" \
+        "probe detects tcshape on a later egress interface"
+)
+printf 'PASS: multi-egress probe checks tcshape and qdisc per interface\n'
 
 generated_config="$TEMP_DIR/generated.conf"
 prepare_dynamic_case

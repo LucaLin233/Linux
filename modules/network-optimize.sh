@@ -139,11 +139,12 @@ CALCULATION_REASON="pending bandwidth"
 RMEM_REASON="pending bandwidth"
 WMEM_REASON="pending bandwidth"
 PROBE_IFACE=""
-PROBE_ENVIRONMENT_SHOWN="false"
+declare -A PROBE_ENVIRONMENT_SHOWN_BY_IFACE=()
 declare -a TRAFFIC_IFACES=()
 declare -A TRAFFIC_RX_START_BY_IFACE=()
 declare -A TRAFFIC_TX_START_BY_IFACE=()
 declare -a IPERF_RUNNER_PIDS=()
+declare -a CLOUDFLARE_WORKER_PIDS=()
 declare -a INITCWND_ROLLBACK_FAILED_ITEMS=()
 PREFERRED_IPERF_PORT=""
 CLOUDFLARE_IPV4=""
@@ -1282,7 +1283,7 @@ read_iface_counter() {
 
 traffic_reset() {
     PROBE_IFACE=""
-    PROBE_ENVIRONMENT_SHOWN="false"
+    PROBE_ENVIRONMENT_SHOWN_BY_IFACE=()
     TRAFFIC_IFACES=()
     TRAFFIC_RX_START_BY_IFACE=()
     TRAFFIC_TX_START_BY_IFACE=()
@@ -1293,7 +1294,7 @@ traffic_add_target() {
     local iface rx tx
 
     iface=$(detect_ipv4_iface_for_target "$target") || return 1
-    [[ -n "$PROBE_IFACE" ]] || PROBE_IFACE="$iface"
+    PROBE_IFACE="$iface"
     if [[ -n "${TRAFFIC_RX_START_BY_IFACE[$iface]+x}" ]]; then
         return 0
     fi
@@ -1387,11 +1388,12 @@ unregister_iperf_runner() {
 
 terminate_recorded_pid() {
     local pid="$1"
+    local kill_after="${2:-$IPERF_KILL_AFTER_SECONDS}"
     local attempt
 
     [[ "$pid" =~ ^[0-9]+$ ]] || return 0
     kill -TERM "$pid" 2>/dev/null || true
-    for ((attempt = 0; attempt < IPERF_KILL_AFTER_SECONDS * 10; attempt++)); do
+    for ((attempt = 0; attempt < kill_after * 10; attempt++)); do
         kill -0 "$pid" 2>/dev/null || break
         sleep 0.1
     done
@@ -1409,10 +1411,33 @@ cleanup_iperf_runners() {
     done
 }
 
-terminate_pid_now() {
-    local pid="$1"
-    [[ "$pid" =~ ^[0-9]+$ ]] || return 0
-    kill -KILL "$pid" 2>/dev/null || true
+register_cloudflare_worker() {
+    CLOUDFLARE_WORKER_PIDS+=("$1")
+}
+
+unregister_cloudflare_worker() {
+    local wanted="$1" pid
+    local -a remaining=()
+
+    for pid in "${CLOUDFLARE_WORKER_PIDS[@]}"; do
+        [[ "$pid" == "$wanted" ]] || remaining+=("$pid")
+    done
+    CLOUDFLARE_WORKER_PIDS=("${remaining[@]}")
+}
+
+cleanup_cloudflare_workers() {
+    local pid
+    local -a pids=("${CLOUDFLARE_WORKER_PIDS[@]}")
+
+    for pid in "${pids[@]}"; do
+        terminate_recorded_pid "$pid"
+        unregister_cloudflare_worker "$pid"
+    done
+}
+
+cleanup_probe_processes() {
+    cleanup_iperf_runners
+    cleanup_cloudflare_workers
 }
 
 run_iperf_runner() {
@@ -1844,7 +1869,12 @@ cloudflare_worker() {
     local direction="$1"
     local upload_file="${2:-}"
     local deadline=$((SECONDS + CLOUDFLARE_DURATION))
-    local remaining
+    local remaining curl_pid="" curl_rc=0
+
+    trap 'terminate_recorded_pid "${curl_pid:-}" 1' EXIT
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
 
     while (( SECONDS < deadline )); do
         remaining=$((deadline - SECONDS))
@@ -1855,7 +1885,7 @@ cloudflare_worker() {
                 --resolve "speed.cloudflare.com:443:$CLOUDFLARE_IPV4" \
                 --header 'Accept-Encoding: identity' \
                 --connect-timeout 4 --max-time "$remaining" \
-                "$SPEED_DOWNLOAD_URL?bytes=$CLOUDFLARE_DOWNLOAD_BYTES" || break
+                "$SPEED_DOWNLOAD_URL?bytes=$CLOUDFLARE_DOWNLOAD_BYTES" &
         else
             curl -4 --noproxy '*' --fail --silent --output /dev/null \
                 --resolve "speed.cloudflare.com:443:$CLOUDFLARE_IPV4" \
@@ -1863,8 +1893,13 @@ cloudflare_worker() {
                 --header 'Expect:' \
                 --connect-timeout 4 --max-time "$remaining" \
                 --request POST --upload-file "$upload_file" \
-                "$SPEED_UPLOAD_URL" || break
+                "$SPEED_UPLOAD_URL" &
         fi
+        curl_pid=$!
+        curl_rc=0
+        wait "$curl_pid" || curl_rc=$?
+        curl_pid=""
+        (( curl_rc == 0 )) || break
     done
 }
 
@@ -1899,7 +1934,9 @@ probe_cloudflare_direction() {
 
     for ((index = 0; index < CLOUDFLARE_PARALLEL; index++)); do
         cloudflare_worker "$direction" "$upload_file" &
-        pids+=("$!")
+        pid=$!
+        pids+=("$pid")
+        register_cloudflare_worker "$pid"
     done
 
     while true; do
@@ -1913,15 +1950,16 @@ probe_cloudflare_direction() {
         [[ "$alive" == "true" ]] || break
 
         if traffic_budget_reached "$direction"; then
-            for pid in "${pids[@]}"; do
-                terminate_pid_now "$pid"
-            done
+            cleanup_cloudflare_workers
             break
         fi
         sleep 0.05
     done
     for pid in "${pids[@]}"; do
-        wait "$pid" 2>/dev/null || true
+        if ! wait "$pid" 2>/dev/null; then
+            detail "Cloudflare worker $pid 已停止或失败"
+        fi
+        unregister_cloudflare_worker "$pid"
     done
     [[ -n "$upload_file" ]] && rm -f "$upload_file"
 
@@ -2008,6 +2046,7 @@ round_bandwidth() {
 }
 
 show_probe_environment() {
+    local iface="${1:-$PROBE_IFACE}"
     local driver="virtual"
     local rx_queues
     local tx_queues
@@ -2016,28 +2055,32 @@ show_probe_environment() {
     local root_qdisc
     local driver_path
 
-    driver_path=$(readlink -f "/sys/class/net/$PROBE_IFACE/device/driver" 2>/dev/null || true)
+    [[ -n "$iface" ]] || return 1
+    driver_path=$(readlink -f "/sys/class/net/$iface/device/driver" 2>/dev/null || true)
     [[ -n "$driver_path" ]] && driver="${driver_path##*/}"
-    rx_queues=$(find "/sys/class/net/$PROBE_IFACE/queues" -maxdepth 1 -name 'rx-*' 2>/dev/null | wc -l)
-    tx_queues=$(find "/sys/class/net/$PROBE_IFACE/queues" -maxdepth 1 -name 'tx-*' 2>/dev/null | wc -l)
+    rx_queues=$(find "/sys/class/net/$iface/queues" -maxdepth 1 -name 'rx-*' 2>/dev/null | wc -l)
+    tx_queues=$(find "/sys/class/net/$iface/queues" -maxdepth 1 -name 'tx-*' 2>/dev/null | wc -l)
     current_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo unknown)
     default_qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo unknown)
-    root_qdisc=$(tc qdisc show dev "$PROBE_IFACE" 2>/dev/null | awk 'NR == 1 {print $2}')
+    root_qdisc=$(tc qdisc show dev "$iface" 2>/dev/null | awk 'NR == 1 {print $2}')
 
-    detail "测速环境：接口 $PROBE_IFACE / 驱动 $driver / RX-TX 队列 ${rx_queues}-${tx_queues}"
+    detail "测速环境：接口 $iface / 驱动 $driver / RX-TX 队列 ${rx_queues}-${tx_queues}"
     detail "测速前网络栈：CC $current_cc / default_qdisc $default_qdisc / root_qdisc ${root_qdisc:-unknown}"
     if [[ "$root_qdisc" == "htb" &&
         -f "${NETWORK_OPTIMIZE_TCSHAPE_CONFIG_FILE:-/etc/tcshape.conf}" ]]; then
         BANDWIDTH_PROBE_NOTE="tcshape HTB 整形状态下测得（可能偏低）"
-        warn "检测到 tcshape HTB 正在限制 $PROBE_IFACE，主动测速结果可能偏低"
+        warn "检测到 tcshape HTB 正在限制 $iface，主动测速结果可能偏低"
         warn "建议先执行 tcshape off，再重新运行 network-optimize 主动测速"
     fi
 }
 
 show_probe_environment_once() {
-    [[ "$PROBE_ENVIRONMENT_SHOWN" != "true" && -n "$PROBE_IFACE" ]] || return 0
-    show_probe_environment
-    PROBE_ENVIRONMENT_SHOWN="true"
+    local iface="${PROBE_IFACE:-}"
+
+    [[ -n "$iface" ]] || return 0
+    [[ -z "${PROBE_ENVIRONMENT_SHOWN_BY_IFACE[$iface]+x}" ]] || return 0
+    show_probe_environment "$iface"
+    PROBE_ENVIRONMENT_SHOWN_BY_IFACE["$iface"]="true"
 }
 
 probe_bandwidth() {
@@ -3472,6 +3515,6 @@ main() {
 trap 'error "网络优化脚本在第 $LINENO 行执行失败"' ERR
 
 if [[ "${BASH_SOURCE[0]:-$0}" == "$0" ]]; then
-    trap 'cleanup_iperf_runners' EXIT
+    trap 'cleanup_probe_processes' EXIT
     main "$@"
 fi
