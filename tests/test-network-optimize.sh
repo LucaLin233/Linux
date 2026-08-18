@@ -7,7 +7,6 @@ trap 'rm -rf "$TEMP_DIR"' EXIT
 export NETWORK_OPTIMIZE_STATE_DIR="$TEMP_DIR/state"
 export NETWORK_OPTIMIZE_CONF="$TEMP_DIR/etc/sysctl.d/99-network-optimize.conf"
 export NETWORK_OPTIMIZE_BBR_MODULES_FILE="$TEMP_DIR/etc/modules-load.d/network-optimize-bbr.conf"
-export NETWORK_OPTIMIZE_IPV6_CONF_ROOT="$TEMP_DIR/proc/sys/net/ipv6/conf"
 export NETWORK_OPTIMIZE_INITCWND_HOOK="$TEMP_DIR/networkd-dispatcher/routable.d/50-network-optimize-initcwnd"
 # shellcheck source=../modules/network-optimize.sh
 source "$ROOT_DIR/modules/network-optimize.sh"
@@ -135,7 +134,10 @@ for diagnostic_key in \
         fail "status omits read-only diagnostic $diagnostic_key"
 done
 printf 'PASS: status includes read-only kernel capacity diagnostics\n'
-show_status >/dev/null || fail "status fails when optional diagnostics are unavailable"
+status_output=$(show_status)
+grep -Fq '转发与 RA（只读，本模块不管理）:' <<< "$status_output" ||
+    fail "status does not mark forwarding and RA as unmanaged read-only values"
+printf 'PASS: status labels forwarding and RA as unmanaged read-only values\n'
 printf 'PASS: status succeeds when optional diagnostics are unavailable\n'
 
 TUNING_MODE=probe

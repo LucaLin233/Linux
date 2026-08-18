@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# linux-setup:name=网络优化（BBR、fq、双栈转发）
+# linux-setup:name=网络优化（BBR、fq、TCP 缓冲区）
 # linux-setup:order=30
 # linux-setup:depends=
 # linux-setup:enabled=true
 # 网络优化模块
-# TCP 调优仅覆盖 IPv4；IPv6 forwarding/RA 仅维护转发正确性。
+# TCP 调优仅覆盖 IPv4；forwarding/RA 仅在 status 中只读显示。
 # 基础调优移植或参考 Kylin010/tcpfit v0.5.6（MIT，提交 67c0bdfb35dd98e86982600298237b6ecc08ebe4）。
-# 事务备份、交互、验证及 Docker/VPS forwarding/RA 为本仓库下游扩展。
-# 功能：配置 BBR、fq、TCP 缓冲区及 RA 安全的双栈转发；主动探测必须明确选择。
+# 事务备份、交互与验证为本仓库下游扩展。
+# 功能：配置 BBR、fq 与 TCP 缓冲区；主动探测必须明确选择。
 #
 # 用法：
 #   bash network-optimize.sh [install] [选项]  # 自动计算并应用
@@ -102,7 +102,6 @@ readonly INITCWND_AUTO_UPLOAD_LIMIT_MBPS=100
 readonly TCP_BUFFER_DEFAULT_BYTES=$((2 * 1024 * 1024))
 readonly IPERF_DEADLINE_GRACE_SECONDS=15
 readonly IPERF_KILL_AFTER_SECONDS=3
-readonly IPV6_CONF_ROOT="${NETWORK_OPTIMIZE_IPV6_CONF_ROOT:-/proc/sys/net/ipv6/conf}"
 
 # 参数与计算结果。命令行参数优先于自动探测。
 COMMAND="install"
@@ -2520,101 +2519,6 @@ EOF
     fi
 }
 
-is_virtual_ipv6_ra_interface() {
-    case "$1" in
-        docker*|br-*|veth*|virbr*|cni*|flannel*|kube*|lxc*|podman*|tailscale*|tun*|tap*|wg*)
-            return 0
-            ;;
-        *)
-            return 1
-            ;;
-    esac
-}
-
-capture_virtual_ipv6_ra_values() {
-    local output_file="$1"
-    local accept_ra_path
-    local interface
-
-    for accept_ra_path in "$IPV6_CONF_ROOT"/*/accept_ra; do
-        [[ -e "$accept_ra_path" ]] || continue
-        interface=$(basename "$(dirname "$accept_ra_path")")
-        [[ "$interface" =~ ^[A-Za-z0-9_-]+$ ]] || continue
-        is_virtual_ipv6_ra_interface "$interface" || continue
-        printf 'net.ipv6.conf.%s.accept_ra=%s\n' \
-            "$interface" "$(cat "$accept_ra_path")" >> "$output_file"
-    done
-}
-
-normalize_virtual_ipv6_ra() {
-    local runtime_backup="$1"
-    local key
-    local value
-    local interface
-    local normalized=0
-
-    while IFS='=' read -r key value; do
-        [[ "$key" =~ ^net\.ipv6\.conf\.([A-Za-z0-9_-]+)\.accept_ra$ ]] || continue
-        interface="${BASH_REMATCH[1]}"
-        is_virtual_ipv6_ra_interface "$interface" || continue
-        [[ -e "$IPV6_CONF_ROOT/$interface/accept_ra" ]] || continue
-
-        if ! sysctl -w "$key=0" >/dev/null 2>&1; then
-            error "无法禁用虚拟接口 IPv6 RA: $interface"
-            return 1
-        fi
-        if [[ "$(sysctl -n "$key" 2>/dev/null || true)" != "0" ]]; then
-            error "虚拟接口 IPv6 RA 验证失败: $interface"
-            return 1
-        fi
-        ((normalized += 1))
-    done < "$runtime_backup"
-
-    if (( normalized > 0 )); then
-        info "已禁用 $normalized 个容器或隧道虚拟接口的 IPv6 RA"
-    fi
-}
-
-detect_ipv6_default_iface() {
-    local interface
-
-    interface=$(ip -6 route get 2606:4700:4700::1111 2>/dev/null | route_value_after dev)
-    if [[ -z "$interface" ]]; then
-        interface=$(ip -6 route show default 2>/dev/null | route_value_after dev)
-    fi
-    [[ "$interface" =~ ^[A-Za-z0-9_-]+$ ]] || return 1
-    case "$interface" in all|default|lo) return 1 ;; esac
-    is_virtual_ipv6_ra_interface "$interface" && return 1
-    [[ -e "$IPV6_CONF_ROOT/$interface/accept_ra" ]] || return 1
-    printf '%s\n' "$interface"
-}
-
-append_ipv6_forwarding_config() {
-    local target_file="$1"
-    local interface=""
-
-    [[ -e "$IPV6_CONF_ROOT/all/forwarding" ]] || return 0
-    [[ -e "$IPV6_CONF_ROOT/all/accept_ra" ]] || return 0
-
-    # forwarding=1 时，accept_ra=1 不再接收 RA；只有实际 IPv6 默认出口需要 2。
-    cat >> "$target_file" <<'EOF'
-
-# IPv6 转发；仅实际默认出口在转发模式下继续接收 Router Advertisement
-net.ipv6.conf.all.accept_ra = 1
-net.ipv6.conf.default.accept_ra = 1
-EOF
-
-    interface=$(detect_ipv6_default_iface || true)
-    if [[ -n "$interface" ]]; then
-        echo "net.ipv6.conf.${interface}.accept_ra = 2" >> "$target_file"
-    fi
-
-    cat >> "$target_file" <<'EOF'
-net.ipv6.conf.default.forwarding = 1
-net.ipv6.conf.all.forwarding = 1
-EOF
-}
-
 create_network_config() {
     local target_file="$1"
     local enable_bbr="$2"
@@ -2634,31 +2538,28 @@ ${BANDWIDTH_PROBE_NOTE:+# 带宽测量环境: $BANDWIDTH_PROBE_NOTE}
 # initcwnd 模式: $INITCWND_MODE
 # initcwnd 策略: $INITCWND_POLICY
 # 缓冲区依据: $CALCULATION_REASON
-# 适用于 Debian 13 代理、转发及中高延迟公网 VPS。
+# 适用于 Debian 13 代理及中高延迟公网 VPS。
 
-# 1. IPv4 转发
-net.ipv4.ip_forward = 1
-
-# 2. 队列调度
+# 1. 队列调度
 net.core.default_qdisc = fq
 
-# 3. TCP Fast Open
+# 2. TCP Fast Open
 net.ipv4.tcp_fastopen = 3
 
-# 4. 连接与接收队列
+# 3. 连接与接收队列
 net.core.somaxconn = 65535
 net.ipv4.tcp_max_syn_backlog = 16384
 net.core.netdev_max_backlog = 16384
 net.core.optmem_max = 65536
 
-# 5. TCP/UDP 缓冲区；TCP 初始默认固定 2 MiB，长流继续依赖 autotuning
+# 4. TCP/UDP 缓冲区；TCP 初始默认固定 2 MiB，长流继续依赖 autotuning
 # core default 与全局 tcp_mem 保留内核或发行版值，避免放大所有 socket 的内存承诺
 net.core.rmem_max = $RMEM_MAX_BYTES
 net.core.wmem_max = $WMEM_MAX_BYTES
 net.ipv4.tcp_rmem = 4096 $RMEM_DEFAULT_BYTES $RMEM_MAX_BYTES
 net.ipv4.tcp_wmem = 4096 $WMEM_DEFAULT_BYTES $WMEM_MAX_BYTES
 
-# 6. 长连接、连接回收与复杂路径
+# 5. 长连接、连接回收与复杂路径
 net.ipv4.tcp_fin_timeout = 30
 net.ipv4.tcp_slow_start_after_idle = 0
 net.ipv4.tcp_keepalive_time = 600
@@ -2674,7 +2575,6 @@ EOF
     fi
 
     append_supported_tcp_settings "$target_file"
-    append_ipv6_forwarding_config "$target_file"
 
     if [[ "$enable_bbr" == "true" ]]; then
         cat >> "$target_file" <<'EOF'
@@ -2691,6 +2591,19 @@ EOF
     fi
 
     chmod 644 "$target_file"
+}
+
+managed_config_has_retired_forwarding() {
+    [[ -f "$NETWORK_CONF" ]] || return 1
+    grep -Fq '# 由 network-optimize.sh 自动生成。' "$NETWORK_CONF" || return 1
+    grep -Eq '^[[:space:]]*net\.(ipv4\.ip_forward|ipv6\.conf\.[^.]+\.(accept_ra|forwarding))[[:space:]]*=' \
+        "$NETWORK_CONF"
+}
+
+warn_retired_forwarding_management() {
+    managed_config_has_retired_forwarding || return 0
+    warn "已停止持久管理 IPv4/IPv6 forwarding 与 RA；当前运行值保持不变。"
+    warn "后续值由系统、网络管理器或其他 sysctl 配置决定。"
 }
 
 prepare_legacy_backup_state() {
@@ -2929,11 +2842,18 @@ install_optimization() {
         return 1
     }
 
-    if ! capture_runtime_values "$temp_config" "$runtime_backup"; then
+    if [[ -f "$NETWORK_CONF" ]] &&
+        grep -Fq '# 由 network-optimize.sh 自动生成。' "$NETWORK_CONF"; then
+        capture_runtime_values_from_files \
+            "$runtime_backup" "$temp_config" "$NETWORK_CONF" || {
+            rm -f "$temp_config" "$runtime_backup"
+            return 1
+        }
+    elif ! capture_runtime_values "$temp_config" "$runtime_backup"; then
         rm -f "$temp_config" "$runtime_backup"
         return 1
     fi
-    capture_virtual_ipv6_ra_values "$runtime_backup"
+    warn_retired_forwarding_management
     prepare_legacy_backup_state
 
     install -d -m 0755 "$NETWORK_OPTIMIZE_STATE_DIR"
@@ -2955,11 +2875,6 @@ install_optimization() {
 
     # 应用前已保存全部涉及参数的运行值，失败时逐项回滚。
     if ! apply_network_config "$temp_config"; then
-        restore_runtime_values "$runtime_backup"
-        rm -f "$temp_config" "$runtime_backup"
-        return 1
-    fi
-    if ! normalize_virtual_ipv6_ra "$runtime_backup"; then
         restore_runtime_values "$runtime_backup"
         rm -f "$temp_config" "$runtime_backup"
         return 1
@@ -3002,7 +2917,7 @@ install_optimization() {
             warn "无法写入 BBR 模块开机加载配置；当前运行不受影响"
         fi
     else
-        warn "BBR 未启用；其余网络与转发参数已正常应用"
+        warn "BBR 未启用；其余网络参数已正常应用"
     fi
 
     show_install_summary "$health_before" "$bbr_enabled"
@@ -3339,7 +3254,7 @@ show_status() {
     print_sysctl_rows "TCP Fast Open|net.ipv4.tcp_fastopen|未知"
 
     echo
-    echo "转发与兼容性:"
+    echo "转发与 RA（只读，本模块不管理）:"
     print_sysctl_rows \
         "IPv4 转发|net.ipv4.ip_forward|未知" \
         "rp_filter(all)|net.ipv4.conf.all.rp_filter|未知" \
@@ -3445,7 +3360,7 @@ verify 选项：
   - 只有 --probe 或交互确认后才主动探测并安装缺失依赖
   - 探测失败时，交互终端转为手填；非交互终端在写配置、sysctl 或路由前失败
   - 自动探测仅测量 IPv4 公网带宽，使用公共 iperf3 与 Cloudflare
-  - TCP 调优仅覆盖 IPv4；Docker/VPS forwarding/RA 是本仓库保留的下游扩展
+  - TCP 调优仅覆盖 IPv4；forwarding 与 RA 只读显示，不由本模块配置
   - 自动测速在单方向 40 GB 或合计 85 GB 时提前停止，硬上限仍为 45/90 GB
   - 流量按实际 IPv4 测速目标的路由接口分别计量并汇总，接口计数包含后台流量
   - 默认不持久管理 ECN；只在传入 --disable-ecn 时写入 tcp_ecn=0
@@ -3462,7 +3377,7 @@ verify 选项：
 
 实现来源：
   - 公共 iperf3、带宽探测、BDP/memory cap 与 initcwnd 策略移植或参考 tcpfit v0.5.6
-  - 参数交互、事务备份/恢复、verify 和 Docker/VPS forwarding/RA 为本仓库下游实现
+  - 参数交互、事务备份/恢复和 verify 为本仓库下游实现
 EOF
 }
 
