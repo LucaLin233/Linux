@@ -126,6 +126,7 @@ DETECTED_RTT_MS=""
 RTT_SOURCE="unknown"
 RTT_POLICY="unknown"
 BANDWIDTH_SOURCE="unknown"
+BANDWIDTH_PROBE_NOTE=""
 PHYSICAL_RAM_MB=0
 RAM_MB=0
 MEMORY_CAP_BYTES=0
@@ -716,7 +717,7 @@ detect_effective_memory_mb() {
 }
 
 memory_status_summary() {
-    local meminfo_file="${1:-/proc/meminfo}"
+    local meminfo_file="${NETWORK_OPTIMIZE_MEMINFO_FILE:-/proc/meminfo}"
 
     [[ -r "$meminfo_file" ]] || {
         printf '%s\n' '不可读'
@@ -735,7 +736,7 @@ memory_status_summary() {
 }
 
 swap_status_summary() {
-    local meminfo_file="${1:-/proc/meminfo}"
+    local meminfo_file="${NETWORK_OPTIMIZE_MEMINFO_FILE:-/proc/meminfo}"
 
     [[ -r "$meminfo_file" ]] || {
         printf '%s\n' '不可读'
@@ -1506,7 +1507,7 @@ run_iperf_test() {
     local port="$2"
     local direction="$3"
     local output stats rc=0 reverse_mode="false"
-    local sender receiver retransmits retransmit_percent cpu remote_cpu
+    local receiver retransmits retransmit_percent cpu remote_cpu
 
     [[ "$direction" == "download" ]] && reverse_mode="true"
     output=$(mktemp) || return 1
@@ -1521,7 +1522,7 @@ run_iperf_test() {
         return 1
     }
     rm -f "$output"
-    IFS='|' read -r sender receiver retransmits retransmit_percent cpu remote_cpu <<< "$stats"
+    IFS='|' read -r _ receiver retransmits retransmit_percent cpu remote_cpu <<< "$stats"
 
     # goodput、CPU、重传与 loss 全部取自同一份完整 JSON 结果。
     printf '%s|%s|%s|%s\n' \
@@ -2015,6 +2016,12 @@ show_probe_environment() {
 
     detail "测速环境：接口 $PROBE_IFACE / 驱动 $driver / RX-TX 队列 ${rx_queues}-${tx_queues}"
     detail "测速前网络栈：CC $current_cc / default_qdisc $default_qdisc / root_qdisc ${root_qdisc:-unknown}"
+    if [[ "$root_qdisc" == "htb" &&
+        -f "${NETWORK_OPTIMIZE_TCSHAPE_CONFIG_FILE:-/etc/tcshape.conf}" ]]; then
+        BANDWIDTH_PROBE_NOTE="tcshape HTB 整形状态下测得（可能偏低）"
+        warn "检测到 tcshape HTB 正在限制 $PROBE_IFACE，主动测速结果可能偏低"
+        warn "建议先执行 tcshape off，再重新运行 network-optimize 主动测速"
+    fi
 }
 
 show_probe_environment_once() {
@@ -2619,6 +2626,7 @@ create_network_config() {
 # 下载带宽: ${DETECTED_DOWNLOAD_MBPS:-unknown} Mbps
 # 上传带宽: ${DETECTED_UPLOAD_MBPS:-unknown} Mbps
 # 带宽来源: $BANDWIDTH_SOURCE
+${BANDWIDTH_PROBE_NOTE:+# 带宽测量环境: $BANDWIDTH_PROBE_NOTE}
 # 计算 RTT: ${DETECTED_RTT_MS:-unknown} ms
 # RTT 来源: $RTT_SOURCE
 # RTT 策略: $RTT_POLICY
@@ -3271,7 +3279,7 @@ print_sysctl_rows() {
 }
 
 file_handle_status() {
-    local source_file="${1:-/proc/sys/fs/file-nr}"
+    local source_file="${NETWORK_OPTIMIZE_FILE_NR:-/proc/sys/fs/file-nr}"
     local allocated
     local unused
     local maximum
@@ -3308,7 +3316,7 @@ show_status() {
     echo "配置文件: $NETWORK_CONF"
     [[ -f "$NETWORK_CONF" ]] && echo "配置状态: 已存在" || echo "配置状态: 未创建"
     if [[ -f "$NETWORK_CONF" ]]; then
-        grep -E '^# (模式|内存|物理内存|有效内存|下载带宽|上传带宽|带宽来源|计算 RTT|RTT 来源|RTT 策略|initcwnd 模式|initcwnd 策略|缓冲区依据):' "$NETWORK_CONF" | sed 's/^# /  /'
+        grep -E '^# (模式|内存|物理内存|有效内存|下载带宽|上传带宽|带宽来源|带宽测量环境|计算 RTT|RTT 来源|RTT 策略|initcwnd 模式|initcwnd 策略|缓冲区依据):' "$NETWORK_CONF" | sed 's/^# /  /'
     fi
     [[ -f "$NETWORK_INITIAL_BACKUP" ]] && echo "初始备份: $NETWORK_INITIAL_BACKUP"
     [[ -f "$NETWORK_INITIAL_ABSENT" ]] && echo "初始状态: 配置文件原本不存在"

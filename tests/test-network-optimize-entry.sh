@@ -71,6 +71,7 @@ reset_selection() {
     MANUAL_RTT_MS=""
     MANUAL_RTT_DEFAULTED=false
     BANDWIDTH_SOURCE=unknown
+    BANDWIDTH_PROBE_NOTE=""
     INITCWND_MODE=auto
     INITCWND_ENABLED=true
     INITCWND_POLICY=unknown
@@ -169,6 +170,7 @@ prepare_dynamic_case() {
     RTT_SOURCE=unknown
     RTT_POLICY=unknown
     BANDWIDTH_SOURCE=unknown
+    BANDWIDTH_PROBE_NOTE=""
     INITCWND_MODE=auto
     INITCWND_ENABLED=true
     INITCWND_POLICY=unknown
@@ -333,7 +335,12 @@ generated_config="$TEMP_DIR/generated.conf"
 prepare_dynamic_case
 resolve_tuning_values >/dev/null
 ECN_DISABLED=false
+BANDWIDTH_PROBE_NOTE='tcshape HTB 整形状态下测得（可能偏低）'
 create_network_config "$generated_config" false
+grep -Fq '# 带宽测量环境: tcshape HTB 整形状态下测得（可能偏低）' "$generated_config" ||
+    fail "generated config omits active tcshape measurement warning"
+printf 'PASS: generated config records shaped bandwidth source\n'
+BANDWIDTH_PROBE_NOTE=""
 if grep -Eq '^net[.]ipv4[.]tcp_ecn[[:space:]]*=' "$generated_config"; then
     fail "default generated config still owns tcp_ecn"
 fi
