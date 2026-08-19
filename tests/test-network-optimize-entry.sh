@@ -7,7 +7,6 @@ trap 'rm -rf "$TEMP_DIR"' EXIT
 export NETWORK_OPTIMIZE_STATE_DIR="$TEMP_DIR/state"
 export NETWORK_OPTIMIZE_CONF="$TEMP_DIR/etc/sysctl.d/99-network-optimize.conf"
 export NETWORK_OPTIMIZE_BBR_MODULES_FILE="$TEMP_DIR/etc/modules-load.d/network-optimize-bbr.conf"
-export NETWORK_OPTIMIZE_IPV6_CONF_ROOT="$TEMP_DIR/proc/sys/net/ipv6/conf"
 export NETWORK_OPTIMIZE_INITCWND_HOOK="$TEMP_DIR/networkd-dispatcher/routable.d/50-network-optimize-initcwnd"
 
 # shellcheck source=../modules/network-optimize.sh
@@ -318,6 +317,89 @@ NETWORK_TEST_TOTAL=85000000000
 assert_ok "active probe budget stops at reserved total threshold" \
     traffic_budget_reached upload
 
+cloudflare_fake_bin="$TEMP_DIR/cloudflare-fake-bin"
+mkdir -p "$cloudflare_fake_bin"
+cat > "$cloudflare_fake_bin/curl" <<'EOF'
+#!/usr/bin/env bash
+mkdir -p "$TEST_CURL_PID_DIR"
+printf '%s\n' "$BASHPID" > "$TEST_CURL_PID_DIR/$BASHPID"
+exec sleep 30
+EOF
+chmod +x "$cloudflare_fake_bin/curl"
+
+assert_cloudflare_curls_stopped() {
+    local pid_file pid found="false"
+
+    for pid_file in "$1"/*; do
+        [[ -f "$pid_file" ]] || continue
+        found="true"
+        pid=$(<"$pid_file")
+        ! kill -0 "$pid" 2>/dev/null || fail "Cloudflare cleanup left curl PID $pid running"
+    done
+    [[ "$found" == "true" ]] || fail "Cloudflare process test did not start curl"
+}
+
+cloudflare_budget_pid_dir="$TEMP_DIR/cloudflare-budget-pids"
+mkdir -p "$cloudflare_budget_pid_dir"
+(
+    trap - EXIT
+    PATH="$cloudflare_fake_bin:$PATH"
+    TEST_CURL_PID_DIR="$cloudflare_budget_pid_dir"
+    export PATH TEST_CURL_PID_DIR
+    CLOUDFLARE_IPV4=192.0.2.80
+    CLOUDFLARE_WORKER_PIDS=()
+    budget_checks=0
+    traffic_used_bytes() { printf '%s\n' 0; }
+    traffic_budget_reached() {
+        local curl_count
+
+        ((budget_checks += 1))
+        (( budget_checks > 1 )) || return 1
+        for _ in {1..200}; do
+            curl_count=$(find "$TEST_CURL_PID_DIR" -type f | wc -l)
+            (( curl_count >= CLOUDFLARE_PARALLEL )) && return 0
+            sleep 0.01
+        done
+        return 0
+    }
+
+    cloudflare_rc=0
+    probe_cloudflare_direction download >/dev/null 2>&1 || cloudflare_rc=$?
+    (( cloudflare_rc != 0 )) || fail "budget-stopped Cloudflare probe unexpectedly succeeded"
+    assert_eq 0 "${#CLOUDFLARE_WORKER_PIDS[@]}" \
+        "budget stop unregisters all Cloudflare workers"
+)
+assert_cloudflare_curls_stopped "$cloudflare_budget_pid_dir"
+printf 'PASS: Cloudflare budget stop reaps real curl children\n'
+
+cloudflare_signal_pid_dir="$TEMP_DIR/cloudflare-signal-pids"
+mkdir -p "$cloudflare_signal_pid_dir"
+(
+    trap - EXIT
+    PATH="$cloudflare_fake_bin:$PATH"
+    TEST_CURL_PID_DIR="$cloudflare_signal_pid_dir"
+    export PATH TEST_CURL_PID_DIR
+    CLOUDFLARE_IPV4=192.0.2.81
+    CLOUDFLARE_WORKER_PIDS=()
+    trap 'cleanup_cloudflare_workers; exit 143' TERM
+    cloudflare_worker download &
+    register_cloudflare_worker "$!"
+    while true; do sleep 0.1; done
+) &
+cloudflare_wrapper_pid=$!
+for _ in {1..200}; do
+    find "$cloudflare_signal_pid_dir" -type f -print -quit | grep -q . && break
+    sleep 0.01
+done
+find "$cloudflare_signal_pid_dir" -type f -print -quit | grep -q . ||
+    fail "signal cleanup test did not start curl"
+kill -TERM "$cloudflare_wrapper_pid"
+cloudflare_signal_rc=0
+wait "$cloudflare_wrapper_pid" 2>/dev/null || cloudflare_signal_rc=$?
+assert_eq 143 "$cloudflare_signal_rc" "Cloudflare wrapper returns signal-derived status"
+assert_cloudflare_curls_stopped "$cloudflare_signal_pid_dir"
+printf 'PASS: Cloudflare signal exit reaps real curl children\n'
+
 ROUTE_GET_LOG="$TEMP_DIR/route-get-target"
 ip() {
     [[ "$1 $2 $3" == '-4 route get' ]] || return 1
@@ -332,6 +414,59 @@ traffic_mark 198.51.100.25
 assert_eq eth7 "$PROBE_IFACE" "traffic accounting uses actual target route interface"
 assert_eq 198.51.100.25 "$(cat "$ROUTE_GET_LOG")" "traffic accounting routes the real IPv4 target"
 unset -f ip read_iface_counter
+
+multi_iface_qdisc_log="$TEMP_DIR/multi-iface-qdisc.log"
+multi_iface_tcshape_config="$TEMP_DIR/multi-iface-tcshape.conf"
+printf '%s\n' 'RATE_MBIT=500' > "$multi_iface_tcshape_config"
+(
+    traffic_reset
+    BANDWIDTH_PROBE_NOTE=""
+    NETWORK_OPTIMIZE_TCSHAPE_CONFIG_FILE="$multi_iface_tcshape_config"
+    ip() {
+        [[ "$1 $2 $3" == '-4 route get' ]] || return 1
+        case "$4" in
+            192.0.2.10) printf '%s dev eth0 src 192.0.2.1\n' "$4" ;;
+            198.51.100.20) printf '%s dev eth1 src 198.51.100.1\n' "$4" ;;
+            *) return 1 ;;
+        esac
+    }
+    read_iface_counter() {
+        case "$2" in rx) printf '%s\n' 100 ;; tx) printf '%s\n' 200 ;; *) return 1 ;; esac
+    }
+    tc() {
+        [[ "$1 $2 $3" == 'qdisc show dev' ]] || return 1
+        printf '%s\n' "$4" >> "$multi_iface_qdisc_log"
+        case "$4" in
+            eth0) printf '%s\n' 'qdisc fq 0: root' ;;
+            eth1) printf '%s\n' 'qdisc htb 1: root' ;;
+            *) return 1 ;;
+        esac
+    }
+    sysctl() {
+        case "${2:-}" in
+            net.ipv4.tcp_congestion_control) printf '%s\n' bbr ;;
+            net.core.default_qdisc) printf '%s\n' fq ;;
+            *) return 1 ;;
+        esac
+    }
+    readlink() { return 1; }
+    find() { return 0; }
+
+    traffic_add_target 192.0.2.10
+    show_probe_environment_once >/dev/null
+    traffic_add_target 198.51.100.20
+    show_probe_environment_once >/dev/null
+    traffic_add_target 192.0.2.10
+    show_probe_environment_once >/dev/null
+
+    expected_qdisc_ifaces=$(printf 'eth0\neth1\n')
+    assert_eq eth0 "$PROBE_IFACE" "probe interface follows latest actual target route"
+    assert_eq "$expected_qdisc_ifaces" "$(cat "$multi_iface_qdisc_log")" \
+        "probe checks qdisc once for every actual egress interface"
+    assert_eq 'tcshape HTB 整形状态下测得（可能偏低）' "$BANDWIDTH_PROBE_NOTE" \
+        "probe detects tcshape on a later egress interface"
+)
+printf 'PASS: multi-egress probe checks tcshape and qdisc per interface\n'
 
 generated_config="$TEMP_DIR/generated.conf"
 prepare_dynamic_case
@@ -365,8 +500,164 @@ for retired_key in \
         fail "generated config still owns $retired_key"
     fi
 done
-assert_eq '1' "$(read_config_value "$generated_config" net.ipv4.ip_forward)" \
-    "generated config preserves IPv4 forwarding"
+if grep -Eq '^[[:space:]]*net[.](ipv4[.]ip_forward|ipv6[.]conf[.][^.]+[.](accept_ra|forwarding))[[:space:]]*=' \
+    "$generated_config"; then
+    fail "generated config still owns forwarding or RA"
+fi
+printf 'PASS: generated config omits forwarding and RA assignments\n'
+
+old_managed_config="$TEMP_DIR/old-managed-network.conf"
+mkdir -p "$(dirname "$NETWORK_CONF")"
+printf '%s\n' \
+    '# 由 network-optimize.sh 自动生成。' \
+    '# legacy bytes must remain unchanged' \
+    'net.ipv4.ip_forward = 1' \
+    'net.ipv6.conf.all.accept_ra = 1' \
+    'net.ipv6.conf.default.accept_ra = 1' \
+    'net.ipv6.conf.eth0.accept_ra = 2' \
+    'net.ipv6.conf.default.forwarding = 1' \
+    'net.ipv6.conf.all.forwarding = 1' > "$NETWORK_CONF"
+# shellcheck disable=SC2218
+command cp "$NETWORK_CONF" "$old_managed_config"
+migration_warning=$(warn_retired_forwarding_management)
+for warning_line in \
+    '已停止持久管理 IPv4/IPv6 forwarding 与 RA；当前运行值保持不变。' \
+    '后续值由系统、网络管理器或其他 sysctl 配置决定。'; do
+    assert_eq 1 "$(grep -Fc "$warning_line" <<< "$migration_warning")" \
+        "managed legacy config prints migration warning once"
+done
+printf '%s\n' 'net.ipv4.ip_forward = 1' > "$NETWORK_CONF"
+assert_eq '' "$(warn_retired_forwarding_management)" \
+    "unmarked config does not print forwarding migration warning"
+# shellcheck disable=SC2218
+command cp "$old_managed_config" "$NETWORK_CONF"
+
+IP_FORWARD_RUNTIME=0
+IPV6_ALL_RA_RUNTIME=2
+IPV6_DEFAULT_RA_RUNTIME=2
+IPV6_ETH0_RA_RUNTIME=1
+IPV6_DEFAULT_FORWARD_RUNTIME=0
+IPV6_ALL_FORWARD_RUNTIME=0
+RETIRED_SYSCTL_WRITES=0
+sysctl() {
+    local key value
+
+    case "$1" in
+        -n)
+            case "$2" in
+                net.ipv4.ip_forward) printf '%s\n' "$IP_FORWARD_RUNTIME" ;;
+                net.ipv6.conf.all.accept_ra) printf '%s\n' "$IPV6_ALL_RA_RUNTIME" ;;
+                net.ipv6.conf.default.accept_ra) printf '%s\n' "$IPV6_DEFAULT_RA_RUNTIME" ;;
+                net.ipv6.conf.eth0.accept_ra) printf '%s\n' "$IPV6_ETH0_RA_RUNTIME" ;;
+                net.ipv6.conf.default.forwarding) printf '%s\n' "$IPV6_DEFAULT_FORWARD_RUNTIME" ;;
+                net.ipv6.conf.all.forwarding) printf '%s\n' "$IPV6_ALL_FORWARD_RUNTIME" ;;
+                *) printf '%s\n' 0 ;;
+            esac
+            ;;
+        -p)
+            while IFS='=' read -r key value; do
+                key="${key//[[:space:]]/}"
+                value="${value//[[:space:]]/}"
+                [[ -n "$key" && "$key" != \#* ]] || continue
+                case "$key" in
+                    net.ipv4.ip_forward)
+                        IP_FORWARD_RUNTIME="$value"
+                        ((RETIRED_SYSCTL_WRITES += 1))
+                        ;;
+                    net.ipv6.conf.all.accept_ra)
+                        IPV6_ALL_RA_RUNTIME="$value"
+                        ((RETIRED_SYSCTL_WRITES += 1))
+                        ;;
+                    net.ipv6.conf.default.accept_ra)
+                        IPV6_DEFAULT_RA_RUNTIME="$value"
+                        ((RETIRED_SYSCTL_WRITES += 1))
+                        ;;
+                    net.ipv6.conf.eth0.accept_ra)
+                        IPV6_ETH0_RA_RUNTIME="$value"
+                        ((RETIRED_SYSCTL_WRITES += 1))
+                        ;;
+                    net.ipv6.conf.default.forwarding)
+                        IPV6_DEFAULT_FORWARD_RUNTIME="$value"
+                        ((RETIRED_SYSCTL_WRITES += 1))
+                        ;;
+                    net.ipv6.conf.all.forwarding)
+                        IPV6_ALL_FORWARD_RUNTIME="$value"
+                        ((RETIRED_SYSCTL_WRITES += 1))
+                        ;;
+                esac
+            done < "$2"
+            ;;
+        -w)
+            key="${2%%=*}"
+            value="${2#*=}"
+            case "$key" in
+                net.ipv4.ip_forward) IP_FORWARD_RUNTIME="$value" ;;
+                net.ipv6.conf.all.accept_ra) IPV6_ALL_RA_RUNTIME="$value" ;;
+                net.ipv6.conf.default.accept_ra) IPV6_DEFAULT_RA_RUNTIME="$value" ;;
+                net.ipv6.conf.eth0.accept_ra) IPV6_ETH0_RA_RUNTIME="$value" ;;
+                net.ipv6.conf.default.forwarding) IPV6_DEFAULT_FORWARD_RUNTIME="$value" ;;
+                net.ipv6.conf.all.forwarding) IPV6_ALL_FORWARD_RUNTIME="$value" ;;
+                *) : ;;
+            esac
+            ((RETIRED_SYSCTL_WRITES += 1))
+            ;;
+        *) return 1 ;;
+    esac
+}
+upgrade_runtime="$TEMP_DIR/upgrade-previous.runtime"
+capture_runtime_values_from_files \
+    "$upgrade_runtime" "$generated_config" "$old_managed_config"
+for expected_runtime in \
+    'net.ipv4.ip_forward=0' \
+    'net.ipv6.conf.all.accept_ra=2' \
+    'net.ipv6.conf.default.accept_ra=2' \
+    'net.ipv6.conf.eth0.accept_ra=1' \
+    'net.ipv6.conf.default.forwarding=0' \
+    'net.ipv6.conf.all.forwarding=0'; do
+    grep -Fxq "$expected_runtime" "$upgrade_runtime" ||
+        fail "upgrade runtime snapshot dropped $expected_runtime"
+done
+printf 'PASS: upgrade runtime snapshot retains retired keys\n'
+
+rm -f "$NETWORK_PREVIOUS_BACKUP" "$NETWORK_PREVIOUS_ABSENT"
+# Sourced implementation is intentionally overridden by later failure-injection tests.
+# shellcheck disable=SC2218
+backup_managed_file \
+    "$NETWORK_CONF" "$NETWORK_INITIAL_BACKUP" "$NETWORK_PREVIOUS_BACKUP" \
+    "$NETWORK_INITIAL_ABSENT" "$NETWORK_PREVIOUS_ABSENT"
+cmp -s "$old_managed_config" "$NETWORK_PREVIOUS_BACKUP" ||
+    fail "previous backup did not preserve legacy config byte-for-byte"
+printf 'PASS: previous backup preserves legacy config byte-for-byte\n'
+atomic_install_file "$generated_config" "$NETWORK_CONF" 0644
+DEBUG=1
+# shellcheck disable=SC2218
+apply_network_config "$NETWORK_CONF"
+assert_eq 0 "$RETIRED_SYSCTL_WRITES" \
+    "upgraded config applies no forwarding or RA runtime writes"
+assert_eq '0|2|2|1|0|0' \
+    "$IP_FORWARD_RUNTIME|$IPV6_ALL_RA_RUNTIME|$IPV6_DEFAULT_RA_RUNTIME|$IPV6_ETH0_RA_RUNTIME|$IPV6_DEFAULT_FORWARD_RUNTIME|$IPV6_ALL_FORWARD_RUNTIME" \
+    "upgrade preserves forwarding and RA runtime values"
+
+IP_FORWARD_RUNTIME=9
+IPV6_ALL_RA_RUNTIME=9
+IPV6_DEFAULT_RA_RUNTIME=9
+IPV6_ETH0_RA_RUNTIME=9
+IPV6_DEFAULT_FORWARD_RUNTIME=9
+IPV6_ALL_FORWARD_RUNTIME=9
+# shellcheck disable=SC2218
+apply_network_config "$NETWORK_PREVIOUS_BACKUP"
+restore_managed_file \
+    "$NETWORK_CONF" "$NETWORK_PREVIOUS_BACKUP" "$NETWORK_PREVIOUS_ABSENT"
+apply_runtime_values_strict "$upgrade_runtime"
+cmp -s "$old_managed_config" "$NETWORK_CONF" ||
+    fail "restore previous did not restore legacy config byte-for-byte"
+assert_eq '0|2|2|1|0|0' \
+    "$IP_FORWARD_RUNTIME|$IPV6_ALL_RA_RUNTIME|$IPV6_DEFAULT_RA_RUNTIME|$IPV6_ETH0_RA_RUNTIME|$IPV6_DEFAULT_FORWARD_RUNTIME|$IPV6_ALL_FORWARD_RUNTIME" \
+    "restore previous explicitly restores legacy forwarding and RA runtime values"
+printf 'PASS: restore previous explicitly restores retired forwarding and RA state\n'
+unset DEBUG
+unset -f sysctl
+
 assert_eq '4096 2097152 39845888' \
     "$(read_config_value "$generated_config" net.ipv4.tcp_rmem)" \
     "generated config uses fixed 2 MiB receive default"
@@ -379,103 +670,6 @@ ECN_DISABLED=true
 create_network_config "$generated_config" false
 assert_eq '0' "$(read_config_value "$generated_config" net.ipv4.tcp_ecn)" \
     "explicit disable writes tcp_ecn=0"
-
-mkdir -p "$IPV6_CONF_ROOT"/{all,default,eth0,eth1,br0,br-docker,veth123}
-touch "$IPV6_CONF_ROOT/all/forwarding" "$IPV6_CONF_ROOT/all/accept_ra"
-for ra_iface in default eth0 eth1 br0 veth123; do
-    touch "$IPV6_CONF_ROOT/$ra_iface/accept_ra"
-done
-IPV6_ROUTE_GET_IFACE=eth1
-IPV6_DEFAULT_IFACE=eth0
-ip() {
-    case "$1 $2 $3" in
-        '-6 route get')
-            [[ -n "$IPV6_ROUTE_GET_IFACE" ]] &&
-                printf '2606:4700:4700::1111 via 2001:db8::1 dev %s src 2001:db8::2\n' \
-                    "$IPV6_ROUTE_GET_IFACE"
-            ;;
-        '-6 route show')
-            [[ -n "$IPV6_DEFAULT_IFACE" ]] &&
-                printf 'default via 2001:db8::1 dev %s proto ra metric 100\n' \
-                    "$IPV6_DEFAULT_IFACE"
-            ;;
-        *) return 1 ;;
-    esac
-}
-ra_config="$TEMP_DIR/ra.conf"
-: > "$ra_config"
-append_ipv6_forwarding_config "$ra_config"
-for expected_ra_line in \
-    'net.ipv6.conf.all.accept_ra = 1' \
-    'net.ipv6.conf.default.accept_ra = 1' \
-    'net.ipv6.conf.default.forwarding = 1' \
-    'net.ipv6.conf.all.forwarding = 1'; do
-    grep -Fq "$expected_ra_line" "$ra_config" ||
-        fail "forwarding/RA config misses $expected_ra_line"
-done
-grep -Fq 'net.ipv6.conf.eth1.accept_ra = 2' "$ra_config" ||
-    fail "actual IPv6 route interface did not receive accept_ra=2"
-for excluded_iface in eth0 br0 veth123; do
-    ! grep -Fq "net.ipv6.conf.${excluded_iface}.accept_ra = 2" "$ra_config" ||
-        fail "non-egress interface $excluded_iface incorrectly received accept_ra=2"
-done
-printf 'PASS: multiple NICs select only actual IPv6 default egress and exclude bridge/veth\n'
-
-IPV6_ROUTE_GET_IFACE=""
-IPV6_DEFAULT_IFACE=eth0
-: > "$ra_config"
-append_ipv6_forwarding_config "$ra_config"
-grep -Fq 'net.ipv6.conf.eth0.accept_ra = 2' "$ra_config" ||
-    fail "IPv6 default-route fallback did not select eth0"
-printf 'PASS: IPv6 default-route fallback selects one egress\n'
-
-IPV6_ROUTE_GET_IFACE=""
-IPV6_DEFAULT_IFACE=""
-: > "$ra_config"
-append_ipv6_forwarding_config "$ra_config"
-! grep -Eq '^net[.]ipv6[.]conf[.].+[.]accept_ra = 2$' "$ra_config" ||
-    fail "accept_ra=2 was generated without an IPv6 default route"
-printf 'PASS: no IPv6 default route generates no per-interface accept_ra=2\n'
-unset -f ip
-
-printf '%s\n' 1 > "$IPV6_CONF_ROOT/br-docker/accept_ra"
-printf '%s\n' 2 > "$IPV6_CONF_ROOT/veth123/accept_ra"
-virtual_ra_backup="$TEMP_DIR/virtual-ra.runtime"
-: > "$virtual_ra_backup"
-capture_virtual_ipv6_ra_values "$virtual_ra_backup"
-assert_eq $'net.ipv6.conf.br-docker.accept_ra=1\nnet.ipv6.conf.veth123.accept_ra=2' \
-    "$(sort "$virtual_ra_backup")" "capture virtual interface RA values"
-RA_BR_DOCKER=1
-RA_VETH123=2
-sysctl() {
-    local key
-
-    case "$1" in
-        -n)
-            case "$2" in
-                net.ipv6.conf.br-docker.accept_ra) printf '%s\n' "$RA_BR_DOCKER" ;;
-                net.ipv6.conf.veth123.accept_ra) printf '%s\n' "$RA_VETH123" ;;
-                *) return 1 ;;
-            esac
-            ;;
-        -w)
-            key="${2%%=*}"
-            case "$key" in
-                net.ipv6.conf.br-docker.accept_ra) RA_BR_DOCKER="${2#*=}" ;;
-                net.ipv6.conf.veth123.accept_ra) RA_VETH123="${2#*=}" ;;
-                *) return 1 ;;
-            esac
-            ;;
-        *) return 1 ;;
-    esac
-}
-normalize_virtual_ipv6_ra "$virtual_ra_backup" >/dev/null
-assert_eq 0 "$RA_BR_DOCKER" "normalize bridge RA"
-assert_eq 0 "$RA_VETH123" "normalize veth RA"
-restore_runtime_values "$virtual_ra_backup"
-assert_eq 1 "$RA_BR_DOCKER" "rollback restores bridge RA"
-assert_eq 2 "$RA_VETH123" "rollback restores veth RA"
-unset -f sysctl
 
 SYSCTL_TCP_ECN='1'
 SYSCTL_CONNTRACK_MAX='262144'
@@ -791,5 +985,19 @@ if grep -Eq 'LEGACY_(KERNEL|SYSCTL)|RETIRED_SYSCTL_KEYS|migrate_legacy_(kernel|s
     fail "removed network migration or mode framework remains"
 fi
 printf 'PASS: removed network migration and mode framework is absent\n'
+
+if grep -Eq 'IPV6_CONF_ROOT|is_virtual_ipv6_ra_interface|capture_virtual_ipv6_ra_values|normalize_virtual_ipv6_ra|detect_ipv6_default_iface|append_ipv6_forwarding_config' \
+    "$ROOT_DIR/modules/network-optimize.sh"; then
+    fail "removed forwarding or virtual RA implementation remains"
+fi
+if grep -Eq '^[[:space:]]*net\.(ipv4\.ip_forward|ipv6\.conf\..*\.(accept_ra|forwarding))[[:space:]]*=' \
+    "$ROOT_DIR/modules/network-optimize.sh"; then
+    fail "network-optimize source still contains forwarding or RA config assignments"
+fi
+if grep -Eq 'sysctl[[:space:]]+-w.*(ip_forward|accept_ra|forwarding)' \
+    "$ROOT_DIR/modules/network-optimize.sh"; then
+    fail "network-optimize source still writes forwarding or RA at runtime"
+fi
+printf 'PASS: forwarding and virtual RA management implementation is absent\n'
 
 printf 'All network-optimize entry tests passed.\n'
