@@ -7,7 +7,7 @@
 # TCP 调优仅覆盖 IPv4。
 # 基础调优移植或参考 Kylin010/tcpfit v0.5.6（MIT，提交 67c0bdfb35dd98e86982600298237b6ecc08ebe4）。
 # 事务备份、交互与验证为本仓库下游扩展。
-# 功能：配置 BBR、fq 与 TCP 缓冲区；主动探测必须明确选择。
+# 功能：配置 BBR、fq 与 TCP 缓冲区；交互默认测速，也可手动提供完整带宽。
 # 完整用法与选项由 show_help 输出。
 
 set -euo pipefail
@@ -42,24 +42,20 @@ readonly ROUTE_HOOK_INITIAL_BACKUP="${NETWORK_OPTIMIZE_STATE_DIR}/network-optimi
 readonly ROUTE_HOOK_PREVIOUS_BACKUP="${NETWORK_OPTIMIZE_STATE_DIR}/network-optimize.previous-initcwnd-hook"
 readonly ROUTE_HOOK_INITIAL_ABSENT="${NETWORK_OPTIMIZE_STATE_DIR}/network-optimize.initial-initcwnd-hook-absent"
 readonly ROUTE_HOOK_PREVIOUS_ABSENT="${NETWORK_OPTIMIZE_STATE_DIR}/network-optimize.previous-initcwnd-hook-absent"
-readonly LOCK_FILE="/run/lock/network-optimize.lock"
+readonly LOCK_FILE="${NETWORK_OPTIMIZE_LOCK_FILE:-/run/lock/network-optimize.lock}"
 readonly NETWORK_DETAIL_LOG="${NETWORK_OPTIMIZE_LOG:-/var/log/linux-setup.log}"
+readonly MEASUREMENT_CACHE="${NETWORK_OPTIMIZE_CACHE_FILE:-${NETWORK_OPTIMIZE_STATE_DIR}/network-optimize.bandwidth-cache}"
 
-# 首选附近公共 iperf3 节点进行多流双向测速；Cloudflare 用于并行交叉验证和回退。
-readonly SPEED_DOWNLOAD_URL="https://speed.cloudflare.com/__down"
-readonly SPEED_UPLOAD_URL="https://speed.cloudflare.com/__up"
+# 公共 iperf3 测速固定使用 IPv4、4 并发和 5 秒时长，最多采纳两个节点。
 readonly IPERF_DURATION=5
 readonly IPERF_PARALLEL=4
 readonly IPERF_MAX_PEERS=2
 readonly -a IPERF_PORTS=(5201 5202 5203 5204 5205 5206 5207 5208 5209 5210 5200)
-readonly VERIFY_MAX_GROUP_ATTEMPTS=3
-readonly CLOUDFLARE_PARALLEL=8
-readonly CLOUDFLARE_DURATION=6
-readonly CLOUDFLARE_DOWNLOAD_BYTES=50000000
-readonly CLOUDFLARE_UPLOAD_BYTES=250000000
-readonly TRAFFIC_TOTAL_LIMIT_BYTES=90000000000
-readonly TRAFFIC_DIRECTION_LIMIT_BYTES=45000000000
-readonly TRAFFIC_STOP_RESERVE_BYTES=5000000000
+readonly TRAFFIC_TOTAL_LIMIT_BYTES=25000000000
+readonly TRAFFIC_DIRECTION_LIMIT_BYTES=12500000000
+readonly CACHE_FRESH_MAX_AGE_SECONDS=$((7 * 24 * 60 * 60))
+readonly CACHE_STALE_MAX_AGE_SECONDS=$((30 * 24 * 60 * 60))
+readonly CACHE_FORMAT_VERSION=1
 
 # 公共节点参考 tcpfit，覆盖常见 VPS 机房区域。端口范围为 5201–5210，并兼容 5200。
 readonly IPERF_PEER_POOL='speedtest.hkg12.hk.leaseweb.net|香港|Leaseweb
@@ -87,13 +83,12 @@ readonly TCP_BUFFER_DEFAULT_BYTES=$((2 * 1024 * 1024))
 readonly IPERF_DEADLINE_GRACE_SECONDS=15
 readonly IPERF_KILL_AFTER_SECONDS=3
 
-# 参数与计算结果。命令行参数优先于自动探测。
+# 参数与计算结果。命令行参数优先于自动测量。
 COMMAND="install"
 RESTORE_SCOPE="previous"
 TUNING_MODE=""
 TUNING_SELECTION_EXPLICIT="false"
-ACTIVE_PROBE_REQUESTED="false"
-ECN_DISABLED="false"
+AUTO_MODE_REQUESTED="false"
 INITCWND_MODE="auto"
 INITCWND_ENABLED="true"
 INITCWND_POLICY="unknown"
@@ -110,6 +105,14 @@ RTT_SOURCE="unknown"
 RTT_POLICY="unknown"
 BANDWIDTH_SOURCE="unknown"
 BANDWIDTH_PROBE_NOTE=""
+MEASUREMENT_SOURCE="unknown"
+MEASUREMENT_EPOCH=0
+MEASUREMENT_TIME="unknown"
+MEASUREMENT_NODES="none"
+MEASUREMENT_CONFIDENCE="unknown"
+MEASUREMENT_WARNINGS=""
+MEASUREMENT_ROUTE_TARGET=""
+MEASUREMENT_ROUTE_IDENTITY=""
 PHYSICAL_RAM_MB=0
 RAM_MB=0
 MEMORY_CAP_BYTES=0
@@ -129,14 +132,9 @@ declare -A TRAFFIC_RX_START_BY_IFACE=()
 declare -A TRAFFIC_TX_START_BY_IFACE=()
 # PID arrays are accessed through namerefs.
 # shellcheck disable=SC2034
-declare -a IPERF_RUNNER_PIDS=() CLOUDFLARE_WORKER_PIDS=()
+declare -a IPERF_RUNNER_PIDS=()
 declare -a INITCWND_ROLLBACK_FAILED_ITEMS=()
 PREFERRED_IPERF_PORT=""
-CLOUDFLARE_IPV4=""
-VERIFY_ASSUME_YES="false"
-VERIFY_CONFIRM_EXPLICIT="false"
-VERIFY_TEMP_DIR=""
-VERIFY_RESULT=""
 
 # === 日志函数 ===
 log() {
@@ -442,10 +440,10 @@ parse_arguments() {
 
     while (( $# > 0 )); do
         case "$1" in
-            --probe)
-                TUNING_MODE="probe"
+            --auto)
+                TUNING_MODE="auto"
                 TUNING_SELECTION_EXPLICIT="true"
-                ACTIVE_PROBE_REQUESTED="true"
+                AUTO_MODE_REQUESTED="true"
                 shift
                 ;;
             --bandwidth-mbps|--download-mbps|--upload-mbps|--rtt-ms)
@@ -462,10 +460,6 @@ parse_arguments() {
                 esac
                 shift 2
                 ;;
-            --disable-ecn)
-                ECN_DISABLED="true"
-                shift
-                ;;
             --enable-initcwnd|--disable-initcwnd)
                 desired_mode="enabled"
                 [[ "$1" != "--disable-initcwnd" ]] || desired_mode="disabled"
@@ -476,10 +470,9 @@ parse_arguments() {
                 INITCWND_MODE="$desired_mode"
                 shift
                 ;;
-            --yes)
-                VERIFY_ASSUME_YES="true"
-                VERIFY_CONFIRM_EXPLICIT="true"
-                shift
+            --probe|--yes|--disable-ecn)
+                error "参数 $1 已退休；请使用 --auto 或完整手动带宽"
+                return 1
                 ;;
             initial)
                 if [[ "$COMMAND" != "restore" ]]; then
@@ -501,7 +494,7 @@ parse_arguments() {
     done
 
     case "$COMMAND" in
-        install|plan|restore|status|verify|help) ;;
+        install|plan|restore|status|help) ;;
         *)
             error "未知命令: $COMMAND"
             return 1
@@ -521,9 +514,9 @@ parse_arguments() {
         fi
     done
 
-    if [[ "$ACTIVE_PROBE_REQUESTED" == "true" ]] &&
+    if [[ "$AUTO_MODE_REQUESTED" == "true" ]] &&
         [[ -n "$MANUAL_BANDWIDTH_MBPS$MANUAL_DOWNLOAD_MBPS$MANUAL_UPLOAD_MBPS" ]]; then
-        error "--probe 不能与手动带宽参数同时使用"
+        error "--auto 不能与手动带宽参数同时使用"
         return 1
     fi
 
@@ -542,20 +535,14 @@ parse_arguments() {
             MANUAL_RTT_MS="$DEFAULT_RTT_MS"
             MANUAL_RTT_DEFAULTED="true"
         fi
-    elif [[ -n "$MANUAL_RTT_MS" && "$ACTIVE_PROBE_REQUESTED" != "true" ]]; then
-        error "仅指定 RTT 无法计算缓冲区；请同时指定带宽，或使用 --probe"
+    elif [[ -n "$MANUAL_RTT_MS" && "$AUTO_MODE_REQUESTED" != "true" ]]; then
+        error "仅指定 RTT 无法计算缓冲区；请同时指定带宽，或使用 --auto"
         return 1
     fi
 
-    if [[ "$COMMAND" != "verify" && "$VERIFY_CONFIRM_EXPLICIT" == "true" ]]; then
-        error "--yes 只能用于 verify"
-        return 1
-    fi
-    if [[ "$COMMAND" == "verify" ]] &&
-        [[ -n "$MANUAL_BANDWIDTH_MBPS$MANUAL_DOWNLOAD_MBPS$MANUAL_UPLOAD_MBPS$MANUAL_RTT_MS" ||
-            "$TUNING_SELECTION_EXPLICIT" == "true" ||
-            "$ECN_DISABLED" == "true" || "$INITCWND_MODE" != "auto" ]]; then
-        error "verify 仅接受 --yes；不会安装或应用网络优化"
+    if [[ "$COMMAND" != "install" && "$COMMAND" != "plan" ]] &&
+        [[ "$TUNING_SELECTION_EXPLICIT" == "true" || "$INITCWND_MODE" != "auto" ]]; then
+        error "$COMMAND 不接受测速或调优选项"
         return 1
     fi
 }
@@ -565,10 +552,10 @@ is_interactive_terminal() {
 }
 
 show_active_probe_warning() {
-    warn "主动探测会安装缺失的 curl、ping、iperf3、jq 等工具"
-    warn "典型流量约等于 32 秒线速传输：1 Gbps 约 4 GB，2.5 Gbps 约 10 GB，10 Gbps 约 40 GB"
-    warn "安全硬上限为单方向 45 GB、合计 90 GB；达到 40/85 GB 时提前终止测速"
-    warn "流量按实际 IPv4 目标的路由接口分别计量并汇总；接口计数含后台流量，属于保守预算"
+    warn "公共测速使用 IPv4 iperf3，最多 2 个节点，每方向 4 并发、5 秒"
+    warn "缺少 iperf3 时可通过系统配置的 APT 软件源非交互安装"
+    warn "流量预算为上传 12.5 GB、下载 12.5 GB、合计 25 GB"
+    warn "流量按实际 IPv4 目标的路由接口汇总；接口计数包含后台流量"
 }
 
 prompt_manual_bandwidth() {
@@ -603,18 +590,25 @@ select_tuning_mode() {
     [[ "$TUNING_SELECTION_EXPLICIT" == "false" ]] || return 0
 
     if ! is_interactive_terminal; then
-        error "非交互运行必须使用 --probe，或显式提供上下行带宽"
+        error "非交互运行必须使用 --auto，或显式提供完整上下行带宽"
         return 1
     fi
 
     show_active_probe_warning
-    read -r -p "是否执行主动测速？[y/N]: " answer || return 1
-    if [[ "$answer" =~ ^[Yy]$ ]]; then
-        TUNING_MODE="probe"
-        ACTIVE_PROBE_REQUESTED="true"
-    else
-        prompt_manual_bandwidth || return 1
-    fi
+    read -r -p "是否执行公共 iperf3 测速？[Y/n]: " answer || return 1
+    case "$answer" in
+        ""|[Yy])
+            TUNING_MODE="auto"
+            AUTO_MODE_REQUESTED="true"
+            ;;
+        [Nn])
+            prompt_manual_bandwidth || return 1
+            ;;
+        *)
+            error "请输入 Y 或 N"
+            return 1
+            ;;
+    esac
 
     TUNING_SELECTION_EXPLICIT="true"
 }
@@ -648,57 +642,6 @@ detect_effective_memory_mb() {
     else
         printf '%s\n' "$physical_mb"
     fi
-}
-
-memory_status_summary() {
-    local meminfo_file="${NETWORK_OPTIMIZE_MEMINFO_FILE:-/proc/meminfo}"
-
-    [[ -r "$meminfo_file" ]] || {
-        printf '%s\n' '不可读'
-        return 0
-    }
-    awk '
-        /^MemTotal:/ {total=$2}
-        /^MemAvailable:/ {available=$2}
-        END {
-            if (!total || available == "") {print "不可读"; exit}
-            used=total-available
-            printf "已用 %.0f MiB / 可用 %.0f MiB / 总计 %.0f MiB", \
-                used/1024, available/1024, total/1024
-        }
-    ' "$meminfo_file" 2>/dev/null
-}
-
-swap_status_summary() {
-    local meminfo_file="${NETWORK_OPTIMIZE_MEMINFO_FILE:-/proc/meminfo}"
-
-    [[ -r "$meminfo_file" ]] || {
-        printf '%s\n' '不可读'
-        return 0
-    }
-    awk '
-        /^SwapTotal:/ {total=$2}
-        /^SwapFree:/ {free=$2}
-        END {
-            if (total == "" || free == "") {print "不可读"; exit}
-            if (total == 0) {print "未配置"; exit}
-            printf "已用 %.0f MiB / 总计 %.0f MiB", (total-free)/1024, total/1024
-        }
-    ' "$meminfo_file" 2>/dev/null
-}
-
-recent_oom_event_count() {
-    local journal
-
-    command -v journalctl >/dev/null 2>&1 || {
-        printf '%s\n' '不可读'
-        return 0
-    }
-    if ! journal=$(journalctl -k --since '-1 hour' --no-pager -o cat 2>/dev/null); then
-        printf '%s\n' '不可读'
-        return 0
-    fi
-    awk '/oom-kill:/ {count += 1} END {print count + 0}' <<< "$journal"
 }
 
 calculate_memory_cap() {
@@ -820,19 +763,11 @@ query_default_ipv4_route() {
 
     routes=$(ip -4 route show default 2>/dev/null) || return 1
     routes="${routes%%$'\n'*}"
-    [[ -n "$routes" ]] || return 2
     printf '%s\n' "$routes"
 }
 
 default_ipv4_route() {
-    local route="" query_status=0
-
-    route=$(query_default_ipv4_route) || query_status=$?
-    case "$query_status" in
-        0) printf '%s\n' "$route" ;;
-        2) printf '\n' ;;
-        *) return 1 ;;
-    esac
+    query_default_ipv4_route
 }
 
 strip_route_window_fields() {
@@ -879,10 +814,9 @@ write_route_snapshot() {
 }
 
 backup_default_route() {
-    local route="" query_status=0
+    local route=""
 
-    route=$(query_default_ipv4_route) || query_status=$?
-    if (( query_status != 0 && query_status != 2 )); then
+    if ! route=$(query_default_ipv4_route); then
         error "读取 IPv4 默认路由失败"
         return 1
     fi
@@ -951,6 +885,36 @@ render_initcwnd_hook() {
     cat <<EOF
 #!/usr/bin/env bash
 # Managed by network-optimize.sh
+# network-optimize:initcwnd-hook:v2
+set -euo pipefail
+
+[[ -e "$ROUTE_OWNED_MARKER" ]] || exit 0
+routes=\$(ip -4 route show default 2>/dev/null || true)
+route=\${routes%%\$'\\n'*}
+[[ -n "\$route" ]] || exit 0
+read -r -a fields <<< "\$route"
+skip=false
+clean=()
+for token in "\${fields[@]}"; do
+    if [[ "\$skip" == "true" ]]; then
+        skip=false
+        continue
+    fi
+    case "\$token" in
+        initcwnd|initrwnd) skip=true ;;
+        *) clean+=("\$token") ;;
+    esac
+done
+(( \${#clean[@]} > 0 )) || exit 0
+[[ -e "$ROUTE_OWNED_MARKER" ]] || exit 0
+ip -4 route replace "\${clean[@]}" initcwnd 32 initrwnd 32
+EOF
+}
+
+render_legacy_initcwnd_hook() {
+    cat <<EOF
+#!/usr/bin/env bash
+# Managed by network-optimize.sh
 # network-optimize:initcwnd-hook:v1
 set -euo pipefail
 
@@ -977,12 +941,14 @@ EOF
 }
 
 is_managed_initcwnd_hook() {
-    local actual expected
+    local actual expected legacy
 
     [[ -f "$INITCWND_ROUTE_HOOK" ]] || return 1
     actual=$(<"$INITCWND_ROUTE_HOOK")
     expected=$(render_initcwnd_hook)
-    [[ "$actual" == "$expected" ]]
+    [[ "$actual" == "$expected" ]] && return 0
+    legacy=$(render_legacy_initcwnd_hook)
+    [[ "$actual" == "$legacy" ]]
 }
 
 route_has_script_windows() {
@@ -1207,10 +1173,7 @@ traffic_add_target() {
 }
 
 traffic_mark() {
-    local target="${1:-}"
-
     traffic_reset
-    [[ -z "$target" ]] || traffic_add_target "$target"
 }
 
 traffic_used_bytes() {
@@ -1256,12 +1219,13 @@ traffic_report() {
 }
 
 traffic_budget_reached() {
-    local direction="$1" total directional total_stop=$((TRAFFIC_TOTAL_LIMIT_BYTES - TRAFFIC_STOP_RESERVE_BYTES))
-    local direction_stop=$((TRAFFIC_DIRECTION_LIMIT_BYTES - TRAFFIC_STOP_RESERVE_BYTES))
+    local direction="$1" total directional
 
+    (( ${#TRAFFIC_IFACES[@]} > 0 )) || return 1
     total=$(traffic_used_bytes total) || return 0
     directional=$(traffic_used_bytes "$direction") || return 0
-    (( total >= total_stop || directional >= direction_stop ))
+    (( total >= TRAFFIC_TOTAL_LIMIT_BYTES ||
+       directional >= TRAFFIC_DIRECTION_LIMIT_BYTES ))
 }
 
 register_tracked_pid() {
@@ -1308,7 +1272,6 @@ cleanup_tracked_pids() {
 
 cleanup_probe_processes() {
     cleanup_tracked_pids IPERF_RUNNER_PIDS
-    cleanup_tracked_pids CLOUDFLARE_WORKER_PIDS
 }
 
 run_iperf_runner() {
@@ -1361,11 +1324,7 @@ rank_iperf_peers() {
     local temp_dir host peer_ip location provider index=0 file
 
     command -v ping >/dev/null 2>&1 || return 1
-    if [[ -n "${VERIFY_TEMP_DIR:-}" ]]; then
-        temp_dir=$(mktemp -d "$VERIFY_TEMP_DIR/peers.XXXXXX") || return 1
-    else
-        temp_dir=$(mktemp -d) || return 1
-    fi
+    temp_dir=$(mktemp -d) || return 1
 
     while IFS='|' read -r host location provider; do
         [[ -n "$host" ]] || continue
@@ -1461,180 +1420,181 @@ parse_iperf_metrics() {
         "$(format_cpu_percent "$host_cpu")" "$(format_cpu_percent "$remote_cpu")"
 }
 
-verify_dependencies_available() {
-    local command_name
-    local -a missing=()
-
-    for command_name in ip iperf3 jq ping timeout tc getent; do
-        command -v "$command_name" >/dev/null 2>&1 || missing+=("$command_name")
-    done
-    (( ${#missing[@]} == 0 )) || {
-        error "verify 缺少依赖：${missing[*]}；请先安装后重试（verify 不自动安装）"
-        return 1
-    }
+current_epoch() {
+    date +%s
 }
 
-run_verify_iperf() {
-    local host="$1" port="$2" streams="$3" output_file rc=0
+format_measurement_epoch() {
+    date -u -d "@$1" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || printf '%s\n' "$1"
+}
 
-    output_file="$VERIFY_TEMP_DIR/iperf-${streams}.json"
-    run_iperf_runner "$output_file" "$host" "$port" "$IPERF_DURATION" \
-        "$streams" upload false || rc=$?
-    if (( rc == 75 )); then
-        error "verify 达到上传或总流量停止阈值，已终止 iperf3"
-        return 75
+add_measurement_warning() {
+    local message="$1"
+
+    [[ -n "$message" ]] || return 0
+    if [[ "; $MEASUREMENT_WARNINGS; " != *"; $message; "* ]]; then
+        MEASUREMENT_WARNINGS="${MEASUREMENT_WARNINGS:+$MEASUREMENT_WARNINGS; }$message"
     fi
-    if (( rc != 0 )); then
-        error "iperf3 ${streams} 流测试失败（退出码 $rc）"
-        return 1
-    fi
-    VERIFY_RESULT=$(parse_iperf_metrics "$output_file") || {
-        error "无法解析 iperf3 ${streams} 流结果"
-        return 1
-    }
+    MEASUREMENT_CONFIDENCE="low"
 }
 
-cleanup_verify() {
-    cleanup_tracked_pids IPERF_RUNNER_PIDS
-    [[ -z "${VERIFY_TEMP_DIR:-}" ]] || rm -rf "$VERIFY_TEMP_DIR"
-    VERIFY_TEMP_DIR=""
+show_measurement_warnings() {
+    local warning
+
+    [[ -n "$MEASUREMENT_WARNINGS" ]] || return 0
+    while IFS= read -r warning; do
+        [[ -n "$warning" ]] && warn "$warning"
+    done < <(printf '%s\n' "$MEASUREMENT_WARNINGS" | sed 's/; /\n/g')
 }
 
-verify_impl() {
-    local answer ranked rtt host peer_ip location provider port health_before allowance_before
-    local single_result="" four_result="" candidate_single rc
-    local single_sender single_receiver single_retrans single_retrans_pct single_cpu single_remote_cpu
-    local four_sender four_receiver four_retrans four_retrans_pct four_cpu four_remote_cpu
-    local qdisc_state qdisc_detail selected="false" traffic_started="false" attempts=0
+read_iface_ifindex() {
+    cat "/sys/class/net/$1/ifindex" 2>/dev/null
+}
 
-    echo "verify 将运行 5 秒单流 + 5 秒四流上传测试。"
-    echo "每个候选先测 1 流再测 4 流；任一步失败则整组作废并轮换，最多尝试 ${VERIFY_MAX_GROUP_ATTEMPTS} 组。"
-    echo "正常完成约为 10 秒实际发送速率；若 1 流成功后 4 流失败，重试会重复单流并产生额外流量。"
-    echo "最坏最多约 30 秒实际发送速率：1 Gbps 约 3.75 GB，10 Gbps 约 37.5 GB。"
-    echo "沿用硬上限：单方向 45 GB、合计 90 GB；在 40/85 GB 提前停止。"
-    echo "按每个实际 IPv4 测速目标的路由接口分别计量并汇总；接口计数包含测试期间后台流量，作为保守安全预算。"
-    echo "不会修改 sysctl、路由或 qdisc；同时读取测试前后内核与网卡计数器。"
-    if [[ "$VERIFY_ASSUME_YES" != "true" ]]; then
-        if ! is_interactive_terminal; then
-            error "非交互环境拒绝产生流量；显式传入 verify --yes 后重试"
-            return 1
-        fi
-        read -r -p "确认开始 verify？[y/N]: " answer || return 1
-        [[ "$answer" =~ ^[Yy]$ ]] || {
-            info "已取消 verify；未产生测速流量"
-            return 2
+route_identity_for_target() {
+    local target="$1" route iface gateway source ifindex
+
+    route=$(ip -4 route get "$target" 2>/dev/null) || return 1
+    iface=$(route_value_after dev <<< "$route")
+    gateway=$(route_value_after via <<< "$route")
+    source=$(route_value_after src <<< "$route")
+    [[ -n "$iface" && -n "$source" ]] || return 1
+    ifindex=$(read_iface_ifindex "$iface") || return 1
+    [[ "$ifindex" =~ ^[0-9]+$ ]] || return 1
+    [[ -n "$gateway" ]] || gateway="direct"
+    printf '%s|%s|%s|%s\n' "$ifindex" "$iface" "$gateway" "$source"
+}
+
+cache_field() {
+    local file="$1" key="$2"
+
+    awk -v wanted="$key" '
+        index($0, wanted "=") == 1 {
+            print substr($0, length(wanted) + 2)
+            exit
         }
-    fi
-
-    verify_dependencies_available || return 1
-    VERIFY_TEMP_DIR=$(mktemp -d) || return 1
-    ranked=$(rank_iperf_peers || true)
-    [[ -n "$ranked" ]] || {
-        error "无法找到可用的附近公共 iperf3 对端"
-        return 1
-    }
-    peer_ip=$(awk -F'|' 'NF >= 3 {print $3; exit}' <<< "$ranked")
-    traffic_mark "$peer_ip" || {
-        error "无法按实际 IPv4 测速目标读取路由接口流量计数器，拒绝测速"
-        return 1
-    }
-    health_before=$(network_health_snapshot "$PROBE_IFACE")
-    allowance_before=$(nic_allowance_snapshot "$PROBE_IFACE")
-
-    while IFS='|' read -r rtt host peer_ip location provider; do
-        [[ -n "$peer_ip" ]] || continue
-        while IFS= read -r port; do
-            (( attempts >= VERIFY_MAX_GROUP_ATTEMPTS )) && break 2
-            tcp_port_open "$peer_ip" "$port" || continue
-            ((attempts += 1))
-            candidate_single=""
-
-            traffic_started="true"
-            run_verify_iperf "$peer_ip" "$port" 1 && rc=0 || rc=$?
-            if (( rc == 0 )); then
-                candidate_single="$VERIFY_RESULT"
-            elif (( rc == 75 )); then
-                show_verify_health_since "$health_before" "$allowance_before"
-                return 1
-            else
-                warn "候选 $host [$peer_ip]:$port 单流测试失败，整组作废"
-            fi
-
-            if [[ -n "$candidate_single" ]]; then
-                run_verify_iperf "$peer_ip" "$port" 4 && rc=0 || rc=$?
-                if (( rc == 0 )); then
-                    single_result="$candidate_single"
-                    four_result="$VERIFY_RESULT"
-                    selected="true"
-                    break 2
-                elif (( rc == 75 )); then
-                    show_verify_health_since "$health_before" "$allowance_before"
-                    return 1
-                else
-                    warn "候选 $host [$peer_ip]:$port 四流测试失败，整组作废"
-                fi
-            fi
-
-        done < <(ordered_iperf_ports)
-    done <<< "$ranked"
-    [[ "$selected" == "true" ]] || {
-        [[ "$traffic_started" != "true" ]] || show_verify_health_since "$health_before" "$allowance_before"
-        error "${attempts} 组公共 iperf3 候选均未得到完整的 1 流和 4 流结果"
-        return 1
-    }
-
-    echo "对端: $location/$provider $host [$peer_ip]:$port（IPv4 RTT ${rtt} ms）"
-    IFS='|' read -r single_sender single_receiver single_retrans single_retrans_pct \
-        single_cpu single_remote_cpu <<< "$single_result"
-    IFS='|' read -r four_sender four_receiver four_retrans four_retrans_pct \
-        four_cpu four_remote_cpu <<< "$four_result"
-    IFS='|' read -r qdisc_state qdisc_detail <<< "$(active_qdisc_state "$PROBE_IFACE")"
-
-    printf '1 流：sender %s Mbps / receiver %s Mbps / 重传率 %s%%（%s 次）/ CPU 本机 %s%% 对端 %s%%\n' \
-        "$single_sender" "$single_receiver" "$single_retrans_pct" "$single_retrans" \
-        "$single_cpu" "$single_remote_cpu"
-    printf '4 流：sender %s Mbps / receiver %s Mbps / 重传率 %s%%（%s 次）/ CPU 本机 %s%% 对端 %s%%\n' \
-        "$four_sender" "$four_receiver" "$four_retrans_pct" "$four_retrans" \
-        "$four_cpu" "$four_remote_cpu"
-    printf '活动 qdisc: %s\n' "$(format_qdisc_state "$qdisc_state" "$qdisc_detail")"
-    show_verify_health_since "$health_before" "$allowance_before"
-    traffic_report
-    if (( four_receiver * 100 >= single_receiver * 125 )); then
-        echo "结论：4 流 goodput 明显高于 1 流；单流可能受 RTT、拥塞控制或路径限制。"
-    elif (( single_receiver * 100 >= four_receiver * 125 )); then
-        echo "结论：1 流 goodput 高于 4 流；对端负载或多流竞争可能影响结果。"
-    else
-        echo "结论：1 流与 4 流 goodput 接近；未见明显并行收益。"
-    fi
+    ' "$file"
 }
 
-run_verify_command() {
-    local rc=0 signal index
-    local -a signals=(EXIT HUP INT TERM) saved_traps=()
+sanitize_cache_value() {
+    printf '%s' "$1" | tr '\n\r' '  '
+}
 
-    for signal in "${signals[@]}"; do
-        saved_traps+=("$(trap -p "$signal")")
+write_measurement_cache() {
+    local ifindex iface gateway source warnings content
+
+    [[ -n "$MEASUREMENT_ROUTE_TARGET" && -n "$MEASUREMENT_ROUTE_IDENTITY" ]] || return 1
+    IFS='|' read -r ifindex iface gateway source <<< "$MEASUREMENT_ROUTE_IDENTITY"
+    [[ "$ifindex" =~ ^[0-9]+$ && -n "$iface" && -n "$gateway" && -n "$source" ]] || return 1
+    warnings=${MEASUREMENT_WARNINGS:-none}
+    content="version=$CACHE_FORMAT_VERSION
+saved_at=$MEASUREMENT_EPOCH
+measured_at=$(sanitize_cache_value "$MEASUREMENT_TIME")
+download_mbps=$DETECTED_DOWNLOAD_MBPS
+upload_mbps=$DETECTED_UPLOAD_MBPS
+source=$(sanitize_cache_value "$MEASUREMENT_SOURCE")
+nodes=$(sanitize_cache_value "$MEASUREMENT_NODES")
+confidence=$(sanitize_cache_value "$MEASUREMENT_CONFIDENCE")
+warnings=$(sanitize_cache_value "$warnings")
+route_target=$MEASUREMENT_ROUTE_TARGET
+ifindex=$ifindex
+iface=$iface
+gateway=$gateway
+source_address=$source"
+    atomic_write_file "$MEASUREMENT_CACHE" "$content" 0600
+}
+
+load_measurement_cache() {
+    local max_age="$1" mode="$2" now saved_at age version download upload source nodes
+    local confidence warnings target ifindex iface gateway source_address cached_identity current_identity measured_at
+
+    [[ -f "$MEASUREMENT_CACHE" ]] || return 1
+    version=$(cache_field "$MEASUREMENT_CACHE" version)
+    saved_at=$(cache_field "$MEASUREMENT_CACHE" saved_at)
+    download=$(cache_field "$MEASUREMENT_CACHE" download_mbps)
+    upload=$(cache_field "$MEASUREMENT_CACHE" upload_mbps)
+    target=$(cache_field "$MEASUREMENT_CACHE" route_target)
+    ifindex=$(cache_field "$MEASUREMENT_CACHE" ifindex)
+    iface=$(cache_field "$MEASUREMENT_CACHE" iface)
+    gateway=$(cache_field "$MEASUREMENT_CACHE" gateway)
+    source_address=$(cache_field "$MEASUREMENT_CACHE" source_address)
+    [[ "$version" == "$CACHE_FORMAT_VERSION" ]] || return 1
+    is_positive_integer "$saved_at" 1 9223372036854775807 || return 1
+    is_positive_integer "$download" 1 100000 || return 1
+    is_positive_integer "$upload" 1 100000 || return 1
+    [[ "$ifindex" =~ ^[0-9]+$ && -n "$target" && -n "$iface" &&
+        -n "$gateway" && -n "$source_address" ]] || return 1
+
+    now=$(current_epoch)
+    is_positive_integer "$now" 1 9223372036854775807 || return 1
+    age=$((now - saved_at))
+    (( age >= 0 && age <= max_age )) || return 1
+    if [[ "$mode" == "stale" ]] && (( age <= CACHE_FRESH_MAX_AGE_SECONDS )); then
+        return 1
+    fi
+
+    cached_identity="$ifindex|$iface|$gateway|$source_address"
+    current_identity=$(route_identity_for_target "$target" || true)
+    [[ -n "$current_identity" && "$current_identity" == "$cached_identity" ]] || {
+        detail "测速缓存路由不匹配，忽略缓存"
+        return 1
+    }
+
+    source=$(cache_field "$MEASUREMENT_CACHE" source)
+    nodes=$(cache_field "$MEASUREMENT_CACHE" nodes)
+    confidence=$(cache_field "$MEASUREMENT_CACHE" confidence)
+    warnings=$(cache_field "$MEASUREMENT_CACHE" warnings)
+    measured_at=$(cache_field "$MEASUREMENT_CACHE" measured_at)
+    [[ "$warnings" != "none" ]] || warnings=""
+
+    DETECTED_DOWNLOAD_MBPS="$download"
+    DETECTED_UPLOAD_MBPS="$upload"
+    MEASUREMENT_EPOCH="$saved_at"
+    MEASUREMENT_TIME="${measured_at:-$(format_measurement_epoch "$saved_at")}"
+    MEASUREMENT_NODES="${nodes:-unknown}"
+    MEASUREMENT_CONFIDENCE="${confidence:-low}"
+    MEASUREMENT_WARNINGS="$warnings"
+    MEASUREMENT_ROUTE_TARGET="$target"
+    MEASUREMENT_ROUTE_IDENTITY="$current_identity"
+    PROBE_IFACE="$iface"
+    if [[ "$mode" == "fresh" ]]; then
+        MEASUREMENT_SOURCE="7-day route-bound cache (${source:-public iperf3})"
+    else
+        MEASUREMENT_SOURCE="same-route stale cache (${source:-public iperf3})"
+        add_measurement_warning "live public iperf3 measurement failed, reused same-route cache no older than 30 days"
+    fi
+    BANDWIDTH_SOURCE="$MEASUREMENT_SOURCE"
+}
+
+max_integer_value() {
+    local value maximum=0
+
+    for value in "$@"; do
+        (( value > maximum )) && maximum=$value
     done
-    trap 'cleanup_verify' EXIT
-    trap 'cleanup_verify; exit 129' HUP
-    trap 'cleanup_verify; exit 130' INT
-    trap 'cleanup_verify; exit 143' TERM
-    verify_impl || rc=$?
-    cleanup_verify
-    for index in "${!signals[@]}"; do
-        if [[ -n "${saved_traps[$index]}" ]]; then
-            eval "${saved_traps[$index]}"
-        else
-            trap - "${signals[$index]}"
-        fi
-    done
-    return "$rc"
+    printf '%s\n' "$maximum"
+}
+
+measurements_diverge_over_30_percent() {
+    local first="$1" second="$2" low high
+
+    if (( first < second )); then
+        low=$first
+        high=$second
+    else
+        low=$second
+        high=$first
+    fi
+    (( high * 100 > low * 130 ))
 }
 
 probe_iperf_bandwidth() {
-    local ranked rtt host peer_ip location provider port upload_result download_result upload download upload_cpu
-    local download_cpu upload_retransmits download_retransmits upload_retransmit_percent download_retransmit_percent
-    local best_upload=0 best_download=0 successful_peers=0
+    local ranked rtt host peer_ip location provider port upload_result download_result
+    local upload upload_cpu upload_retransmits upload_retransmit_percent
+    local download download_cpu download_retransmits download_retransmit_percent
+    local upload_rc download_rc node node_detail route_identity first_route_identity="" budget_stopped="false"
+    local route_binding_valid="true" successful_peers=0
+    local -a upload_values=() download_values=() nodes=()
 
     command -v iperf3 >/dev/null 2>&1 || return 1
     command -v jq >/dev/null 2>&1 || return 1
@@ -1642,195 +1602,123 @@ probe_iperf_bandwidth() {
 
     ranked=$(rank_iperf_peers || true)
     [[ -n "$ranked" ]] || return 1
+    MEASUREMENT_WARNINGS=""
+    MEASUREMENT_CONFIDENCE="high"
+    MEASUREMENT_ROUTE_TARGET=""
+    MEASUREMENT_ROUTE_IDENTITY=""
 
     while IFS='|' read -r rtt host peer_ip location provider; do
-        [[ -n "$host" ]] || continue
-        (( rtt <= 150 )) || continue
-        traffic_budget_reached upload && traffic_budget_reached download && break
+        [[ -n "$host" && -n "$peer_ip" ]] || continue
+        if traffic_budget_reached upload && traffic_budget_reached download; then
+            budget_stopped="true"
+            break
+        fi
 
         while IFS= read -r port; do
             traffic_add_target "$peer_ip" || continue
             show_probe_environment_once
             tcp_port_open "$peer_ip" "$port" || continue
-            upload_result=$(run_iperf_test "$peer_ip" "$port" upload || true)
-            download_result=$(run_iperf_test "$peer_ip" "$port" download || true)
-            [[ -n "$upload_result$download_result" ]] || continue
 
-            upload=""; upload_cpu=""; upload_retransmits=""; upload_retransmit_percent=""
-            download=""; download_cpu=""; download_retransmits=""; download_retransmit_percent=""
-            [[ -n "$upload_result" ]] &&
+            upload_result=""
+            download_result=""
+            upload_rc=0
+            download_rc=0
+            if traffic_budget_reached upload; then
+                upload_rc=75
+            else
+                upload_result=$(run_iperf_test "$peer_ip" "$port" upload) || upload_rc=$?
+            fi
+            if traffic_budget_reached download; then
+                download_rc=75
+            else
+                download_result=$(run_iperf_test "$peer_ip" "$port" download) || download_rc=$?
+            fi
+            (( upload_rc != 75 && download_rc != 75 )) || budget_stopped="true"
+
+            upload=""
+            upload_cpu=""
+            upload_retransmits=""
+            upload_retransmit_percent=""
+            download=""
+            download_cpu=""
+            download_retransmits=""
+            download_retransmit_percent=""
+            if [[ -n "$upload_result" ]]; then
                 IFS='|' read -r upload upload_cpu upload_retransmits upload_retransmit_percent <<< "$upload_result"
-            [[ -n "$download_result" ]] &&
+                is_positive_integer "$upload" 1 100000 || upload=""
+            fi
+            if [[ -n "$download_result" ]]; then
                 IFS='|' read -r download download_cpu download_retransmits download_retransmit_percent <<< "$download_result"
+                is_positive_integer "$download" 1 100000 || download=""
+            fi
+            [[ -n "$upload$download" ]] || continue
+
             upload_cpu=$(format_cpu_percent "$upload_cpu")
             download_cpu=$(format_cpu_percent "$download_cpu")
-
             PREFERRED_IPERF_PORT="$port"
-            detail "iperf3 成功节点：$location/$provider $host [$peer_ip]:$port（IPv4 RTT ${rtt} ms）"
-            detail "节点结果：下载 ${download:-失败} Mbps（CPU ${download_cpu:-?}% / 重传率 ${download_retransmit_percent:-?}% [${download_retransmits:-?} 次]），上传 ${upload:-失败} Mbps（CPU ${upload_cpu:-?}% / 重传率 ${upload_retransmit_percent:-?}% [${upload_retransmits:-?} 次]）"
-
-            [[ -n "$upload" ]] && (( upload > best_upload )) && best_upload=$upload
-            [[ -n "$download" ]] && (( download > best_download )) && best_download=$download
+            node="$location/$provider $host [$peer_ip]:$port (IPv4 RTT ${rtt} ms)"
+            nodes+=("$node")
+            [[ -z "$upload" ]] || upload_values+=("$upload")
+            [[ -z "$download" ]] || download_values+=("$download")
             ((successful_peers += 1))
+            detail "iperf3 node: $node"
+            node_detail="download ${download:-failed} Mbps "
+            node_detail+="(CPU ${download_cpu:-?}% / "
+            node_detail+="retransmit ${download_retransmit_percent:-?}% "
+            node_detail+="[${download_retransmits:-?}]); "
+            node_detail+="upload ${upload:-failed} Mbps "
+            node_detail+="(CPU ${upload_cpu:-?}% / "
+            node_detail+="retransmit ${upload_retransmit_percent:-?}% "
+            node_detail+="[${upload_retransmits:-?}])"
+            detail "node result: $node_detail"
+
+            route_identity=$(route_identity_for_target "$peer_ip" || true)
+            if [[ "$route_binding_valid" != "true" || -z "$route_identity" ]]; then
+                route_binding_valid="false"
+            elif [[ -z "$first_route_identity" ]]; then
+                first_route_identity="$route_identity"
+                MEASUREMENT_ROUTE_TARGET="$peer_ip"
+            elif [[ "$route_identity" != "$first_route_identity" ]]; then
+                route_binding_valid="false"
+            fi
+            if [[ "$route_binding_valid" != "true" ]]; then
+                MEASUREMENT_ROUTE_TARGET=""
+                first_route_identity=""
+                add_measurement_warning "selected peers did not share one complete route identity, cache disabled"
+            fi
             break
         done < <(ordered_iperf_ports)
 
         (( successful_peers >= IPERF_MAX_PEERS )) && break
     done <<< "$ranked"
 
-    (( best_upload > 0 || best_download > 0 )) || return 1
-    (( best_upload > 0 )) && DETECTED_UPLOAD_MBPS=$best_upload
-    (( best_download > 0 )) && DETECTED_DOWNLOAD_MBPS=$best_download
-    BANDWIDTH_SOURCE="public iperf3, ${IPERF_PARALLEL} streams"
-}
+    (( ${#upload_values[@]} > 0 && ${#download_values[@]} > 0 )) || return 1
+    DETECTED_UPLOAD_MBPS=$(max_integer_value "${upload_values[@]}")
+    DETECTED_DOWNLOAD_MBPS=$(max_integer_value "${download_values[@]}")
+    MEASUREMENT_ROUTE_IDENTITY="$first_route_identity"
+    MEASUREMENT_NODES=$(IFS='; '; printf '%s' "${nodes[*]}")
+    MEASUREMENT_EPOCH=$(current_epoch)
+    MEASUREMENT_TIME=$(format_measurement_epoch "$MEASUREMENT_EPOCH")
+    MEASUREMENT_SOURCE="public iperf3 IPv4 (P=$IPERF_PARALLEL, t=${IPERF_DURATION}s)"
+    BANDWIDTH_SOURCE="$MEASUREMENT_SOURCE"
 
-cloudflare_worker() {
-    local direction="$1" upload_file="${2:-}" deadline=$((SECONDS + CLOUDFLARE_DURATION))
-    local remaining curl_pid="" curl_rc=0
-
-    trap 'terminate_recorded_pid "${curl_pid:-}" 1' EXIT
-    trap 'exit 129' HUP
-    trap 'exit 130' INT
-    trap 'exit 143' TERM
-
-    while (( SECONDS < deadline )); do
-        remaining=$((deadline - SECONDS))
-        (( remaining > 0 )) || break
-
-        if [[ "$direction" == "download" ]]; then
-            curl -4 --noproxy '*' --fail --silent --output /dev/null \
-                --resolve "speed.cloudflare.com:443:$CLOUDFLARE_IPV4" \
-                --header 'Accept-Encoding: identity' \
-                --connect-timeout 4 --max-time "$remaining" \
-                "$SPEED_DOWNLOAD_URL?bytes=$CLOUDFLARE_DOWNLOAD_BYTES" &
-        else
-            curl -4 --noproxy '*' --fail --silent --output /dev/null \
-                --resolve "speed.cloudflare.com:443:$CLOUDFLARE_IPV4" \
-                --header 'Content-Type: application/octet-stream' \
-                --header 'Expect:' \
-                --connect-timeout 4 --max-time "$remaining" \
-                --request POST --upload-file "$upload_file" \
-                "$SPEED_UPLOAD_URL" &
-        fi
-        curl_pid=$!
-        curl_rc=0
-        wait "$curl_pid" || curl_rc=$?
-        curl_pid=""
-        (( curl_rc == 0 )) || break
-    done
-}
-
-probe_cloudflare_direction() {
-    local direction="$1" started ended elapsed start_bytes end_bytes transferred alive index pid upload_file=""
-    local -a pids=()
-
-    traffic_budget_reached "$direction" && return 1
-    if [[ "$direction" == "upload" ]]; then
-        upload_file=$(mktemp) || return 1
-        if ! truncate -s "$CLOUDFLARE_UPLOAD_BYTES" "$upload_file"; then
-            rm -f "$upload_file"
-            return 1
-        fi
+    if (( successful_peers < IPERF_MAX_PEERS )); then
+        add_measurement_warning "only one public iperf3 peer produced a usable result"
     fi
-
-    start_bytes=$(traffic_used_bytes "$direction") || {
-        [[ -n "$upload_file" ]] && rm -f "$upload_file"
-        return 1
-    }
-    started=$(date +%s%N)
-
-    for ((index = 0; index < CLOUDFLARE_PARALLEL; index++)); do
-        cloudflare_worker "$direction" "$upload_file" &
-        pid=$!
-        pids+=("$pid")
-        register_tracked_pid CLOUDFLARE_WORKER_PIDS "$pid"
-    done
-
-    while true; do
-        alive="false"
-        for pid in "${pids[@]}"; do
-            if kill -0 "$pid" 2>/dev/null; then
-                alive="true"
-                break
-            fi
-        done
-        [[ "$alive" == "true" ]] || break
-
-        if traffic_budget_reached "$direction"; then
-            cleanup_tracked_pids CLOUDFLARE_WORKER_PIDS
-            break
-        fi
-        sleep 0.05
-    done
-    for pid in "${pids[@]}"; do
-        if ! wait "$pid" 2>/dev/null; then
-            detail "Cloudflare worker $pid 已停止或失败"
-        fi
-        unregister_tracked_pid CLOUDFLARE_WORKER_PIDS "$pid"
-    done
-    [[ -n "$upload_file" ]] && rm -f "$upload_file"
-
-    ended=$(date +%s%N)
-    end_bytes=$(traffic_used_bytes "$direction") || return 1
-    transferred=$((end_bytes - start_bytes))
-    (( transferred >= 33554432 )) || return 1
-
-    elapsed=$(awk -v start="$started" -v end="$ended" \
-        'BEGIN {printf "%.3f", (end - start) / 1000000000}')
-    awk -v bytes="$transferred" -v seconds="$elapsed" '
-        BEGIN {
-            if (seconds <= 0) exit 1
-            printf "%.0f\n", bytes * 8 / seconds / 1000000
-        }
-    '
-}
-
-format_bandwidth_result() {
-    if [[ "$1" =~ ^[0-9]+$ ]]; then
-        echo " $1 Mbps"
-    else
-        echo "失败"
+    if (( ${#upload_values[@]} < IPERF_MAX_PEERS )); then
+        add_measurement_warning "upload has fewer than two valid peer samples"
+    elif measurements_diverge_over_30_percent "${upload_values[0]}" "${upload_values[1]}"; then
+        add_measurement_warning "upload peer results differ by more than 30%, using the higher valid result"
     fi
-}
-
-probe_cloudflare_bandwidth() {
-    local upload="" download="" crosscheck=""
-
-    command -v curl >/dev/null 2>&1 || return 1
-    CLOUDFLARE_IPV4=$(resolve_ipv4 speed.cloudflare.com || true)
-    [[ -n "$CLOUDFLARE_IPV4" ]] || return 1
-    traffic_add_target "$CLOUDFLARE_IPV4" || {
-        warn "无法按 Cloudflare 实际 IPv4 目标读取路由接口计数器"
-        return 1
-    }
-    show_probe_environment_once
-    detail "使用 8 流 Cloudflare 交叉验证；iperf3 不可用时同时作为回退..."
-
-    download=$(probe_cloudflare_direction download || true)
-    upload=$(probe_cloudflare_direction upload || true)
-
-    if [[ -n "$download" || -n "$upload" ]]; then
-        detail "Cloudflare 结果：下载$(format_bandwidth_result "$download")，上传$(format_bandwidth_result "$upload")"
-    else
-        warn "Cloudflare 交叉验证失败：两个方向均未获得足够有效流量"
+    if (( ${#download_values[@]} < IPERF_MAX_PEERS )); then
+        add_measurement_warning "download has fewer than two valid peer samples"
+    elif measurements_diverge_over_30_percent "${download_values[0]}" "${download_values[1]}"; then
+        add_measurement_warning "download peer results differ by more than 30%, using the higher valid result"
     fi
-
-    if [[ -n "$download" ]] &&
-        { [[ -z "$DETECTED_DOWNLOAD_MBPS" ]] || (( download > DETECTED_DOWNLOAD_MBPS )); }; then
-        DETECTED_DOWNLOAD_MBPS="$download"
-    fi
-    if [[ -n "$upload" ]] &&
-        { [[ -z "$DETECTED_UPLOAD_MBPS" ]] || (( upload > DETECTED_UPLOAD_MBPS )); }; then
-        DETECTED_UPLOAD_MBPS="$upload"
-    fi
-    [[ -n "$DETECTED_DOWNLOAD_MBPS$DETECTED_UPLOAD_MBPS" ]] || return 1
-
-    [[ -n "$download" ]] && crosscheck="download"
-    [[ -n "$upload" ]] && crosscheck="${crosscheck:+$crosscheck/}upload"
-    if [[ "$BANDWIDTH_SOURCE" == "unknown" ]]; then
-        BANDWIDTH_SOURCE="Cloudflare $crosscheck, ${CLOUDFLARE_PARALLEL} parallel streams"
-    elif [[ -n "$crosscheck" ]]; then
-        BANDWIDTH_SOURCE="$BANDWIDTH_SOURCE + Cloudflare $crosscheck cross-check"
+    [[ "$budget_stopped" != "true" ]] ||
+        add_measurement_warning "traffic budget stopped additional public iperf3 tests"
+    if [[ -z "$MEASUREMENT_ROUTE_TARGET" || -z "$MEASUREMENT_ROUTE_IDENTITY" ]]; then
+        add_measurement_warning "ifindex/interface/gateway/source route binding unavailable, cache not written"
     fi
 }
 
@@ -1867,6 +1755,7 @@ show_probe_environment() {
     if [[ "$root_qdisc" == "htb" &&
         -f "${NETWORK_OPTIMIZE_TCSHAPE_CONFIG_FILE:-/etc/tcshape.conf}" ]]; then
         BANDWIDTH_PROBE_NOTE="tcshape HTB 整形状态下测得（可能偏低）"
+        add_measurement_warning "$BANDWIDTH_PROBE_NOTE"
         warn "检测到 tcshape HTB 正在限制 $iface，主动测速结果可能偏低"
         warn "建议先执行 tcshape off，再重新运行 network-optimize 主动测速"
     fi
@@ -1887,30 +1776,23 @@ probe_bandwidth() {
     command -v ip >/dev/null 2>&1 || return 1
     traffic_mark
 
-    info "自动测量公网带宽（40/85 GB 提前停止，硬上限 45/90 GB；按实际目标接口汇总）..."
-    probe_iperf_bandwidth || true
-    # 公共 iperf3 节点可能忙碌或单向限速；只要预算允许，再用并行 Cloudflare
-    # 交叉验证，并对每个方向保留较高结果。
-    probe_cloudflare_bandwidth || true
+    info "测量 IPv4 公网带宽（每方向 12.5 GB，合计 25 GB；按实际目标接口汇总）..."
+    if ! probe_iperf_bandwidth; then
+        traffic_report
+        return 1
+    fi
     traffic_report
 
-    [[ -n "$DETECTED_DOWNLOAD_MBPS$DETECTED_UPLOAD_MBPS" ]] || return 1
     raw_download="$DETECTED_DOWNLOAD_MBPS"
     raw_upload="$DETECTED_UPLOAD_MBPS"
-
-    if [[ -z "$DETECTED_UPLOAD_MBPS" && -n "$DETECTED_DOWNLOAD_MBPS" ]]; then
-        DETECTED_UPLOAD_MBPS="$DETECTED_DOWNLOAD_MBPS"
-        BANDWIDTH_SOURCE="$BANDWIDTH_SOURCE; upload inferred"
-    elif [[ -z "$DETECTED_DOWNLOAD_MBPS" && -n "$DETECTED_UPLOAD_MBPS" ]]; then
-        DETECTED_DOWNLOAD_MBPS="$DETECTED_UPLOAD_MBPS"
-        BANDWIDTH_SOURCE="$BANDWIDTH_SOURCE; download inferred"
-    fi
-
     DETECTED_DOWNLOAD_MBPS=$(round_bandwidth "$DETECTED_DOWNLOAD_MBPS")
     DETECTED_UPLOAD_MBPS=$(round_bandwidth "$DETECTED_UPLOAD_MBPS")
+    if [[ -n "$MEASUREMENT_ROUTE_IDENTITY" ]] && ! write_measurement_cache; then
+        add_measurement_warning "failed to persist the route-bound measurement cache"
+    fi
 
-    detail "原始测速：下载 ${raw_download:-缺失} Mbps，上传 ${raw_upload:-缺失} Mbps"
-    detail "计算带宽：下载 $DETECTED_DOWNLOAD_MBPS Mbps，上传 $DETECTED_UPLOAD_MBPS Mbps"
+    detail "raw measurement: download $raw_download Mbps, upload $raw_upload Mbps"
+    detail "calculation bandwidth: download $DETECTED_DOWNLOAD_MBPS Mbps, upload $DETECTED_UPLOAD_MBPS Mbps"
 }
 
 calculate_buffer_max() {
@@ -1939,41 +1821,45 @@ buffer_limit_reason() {
     fi
 }
 
-needs_automatic_probe() {
-    [[ "$TUNING_MODE" == "probe" ]] || return 1
-    [[ -z "$MANUAL_BANDWIDTH_MBPS" &&
-       ( -z "$MANUAL_DOWNLOAD_MBPS" || -z "$MANUAL_UPLOAD_MBPS" ) ]]
-}
-
 install_probe_dependencies() {
     local packages=()
 
-    command -v curl >/dev/null 2>&1 || packages+=(curl)
     command -v ping >/dev/null 2>&1 || packages+=(iputils-ping)
     command -v iperf3 >/dev/null 2>&1 || packages+=(iperf3)
     command -v jq >/dev/null 2>&1 || packages+=(jq)
     command -v timeout >/dev/null 2>&1 || packages+=(coreutils)
-    [[ -s /etc/ssl/certs/ca-certificates.crt ]] || packages+=(ca-certificates)
     (( ${#packages[@]} > 0 )) || return 0
 
     if ! command -v apt-get >/dev/null 2>&1; then
-        warn "缺少探测工具且未找到 apt-get"
+        warn "缺少测速依赖且未找到 apt-get"
         return 1
     fi
 
-    info "安装网络探测依赖：${packages[*]}"
+    info "通过 APT 安装公共测速依赖：${packages[*]}"
     if ! DEBIAN_FRONTEND=noninteractive apt-get update -qq; then
-        warn "apt 索引更新失败，将继续尝试安装依赖"
+        warn "APT 索引更新失败，将继续尝试安装"
     fi
     if ! DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
         "${packages[@]}"; then
-        warn "网络探测依赖安装失败"
+        warn "公共测速依赖安装失败"
         return 1
     fi
 }
 
+set_manual_measurement_metadata() {
+    [[ "$BANDWIDTH_SOURCE" != "unknown" ]] || BANDWIDTH_SOURCE="command line manual input"
+    MEASUREMENT_SOURCE="$BANDWIDTH_SOURCE"
+    MEASUREMENT_EPOCH=$(current_epoch)
+    MEASUREMENT_TIME=$(format_measurement_epoch "$MEASUREMENT_EPOCH")
+    MEASUREMENT_NODES="manual input"
+    MEASUREMENT_CONFIDENCE="manual"
+    MEASUREMENT_WARNINGS=""
+    MEASUREMENT_ROUTE_TARGET=""
+    MEASUREMENT_ROUTE_IDENTITY=""
+}
+
 resolve_tuning_values() {
-    local download_mbps="" upload_mbps="" rtt_ms=""
+    local download_mbps="" upload_mbps="" rtt_ms="" live_ready="true"
 
     PHYSICAL_RAM_MB=$(detect_memory_mb)
     is_positive_integer "$PHYSICAL_RAM_MB" 1 1073741824 || {
@@ -1995,24 +1881,38 @@ resolve_tuning_values() {
     fi
 
     if [[ -z "$download_mbps" || -z "$upload_mbps" ]]; then
-        if [[ "$TUNING_MODE" != "probe" ]]; then
+        if [[ "$TUNING_MODE" != "auto" ]]; then
             error "缺少有效上下行带宽，拒绝生成或应用配置"
             return 1
         fi
-        if probe_bandwidth; then
-            [[ -n "$download_mbps" ]] || download_mbps="$DETECTED_DOWNLOAD_MBPS"
-            [[ -n "$upload_mbps" ]] || upload_mbps="$DETECTED_UPLOAD_MBPS"
+        if load_measurement_cache "$CACHE_FRESH_MAX_AGE_SECONDS" fresh; then
+            download_mbps="$DETECTED_DOWNLOAD_MBPS"
+            upload_mbps="$DETECTED_UPLOAD_MBPS"
         else
-            warn "带宽探测失败"
-            if ! is_interactive_terminal; then
-                error "非交互终端无法手填带宽，拒绝生成或应用配置"
-                return 1
+            if [[ "$COMMAND" == "install" ]] && ! install_probe_dependencies; then
+                live_ready="false"
             fi
-            info "请手动提供上下行带宽"
-            prompt_manual_bandwidth "interactive fallback after probe failure" || return 1
-            download_mbps="$MANUAL_DOWNLOAD_MBPS"
-            upload_mbps="$MANUAL_UPLOAD_MBPS"
+            if [[ "$live_ready" == "true" ]] && probe_bandwidth; then
+                download_mbps="$DETECTED_DOWNLOAD_MBPS"
+                upload_mbps="$DETECTED_UPLOAD_MBPS"
+            elif load_measurement_cache "$CACHE_STALE_MAX_AGE_SECONDS" stale; then
+                download_mbps="$DETECTED_DOWNLOAD_MBPS"
+                upload_mbps="$DETECTED_UPLOAD_MBPS"
+            else
+                warn "公共 iperf3 未获得完整双向结果，且没有可用同路由缓存"
+                if ! is_interactive_terminal; then
+                    error "非交互终端无法手填带宽，拒绝生成或应用配置"
+                    return 1
+                fi
+                info "请手动提供上下行带宽"
+                prompt_manual_bandwidth "interactive fallback after public iperf3 failure" || return 1
+                download_mbps="$MANUAL_DOWNLOAD_MBPS"
+                upload_mbps="$MANUAL_UPLOAD_MBPS"
+                set_manual_measurement_metadata
+            fi
         fi
+    else
+        set_manual_measurement_metadata
     fi
 
     if [[ -n "$MANUAL_RTT_MS" ]]; then
@@ -2032,16 +1932,14 @@ resolve_tuning_values() {
 
     if ! is_positive_integer "$download_mbps" 1 100000 ||
         ! is_positive_integer "$upload_mbps" 1 100000; then
-        error "未获得有效上下行带宽，拒绝生成或应用配置"
+        error "未获得完整有效上下行带宽，拒绝生成或应用配置"
         return 1
-    fi
-    if [[ "$TUNING_MODE" == "manual" && "$BANDWIDTH_SOURCE" == "unknown" ]]; then
-        BANDWIDTH_SOURCE="command line"
     fi
 
     DETECTED_DOWNLOAD_MBPS="$download_mbps"
     DETECTED_UPLOAD_MBPS="$upload_mbps"
     DETECTED_RTT_MS="$rtt_ms"
+    BANDWIDTH_SOURCE="$MEASUREMENT_SOURCE"
 
     RX_BDP_BYTES=$((download_mbps * rtt_ms * 125))
     TX_BDP_BYTES=$((upload_mbps * rtt_ms * 125))
@@ -2054,6 +1952,7 @@ resolve_tuning_values() {
     CALCULATION_REASON="rmem: $RMEM_REASON; wmem: $WMEM_REASON"
 
     resolve_initcwnd_policy
+    show_measurement_warnings
 }
 
 format_buffer_size() {
@@ -2071,7 +1970,11 @@ show_tuning_plan() {
     echo "单 socket 上限: $(format_buffer_size "$MEMORY_CAP_BYTES")（有效内存 / 32，绝对上限 256 MiB）"
     echo "下载带宽: ${DETECTED_DOWNLOAD_MBPS:-未知} Mbps"
     echo "上传带宽: ${DETECTED_UPLOAD_MBPS:-未知} Mbps"
-    echo "带宽来源: $BANDWIDTH_SOURCE"
+    echo "测量来源: $MEASUREMENT_SOURCE"
+    echo "测量时间: $MEASUREMENT_TIME"
+    echo "测量节点: $MEASUREMENT_NODES"
+    echo "测量可信度: $MEASUREMENT_CONFIDENCE"
+    echo "测量警告: ${MEASUREMENT_WARNINGS:-none}"
     format_rtt_selection_summary
     echo "接收 BDP: $((RX_BDP_BYTES / 1024)) KiB"
     echo "发送 BDP: $((TX_BDP_BYTES / 1024)) KiB"
@@ -2082,178 +1985,7 @@ show_tuning_plan() {
     echo "计算依据: $CALCULATION_REASON"
     echo "initcwnd 模式: $INITCWND_MODE"
     echo "initcwnd/initrwnd: $([[ "$INITCWND_ENABLED" == "true" ]] && echo "32" || echo "内核默认")（策略: $INITCWND_POLICY）"
-    echo "ECN: $([[ "$ECN_DISABLED" == "true" ]] && echo "显式禁用" || echo "保留当前设置（不持久接管）")"
-}
-
-network_health_snapshot() {
-    local iface="${1:-}" dropped=0 squeezed=0 rx_errors=0 tx_errors=0 rx_dropped=0 tx_dropped=0 rx_packets=0
-    local tx_packets=0 retrans=0 limited=0 line drop_hex squeeze_hex
-
-    if [[ -r /proc/net/softnet_stat ]]; then
-        while read -r line; do
-            read -r _ drop_hex squeeze_hex _ <<< "$line"
-            dropped=$((dropped + 16#${drop_hex:-0}))
-            squeezed=$((squeezed + 16#${squeeze_hex:-0}))
-        done < /proc/net/softnet_stat
-    fi
-    if [[ -n "$iface" ]]; then
-        rx_errors=$(cat "/sys/class/net/$iface/statistics/rx_errors" 2>/dev/null || echo 0)
-        tx_errors=$(cat "/sys/class/net/$iface/statistics/tx_errors" 2>/dev/null || echo 0)
-        rx_dropped=$(cat "/sys/class/net/$iface/statistics/rx_dropped" 2>/dev/null || echo 0)
-        tx_dropped=$(cat "/sys/class/net/$iface/statistics/tx_dropped" 2>/dev/null || echo 0)
-        rx_packets=$(cat "/sys/class/net/$iface/statistics/rx_packets" 2>/dev/null || echo 0)
-        tx_packets=$(cat "/sys/class/net/$iface/statistics/tx_packets" 2>/dev/null || echo 0)
-    fi
-    retrans=$(awk '/^Tcp:/ {if (++seen == 2) print $13}' /proc/net/snmp 2>/dev/null || echo 0)
-    if command -v ss >/dev/null 2>&1; then
-        limited=$(ss -tinmH 2>/dev/null |
-            awk '/(sndbuf_limited|rwnd_limited)/ {count++} END {print count+0}')
-    fi
-
-    printf '%s %s %s %s %s %s %s %s %s %s\n' \
-        "$dropped" "$squeezed" "${rx_errors:-0}" "${tx_errors:-0}" \
-        "${rx_dropped:-0}" "${tx_dropped:-0}" "${retrans:-0}" "$limited" \
-        "${rx_packets:-0}" "${tx_packets:-0}"
-}
-
-classify_network_health() {
-    local softnet_drop="$1" squeezed="$2" errors="$3" nic_drop="$4" packets="$5" drop_ppm=0
-
-    (( packets > 0 )) && drop_ppm=$((nic_drop * 1000000 / packets))
-
-    if (( softnet_drop > 0 || errors > 0 ||
-          (nic_drop >= 100 && packets > 0 && drop_ppm >= 1000) )); then
-        printf '异常：测速期间 softnet 丢包 +%s，网卡丢包 +%s（%s ppm），网卡错误 +%s' \
-            "$softnet_drop" "$nic_drop" "$drop_ppm" "$errors"
-    elif (( nic_drop > 10 || drop_ppm > 100 || squeezed > 0 ||
-             (nic_drop > 0 && packets == 0) )); then
-        printf '注意：测速期间 softnet budget pressure +%s，网卡丢包 +%s（%s ppm），无新增 softnet 丢包或网卡错误' \
-            "$squeezed" "$nic_drop" "$drop_ppm"
-    elif (( nic_drop > 0 )); then
-        printf '正常：测速期间仅有轻微网卡丢包波动 +%s（%s ppm），无 softnet 丢包或网卡错误' \
-            "$nic_drop" "$drop_ppm"
-    else
-        printf '正常：测速期间 softnet 和网卡无新增丢包或错误'
-    fi
-}
-
-nic_allowance_snapshot() {
-    local iface="${1:-}" output
-
-    [[ -n "$iface" ]] || return 0
-    command -v ethtool >/dev/null 2>&1 || return 0
-    output=$(ethtool -S "$iface" 2>/dev/null) || return 0
-    awk '
-            $1 ~ /_allowance_exceeded:$/ && $2 ~ /^[0-9]+$/ {
-                key = $1
-                sub(/:$/, "", key)
-                print key "=" $2
-            }
-        ' <<< "$output"
-}
-
-format_nic_allowance_delta() {
-    local before="$1" after="$2" key value before_value after_value delta part output=""
-    local -a keys=()
-    local -A before_values=()
-    local -A after_values=()
-
-    while IFS='=' read -r key value; do
-        [[ -n "$key" && "$value" =~ ^[0-9]+$ ]] || continue
-        before_values["$key"]="$value"
-    done <<< "$before"
-    while IFS='=' read -r key value; do
-        [[ -n "$key" && "$value" =~ ^[0-9]+$ ]] || continue
-        after_values["$key"]="$value"
-    done <<< "$after"
-    mapfile -t keys < <(
-        printf '%s\n' "${!before_values[@]}" "${!after_values[@]}" |
-            sed '/^$/d' | sort -u
-    )
-    (( ${#keys[@]} > 0 )) || return 0
-
-    for key in "${keys[@]}"; do
-        before_value=${before_values[$key]:-0}
-        after_value=${after_values[$key]:-$before_value}
-        if (( after_value < before_value )); then
-            part="$key 计数器重置（$before_value -> $after_value）"
-        else
-            delta=$((after_value - before_value))
-            (( delta > 0 )) || continue
-            part="$key +$delta"
-        fi
-        [[ -z "$output" ]] || output+=", "
-        output+="$part"
-    done
-
-    if [[ -n "$output" ]]; then
-        printf '驱动 allowance：%s\n' "$output"
-    else
-        printf '驱动 allowance：无新增超额事件\n'
-    fi
-}
-
-health_delta() {
-    local before="$1" after="$2" value health
-    local b_drop b_squeeze b_rxerr b_txerr b_rxdrop b_txdrop b_retrans _ b_rxpkt b_txpkt
-    local a_drop a_squeeze a_rxerr a_txerr a_rxdrop a_txdrop a_retrans a_limited a_rxpkt a_txpkt
-
-    read -r b_drop b_squeeze b_rxerr b_txerr b_rxdrop b_txdrop b_retrans _ b_rxpkt b_txpkt <<< "$before"
-    read -r a_drop a_squeeze a_rxerr a_txerr a_rxdrop a_txdrop a_retrans a_limited a_rxpkt a_txpkt <<< "$after"
-    for value in "$b_drop" "$b_squeeze" "$b_rxerr" "$b_txerr" "$b_rxdrop" "$b_txdrop" \
-        "$b_retrans" "$b_rxpkt" "$b_txpkt" "$a_drop" "$a_squeeze" "$a_rxerr" \
-        "$a_txerr" "$a_rxdrop" "$a_txdrop" "$a_retrans" "$a_limited" "$a_rxpkt" "$a_txpkt"; do
-        [[ "$value" =~ ^[0-9]+$ ]] || { printf '%s\n' 'unreadable|计数器不可读'; return; }
-    done
-    if (( a_drop < b_drop || a_squeeze < b_squeeze || a_rxerr < b_rxerr ||
-          a_txerr < b_txerr || a_rxdrop < b_rxdrop || a_txdrop < b_txdrop ||
-          a_retrans < b_retrans || a_rxpkt < b_rxpkt || a_txpkt < b_txpkt )); then
-        printf '%s\n' 'reset|计数器已重置'
-        return
-    fi
-    health=$(classify_network_health \
-        "$((a_drop - b_drop))" "$((a_squeeze - b_squeeze))" \
-        "$((a_rxerr - b_rxerr + a_txerr - b_txerr))" \
-        "$((a_rxdrop - b_rxdrop + a_txdrop - b_txdrop))" \
-        "$((a_rxpkt - b_rxpkt + a_txpkt - b_txpkt))")
-    printf 'ok|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' "$health" \
-        "$((a_drop - b_drop))" "$((a_squeeze - b_squeeze))" \
-        "$((a_rxerr - b_rxerr))" "$((a_txerr - b_txerr))" \
-        "$((a_rxdrop - b_rxdrop))" "$((a_txdrop - b_txdrop))" \
-        "$((a_retrans - b_retrans))" "$a_limited" \
-        "$((a_rxpkt - b_rxpkt))" "$((a_txpkt - b_txpkt))"
-}
-
-format_verify_health_delta() {
-    local before="$1" after="$2" allowance_before="$3" allowance_after="$4"
-    local status health delta_drop delta_squeeze delta_rxerr delta_txerr delta_rxdrop delta_txdrop
-    local delta_retrans limited delta_rxpkt delta_txpkt
-
-    IFS='|' read -r status health delta_drop delta_squeeze delta_rxerr delta_txerr \
-        delta_rxdrop delta_txdrop delta_retrans limited delta_rxpkt delta_txpkt \
-        <<< "$(health_delta "$before" "$after")"
-    if [[ "$status" != "ok" ]]; then
-        [[ "$status" == "reset" ]] &&
-            printf '网络健康：测试期间计数器重置，无法计算可靠增量\n' ||
-            printf '网络健康：计数器不可读，无法计算 verify 增量\n'
-        format_nic_allowance_delta "$allowance_before" "$allowance_after"
-        return 0
-    fi
-
-    printf '系统计数增量：softnet_dropped +%s / time_squeeze +%s / 全机 TCP 重传 +%s\n' \
-        "$delta_drop" "$delta_squeeze" "$delta_retrans"
-    printf '网卡计数增量：drops rx +%s tx +%s / errors rx +%s tx +%s / packets rx +%s tx +%s\n' \
-        "$delta_rxdrop" "$delta_txdrop" "$delta_rxerr" "$delta_txerr" "$delta_rxpkt" "$delta_txpkt"
-    printf '网络健康：%s；当前受限 socket %s\n' "$health" "$limited"
-    format_nic_allowance_delta "$allowance_before" "$allowance_after"
-}
-show_verify_health_since() {
-    local health_before="$1" allowance_before="$2" health_after allowance_after
-
-    health_after=$(network_health_snapshot "$PROBE_IFACE")
-    allowance_after=$(nic_allowance_snapshot "$PROBE_IFACE")
-    format_verify_health_delta "$health_before" "$health_after" \
-        "$allowance_before" "$allowance_after"
+    echo "ECN: 保留当前设置（不持久接管）"
 }
 
 format_rtt_selection_summary() {
@@ -2262,16 +1994,8 @@ format_rtt_selection_summary() {
 }
 
 show_install_summary() {
-    local before="$1" bbr_enabled="$2" after status health delta_retrans limited
-    local algorithm="当前拥塞控制" qdisc_state qdisc_detail
+    local bbr_enabled="$1" algorithm="当前拥塞控制" qdisc_state qdisc_detail
 
-    after=$(network_health_snapshot "$PROBE_IFACE")
-    IFS='|' read -r status health _ _ _ _ _ _ delta_retrans limited _ _ \
-        <<< "$(health_delta "$before" "$after")"
-    if [[ "$status" != "ok" ]]; then
-        delta_retrans="?"
-        limited="?"
-    fi
     [[ "$bbr_enabled" == "true" ]] && algorithm="BBR"
     IFS='|' read -r qdisc_state qdisc_detail <<< \
         "$(active_qdisc_state "${PROBE_IFACE:-}")"
@@ -2280,16 +2004,16 @@ show_install_summary() {
         "$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 未知)" \
         "$(awk -v mb="$RAM_MB" 'BEGIN {print mb / 1024}')" \
         "${PROBE_IFACE:-unknown}"
-    printf '测量：%s↓ %s↑ Mbps\n' \
-        "${DETECTED_DOWNLOAD_MBPS:-未知}" "${DETECTED_UPLOAD_MBPS:-未知}"
+    printf '测量：%s↓ %s↑ Mbps；来源 %s；时间 %s\n' \
+        "${DETECTED_DOWNLOAD_MBPS:-未知}" "${DETECTED_UPLOAD_MBPS:-未知}" \
+        "$MEASUREMENT_SOURCE" "$MEASUREMENT_TIME"
+    printf '节点：%s；可信度 %s；警告 %s\n' \
+        "$MEASUREMENT_NODES" "$MEASUREMENT_CONFIDENCE" "${MEASUREMENT_WARNINGS:-none}"
     format_rtt_selection_summary
     printf '缓冲：TCP 起点 %s / 最大 %s\n' \
         "$(format_buffer_size "$WMEM_DEFAULT_BYTES")" "$(format_buffer_size "$WMEM_MAX_BYTES")"
-    printf '网络健康：%s；TCP 重传新增 %s；受限 socket %s\n' \
-        "$health" "$delta_retrans" "$limited"
-    printf '应用：%s + ECN %s，配置成功；fq %s\n' \
-        "$algorithm" "$([[ "$ECN_DISABLED" == "true" ]] && echo 已禁用 || echo 未接管)" \
-        "$(format_qdisc_state "$qdisc_state" "$qdisc_detail")"
+    printf '应用：%s + ECN 未接管，配置成功；fq %s\n' \
+        "$algorithm" "$(format_qdisc_state "$qdisc_state" "$qdisc_detail")"
     printf 'initcwnd：%s（策略 %s）\n' \
         "$([[ "$INITCWND_ENABLED" == "true" ]] && echo 32 || echo 内核默认)" \
         "$INITCWND_POLICY"
@@ -2309,18 +2033,10 @@ net.ipv4.tcp_sack = 1
 net.ipv4.tcp_dsack = 1
 net.ipv4.tcp_timestamps = 1
 EOF
-
-    if [[ -e /proc/sys/net/ipv4/tcp_shrink_window ]]; then
-        echo "net.ipv4.tcp_shrink_window = 1" >> "$target_file"
-    fi
-
-    if [[ -e /proc/sys/net/ipv4/tcp_collapse_max_bytes ]]; then
-        echo "net.ipv4.tcp_collapse_max_bytes = 6291456" >> "$target_file"
-    fi
 }
 
 create_network_config() {
-    local target_file="$1" enable_bbr="$2"
+    local target_file="$1" enable_bbr="$2" measurement_warnings="${MEASUREMENT_WARNINGS:-none}"
 
     cat > "$target_file" <<EOF
 # 由 network-optimize.sh 自动生成。
@@ -2329,7 +2045,11 @@ create_network_config() {
 # 有效内存: ${RAM_MB} MiB
 # 下载带宽: ${DETECTED_DOWNLOAD_MBPS:-unknown} Mbps
 # 上传带宽: ${DETECTED_UPLOAD_MBPS:-unknown} Mbps
-# 带宽来源: $BANDWIDTH_SOURCE
+# 测量来源: $MEASUREMENT_SOURCE
+# 测量时间: $MEASUREMENT_TIME
+# 测量节点: $MEASUREMENT_NODES
+# 测量可信度: $MEASUREMENT_CONFIDENCE
+# 测量警告: $measurement_warnings
 ${BANDWIDTH_PROBE_NOTE:+# 带宽测量环境: $BANDWIDTH_PROBE_NOTE}
 # 计算 RTT: ${DETECTED_RTT_MS:-unknown} ms
 # RTT 来源: $RTT_SOURCE
@@ -2364,14 +2084,6 @@ net.ipv4.tcp_slow_start_after_idle = 0
 net.ipv4.tcp_keepalive_time = 600
 net.ipv4.tcp_mtu_probing = 1
 EOF
-
-    if [[ "$ECN_DISABLED" == "true" ]]; then
-        cat >> "$target_file" <<'EOF'
-
-# 仅在显式请求时禁用 ECN；默认保留系统或管理员设置
-net.ipv4.tcp_ecn = 0
-EOF
-    fi
 
     append_supported_tcp_settings "$target_file"
 
@@ -2580,7 +2292,7 @@ rollback_initcwnd_install() {
 }
 
 install_optimization() {
-    local temp_config runtime_backup bbr_enabled="false" health_before
+    local temp_config runtime_backup bbr_enabled="false"
 
     info "开始配置网络优化..."
 
@@ -2588,13 +2300,8 @@ install_optimization() {
         warn "检测到容器虚拟化环境，部分 sysctl 参数可能受宿主机限制"
     fi
 
-    if needs_automatic_probe; then
-        install_probe_dependencies || true
-    fi
-
-    PROBE_IFACE=$(detect_default_iface || true)
-    health_before=$(network_health_snapshot "$PROBE_IFACE")
     resolve_tuning_values || return 1
+    [[ -n "$PROBE_IFACE" ]] || PROBE_IFACE=$(detect_default_iface || true)
     if [[ "${DEBUG:-}" == "1" ]]; then
         show_tuning_plan
     fi
@@ -2666,12 +2373,12 @@ install_optimization() {
         warn "BBR 未启用；其余网络参数已正常应用"
     fi
 
-    show_install_summary "$health_before" "$bbr_enabled"
+    show_install_summary "$bbr_enabled"
 }
 
 # Capture operation-before state for compensating rollback on restore failure.
 begin_restore_transaction() {
-    local config_backup="$1" runtime_backup="$2" transaction_dir="" route="" query_status=0
+    local config_backup="$1" runtime_backup="$2" transaction_dir="" route=""
 
     install -d -m 0755 "$NETWORK_OPTIMIZE_STATE_DIR" || return 1
     transaction_dir=$(mktemp -d \
@@ -2690,12 +2397,15 @@ begin_restore_transaction() {
         return 1
     fi
 
-    route=$(query_default_ipv4_route) || query_status=$?
-    case "$query_status" in
-        0) atomic_write_file "$transaction_dir/route" "$route" 0600 ;;
-        2) atomic_write_file "$transaction_dir/route-absent" "absent" 0600 ;;
-        *) false ;;
-    esac || {
+    if ! route=$(query_default_ipv4_route); then
+        rm -rf -- "$transaction_dir"
+        return 1
+    fi
+    if [[ -n "$route" ]]; then
+        atomic_write_file "$transaction_dir/route" "$route" 0600
+    else
+        atomic_write_file "$transaction_dir/route-absent" "absent" 0600
+    fi || {
         rm -rf -- "$transaction_dir"
         return 1
     }
@@ -2718,7 +2428,7 @@ restore_captured_route_ownership() {
 }
 
 restore_captured_default_route() {
-    local transaction_dir="$1" target_route_file="$2" current_route="" expected_route="" query_status=0
+    local transaction_dir="$1" target_route_file="$2" current_route="" expected_route=""
     local -a route_args=()
 
     if [[ -f "$transaction_dir/route" ]]; then
@@ -2728,12 +2438,11 @@ restore_captured_default_route() {
     fi
     [[ -e "$transaction_dir/route-absent" ]] || return 1
 
-    current_route=$(query_default_ipv4_route) || query_status=$?
-    if (( query_status == 2 )); then
+    current_route=$(query_default_ipv4_route) || return 1
+    if [[ -z "$current_route" ]]; then
         restore_captured_route_ownership "$transaction_dir"
         return
     fi
-    (( query_status == 0 )) || return 1
 
     [[ -f "$target_route_file" ]] || return 1
     expected_route=$(<"$target_route_file")
@@ -2900,19 +2609,23 @@ print_status_section() {
     done
 }
 
-file_handle_status() {
-    local source_file="${NETWORK_OPTIMIZE_FILE_NR:-/proc/sys/fs/file-nr}" allocated unused maximum
+config_comment_value() {
+    local file="$1" label="$2" fallback="${3:-未记录}" value
 
-    if read -r allocated unused maximum 2>/dev/null < "$source_file"; then
-        printf '%s allocated / %s unused / %s max\n' "$allocated" "$unused" "$maximum"
-    else
-        printf '%s\n' '不可用'
-    fi
+    value=$(awk -v prefix="# $label: " '
+        index($0, prefix) == 1 {
+            print substr($0, length(prefix) + 1)
+            exit
+        }
+    ' "$file" 2>/dev/null || true)
+    printf '%s\n' "${value:-$fallback}"
 }
 
 show_status() {
     local available_cc default_iface active_qdisc_state_name active_qdisc_detail
     local initcwnd_state_name initcwnd_detail drift_status=""
+    local measurement_source="未记录" measurement_time="未记录" measurement_nodes="未记录"
+    local measurement_confidence="未记录" measurement_warnings="none" cache_status="不存在"
 
     available_cc=$(cat /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null || echo "未知")
     default_iface=$(detect_default_iface || true)
@@ -2921,70 +2634,55 @@ show_status() {
     IFS='|' read -r initcwnd_state_name initcwnd_detail <<< "$(detect_initcwnd_state)"
     [[ "$initcwnd_state_name" != "drift" ]] || drift_status="initcwnd 状态|漂移"
 
+    if [[ -f "$NETWORK_CONF" ]]; then
+        measurement_source=$(config_comment_value "$NETWORK_CONF" 测量来源)
+        measurement_time=$(config_comment_value "$NETWORK_CONF" 测量时间)
+        measurement_nodes=$(config_comment_value "$NETWORK_CONF" 测量节点)
+        measurement_confidence=$(config_comment_value "$NETWORK_CONF" 测量可信度)
+        measurement_warnings=$(config_comment_value "$NETWORK_CONF" 测量警告 none)
+    elif [[ -f "$MEASUREMENT_CACHE" ]]; then
+        measurement_source="cache: $(cache_field "$MEASUREMENT_CACHE" source)"
+        measurement_time=$(cache_field "$MEASUREMENT_CACHE" measured_at)
+        measurement_nodes=$(cache_field "$MEASUREMENT_CACHE" nodes)
+        measurement_confidence=$(cache_field "$MEASUREMENT_CACHE" confidence)
+        measurement_warnings=$(cache_field "$MEASUREMENT_CACHE" warnings)
+    fi
+    [[ -f "$MEASUREMENT_CACHE" ]] && cache_status="存在（$MEASUREMENT_CACHE）"
+
     echo "========== 网络优化状态 =========="
     echo "配置文件: $NETWORK_CONF"
     [[ -f "$NETWORK_CONF" ]] && echo "配置状态: 已存在" || echo "配置状态: 未创建"
     if [[ -f "$NETWORK_CONF" ]]; then
-        grep -E '^# (模式|内存|物理内存|有效内存|下载带宽|上传带宽|带宽来源|带宽测量环境|计算 RTT|RTT 来源|RTT 策略|initcwnd 模式|initcwnd 策略|缓冲区依据):' "$NETWORK_CONF" | sed 's/^# /  /'
+        grep -E '^# (模式|物理内存|有效内存|下载带宽|上传带宽|带宽测量环境|计算 RTT|RTT 来源|RTT 策略|initcwnd 模式|initcwnd 策略|缓冲区依据):' \
+            "$NETWORK_CONF" | sed 's/^# /  /'
     fi
     [[ -f "$NETWORK_INITIAL_BACKUP" ]] && echo "初始备份: $NETWORK_INITIAL_BACKUP"
     [[ -f "$NETWORK_INITIAL_ABSENT" ]] && echo "初始状态: 配置文件原本不存在"
     [[ -f "$NETWORK_INITIAL_UNKNOWN" ]] && echo "初始状态: 旧版未记录，无法安全推测"
     [[ -f "$NETWORK_PREVIOUS_BACKUP" ]] && echo "上次备份: $NETWORK_PREVIOUS_BACKUP"
 
-    print_status_section "系统资源" \
-        "RAM|$(memory_status_summary)" \
-        "Swap|$(swap_status_summary)" \
-        "最近一小时 OOM|$(recent_oom_event_count)"
-    print_status_section "拥塞控制" \
+    print_status_section "测量记录" \
+        "测量来源|${measurement_source:-未记录}" \
+        "测量时间|${measurement_time:-未记录}" \
+        "测量节点|${measurement_nodes:-未记录}" \
+        "测量可信度|${measurement_confidence:-未记录}" \
+        "测量警告|${measurement_warnings:-none}" \
+        "路由绑定缓存|$cache_status"
+    print_status_section "拥塞与队列" \
         "可用算法|$available_cc" \
         "当前算法|$(read_sysctl_or net.ipv4.tcp_congestion_control 未知)" \
         "default qdisc|$(read_sysctl_or net.core.default_qdisc 未知)" \
-        "active qdisc (${default_iface:-未知接口})|$(format_qdisc_state "$active_qdisc_state_name" "$active_qdisc_detail")" \
-        "TCP Fast Open|sysctl:net.ipv4.tcp_fastopen|未知"
-    print_status_section "兼容性诊断（只读）" \
-        "rp_filter(all)|sysctl:net.ipv4.conf.all.rp_filter|未知" \
-        "rp_filter(default)|sysctl:net.ipv4.conf.default.rp_filter|未知" \
-        "route_localnet|未由本模块配置" \
-        "MPTCP|未由本模块配置"
-    print_status_section "连接容量" \
-        "somaxconn|sysctl:net.core.somaxconn|未知" \
-        "tcp_max_syn_backlog|sysctl:net.ipv4.tcp_max_syn_backlog|未知" \
-        "netdev_max_backlog|sysctl:net.core.netdev_max_backlog|未知" \
-        "optmem_max|sysctl:net.core.optmem_max|不可用" \
-        "临时端口范围|sysctl:net.ipv4.ip_local_port_range|未知" \
-        "保留本地端口|sysctl:net.ipv4.ip_local_reserved_ports|未配置" \
-        "Conntrack 使用量|$(read_sysctl_or net.netfilter.nf_conntrack_count) / $(read_sysctl_or net.netfilter.nf_conntrack_max)" \
-        "Conntrack buckets|sysctl:net.netfilter.nf_conntrack_buckets|不可用"
-    print_status_section "缓冲区" \
-        "rmem_default|sysctl:net.core.rmem_default|未知" \
-        "wmem_default|sysctl:net.core.wmem_default|未知" \
+        "active qdisc (${default_iface:-未知接口})|$(format_qdisc_state "$active_qdisc_state_name" "$active_qdisc_detail")"
+    print_status_section "受管缓冲区" \
         "rmem_max|sysctl:net.core.rmem_max|未知" \
         "wmem_max|sysctl:net.core.wmem_max|未知" \
         "tcp_rmem|sysctl:net.ipv4.tcp_rmem|未知" \
         "tcp_wmem|sysctl:net.ipv4.tcp_wmem|未知" \
-        "tcp_mem（内核管理）|sysctl:net.ipv4.tcp_mem|未知" \
         "tcp_moderate_rcvbuf|sysctl:net.ipv4.tcp_moderate_rcvbuf|未知"
-    print_status_section "TCP 行为" \
-        "fin_timeout|sysctl:net.ipv4.tcp_fin_timeout|未知" \
-        "slow_start_after_idle|sysctl:net.ipv4.tcp_slow_start_after_idle|未知" \
-        "mtu_probing|sysctl:net.ipv4.tcp_mtu_probing|未知" \
-        "keepalive_time|sysctl:net.ipv4.tcp_keepalive_time|不可用" \
-        "tcp_tw_reuse（只读）|sysctl:net.ipv4.tcp_tw_reuse|不可用" \
-        "ECN|sysctl:net.ipv4.tcp_ecn|不可用" \
-        "initcwnd ownership marker|$([[ -e "$ROUTE_OWNED_MARKER" ]] && echo 存在 || echo 不存在)" \
-        "initcwnd 持久化钩子|$(initcwnd_hook_status)" \
+    print_status_section "初始拥塞窗口" \
+        "ownership marker|$([[ -e "$ROUTE_OWNED_MARKER" ]] && echo 存在 || echo 不存在)" \
+        "持久化钩子|$(initcwnd_hook_status)" \
         "默认路由窗口|$initcwnd_detail" "$drift_status"
-    print_status_section "内核容量诊断（只读）" \
-        "min_free_kbytes|sysctl:vm.min_free_kbytes|不可用" \
-        "file-max|sysctl:fs.file-max|不可用" \
-        "nr_open|sysctl:fs.nr_open|不可用" \
-        "netdev_budget|sysctl:net.core.netdev_budget|不可用" \
-        "netdev_budget_usecs|sysctl:net.core.netdev_budget_usecs|不可用" \
-        "file-nr|$(file_handle_status)"
-    print_status_section "网络健康" \
-        "健康快照字段|softnet_dropped time_squeeze rx_errors tx_errors rx_dropped tx_dropped tcp_retrans limited_sockets rx_packets tx_packets" \
-        "健康快照累计值|$(network_health_snapshot "$(detect_default_iface || true)")"
 
     return 0
 }
@@ -2992,61 +2690,54 @@ show_status() {
 show_help() {
     cat <<'EOF'
 用法：
-  network-optimize.sh [install] [选项]  自动计算并应用网络优化
+  network-optimize.sh [install] [选项]  计算并应用网络优化
   network-optimize.sh plan [选项]       只计算并显示计划，不修改系统
   network-optimize.sh restore           恢复上一次运行前的配置
   network-optimize.sh restore initial   恢复首次运行前的可信配置
-  network-optimize.sh status            查看当前网络优化状态
-  network-optimize.sh verify [--yes]    确认后比较 1 流与 4 流 iperf3，只读系统状态
+  network-optimize.sh status            查看优化与测量状态
   network-optimize.sh help              显示帮助
 
 install/plan 选项：
-  --probe                 明确执行自动探测
+  --auto                  非交互使用公共 IPv4 iperf3 自动测速
   --bandwidth-mbps N      指定对称带宽，单位 Mbps
   --download-mbps N       指定下载带宽，单位 Mbps
   --upload-mbps N         指定上传带宽，单位 Mbps
   --rtt-ms N              指定 RTT，单位 ms
-  --disable-ecn           禁用 ECN，兼容存在 ECN 黑洞的旧链路
   --enable-initcwnd       强制把默认路由 initcwnd/initrwnd 设置为 32
   --disable-initcwnd      强制保留内核默认初始拥塞窗口
 
-verify 选项：
-  --yes                   非交互环境显式确认产生测速流量
-
 示例：
-  network-optimize.sh                 # 交互选择测速或手填上下行带宽
-  network-optimize.sh plan            # 交互选择测速或手填上下行带宽
-  network-optimize.sh install --probe # 明确执行主动探测
-  network-optimize.sh install --bandwidth-mbps 1000 --rtt-ms 180
+  network-optimize.sh                  # 交互询问测速，回车默认 Y
+  network-optimize.sh install --auto   # 非交互自动测速并应用
+  network-optimize.sh plan --bandwidth-mbps 1000 --rtt-ms 180
   network-optimize.sh install --download-mbps 1000 --upload-mbps 500 --rtt-ms 180
-  network-optimize.sh verify --yes
+  network-optimize.sh status
 
 默认行为：
-  - 交互终端只询问是否测速；拒绝后要求手填下载和上传带宽
-  - 非交互终端必须使用 --probe，或显式提供对称带宽/完整上下行带宽
-  - 手填带宽缺少 RTT 时按 150 ms 计算；显式 --rtt-ms 严格采用用户值
-  - 主动探测不采集 RTT；未显式提供 --rtt-ms 时按 150 ms 计算 BDP
-  - 只有 --probe 或交互确认后才主动探测并安装缺失依赖
-  - 探测失败时，交互终端转为手填；非交互终端在写配置、sysctl 或路由前失败
-  - 自动探测仅测量 IPv4 公网带宽，使用公共 iperf3 与 Cloudflare
-  - TCP 调优仅覆盖 IPv4
-  - 自动测速在单方向 40 GB 或合计 85 GB 时提前停止，硬上限仍为 45/90 GB
-  - 流量按实际 IPv4 测速目标的路由接口分别计量并汇总，接口计数包含后台流量
-  - 默认不持久管理 ECN；只在传入 --disable-ecn 时写入 tcp_ecn=0
-  - initcwnd 默认 auto：已知上传 > 100 Mbps 设置 32，低于等于 100 Mbps或未知时保留内核默认
-  - 仅凭本脚本 marker、受管 hook 或可信路由快照清理旧 initcwnd/initrwnd
-  - 检测到 networkd-dispatcher 时持久化 IPv4 默认路由的 initcwnd/initrwnd；不扩展 IPv6
-  - --enable-initcwnd/--disable-initcwnd 显式覆盖 auto，冲突参数会被拒绝
-  - 根据 2 x BDP + 2 MiB 余量动态设置缓冲区上限，TCP 初始默认固定 2 MiB
-  - RAM cap 为有效 RAM / 32，最低 8 MiB、最高 256 MiB，并识别有限 cgroup memory limit
-  - 动态 socket 最大值保留 4 MiB 绝对下限；core socket 默认值和全局 tcp_mem 保留系统值
-  - 只在本次运行计算和应用，不创建定时任务
-  - verify 仅在交互确认或显式 --yes 后产生流量；install/status 不会调用 verify
-  - verify 不修改 sysctl、路由或 qdisc，也不安装依赖或持久服务
+  - 无参数交互询问公共 iperf3 测速，默认 Y；选择 N 后手填完整上下行带宽
+  - 非交互必须使用 --auto，或提供对称带宽/完整上下行带宽
+  - install --auto 可通过系统配置的 APT 软件源非交互安装缺失测速依赖
+  - 自动测速仅使用 IPv4 公共 iperf3；最多 2 个节点，每方向 P=4、t=5 秒
+  - 每方向取有效较高结果；节点差异超过 30% 仅降低可信度并警告
+  - 上传、下载各 12.5 GB，合计 25 GB；接口计数包含测试期间后台流量
+  - 7 天内缓存可直接复用；主动测速失败时，仅回退到 30 天内同路由缓存
+  - 缓存严格绑定 ifindex、接口、网关、源地址和测速目标
+  - 只有完整上下行输入才生成配置；低可信度会警告并持久化，但不改变成功退出码
+  - 手填带宽缺少 RTT 时按 150 ms 计算；自动测速不采集 RTT
+  - 主动测速失败且无缓存时，交互可转手填；非交互在系统写入前失败
+  - TCP 调优仅覆盖 IPv4，不管理 forwarding、IPv6 RA 或系统代理
+  - ECN 始终保留系统或管理员设置，不由本模块持久管理
+  - initcwnd 默认 auto：上传 > 100 Mbps 设置 32，否则保留内核默认
+  - initcwnd hook 在最终写路由前再次检查 ownership marker
+  - 根据 2 x BDP + 2 MiB 余量设置缓冲区上限，TCP 初始默认固定 2 MiB
+  - RAM cap 为有效 RAM / 32，最低 8 MiB、最高 256 MiB
+  - 不创建定时任务，不调用 traffic-shape，也不共享其状态、缓存、锁或运行库
+
+已退休且会被拒绝：verify、--probe、--yes、--disable-ecn。
 
 实现来源：
-  - 公共 iperf3、带宽探测、BDP/memory cap 与 initcwnd 策略移植或参考 tcpfit v0.5.6
-  - 参数交互、事务备份/恢复和 verify 为本仓库下游实现
+  - 公共 iperf3、BDP/memory cap 与 initcwnd 策略移植或参考 tcpfit v0.5.6
+  - 参数交互、路由绑定缓存和事务备份/恢复为本仓库下游实现
 EOF
 }
 
@@ -3081,9 +2772,6 @@ main() {
             ;;
         status)
             show_status
-            ;;
-        verify)
-            run_verify_command
             ;;
         help)
             show_help

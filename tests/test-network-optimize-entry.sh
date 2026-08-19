@@ -8,6 +8,8 @@ export NETWORK_OPTIMIZE_STATE_DIR="$TEMP_DIR/state"
 export NETWORK_OPTIMIZE_CONF="$TEMP_DIR/etc/sysctl.d/99-network-optimize.conf"
 export NETWORK_OPTIMIZE_BBR_MODULES_FILE="$TEMP_DIR/etc/modules-load.d/network-optimize-bbr.conf"
 export NETWORK_OPTIMIZE_INITCWND_HOOK="$TEMP_DIR/networkd-dispatcher/routable.d/50-network-optimize-initcwnd"
+export NETWORK_OPTIMIZE_CACHE_FILE="$TEMP_DIR/state/network-optimize.bandwidth-cache"
+export NETWORK_OPTIMIZE_LOCK_FILE="$TEMP_DIR/network-optimize.lock"
 
 # shellcheck source=../modules/network-optimize.sh
 source "$ROOT_DIR/modules/network-optimize.sh"
@@ -39,9 +41,18 @@ assert_fail() {
     printf 'PASS: %s\n' "$name"
 }
 
+deny_real_network() {
+    fail "CI attempted an unmocked public network or APT operation: $*"
+}
+iperf3() { deny_real_network iperf3 "$@"; }
+ping() { deny_real_network ping "$@"; }
+getent() { deny_real_network getent "$@"; }
+apt-get() { deny_real_network apt-get "$@"; }
+ip() { deny_real_network ip "$@"; }
+read_iface_counter() { deny_real_network interface-counter "$@"; }
+
 read_config_value() {
-    local file="$1"
-    local wanted_key="$2"
+    local file="$1" wanted_key="$2"
 
     awk -F= -v wanted="$wanted_key" '
         {
@@ -62,113 +73,10 @@ reset_selection() {
     RESTORE_SCOPE=previous
     TUNING_MODE=""
     TUNING_SELECTION_EXPLICIT=false
-    ACTIVE_PROBE_REQUESTED=false
-    ECN_DISABLED=false
-    MANUAL_BANDWIDTH_MBPS=""
-    MANUAL_DOWNLOAD_MBPS=""
-    MANUAL_UPLOAD_MBPS=""
-    MANUAL_RTT_MS=""
-    MANUAL_RTT_DEFAULTED=false
-    BANDWIDTH_SOURCE=unknown
-    BANDWIDTH_PROBE_NOTE=""
+    AUTO_MODE_REQUESTED=false
     INITCWND_MODE=auto
     INITCWND_ENABLED=true
     INITCWND_POLICY=unknown
-    VERIFY_ASSUME_YES=false
-    VERIFY_CONFIRM_EXPLICIT=false
-}
-
-is_interactive_terminal() { return 1; }
-reset_selection
-assert_fail "non-interactive execution requires an explicit bandwidth source" \
-    select_tuning_mode >/dev/null 2>&1
-assert_eq '' "$TUNING_MODE" "refused non-interactive selection leaves mode unset"
-
-is_interactive_terminal() { return 0; }
-reset_selection
-select_tuning_mode >/dev/null <<< "y"
-assert_eq probe "$TUNING_MODE" "interactive yes selects active probe"
-assert_eq true "$ACTIVE_PROBE_REQUESTED" "interactive yes records probe consent"
-
-reset_selection
-select_tuning_mode >/dev/null <<'EOF'
-n
-1000
-500
-EOF
-assert_eq manual "$TUNING_MODE" "interactive no selects manual bandwidth"
-assert_eq 1000 "$MANUAL_DOWNLOAD_MBPS" "manual mode records download bandwidth"
-assert_eq 500 "$MANUAL_UPLOAD_MBPS" "manual mode records upload bandwidth"
-assert_eq 150 "$MANUAL_RTT_MS" "manual mode defaults RTT to 150 ms"
-assert_eq true "$MANUAL_RTT_DEFAULTED" "interactive manual mode records default RTT"
-
-reset_selection
-parse_arguments install --probe
-read() { fail "explicit probe unexpectedly prompted"; }
-select_tuning_mode
-unset -f read
-assert_eq true "$TUNING_SELECTION_EXPLICIT" "explicit probe bypasses selection menu"
-assert_eq probe "$TUNING_MODE" "explicit probe selects probe mode"
-assert_eq true "$ACTIVE_PROBE_REQUESTED" "probe flag records explicit consent"
-
-reset_selection
-assert_fail "reject removed --auto option" parse_arguments install --auto
-reset_selection
-assert_fail "reject removed --static option" parse_arguments install --static
-reset_selection
-assert_fail "reject removed --no-probe option" parse_arguments install --no-probe
-reset_selection
-assert_fail "reject zero symmetric bandwidth" parse_arguments plan --bandwidth-mbps 0
-reset_selection
-assert_fail "reject excessive download bandwidth" \
-    parse_arguments plan --download-mbps 100001 --upload-mbps 1
-reset_selection
-assert_fail "reject malformed upload bandwidth" \
-    parse_arguments plan --download-mbps 1 --upload-mbps invalid
-reset_selection
-assert_fail "reject excessive manual RTT" \
-    parse_arguments plan --bandwidth-mbps 1 --rtt-ms 5001
-
-reset_selection
-parse_arguments install --disable-ecn
-assert_eq true "$ECN_DISABLED" "disable ECN requires an explicit flag"
-
-reset_selection
-parse_arguments install --enable-initcwnd
-assert_eq enabled "$INITCWND_MODE" "explicitly enable initcwnd"
-reset_selection
-parse_arguments install --disable-initcwnd
-assert_eq disabled "$INITCWND_MODE" "explicitly disable initcwnd"
-reset_selection
-assert_fail "reject conflicting initcwnd flags" \
-    parse_arguments install --enable-initcwnd --disable-initcwnd
-
-reset_selection
-parse_arguments install --download-mbps 1000 --upload-mbps 500
-read() { fail "explicit manual bandwidth unexpectedly prompted"; }
-select_tuning_mode
-unset -f read
-assert_eq manual "$TUNING_MODE" "complete manual bandwidth bypasses interaction"
-assert_eq 150 "$MANUAL_RTT_MS" "manual bandwidth defaults missing RTT to 150 ms"
-assert_eq true "$MANUAL_RTT_DEFAULTED" "manual bandwidth records default RTT source"
-reset_selection
-parse_arguments plan --bandwidth-mbps 800
-assert_eq 800 "$MANUAL_DOWNLOAD_MBPS" "symmetric bandwidth fills download"
-assert_eq 800 "$MANUAL_UPLOAD_MBPS" "symmetric bandwidth fills upload"
-reset_selection
-assert_fail "reject incomplete manual download bandwidth" \
-    parse_arguments plan --download-mbps 1000
-reset_selection
-assert_fail "reject incomplete manual upload bandwidth" \
-    parse_arguments plan --upload-mbps 500
-reset_selection
-assert_fail "reject probe combined with manual bandwidth" \
-    parse_arguments plan --probe --bandwidth-mbps 1000
-reset_selection
-assert_fail "removed custom RTT target is rejected" parse_arguments plan --probe --target example.com
-
-prepare_dynamic_case() {
-    TUNING_MODE=probe
     MANUAL_BANDWIDTH_MBPS=""
     MANUAL_DOWNLOAD_MBPS=""
     MANUAL_UPLOAD_MBPS=""
@@ -181,135 +89,118 @@ prepare_dynamic_case() {
     RTT_POLICY=unknown
     BANDWIDTH_SOURCE=unknown
     BANDWIDTH_PROBE_NOTE=""
-    INITCWND_MODE=auto
-    INITCWND_ENABLED=true
-    INITCWND_POLICY=unknown
+    MEASUREMENT_SOURCE=unknown
+    MEASUREMENT_EPOCH=0
+    MEASUREMENT_TIME=unknown
+    MEASUREMENT_NODES=none
+    MEASUREMENT_CONFIDENCE=unknown
+    MEASUREMENT_WARNINGS=""
+    MEASUREMENT_ROUTE_TARGET=""
+    MEASUREMENT_ROUTE_IDENTITY=""
 }
-
-detect_memory_mb() { printf '%s\n' 8192; }
-detect_cgroup_memory_limit_mb() { return 1; }
-PROBE_SHOULD_FAIL=false
-probe_bandwidth() {
-    [[ "$PROBE_SHOULD_FAIL" == "false" ]] || return 1
-    DETECTED_DOWNLOAD_MBPS=1000
-    DETECTED_UPLOAD_MBPS=500
-}
-for observed_rtt in 40 180 300; do
-    prepare_dynamic_case
-    DETECTED_RTT_MS="$observed_rtt"
-    resolve_tuning_values >/dev/null
-    assert_eq 150 "$DETECTED_RTT_MS" \
-        "automatic calculation ignores observed ${observed_rtt} ms and uses 150 ms"
-    assert_eq 'fixed 150 ms' "$RTT_POLICY" \
-        "automatic ${observed_rtt} ms case records fixed policy"
-done
-assert_eq 39845888 "$RMEM_MAX_BYTES" "automatic calculation uses fixed 150 ms for buffer max"
-
-PROBE_SHOULD_FAIL=true
-is_interactive_terminal() { return 0; }
-prepare_dynamic_case
-BANDWIDTH_PROBE_NOTE='tcshape HTB 整形状态下测得（可能偏低）'
-resolve_tuning_values >/dev/null <<'EOF'
-1200
-600
-EOF
-assert_eq manual "$TUNING_MODE" "interactive probe failure switches to manual mode"
-assert_eq 1200 "$DETECTED_DOWNLOAD_MBPS" "probe failure fallback records download"
-assert_eq 600 "$DETECTED_UPLOAD_MBPS" "probe failure fallback records upload"
-assert_eq 150 "$DETECTED_RTT_MS" "probe failure fallback keeps 150 ms default RTT"
-assert_eq '' "$BANDWIDTH_PROBE_NOTE" "manual fallback clears shaped probe note"
-
-prepare_dynamic_case
-MANUAL_RTT_MS=180
-resolve_tuning_values >/dev/null <<'EOF'
-1200
-600
-EOF
-assert_eq 180 "$DETECTED_RTT_MS" "probe failure fallback preserves explicit RTT"
-assert_eq 'manual override' "$RTT_POLICY" "probe fallback records explicit RTT policy"
 
 is_interactive_terminal() { return 1; }
-prepare_dynamic_case
-assert_fail "non-interactive probe failure rejects missing bandwidth" \
-    resolve_tuning_values >/dev/null 2>&1
+reset_selection
+assert_fail "non-interactive execution requires --auto or complete bandwidth" \
+    select_tuning_mode >/dev/null 2>&1
+assert_eq '' "$TUNING_MODE" "refused non-interactive selection leaves mode unset"
 
-install_probe_dependencies() { return 0; }
-detect_container() { return 1; }
-detect_default_iface() { return 1; }
-network_health_snapshot() { printf '%s\n' '0 0 0 0 0 0 0 0 0 0'; }
-ZERO_SYSCTL_WRITES=0
-ZERO_ROUTE_WRITES=0
-sysctl() {
-    case "$1" in
-        -w|-p) ((ZERO_SYSCTL_WRITES += 1)) ;;
-    esac
-    return 1
-}
-ip() {
-    case "$1 $2 $3" in
-        '-4 route replace'|'-4 route del') ((ZERO_ROUTE_WRITES += 1)) ;;
-    esac
-    return 1
-}
-rm -rf "$NETWORK_CONF" "$NETWORK_OPTIMIZE_STATE_DIR" "$ROUTE_OWNED_MARKER"
-prepare_dynamic_case
-assert_fail "failed non-interactive probe aborts install" \
-    install_optimization >/dev/null 2>&1
-[[ ! -e "$NETWORK_CONF" && ! -e "$NETWORK_OPTIMIZE_STATE_DIR" &&
-    ! -e "$ROUTE_OWNED_MARKER" ]] ||
-    fail "failed probe wrote config, state, or route ownership"
-assert_eq 0 "$ZERO_SYSCTL_WRITES" "failed probe performs zero sysctl writes"
-assert_eq 0 "$ZERO_ROUTE_WRITES" "failed probe performs zero route writes"
-printf 'PASS: invalid bandwidth fails before config, sysctl, or route writes\n'
-unset -f sysctl ip
-
-PROBE_SHOULD_FAIL=false
 is_interactive_terminal() { return 0; }
-for manual_rtt in 40 300; do
-    prepare_dynamic_case
-    TUNING_MODE=manual
-    MANUAL_DOWNLOAD_MBPS=1000
-    MANUAL_UPLOAD_MBPS=500
-    MANUAL_RTT_MS="$manual_rtt"
-    resolve_tuning_values >/dev/null
-    assert_eq "$manual_rtt" "$DETECTED_RTT_MS" \
-        "manual RTT ${manual_rtt} ms remains unchanged"
-    assert_eq 'manual override' "$RTT_POLICY" \
-        "manual RTT ${manual_rtt} ms records override policy"
+reset_selection
+select_tuning_mode >/dev/null <<< ""
+assert_eq auto "$TUNING_MODE" "interactive Enter selects default public speed test"
+assert_eq true "$AUTO_MODE_REQUESTED" "default Enter records automatic mode"
+
+reset_selection
+select_tuning_mode >/dev/null <<'EOF'
+n
+1000
+500
+EOF
+assert_eq manual "$TUNING_MODE" "interactive N selects manual bandwidth"
+assert_eq 1000 "$MANUAL_DOWNLOAD_MBPS" "manual mode records download bandwidth"
+assert_eq 500 "$MANUAL_UPLOAD_MBPS" "manual mode records upload bandwidth"
+assert_eq 150 "$MANUAL_RTT_MS" "manual mode defaults RTT to 150 ms"
+
+is_interactive_terminal() { return 1; }
+reset_selection
+parse_arguments install --auto
+read() { fail "explicit --auto unexpectedly prompted"; }
+select_tuning_mode
+unset -f read
+assert_eq auto "$TUNING_MODE" "--auto selects non-interactive automatic mode"
+assert_eq true "$TUNING_SELECTION_EXPLICIT" "--auto bypasses the prompt"
+
+for retired in --probe --yes --disable-ecn; do
+    reset_selection
+    assert_fail "reject retired $retired" parse_arguments install "$retired"
 done
+reset_selection
+assert_fail "reject retired verify command" parse_arguments verify
+reset_selection
+assert_fail "reject --auto with manual bandwidth" \
+    parse_arguments install --auto --bandwidth-mbps 1000
+reset_selection
+assert_fail "reject incomplete manual bandwidth" \
+    parse_arguments plan --download-mbps 1000
+reset_selection
+assert_fail "reject RTT without bandwidth or --auto" \
+    parse_arguments plan --rtt-ms 180
+reset_selection
+parse_arguments install --download-mbps 1000 --upload-mbps 500
+assert_eq manual "$TUNING_MODE" "complete manual bandwidth selects manual mode"
+assert_eq 150 "$MANUAL_RTT_MS" "manual command defaults RTT"
 
-INITCWND_MODE=auto
-DETECTED_UPLOAD_MBPS=100
-resolve_initcwnd_policy
-assert_eq false "$INITCWND_ENABLED" "auto initcwnd keeps kernel default at 100 Mbps"
-assert_eq 'auto: upload <= 100 Mbps, preserve kernel default' "$INITCWND_POLICY" \
-    "auto initcwnd explains low-upload policy"
-INITCWND_MODE=auto
-DETECTED_UPLOAD_MBPS=101
-resolve_initcwnd_policy
-assert_eq true "$INITCWND_ENABLED" "auto initcwnd enables 32 above 100 Mbps"
-INITCWND_MODE=auto
-DETECTED_UPLOAD_MBPS=""
-resolve_initcwnd_policy
-assert_eq false "$INITCWND_ENABLED" "auto initcwnd keeps kernel default when upload is unknown"
-assert_eq 'auto: upload unknown, preserve kernel default' "$INITCWND_POLICY" \
-    "auto initcwnd explains unknown-upload policy"
-INITCWND_MODE=enabled
-DETECTED_UPLOAD_MBPS=10
-initcwnd_warning_log="$TEMP_DIR/initcwnd-warning.log"
-resolve_initcwnd_policy > "$initcwnd_warning_log"
-initcwnd_warning=$(<"$initcwnd_warning_log")
-assert_eq true "$INITCWND_ENABLED" "explicit initcwnd enable overrides low upload"
-grep -Fq '不高于 100 Mbps' <<< "$initcwnd_warning" ||
-    fail "explicit low-bandwidth initcwnd enable did not warn"
-printf 'PASS: explicit low-bandwidth initcwnd enable warns\n'
-INITCWND_MODE=disabled
-DETECTED_UPLOAD_MBPS=1000
-resolve_initcwnd_policy
-assert_eq false "$INITCWND_ENABLED" "explicit initcwnd disable overrides high upload"
+(
+    mutation_log="$TEMP_DIR/retired-mutations.log"
+    : > "$mutation_log"
+    atomic_write_file() { printf 'atomic\n' >> "$mutation_log"; }
+    sysctl() { printf 'sysctl\n' >> "$mutation_log"; return 1; }
+    ip() { printf 'ip\n' >> "$mutation_log"; return 1; }
+    apt-get() { printf 'apt\n' >> "$mutation_log"; return 1; }
+    for retired in --probe --yes --disable-ecn; do
+        reset_selection
+        if (main install "$retired" >/dev/null 2>&1); then
+            fail "retired $retired unexpectedly reached main success"
+        fi
+    done
+    reset_selection
+    if (main verify >/dev/null 2>&1); then
+        fail "retired verify command unexpectedly reached main success"
+    fi
+    [[ ! -s "$mutation_log" ]] || fail "retired interfaces performed a write"
+    printf 'PASS: retired parameters and command perform no writes\n'
+)
 
-NETWORK_TEST_TOTAL=84999999999
-NETWORK_TEST_UPLOAD=39999999999
+if grep -Fq 'network-optimize' "$ROOT_DIR/linux_setup.sh"; then
+    fail "linux_setup contains a network-optimize special case"
+fi
+execute_module_body=$(sed -n '/^execute_module() {/,/^}/p' "$ROOT_DIR/linux_setup.sh")
+grep -Fq 'if bash "$module_file"; then' <<< "$execute_module_body" ||
+    fail "linux_setup no longer invokes modules without arguments"
+printf 'PASS: linux_setup keeps generic no-argument module invocation\n'
+
+(
+    apt_log="$TEMP_DIR/apt.log"
+    : > "$apt_log"
+    command() {
+        [[ "$1" == "-v" ]] || return 1
+        [[ "$2" != "iperf3" ]]
+    }
+    apt-get() {
+        printf '%s\n' "$*" >> "$apt_log"
+        return 0
+    }
+    install_probe_dependencies >/dev/null
+    grep -Fqx 'update -qq' "$apt_log" || fail "dependency install skipped apt update"
+    grep -Fqx 'install -y --no-install-recommends iperf3' "$apt_log" ||
+        fail "dependency install did not use APT for iperf3 only"
+    printf 'PASS: missing iperf3 installs through non-interactive APT\n'
+)
+
+NETWORK_TEST_TOTAL=24999999999
+NETWORK_TEST_UPLOAD=12499999999
+TRAFFIC_IFACES=(eth0)
 traffic_used_bytes() {
     case "$1" in
         total) printf '%s\n' "$NETWORK_TEST_TOTAL" ;;
@@ -318,211 +209,130 @@ traffic_used_bytes() {
         *) return 1 ;;
     esac
 }
-assert_fail "active probe budget stays open below reserved threshold" \
-    traffic_budget_reached upload
-NETWORK_TEST_UPLOAD=40000000000
-assert_ok "active probe budget stops at reserved direction threshold" \
-    traffic_budget_reached upload
+assert_fail "budget stays open below 12.5/25 GB" traffic_budget_reached upload
+NETWORK_TEST_UPLOAD=12500000000
+assert_ok "budget stops at 12.5 GB direction limit" traffic_budget_reached upload
 NETWORK_TEST_UPLOAD=0
-NETWORK_TEST_TOTAL=85000000000
-assert_ok "active probe budget stops at reserved total threshold" \
-    traffic_budget_reached upload
+NETWORK_TEST_TOTAL=25000000000
+assert_ok "budget stops at 25 GB total limit" traffic_budget_reached upload
+unset -f traffic_used_bytes
 
-cloudflare_fake_bin="$TEMP_DIR/cloudflare-fake-bin"
-mkdir -p "$cloudflare_fake_bin"
-cat > "$cloudflare_fake_bin/curl" <<'EOF'
-#!/usr/bin/env bash
-mkdir -p "$TEST_CURL_PID_DIR"
-printf '%s\n' "$BASHPID" > "$TEST_CURL_PID_DIR/$BASHPID"
-exec sleep 30
-EOF
-chmod +x "$cloudflare_fake_bin/curl"
-
-assert_cloudflare_curls_stopped() {
-    local pid_file pid found="false"
-
-    for pid_file in "$1"/*; do
-        [[ -f "$pid_file" ]] || continue
-        found="true"
-        pid=$(<"$pid_file")
-        ! kill -0 "$pid" 2>/dev/null || fail "Cloudflare cleanup left curl PID $pid running"
-    done
-    [[ "$found" == "true" ]] || fail "Cloudflare process test did not start curl"
-}
-
-cloudflare_budget_pid_dir="$TEMP_DIR/cloudflare-budget-pids"
-mkdir -p "$cloudflare_budget_pid_dir"
 (
-    trap - EXIT
-    PATH="$cloudflare_fake_bin:$PATH"
-    TEST_CURL_PID_DIR="$cloudflare_budget_pid_dir"
-    export PATH TEST_CURL_PID_DIR
-    CLOUDFLARE_IPV4=192.0.2.80
-    CLOUDFLARE_WORKER_PIDS=()
-    budget_checks=0
-    traffic_used_bytes() { printf '%s\n' 0; }
-    traffic_budget_reached() {
-        local curl_count
+    reset_selection
+    detect_memory_mb() { printf '%s\n' 8192; }
+    detect_cgroup_memory_limit_mb() { return 1; }
+    current_epoch() { printf '%s\n' 2000000000; }
+    format_measurement_epoch() { printf '%s\n' '2033-05-18T03:33:20Z'; }
+    TUNING_MODE=manual
+    MANUAL_DOWNLOAD_MBPS=1000
+    MANUAL_UPLOAD_MBPS=500
+    MANUAL_RTT_MS=180
+    resolve_tuning_values >/dev/null
+    assert_eq manual "$MEASUREMENT_CONFIDENCE" "manual input records explicit confidence"
+    assert_eq 'command line manual input' "$MEASUREMENT_SOURCE" "manual input records source"
 
-        ((budget_checks += 1))
-        (( budget_checks > 1 )) || return 1
-        for _ in {1..200}; do
-            curl_count=$(find "$TEST_CURL_PID_DIR" -type f | wc -l)
-            (( curl_count >= CLOUDFLARE_PARALLEL )) && return 0
-            sleep 0.01
-        done
+    generated_config="$TEMP_DIR/generated.conf"
+    create_network_config "$generated_config" false
+    grep -Fq '# 测量来源: command line manual input' "$generated_config" ||
+        fail "generated config omits measurement source"
+    grep -Fq '# 测量时间: 2033-05-18T03:33:20Z' "$generated_config" ||
+        fail "generated config omits measurement time"
+    grep -Fq '# 测量节点: manual input' "$generated_config" ||
+        fail "generated config omits measurement nodes"
+    grep -Fq '# 测量可信度: manual' "$generated_config" ||
+        fail "generated config omits confidence"
+    grep -Fq '# 测量警告: none' "$generated_config" ||
+        fail "generated config omits warnings"
+
+    for forbidden_key in \
+        net.ipv4.tcp_ecn \
+        net.ipv4.tcp_shrink_window \
+        net.ipv4.tcp_collapse_max_bytes \
+        net.ipv4.conf.all.forwarding \
+        net.ipv4.conf.default.forwarding \
+        net.ipv6.conf.all.forwarding \
+        net.ipv6.conf.default.forwarding \
+        net.ipv6.conf.all.accept_ra \
+        net.ipv6.conf.default.accept_ra; do
+        if grep -Eq "^${forbidden_key//./[.]}[[:space:]]*=" "$generated_config"; then
+            fail "generated config still writes $forbidden_key"
+        fi
+    done
+    assert_eq '4096 2097152 47185920' \
+        "$(read_config_value "$generated_config" net.ipv4.tcp_rmem)" \
+        "generated config keeps receive buffer calculation"
+    assert_eq '4096 2097152 25165824' \
+        "$(read_config_value "$generated_config" net.ipv4.tcp_wmem)" \
+        "generated config keeps send buffer calculation"
+
+    mkdir -p "$(dirname "$NETWORK_CONF")"
+    cp "$generated_config" "$NETWORK_CONF"
+    detect_default_iface() { return 1; }
+    default_ipv4_route() { printf '\n'; }
+    sysctl() { return 1; }
+    tc() { return 1; }
+    status_output=$(show_status)
+    grep -Fq '测量来源: command line manual input' <<< "$status_output" ||
+        fail "status omits measurement source"
+    grep -Fq '测量时间: 2033-05-18T03:33:20Z' <<< "$status_output" ||
+        fail "status omits measurement time"
+    grep -Fq '测量节点: manual input' <<< "$status_output" ||
+        fail "status omits measurement nodes"
+    grep -Fq '测量可信度: manual' <<< "$status_output" ||
+        fail "status omits confidence"
+    grep -Fq '测量警告: none' <<< "$status_output" ||
+        fail "status omits warnings"
+    printf 'PASS: status reports persisted measurement metadata\n'
+)
+
+if grep -Eq 'network_health_snapshot|classify_network_health|最近一小时 OOM|Conntrack 使用量|file_handle_status' \
+    "$ROOT_DIR/modules/network-optimize.sh"; then
+    fail "generic health panel remains in network-optimize"
+fi
+printf 'PASS: generic health panel is absent\n'
+
+(
+    reset_selection
+    COMMAND=plan
+    TUNING_MODE=auto
+    AUTO_MODE_REQUESTED=true
+    detect_memory_mb() { printf '%s\n' 8192; }
+    detect_cgroup_memory_limit_mb() { return 1; }
+    load_measurement_cache() { return 1; }
+    probe_bandwidth() {
+        DETECTED_DOWNLOAD_MBPS=1000
+        DETECTED_UPLOAD_MBPS=500
+        MEASUREMENT_SOURCE='mock public iperf3'
+        MEASUREMENT_EPOCH=2000000000
+        MEASUREMENT_TIME='2033-05-18T03:33:20Z'
+        MEASUREMENT_NODES='one.example'
+        MEASUREMENT_CONFIDENCE=low
+        MEASUREMENT_WARNINGS='only one peer'
         return 0
     }
-
-    cloudflare_rc=0
-    probe_cloudflare_direction download >/dev/null 2>&1 || cloudflare_rc=$?
-    (( cloudflare_rc != 0 )) || fail "budget-stopped Cloudflare probe unexpectedly succeeded"
-    assert_eq 0 "${#CLOUDFLARE_WORKER_PIDS[@]}" \
-        "budget stop unregisters all Cloudflare workers"
+    is_interactive_terminal() { return 1; }
+    resolve_tuning_values >/dev/null
+    assert_eq 1000 "$DETECTED_DOWNLOAD_MBPS" "low-confidence complete download succeeds"
+    assert_eq 500 "$DETECTED_UPLOAD_MBPS" "low-confidence complete upload succeeds"
+    low_config="$TEMP_DIR/low-confidence.conf"
+    create_network_config "$low_config" false
+    grep -Fq '# 测量可信度: low' "$low_config" || fail "low confidence was not persisted"
+    grep -Fq '# 测量警告: only one peer' "$low_config" || fail "warning was not persisted"
+    printf 'PASS: complete low-confidence input returns success and persists warning\n'
 )
-assert_cloudflare_curls_stopped "$cloudflare_budget_pid_dir"
-printf 'PASS: Cloudflare budget stop reaps real curl children\n'
 
-cloudflare_signal_pid_dir="$TEMP_DIR/cloudflare-signal-pids"
-mkdir -p "$cloudflare_signal_pid_dir"
 (
-    trap - EXIT
-    PATH="$cloudflare_fake_bin:$PATH"
-    TEST_CURL_PID_DIR="$cloudflare_signal_pid_dir"
-    export PATH TEST_CURL_PID_DIR
-    CLOUDFLARE_IPV4=192.0.2.81
-    CLOUDFLARE_WORKER_PIDS=()
-    trap 'cleanup_tracked_pids CLOUDFLARE_WORKER_PIDS; exit 143' TERM
-    cloudflare_worker download &
-    register_tracked_pid CLOUDFLARE_WORKER_PIDS "$!"
-    while true; do sleep 0.1; done
-) &
-cloudflare_wrapper_pid=$!
-for _ in {1..200}; do
-    find "$cloudflare_signal_pid_dir" -type f -print -quit | grep -q . && break
-    sleep 0.01
-done
-find "$cloudflare_signal_pid_dir" -type f -print -quit | grep -q . ||
-    fail "signal cleanup test did not start curl"
-kill -TERM "$cloudflare_wrapper_pid"
-cloudflare_signal_rc=0
-wait "$cloudflare_wrapper_pid" 2>/dev/null || cloudflare_signal_rc=$?
-assert_eq 143 "$cloudflare_signal_rc" "Cloudflare wrapper returns signal-derived status"
-assert_cloudflare_curls_stopped "$cloudflare_signal_pid_dir"
-printf 'PASS: Cloudflare signal exit reaps real curl children\n'
-
-ROUTE_GET_LOG="$TEMP_DIR/route-get-target"
-ip() {
-    [[ "$1 $2 $3" == '-4 route get' ]] || return 1
-    printf '%s\n' "$4" > "$ROUTE_GET_LOG"
-    printf '%s via 192.0.2.1 dev eth7 src 192.0.2.2\n' "$4"
-}
-read_iface_counter() {
-    [[ "$1" == eth7 ]] || return 1
-    case "$2" in rx) printf '%s\n' 100 ;; tx) printf '%s\n' 200 ;; *) return 1 ;; esac
-}
-traffic_mark 198.51.100.25
-assert_eq eth7 "$PROBE_IFACE" "traffic accounting uses actual target route interface"
-assert_eq 198.51.100.25 "$(cat "$ROUTE_GET_LOG")" "traffic accounting routes the real IPv4 target"
-unset -f ip read_iface_counter
-
-multi_iface_qdisc_log="$TEMP_DIR/multi-iface-qdisc.log"
-multi_iface_tcshape_config="$TEMP_DIR/multi-iface-tcshape.conf"
-printf '%s\n' 'RATE_MBIT=500' > "$multi_iface_tcshape_config"
-(
-    traffic_reset
-    BANDWIDTH_PROBE_NOTE=""
-    NETWORK_OPTIMIZE_TCSHAPE_CONFIG_FILE="$multi_iface_tcshape_config"
-    ip() {
-        [[ "$1 $2 $3" == '-4 route get' ]] || return 1
-        case "$4" in
-            192.0.2.10) printf '%s dev eth0 src 192.0.2.1\n' "$4" ;;
-            198.51.100.20) printf '%s dev eth1 src 198.51.100.1\n' "$4" ;;
-            *) return 1 ;;
-        esac
-    }
-    read_iface_counter() {
-        case "$2" in rx) printf '%s\n' 100 ;; tx) printf '%s\n' 200 ;; *) return 1 ;; esac
-    }
-    tc() {
-        [[ "$1 $2 $3" == 'qdisc show dev' ]] || return 1
-        printf '%s\n' "$4" >> "$multi_iface_qdisc_log"
-        case "$4" in
-            eth0) printf '%s\n' 'qdisc fq 0: root' ;;
-            eth1) printf '%s\n' 'qdisc htb 1: root' ;;
-            *) return 1 ;;
-        esac
-    }
-    sysctl() {
-        case "${2:-}" in
-            net.ipv4.tcp_congestion_control) printf '%s\n' bbr ;;
-            net.core.default_qdisc) printf '%s\n' fq ;;
-            *) return 1 ;;
-        esac
-    }
-    readlink() { return 1; }
-    find() { return 0; }
-
-    traffic_add_target 192.0.2.10
-    show_probe_environment_once >/dev/null
-    traffic_add_target 198.51.100.20
-    show_probe_environment_once >/dev/null
-    traffic_add_target 192.0.2.10
-    show_probe_environment_once >/dev/null
-
-    expected_qdisc_ifaces=$(printf 'eth0\neth1\n')
-    assert_eq eth0 "$PROBE_IFACE" "probe interface follows latest actual target route"
-    assert_eq "$expected_qdisc_ifaces" "$(cat "$multi_iface_qdisc_log")" \
-        "probe checks qdisc once for every actual egress interface"
-    assert_eq 'tcshape HTB 整形状态下测得（可能偏低）' "$BANDWIDTH_PROBE_NOTE" \
-        "probe detects tcshape on a later egress interface"
+    reset_selection
+    COMMAND=plan
+    TUNING_MODE=auto
+    AUTO_MODE_REQUESTED=true
+    detect_memory_mb() { printf '%s\n' 8192; }
+    detect_cgroup_memory_limit_mb() { return 1; }
+    load_measurement_cache() { return 1; }
+    probe_bandwidth() { return 1; }
+    is_interactive_terminal() { return 1; }
+    assert_fail "missing complete measurement returns failure" resolve_tuning_values >/dev/null 2>&1
 )
-printf 'PASS: multi-egress probe checks tcshape and qdisc per interface\n'
-
-generated_config="$TEMP_DIR/generated.conf"
-prepare_dynamic_case
-resolve_tuning_values >/dev/null
-ECN_DISABLED=false
-BANDWIDTH_PROBE_NOTE='tcshape HTB 整形状态下测得（可能偏低）'
-create_network_config "$generated_config" false
-grep -Fq '# 带宽测量环境: tcshape HTB 整形状态下测得（可能偏低）' "$generated_config" ||
-    fail "generated config omits active tcshape measurement warning"
-printf 'PASS: generated config records shaped bandwidth source\n'
-BANDWIDTH_PROBE_NOTE=""
-if grep -Eq '^net[.]ipv4[.]tcp_ecn[[:space:]]*=' "$generated_config"; then
-    fail "default generated config still owns tcp_ecn"
-fi
-if grep -Eq '^net[.]netfilter[.]nf_conntrack_max[[:space:]]*=' "$generated_config"; then
-    fail "generated config still owns nf_conntrack_max"
-fi
-for retired_key in \
-    net.ipv4.tcp_mem \
-    net.ipv4.tcp_adv_win_scale \
-    net.ipv4.ip_local_port_range \
-    net.ipv4.conf.all.rp_filter \
-    net.ipv4.conf.default.rp_filter \
-    net.ipv4.udp_rmem_min \
-    net.ipv4.udp_wmem_min \
-    net.core.rmem_default \
-    net.core.wmem_default \
-    net.core.netdev_budget \
-    net.core.netdev_budget_usecs; do
-    if grep -Eq "^${retired_key//./[.]}[[:space:]]*=" "$generated_config"; then
-        fail "generated config still owns $retired_key"
-    fi
-done
-assert_eq '4096 2097152 39845888' \
-    "$(read_config_value "$generated_config" net.ipv4.tcp_rmem)" \
-    "generated config uses fixed 2 MiB receive default"
-assert_eq '4096 2097152 20971520' \
-    "$(read_config_value "$generated_config" net.ipv4.tcp_wmem)" \
-    "generated config uses fixed 2 MiB send default"
-printf 'PASS: default generated config leaves retired global parameters unmanaged\n'
-
-ECN_DISABLED=true
-create_network_config "$generated_config" false
-assert_eq '0' "$(read_config_value "$generated_config" net.ipv4.tcp_ecn)" \
-    "explicit disable writes tcp_ecn=0"
 
 SYSCTL_TCP_ECN='1'
 SYSCTL_CONNTRACK_MAX='262144'
@@ -793,8 +603,10 @@ if restore_optimization previous > "$restore_log" 2>&1; then
     fail "route target restore failure unexpectedly returned success"
 fi
 assert_restore_rolled_back "route target failure"
-grep -Fq '恢复项 route：失败' "$restore_log" ||
+grep -Fq '恢复项 route：失败' "$restore_log" || {
+    cat "$restore_log" >&2
     fail "route target failure was not named"
+}
 grep -Fq '目标恢复失败，已回滚到操作前状态' "$restore_log" ||
     fail "route target failure did not report successful rollback"
 ! grep -Fq '部分恢复' "$restore_log" ||

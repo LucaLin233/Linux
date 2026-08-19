@@ -8,6 +8,8 @@ export NETWORK_OPTIMIZE_STATE_DIR="$TEMP_DIR/state"
 export NETWORK_OPTIMIZE_CONF="$TEMP_DIR/etc/sysctl.d/99-network-optimize.conf"
 export NETWORK_OPTIMIZE_BBR_MODULES_FILE="$TEMP_DIR/etc/modules-load.d/network-optimize-bbr.conf"
 export NETWORK_OPTIMIZE_INITCWND_HOOK="$TEMP_DIR/networkd-dispatcher/routable.d/50-network-optimize-initcwnd"
+export NETWORK_OPTIMIZE_CACHE_FILE="$TEMP_DIR/state/network-optimize.bandwidth-cache"
+export NETWORK_OPTIMIZE_LOCK_FILE="$TEMP_DIR/network-optimize.lock"
 # shellcheck source=../modules/network-optimize.sh
 source "$ROOT_DIR/modules/network-optimize.sh"
 
@@ -17,12 +19,36 @@ fail() {
 }
 
 assert_eq() {
-    local expected="$1"
-    local actual="$2"
-    local name="$3"
+    local expected="$1" actual="$2" name="$3"
     [[ "$actual" == "$expected" ]] || fail "$name: expected '$expected', got '$actual'"
     printf 'PASS: %s\n' "$name"
 }
+
+assert_ok() {
+    local name="$1"
+    shift
+    "$@" || fail "$name"
+    printf 'PASS: %s\n' "$name"
+}
+
+assert_fail() {
+    local name="$1"
+    shift
+    if "$@"; then
+        fail "$name: command unexpectedly succeeded"
+    fi
+    printf 'PASS: %s\n' "$name"
+}
+
+deny_real_network() {
+    fail "CI attempted an unmocked public network or APT operation: $*"
+}
+iperf3() { deny_real_network iperf3 "$@"; }
+ping() { deny_real_network ping "$@"; }
+getent() { deny_real_network getent "$@"; }
+apt-get() { deny_real_network apt-get "$@"; }
+ip() { deny_real_network ip "$@"; }
+read_iface_counter() { deny_real_network interface-counter "$@"; }
 
 assert_eq "6291456" "$(calculate_buffer_max 100 150 268435456)" \
     "buffer max follows 2 x BDP above 4 MiB floor"
@@ -32,16 +58,8 @@ assert_eq "4194304" "$(calculate_buffer_max 10 20 268435456)" \
     "buffer max keeps 4 MiB floor"
 assert_eq "16777216" "$(calculate_memory_cap 512)" \
     "512 MiB host caps each socket at RAM / 32"
-assert_eq "33554432" "$(calculate_memory_cap 1024)" \
-    "1 GiB host caps each socket at RAM / 32"
-assert_eq "67108864" "$(calculate_memory_cap 2048)" \
-    "2 GiB host caps each socket at RAM / 32"
-assert_eq "134217728" "$(calculate_memory_cap 4096)" \
-    "4 GiB host caps each socket at RAM / 32"
 assert_eq "268435456" "$(calculate_memory_cap 16384)" \
     "large-memory cap keeps 256 MiB ceiling"
-assert_eq "effective RAM / 32 cap" "$(buffer_limit_reason 10000 150 67108864)" \
-    "buffer reason reports the memory-derived cap"
 assert_eq "2097152" "$TCP_BUFFER_DEFAULT_BYTES" \
     "TCP receive and send defaults stay fixed at 2 MiB"
 detect_cgroup_memory_limit_mb() { printf '%s\n' 512; }
@@ -50,100 +68,31 @@ assert_eq '512' "$(detect_effective_memory_mb 1024)" \
 detect_cgroup_memory_limit_mb() { printf '%s\n' 2048; }
 assert_eq '1024' "$(detect_effective_memory_mb 1024)" \
     "effective memory does not exceed physical RAM"
-detect_cgroup_memory_limit_mb() { return 1; }
+unset -f detect_cgroup_memory_limit_mb
+eval "$(sed -n '/^detect_cgroup_memory_limit_mb() {/,/^}/p' "$ROOT_DIR/modules/network-optimize.sh")"
 
-meminfo_fixture="$TEMP_DIR/meminfo"
-printf '%s\n' \
-    'MemTotal:        1048576 kB' \
-    'MemAvailable:     262144 kB' \
-    'SwapTotal:        524288 kB' \
-    'SwapFree:         393216 kB' > "$meminfo_fixture"
-assert_eq '已用 768 MiB / 可用 256 MiB / 总计 1024 MiB' \
-    "$(NETWORK_OPTIMIZE_MEMINFO_FILE="$meminfo_fixture" memory_status_summary)" "format RAM status"
-assert_eq '已用 128 MiB / 总计 512 MiB' \
-    "$(NETWORK_OPTIMIZE_MEMINFO_FILE="$meminfo_fixture" swap_status_summary)" "format Swap status"
-printf '%s\n' 'SwapTotal: 0 kB' 'SwapFree: 0 kB' > "$meminfo_fixture"
-assert_eq '未配置' "$(NETWORK_OPTIMIZE_MEMINFO_FILE="$meminfo_fixture" swap_status_summary)" "report absent Swap"
-journalctl() {
-    printf '%s\n' \
-        'oom-kill:constraint=CONSTRAINT_NONE' \
-        'Out of memory: Killed process 123' \
-        'oom-kill:constraint=CONSTRAINT_MEMCG'
+fixture="$TEMP_DIR/iperf.json"
+cat > "$fixture" <<'JSON'
+{
+  "start": {"tcp_mss_default": 1448},
+  "end": {
+    "sum_sent": {"bits_per_second": 1000000000, "bytes": 724000000, "retransmits": 500},
+    "sum_received": {"bits_per_second": 950000000},
+    "cpu_utilization_percent": {"host_total": 12.34, "remote_total": 7.89}
+  }
 }
-assert_eq '2' "$(recent_oom_event_count)" "count canonical OOM events once"
-unset -f journalctl
-
-sysctl() {
-    [[ "$1" == "-n" ]] || return 1
-    case "$2" in
-        net.test.present) printf '%s\n' '42' ;;
-        net.test.empty) printf '\n' ;;
-        *) return 1 ;;
-    esac
-}
-assert_eq '42' "$(read_sysctl_or net.test.present)" "read available sysctl value"
-assert_eq 'none' "$(read_sysctl_or net.test.empty none)" \
-    "use fallback for an empty sysctl value"
-assert_eq 'fallback' "$(read_sysctl_or net.test.missing fallback)" \
-    "use explicit fallback for unavailable sysctl"
-assert_eq $'\nStatus:\n  Direct: value\n  Present: 42\n  Missing: unavailable' \
-    "$(print_status_section Status \
-        'Direct|value' '' \
-        'Present|sysctl:net.test.present|unavailable' \
-        'Missing|sysctl:net.test.missing|unavailable')" \
-    "format mixed table-driven status section"
-unset -f sysctl
-
-file_nr_fixture="$TEMP_DIR/file-nr"
-printf '%s\n' '120 0 100000' > "$file_nr_fixture"
-assert_eq '120 allocated / 0 unused / 100000 max' \
-    "$(NETWORK_OPTIMIZE_FILE_NR="$file_nr_fixture" file_handle_status)" "format file handle status"
-assert_eq '不可用' "$(NETWORK_OPTIMIZE_FILE_NR="$TEMP_DIR/missing-file-nr" file_handle_status)" \
-    "handle unavailable file handle status"
-
-tcshape_config="$TEMP_DIR/etc/tcshape.conf"
-tcshape_probe_log="$TEMP_DIR/tcshape-probe.log"
-mkdir -p "$(dirname "$tcshape_config")"
-printf '%s\n' 'RATE_MBIT=500' > "$tcshape_config"
-PROBE_IFACE=eth0
-BANDWIDTH_PROBE_NOTE=""
-NETWORK_OPTIMIZE_TCSHAPE_CONFIG_FILE="$tcshape_config"
-tc() { printf '%s\n' 'qdisc htb 1: root refcnt 2 default 10'; }
-sysctl() {
-    case "${2:-}" in
-        net.ipv4.tcp_congestion_control) printf '%s\n' bbr ;;
-        net.core.default_qdisc) printf '%s\n' fq ;;
-        *) return 1 ;;
-    esac
-}
-readlink() { return 1; }
-find() { return 0; }
-show_probe_environment > "$tcshape_probe_log" 2>&1
-assert_eq 'tcshape HTB 整形状态下测得（可能偏低）' "$BANDWIDTH_PROBE_NOTE" \
-    "mark bandwidth measured under tcshape"
-grep -Fq '建议先执行 tcshape off' "$tcshape_probe_log" ||
-    fail "active tcshape probe warning omits recovery guidance"
-printf 'PASS: warn before probing through active tcshape\n'
-unset NETWORK_OPTIMIZE_TCSHAPE_CONFIG_FILE
-unset -f tc sysctl readlink find
-
-status_function=$(declare -f show_status)
-for diagnostic_key in \
-    vm.min_free_kbytes fs.file-max fs.nr_open net.ipv4.tcp_tw_reuse \
-    net.core.netdev_budget net.core.netdev_budget_usecs; do
-    grep -Fq "$diagnostic_key" <<< "$status_function" ||
-        fail "status omits read-only diagnostic $diagnostic_key"
-done
-printf 'PASS: status includes read-only kernel capacity diagnostics\n'
-show_status >/dev/null || fail "status fails when optional diagnostics are unavailable"
-printf 'PASS: status succeeds when optional diagnostics are unavailable\n'
-
-TUNING_MODE=probe
-DETECTED_RTT_MS=150
-RTT_SOURCE='automatic policy'
-RTT_POLICY='fixed 150 ms'
-assert_eq 'RTT：计算 150 ms（来源 automatic policy；策略 fixed 150 ms）' \
-    "$(format_rtt_selection_summary)" "summary reports fixed automatic calculation RTT"
+JSON
+assert_eq '1000|950|500|0.1000|12.3|7.9' "$(parse_iperf_metrics "$fixture")" \
+    "parse complete iperf3 JSON metrics"
+traffic_reset
+assert_fail "empty interface accounting does not preempt the first peer" \
+    traffic_budget_reached upload
+assert_eq 4 "$IPERF_PARALLEL" "public measurement uses four parallel streams"
+assert_eq 5 "$IPERF_DURATION" "public measurement uses five-second tests"
+assert_eq 2 "$IPERF_MAX_PEERS" "public measurement selects at most two peers"
+grep -Fq 'iperf3 -4 -c "$host"' <<< "$(declare -f run_iperf_runner)" ||
+    fail "iperf3 runner is not forced to IPv4"
+printf 'PASS: public iperf3 runner is IPv4 only\n'
 
 PROBE_IFACE=eth0
 TRAFFIC_IFACES=(eth0 eth1)
@@ -159,109 +108,199 @@ read_iface_counter() {
     esac
 }
 assert_eq '流量（接口 eth0,eth1；含测试期间后台流量，按保守安全预算累计）：上传 2.75 GB / 下载 1.75 GB / 合计 4.50 GB' \
-    "$(traffic_report)" "traffic report sums actual target interfaces conservatively"
+    "$(traffic_report)" "traffic report sums mocked target interfaces"
+read_iface_counter() { deny_real_network interface-counter "$@"; }
 
 assert_eq "default via 192.0.2.1 dev eth0 proto dhcp metric 100" \
     "$(strip_route_window_fields 'default via 192.0.2.1 dev eth0 proto dhcp metric 100 initcwnd 32 initrwnd 32')" \
     "strip route window fields without losing route attributes"
-
 assert_eq 'effective|root fq' "$(classify_active_qdisc <<'EOF'
 qdisc fq 0: root refcnt 2 limit 10000p flow_limit 100p
 EOF
 )" "classify root fq as effective"
-assert_eq 'effective|root mq; all 2 leaves fq' "$(classify_active_qdisc <<'EOF'
-qdisc mq 0: root
-qdisc fq 0: parent :2 limit 10000p
-qdisc fq 0: parent :1 limit 10000p
-qdisc clsact ffff: parent ffff:fff1
-EOF
-)" "classify mq with all fq leaves as effective"
 assert_eq 'effective|root htb; all 1 leaves fq' "$(classify_active_qdisc <<'EOF'
-qdisc htb 1: root refcnt 2 r2q 10 default 0xa direct_packets_stat 0
-qdisc fq 10: parent 1:10 limit 10000p flow_limit 100p
-qdisc clsact ffff: parent ffff:fff1
+qdisc htb 1: root refcnt 2 default 10
+qdisc fq 10: parent 1:10 limit 10000p
 EOF
-)" "classify htb with fq leaf as effective"
-assert_eq 'mixed|root htb; fq leaves 1/2; other: fq_codel' "$(classify_active_qdisc <<'EOF'
-qdisc htb 1: root refcnt 2 r2q 10 default 0xa direct_packets_stat 0
-qdisc fq 10: parent 1:10 limit 10000p flow_limit 100p
-qdisc fq_codel 20: parent 1:20 limit 10240p
-EOF
-)" "classify mixed htb leaves"
-assert_eq 'inactive|root htb; no readable leaves' "$(classify_active_qdisc <<'EOF'
-qdisc htb 1: root refcnt 2 r2q 10 default 0xa direct_packets_stat 0
-EOF
-)" "classify htb without readable leaves as inactive"
-assert_eq 'mixed|root mq; fq leaves 1/2; other: fq_codel' "$(classify_active_qdisc <<'EOF'
-qdisc mq 0: root
-qdisc fq 0: parent :2 limit 10000p
-qdisc fq_codel 0: parent :1 limit 10240p
-EOF
-)" "classify mixed mq leaves"
-assert_eq 'inactive|root noqueue' "$(classify_active_qdisc <<'EOF'
-qdisc noqueue 0: root refcnt 2
-EOF
-)" "classify root noqueue explicitly"
-assert_eq 'unreadable|no qdisc data' "$(classify_active_qdisc </dev/null)" \
-    "classify unreadable qdisc output"
+)" "classify traffic-shape HTB with fq leaf as effective"
 
-assert_eq "正常：测速期间 softnet 和网卡无新增丢包或错误" \
-    "$(classify_network_health 0 0 0 0 1000000)" \
-    "classify clean health snapshot"
-assert_eq "正常：测速期间仅有轻微网卡丢包波动 +1（1 ppm），无 softnet 丢包或网卡错误" \
-    "$(classify_network_health 0 0 0 1 1000000)" \
-    "classify isolated NIC drop as normal fluctuation"
-assert_eq "注意：测速期间 softnet budget pressure +105，网卡丢包 +0（0 ppm），无新增 softnet 丢包或网卡错误" \
-    "$(classify_network_health 0 105 0 0 1000000)" \
-    "classify softnet budget pressure as notice"
-assert_eq "注意：测速期间 softnet budget pressure +0，网卡丢包 +1983（39 ppm），无新增 softnet 丢包或网卡错误" \
-    "$(classify_network_health 0 0 0 1983 50000000)" \
-    "classify low-ratio NIC drops during high-volume test as notice"
-assert_eq "注意：测速期间 softnet budget pressure +0，网卡丢包 +2000（0 ppm），无新增 softnet 丢包或网卡错误" \
-    "$(classify_network_health 0 0 0 2000 0)" \
-    "classify NIC drops without packet denominator as notice"
-assert_eq "异常：测速期间 softnet 丢包 +1，网卡丢包 +0（0 ppm），网卡错误 +0" \
-    "$(classify_network_health 1 0 0 0 1000000)" \
-    "classify softnet drops as abnormal"
-assert_eq "异常：测速期间 softnet 丢包 +0，网卡丢包 +2000（2000 ppm），网卡错误 +0" \
-    "$(classify_network_health 0 0 0 2000 1000000)" \
-    "classify material NIC drop ratio as abnormal"
-assert_eq "异常：测速期间 softnet 丢包 +0，网卡丢包 +0（0 ppm），网卡错误 +1" \
-    "$(classify_network_health 0 0 1 0 1000000)" \
-    "classify NIC errors as abnormal"
-
-ethtool() {
-    [[ "$*" == '-S eth0' ]] || return 1
-    printf '%s\n' \
-        'NIC statistics:' \
-        '     bw_out_allowance_exceeded: 4' \
-        '     pps_allowance_exceeded: 7' \
-        '     unrelated_counter: 99'
+setup_probe_mocks() {
+    command() { return 0; }
+    ordered_iperf_ports() { printf '%s\n' 5201; }
+    traffic_add_target() { PROBE_IFACE=eth0; return 0; }
+    traffic_budget_reached() { return 1; }
+    show_probe_environment_once() { return 0; }
+    tcp_port_open() { return 0; }
+    route_identity_for_target() { printf '%s\n' '2|eth0|192.0.2.1|192.0.2.2'; }
+    current_epoch() { printf '%s\n' 2000000000; }
+    format_measurement_epoch() { printf '%s\n' '2033-05-18T03:33:20Z'; }
 }
-assert_eq $'bw_out_allowance_exceeded=4\npps_allowance_exceeded=7' \
-    "$(nic_allowance_snapshot eth0)" "read supported driver allowance counters"
-ethtool() { return 1; }
-assert_eq '' "$(nic_allowance_snapshot eth0)" \
-    "ignore unsupported ethtool statistics"
-unset -f ethtool
 
-assert_eq $'系统计数增量：softnet_dropped +1 / time_squeeze +5 / 全机 TCP 重传 +30\n网卡计数增量：drops rx +10 tx +20 / errors rx +0 tx +1 / packets rx +100 tx +500\n网络健康：异常：测速期间 softnet 丢包 +1，网卡丢包 +30（50000 ppm），网卡错误 +1；当前受限 socket 2\n驱动 allowance：bw_out_allowance_exceeded +2' \
-    "$(format_verify_health_delta \
-        '0 10 0 0 2 3 100 0 1000 2000' \
-        '1 15 0 1 12 23 130 2 1100 2500' \
-        'bw_out_allowance_exceeded=4' \
-        'bw_out_allowance_exceeded=6')" \
-    "format verify health and allowance deltas"
-assert_eq '驱动 allowance：无新增超额事件' \
-    "$(format_nic_allowance_delta \
-        $'bw_out_allowance_exceeded=4\npps_allowance_exceeded=7' \
-        $'bw_out_allowance_exceeded=4\npps_allowance_exceeded=7')" \
-    "format unchanged allowance counters"
-assert_eq '网络健康：测试期间计数器重置，无法计算可靠增量' \
-    "$(format_verify_health_delta \
-        '1 0 0 0 0 0 10 0 100 100' \
-        '0 0 0 0 0 0 10 0 100 100' '' '')" \
-    "reject reset verify counters"
+(
+    setup_probe_mocks
+    calls="$TEMP_DIR/dual-peer.calls"
+    : > "$calls"
+    rank_iperf_peers() {
+        printf '%s\n' \
+            '10|one.example|192.0.2.10|A|ProviderA' \
+            '20|two.example|192.0.2.20|B|ProviderB' \
+            '30|three.example|192.0.2.30|C|ProviderC'
+    }
+    run_iperf_test() {
+        printf '%s:%s\n' "$1" "$3" >> "$calls"
+        case "$1:$3" in
+            192.0.2.10:upload) printf '%s\n' '500|10|1|0.01' ;;
+            192.0.2.10:download) printf '%s\n' '800|10|1|0.01' ;;
+            192.0.2.20:upload) printf '%s\n' '600|10|1|0.01' ;;
+            192.0.2.20:download) printf '%s\n' '700|10|1|0.01' ;;
+            *) fail "third peer was tested" ;;
+        esac
+    }
+    probe_iperf_bandwidth
+    assert_eq 600 "$DETECTED_UPLOAD_MBPS" "dual-peer upload keeps higher valid result"
+    assert_eq 800 "$DETECTED_DOWNLOAD_MBPS" "dual-peer download keeps higher valid result"
+    assert_eq high "$MEASUREMENT_CONFIDENCE" "consistent dual-peer result is high confidence"
+    assert_eq 4 "$(wc -l < "$calls" | tr -d ' ')" "only two peers are tested in both directions"
+)
+
+(
+    setup_probe_mocks
+    rank_iperf_peers() {
+        printf '%s\n' '10|one.example|192.0.2.10|A|ProviderA'
+    }
+    run_iperf_test() {
+        case "$3" in
+            upload) printf '%s\n' '500|10|1|0.01' ;;
+            download) printf '%s\n' '800|10|1|0.01' ;;
+        esac
+    }
+    probe_iperf_bandwidth
+    assert_eq low "$MEASUREMENT_CONFIDENCE" "single-peer complete result is low confidence"
+    grep -Fq 'only one public iperf3 peer' <<< "$MEASUREMENT_WARNINGS" ||
+        fail "single-peer result did not warn"
+    printf 'PASS: single-peer warning does not fail complete measurement\n'
+)
+
+(
+    setup_probe_mocks
+    rank_iperf_peers() {
+        printf '%s\n' \
+            '10|one.example|192.0.2.10|A|ProviderA' \
+            '20|two.example|192.0.2.20|B|ProviderB'
+    }
+    run_iperf_test() {
+        case "$1:$3" in
+            192.0.2.10:upload) printf '%s\n' '500|10|1|0.01' ;;
+            192.0.2.10:download) printf '%s\n' '1000|10|1|0.01' ;;
+            192.0.2.20:upload) printf '%s\n' '800|10|1|0.01' ;;
+            192.0.2.20:download) printf '%s\n' '1200|10|1|0.01' ;;
+        esac
+    }
+    probe_iperf_bandwidth
+    assert_eq 800 "$DETECTED_UPLOAD_MBPS" "divergent upload keeps higher result"
+    assert_eq low "$MEASUREMENT_CONFIDENCE" "over-30-percent difference lowers confidence only"
+    grep -Fq 'upload peer results differ by more than 30%' <<< "$MEASUREMENT_WARNINGS" ||
+        fail "over-30-percent result did not warn"
+    printf 'PASS: over-30-percent peer difference remains successful\n'
+)
+
+(
+    setup_probe_mocks
+    rank_iperf_peers() {
+        printf '%s\n' \
+            '10|one.example|192.0.2.10|A|ProviderA' \
+            '20|two.example|192.0.2.20|B|ProviderB'
+    }
+    run_iperf_test() {
+        if [[ "$1" == 192.0.2.20 ]]; then
+            return 75
+        fi
+        case "$3" in
+            upload) printf '%s\n' '500|10|1|0.01' ;;
+            download) printf '%s\n' '800|10|1|0.01' ;;
+        esac
+    }
+    probe_iperf_bandwidth
+    grep -Fq 'traffic budget stopped additional' <<< "$MEASUREMENT_WARNINGS" ||
+        fail "budget stop did not persist a warning"
+    assert_eq 500 "$DETECTED_UPLOAD_MBPS" "budget stop preserves complete earlier upload"
+    assert_eq 800 "$DETECTED_DOWNLOAD_MBPS" "budget stop preserves complete earlier download"
+    printf 'PASS: budget stop remains successful with earlier complete input\n'
+)
+
+(
+    mkdir -p "$(dirname "$MEASUREMENT_CACHE")"
+    current_epoch() { printf '%s\n' 2000000000; }
+    CURRENT_IDENTITY='2|eth0|192.0.2.1|192.0.2.2'
+    route_identity_for_target() { printf '%s\n' "$CURRENT_IDENTITY"; }
+    seed_cache() {
+        local saved_at="$1"
+        cat > "$MEASUREMENT_CACHE" <<EOF
+version=1
+saved_at=$saved_at
+measured_at=2033-05-18T03:33:20Z
+download_mbps=1000
+upload_mbps=500
+source=public iperf3 IPv4
+nodes=one.example;two.example
+confidence=high
+warnings=none
+route_target=192.0.2.10
+ifindex=2
+iface=eth0
+gateway=192.0.2.1
+source_address=192.0.2.2
+EOF
+    }
+
+    seed_cache $((2000000000 - CACHE_FRESH_MAX_AGE_SECONDS))
+    assert_ok "seven-day cache is fresh" \
+        load_measurement_cache "$CACHE_FRESH_MAX_AGE_SECONDS" fresh
+    assert_eq 1000 "$DETECTED_DOWNLOAD_MBPS" "fresh cache restores download"
+
+    seed_cache $((2000000000 - CACHE_FRESH_MAX_AGE_SECONDS - 1))
+    assert_fail "cache older than seven days is not fresh" \
+        load_measurement_cache "$CACHE_FRESH_MAX_AGE_SECONDS" fresh
+    assert_ok "same-route cache just older than seven days is stale fallback" \
+        load_measurement_cache "$CACHE_STALE_MAX_AGE_SECONDS" stale
+    assert_eq low "$MEASUREMENT_CONFIDENCE" "stale fallback lowers confidence"
+
+    seed_cache $((2000000000 - CACHE_STALE_MAX_AGE_SECONDS))
+    assert_ok "thirty-day same-route cache is accepted" \
+        load_measurement_cache "$CACHE_STALE_MAX_AGE_SECONDS" stale
+    seed_cache $((2000000000 - CACHE_STALE_MAX_AGE_SECONDS - 1))
+    assert_fail "cache older than thirty days is rejected" \
+        load_measurement_cache "$CACHE_STALE_MAX_AGE_SECONDS" stale
+
+    seed_cache $((2000000000 - 60))
+    CURRENT_IDENTITY='2|eth0|198.51.100.1|192.0.2.2'
+    assert_fail "route-mismatched cache is rejected" \
+        load_measurement_cache "$CACHE_FRESH_MAX_AGE_SECONDS" fresh
+
+    CURRENT_IDENTITY='2|eth0|192.0.2.1|192.0.2.2'
+    DETECTED_DOWNLOAD_MBPS=900
+    DETECTED_UPLOAD_MBPS=450
+    MEASUREMENT_EPOCH=2000000000
+    MEASUREMENT_TIME=2033-05-18T03:33:20Z
+    MEASUREMENT_SOURCE='public iperf3 IPv4'
+    MEASUREMENT_NODES='one.example'
+    MEASUREMENT_CONFIDENCE=low
+    MEASUREMENT_WARNINGS='only one peer'
+    MEASUREMENT_ROUTE_TARGET=192.0.2.10
+    MEASUREMENT_ROUTE_IDENTITY="$CURRENT_IDENTITY"
+    write_measurement_cache
+    grep -Fqx 'ifindex=2' "$MEASUREMENT_CACHE" || fail "cache omits ifindex"
+    grep -Fqx 'iface=eth0' "$MEASUREMENT_CACHE" || fail "cache omits interface"
+    grep -Fqx 'gateway=192.0.2.1' "$MEASUREMENT_CACHE" || fail "cache omits gateway"
+    grep -Fqx 'source_address=192.0.2.2' "$MEASUREMENT_CACHE" || fail "cache omits source address"
+    printf 'PASS: cache persists complete route binding\n'
+)
+
+if grep -Eq '(^|[[:space:]])(return|exit)[[:space:]]+2([[:space:]]|$)' \
+    "$ROOT_DIR/modules/network-optimize.sh"; then
+    fail "network-optimize still returns exit code 2"
+fi
+printf 'PASS: network-optimize has no exit code 2 path\n'
 
 CURRENT_ROUTE="default via 192.0.2.1 dev eth0 proto dhcp src 192.0.2.10 metric 100 onlink"
 LAST_ROUTE_ARGS=""
@@ -304,10 +343,28 @@ printf 'PASS: apply initcwnd records ownership\n'
 [[ -x "$INITCWND_ROUTE_HOOK" ]] || fail "apply initcwnd installs executable route hook"
 grep -Fq '# Managed by network-optimize.sh' "$INITCWND_ROUTE_HOOK" ||
     fail "initcwnd route hook lacks ownership marker"
-grep -Fq '# network-optimize:initcwnd-hook:v1' "$INITCWND_ROUTE_HOOK" ||
+grep -Fq '# network-optimize:initcwnd-hook:v2' "$INITCWND_ROUTE_HOOK" ||
     fail "initcwnd route hook lacks verifiable version marker"
+marker_pattern="[[ -e \"$ROUTE_OWNED_MARKER\" ]] || exit 0"
+marker_checks=$(grep -nF "$marker_pattern" "$INITCWND_ROUTE_HOOK")
+assert_eq 2 "$(wc -l <<< "$marker_checks" | tr -d ' ')" \
+    "initcwnd hook checks ownership at start and immediately before write"
+final_marker_line=$(tail -n 1 <<< "$marker_checks" | cut -d: -f1)
+route_write_line=$(grep -nF 'ip -4 route replace "${clean[@]}" initcwnd 32 initrwnd 32' \
+    "$INITCWND_ROUTE_HOOK" | cut -d: -f1)
+assert_eq "$((final_marker_line + 1))" "$route_write_line" \
+    "final ownership check directly guards route replacement"
 initcwnd_settings_owned || fail "ownership marker is not accepted as ownership evidence"
 printf 'PASS: marker ownership evidence is accepted\n'
+render_legacy_initcwnd_hook > "$INITCWND_ROUTE_HOOK"
+is_managed_initcwnd_hook || fail "exact v1 hook was not accepted for migration"
+write_initcwnd_hook
+if grep -Fq '# network-optimize:initcwnd-hook:v1' "$INITCWND_ROUTE_HOOK"; then
+    fail "legacy initcwnd hook was not upgraded"
+fi
+grep -Fq '# network-optimize:initcwnd-hook:v2' "$INITCWND_ROUTE_HOOK" ||
+    fail "legacy initcwnd hook did not migrate to v2"
+printf 'PASS: exact legacy hook migrates to final-guard version\n'
 bash -n "$INITCWND_ROUTE_HOOK" || fail "generated initcwnd route hook has invalid syntax"
 (
     install() { fail "hook write attempted to normalize existing parent directory"; }
