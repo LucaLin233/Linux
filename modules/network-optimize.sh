@@ -155,8 +155,7 @@ VERIFY_RESULT=""
 
 # === 日志函数 ===
 log() {
-    local msg="$1"
-    local level="${2:-info}"
+    local msg="$1" level="${2:-info}"
     local -A colors=(
         [info]="\033[0;36m"
         [warn]="\033[0;33m"
@@ -199,10 +198,7 @@ detail() {
 
 
 stage_managed_state() {
-    local target="$1"
-    local backup="$2"
-    local absent="$3"
-    local stage
+    local target="$1" backup="$2" absent="$3" stage
 
     install -d -m 0755 "$(dirname "$backup")" || return 1
     if [[ -e "$target" || -L "$target" ]]; then
@@ -232,10 +228,7 @@ stage_managed_state() {
 }
 
 atomic_install_file() {
-    local source_file="$1"
-    local destination="$2"
-    local mode="${3:-0600}"
-    local stage
+    local source_file="$1" destination="$2" mode="${3:-0600}" stage
 
     install -d -m 0755 "$(dirname "$destination")" || return 1
     stage=$(mktemp "${destination}.new.XXXXXX") || return 1
@@ -250,10 +243,7 @@ atomic_install_file() {
 }
 
 atomic_write_file() {
-    local destination="$1"
-    local content="$2"
-    local mode="${3:-0600}"
-    local stage
+    local destination="$1" content="$2" mode="${3:-0600}" stage
 
     install -d -m 0755 "$(dirname "$destination")" || return 1
     stage=$(mktemp "${destination}.new.XXXXXX") || return 1
@@ -268,9 +258,7 @@ atomic_write_file() {
 }
 
 atomic_restore_file() {
-    local source_file="$1"
-    local destination="$2"
-    local stage
+    local source_file="$1" destination="$2" stage
 
     install -d -m 0755 "$(dirname "$destination")" || return 1
     stage=$(mktemp "${destination}.rollback.XXXXXX") || return 1
@@ -286,11 +274,7 @@ atomic_restore_file() {
 }
 
 backup_managed_file() {
-    local target="$1"
-    local initial_backup="$2"
-    local previous_backup="$3"
-    local initial_absent="$4"
-    local previous_absent="$5"
+    local target="$1" initial_backup="$2" previous_backup="$3" initial_absent="$4" previous_absent="$5"
 
     local initial_unknown="${initial_backup%.initial-backup}.initial-unknown"
 
@@ -317,9 +301,7 @@ previous_state_paths() {
 }
 
 begin_previous_state_transaction() {
-    local transaction_dir=""
-    local path
-    local index=0
+    local transaction_dir="" path index=0
 
     install -d -m 0755 "$NETWORK_OPTIMIZE_STATE_DIR" || return 1
     transaction_dir=$(mktemp -d \
@@ -341,10 +323,7 @@ begin_previous_state_transaction() {
 }
 
 restore_previous_state_transaction() {
-    local transaction_dir="$1"
-    local path
-    local index=0
-    local failed="false"
+    local transaction_dir="$1" path index=0 failed="false"
 
     while IFS= read -r path; do
         if [[ -e "$transaction_dir/present.$index" ]]; then
@@ -361,9 +340,7 @@ restore_previous_state_transaction() {
 }
 
 backup_previous_state_set() {
-    local runtime_snapshot="$1"
-    local transaction_dir
-    local failed_item=""
+    local runtime_snapshot="$1" transaction_dir failed_item=""
 
     transaction_dir=$(begin_previous_state_transaction) || {
         error "无法创建 previous 备份事务"
@@ -394,9 +371,7 @@ backup_previous_state_set() {
 }
 
 restore_managed_file() {
-    local target="$1"
-    local backup="$2"
-    local absent="$3"
+    local target="$1" backup="$2" absent="$3"
 
     if [[ -e "$backup" || -L "$backup" ]]; then
         atomic_restore_file "$backup" "$target"
@@ -631,9 +606,7 @@ show_active_probe_warning() {
 }
 
 prompt_manual_bandwidth() {
-    local source="${1:-interactive manual entry}"
-    local download_mbps
-    local upload_mbps
+    local source="${1:-interactive manual entry}" download_mbps upload_mbps
 
     read -r -p "下载带宽 Mbps: " download_mbps || return 1
     is_positive_integer "$download_mbps" 1 100000 || {
@@ -685,8 +658,7 @@ detect_memory_mb() {
 }
 
 detect_cgroup_memory_limit_mb() {
-    local value=""
-    local limit_file
+    local value="" limit_file
 
     for limit_file in /sys/fs/cgroup/memory.max \
         /sys/fs/cgroup/memory/memory.limit_in_bytes; do
@@ -701,8 +673,7 @@ detect_cgroup_memory_limit_mb() {
 }
 
 detect_effective_memory_mb() {
-    local physical_mb="${1:-}"
-    local cgroup_mb=""
+    local physical_mb="${1:-}" cgroup_mb=""
 
     [[ "$physical_mb" =~ ^[0-9]+$ ]] || physical_mb=$(detect_memory_mb)
     cgroup_mb=$(detect_cgroup_memory_limit_mb 2>/dev/null || true)
@@ -767,8 +738,7 @@ recent_oom_event_count() {
 calculate_memory_cap() {
     local ram_mb="$1"
     local cap=$((ram_mb * 32768)) # 有效 RAM / 32
-    local minimum=$((8 * 1024 * 1024))
-    local maximum=$((256 * 1024 * 1024))
+    local minimum=$((8 * 1024 * 1024)) maximum=$((256 * 1024 * 1024))
 
     (( cap < minimum )) && cap=$minimum
     (( cap > maximum )) && cap=$maximum
@@ -776,8 +746,7 @@ calculate_memory_cap() {
 }
 
 cleanup_temp_dir() {
-    local directory="$1"
-    local file
+    local directory="$1" file
 
     for file in "$directory"/*; do
         [[ -e "$file" ]] || continue
@@ -830,8 +799,7 @@ classify_active_qdisc() {
 }
 
 active_qdisc_state() {
-    local iface="$1"
-    local output
+    local iface="$1" output
 
     [[ -n "$iface" ]] || {
         printf '%s\n' 'unreadable|default interface unavailable'
@@ -891,8 +859,7 @@ query_default_ipv4_route() {
 }
 
 default_ipv4_route() {
-    local route
-    local query_status
+    local route query_status
 
     if route=$(query_default_ipv4_route); then
         printf '%s\n' "$route"
@@ -907,8 +874,7 @@ default_ipv4_route() {
 }
 
 strip_route_window_fields() {
-    local route="$1"
-    local skip=false token
+    local route="$1" skip=false token
     local -a fields=() clean=()
 
     read -r -a fields <<< "$route"
@@ -934,8 +900,7 @@ remove_initcwnd_ownership_marker() {
 }
 
 backup_default_route() {
-    local route=""
-    local query_status=0
+    local route="" query_status=0
 
     route=$(query_default_ipv4_route) || query_status=$?
     if (( query_status != 0 )); then
@@ -1080,9 +1045,7 @@ route_has_script_windows() {
 }
 
 route_snapshot_proves_no_windows() {
-    local route_file="$1"
-    local unknown_marker="${2:-}"
-    local current_route snapshot_route
+    local route_file="$1" unknown_marker="${2:-}" current_route snapshot_route
 
     [[ -f "$route_file" ]] || return 1
     [[ -z "$unknown_marker" || ! -e "$unknown_marker" ]] || return 1
@@ -1125,8 +1088,7 @@ remove_initcwnd_hook() {
 }
 
 write_initcwnd_hook() {
-    local hook_dir
-    local temp_hook
+    local hook_dir temp_hook
 
     hook_dir=$(dirname "$INITCWND_ROUTE_HOOK")
     if [[ ! -d "$hook_dir" ]]; then
@@ -1153,8 +1115,7 @@ write_initcwnd_hook() {
 # Generated hook uses clean as an array; apply path intentionally shadows it as a string.
 # shellcheck disable=SC2128,SC2178
 apply_initcwnd() {
-    local route="" clean=""
-    local owned="false"
+    local route="" clean="" owned="false"
     local -a route_args=()
 
     if [[ "$INITCWND_ENABLED" != "true" ]]; then
@@ -1224,11 +1185,7 @@ apply_initcwnd() {
 }
 
 restore_default_route() {
-    local route_file="$1"
-    local owned_file="${2:-}"
-    local absent_file="${3:-}"
-    local route=""
-    local clean=""
+    local route_file="$1" owned_file="${2:-}" absent_file="${3:-}" route="" clean=""
     local -a route_args=()
 
     if [[ ! -f "$route_file" && -n "$absent_file" && -e "$absent_file" ]]; then
@@ -1269,8 +1226,7 @@ restore_default_route() {
 }
 
 detect_ipv4_iface_for_target() {
-    local target="$1"
-    local iface
+    local target="$1" iface
 
     iface=$(ip -4 route get "$target" 2>/dev/null | route_value_after dev)
     [[ -n "$iface" ]] || return 1
@@ -1278,8 +1234,7 @@ detect_ipv4_iface_for_target() {
 }
 
 read_iface_counter() {
-    local iface="$1"
-    local direction="$2"
+    local iface="$1" direction="$2"
     cat "/sys/class/net/$iface/statistics/${direction}_bytes" 2>/dev/null
 }
 
@@ -1292,8 +1247,7 @@ traffic_reset() {
 }
 
 traffic_add_target() {
-    local target="$1"
-    local iface rx tx
+    local target="$1" iface rx tx
 
     iface=$(detect_ipv4_iface_for_target "$target") || return 1
     PROBE_IFACE="$iface"
@@ -1318,10 +1272,7 @@ traffic_mark() {
 }
 
 traffic_used_bytes() {
-    local direction="${1:-total}"
-    local iface rx tx rx_used tx_used
-    local total_rx=0
-    local total_tx=0
+    local direction="${1:-total}" iface rx tx rx_used tx_used total_rx=0 total_tx=0
 
     (( ${#TRAFFIC_IFACES[@]} > 0 )) || return 1
     for iface in "${TRAFFIC_IFACES[@]}"; do
@@ -1363,10 +1314,7 @@ traffic_report() {
 }
 
 traffic_budget_reached() {
-    local direction="$1"
-    local total
-    local directional
-    local total_stop=$((TRAFFIC_TOTAL_LIMIT_BYTES - TRAFFIC_STOP_RESERVE_BYTES))
+    local direction="$1" total directional total_stop=$((TRAFFIC_TOTAL_LIMIT_BYTES - TRAFFIC_STOP_RESERVE_BYTES))
     local direction_stop=$((TRAFFIC_DIRECTION_LIMIT_BYTES - TRAFFIC_STOP_RESERVE_BYTES))
 
     total=$(traffic_used_bytes total) || return 0
@@ -1389,9 +1337,7 @@ unregister_iperf_runner() {
 }
 
 terminate_recorded_pid() {
-    local pid="$1"
-    local kill_after="${2:-$IPERF_KILL_AFTER_SECONDS}"
-    local attempt
+    local pid="$1" kill_after="${2:-$IPERF_KILL_AFTER_SECONDS}" attempt
 
     [[ "$pid" =~ ^[0-9]+$ ]] || return 0
     kill -TERM "$pid" 2>/dev/null || true
@@ -1443,15 +1389,8 @@ cleanup_probe_processes() {
 }
 
 run_iperf_runner() {
-    local output_file="$1"
-    local host="$2"
-    local port="$3"
-    local duration="$4"
-    local streams="$5"
-    local direction="$6"
-    local reverse_mode="${7:-false}"
-    local deadline=$((duration + IPERF_DEADLINE_GRACE_SECONDS))
-    local pid rc=0 limited="false"
+    local output_file="$1" host="$2" port="$3" duration="$4" streams="$5" direction="$6" reverse_mode="${7:-false}"
+    local deadline=$((duration + IPERF_DEADLINE_GRACE_SECONDS)) pid rc=0 limited="false"
     local -a reverse=()
 
     [[ "$reverse_mode" == "true" ]] && reverse=(-R)
@@ -1496,13 +1435,7 @@ ordered_iperf_ports() {
 }
 
 rank_iperf_peers() {
-    local temp_dir
-    local host
-    local peer_ip
-    local location
-    local provider
-    local index=0
-    local file
+    local temp_dir host peer_ip location provider index=0 file
 
     command -v ping >/dev/null 2>&1 || return 1
     if [[ -n "${VERIFY_TEMP_DIR:-}" ]]; then
@@ -1534,16 +1467,12 @@ rank_iperf_peers() {
 }
 
 tcp_port_open() {
-    local ipv4="$1"
-    local port="$2"
+    local ipv4="$1" port="$2"
     timeout 3 bash -c "exec 3<>/dev/tcp/$ipv4/$port" 2>/dev/null
 }
 
 run_iperf_test() {
-    local host="$1"
-    local port="$2"
-    local direction="$3"
-    local output stats rc=0 reverse_mode="false"
+    local host="$1" port="$2" direction="$3" output stats rc=0 reverse_mode="false"
     local receiver retransmits retransmit_percent cpu remote_cpu
 
     [[ "$direction" == "download" ]] && reverse_mode="true"
@@ -1575,9 +1504,7 @@ format_cpu_percent() {
 }
 
 parse_iperf_metrics() {
-    local output_file="$1"
-    local stats
-    local sender_bps receiver_bps sent_bytes retransmits mss host_cpu remote_cpu
+    local output_file="$1" stats sender_bps receiver_bps sent_bytes retransmits mss host_cpu remote_cpu
     local retransmit_percent
 
     stats=$(jq -r '
@@ -1625,8 +1552,7 @@ verify_dependencies_available() {
 }
 
 run_verify_iperf() {
-    local host="$1" port="$2" streams="$3"
-    local output_file rc=0
+    local host="$1" port="$2" streams="$3" output_file rc=0
 
     output_file="$VERIFY_TEMP_DIR/iperf-${streams}.json"
     run_iperf_runner "$output_file" "$host" "$port" "$IPERF_DURATION" \
@@ -1652,8 +1578,7 @@ cleanup_verify() {
 }
 
 verify_impl() {
-    local answer ranked rtt host peer_ip location provider port
-    local health_before allowance_before
+    local answer ranked rtt host peer_ip location provider port health_before allowance_before
     local single_result="" four_result="" candidate_single rc
     local single_sender single_receiver single_retrans single_retrans_pct single_cpu single_remote_cpu
     local four_sender four_receiver four_retrans four_retrans_pct four_cpu four_remote_cpu
@@ -1761,8 +1686,7 @@ verify_impl() {
 }
 
 run_verify_command() {
-    local rc=0
-    local previous_exit_trap previous_hup_trap previous_int_trap previous_term_trap
+    local rc=0 previous_exit_trap previous_hup_trap previous_int_trap previous_term_trap
 
     previous_exit_trap=$(trap -p EXIT)
     previous_hup_trap=$(trap -p HUP)
@@ -1798,26 +1722,9 @@ run_verify_command() {
 }
 
 probe_iperf_bandwidth() {
-    local ranked
-    local rtt
-    local host
-    local peer_ip
-    local location
-    local provider
-    local port
-    local upload_result
-    local download_result
-    local upload
-    local download
-    local upload_cpu
-    local download_cpu
-    local upload_retransmits
-    local download_retransmits
-    local upload_retransmit_percent
-    local download_retransmit_percent
-    local best_upload=0
-    local best_download=0
-    local successful_peers=0
+    local ranked rtt host peer_ip location provider port upload_result download_result upload download upload_cpu
+    local download_cpu upload_retransmits download_retransmits upload_retransmit_percent download_retransmit_percent
+    local best_upload=0 best_download=0 successful_peers=0
 
     command -v iperf3 >/dev/null 2>&1 || return 1
     command -v jq >/dev/null 2>&1 || return 1
@@ -1868,9 +1775,7 @@ probe_iperf_bandwidth() {
 }
 
 cloudflare_worker() {
-    local direction="$1"
-    local upload_file="${2:-}"
-    local deadline=$((SECONDS + CLOUDFLARE_DURATION))
+    local direction="$1" upload_file="${2:-}" deadline=$((SECONDS + CLOUDFLARE_DURATION))
     local remaining curl_pid="" curl_rc=0
 
     trap 'terminate_recorded_pid "${curl_pid:-}" 1' EXIT
@@ -1906,17 +1811,7 @@ cloudflare_worker() {
 }
 
 probe_cloudflare_direction() {
-    local direction="$1"
-    local started
-    local ended
-    local elapsed
-    local start_bytes
-    local end_bytes
-    local transferred
-    local alive
-    local index
-    local pid
-    local upload_file=""
+    local direction="$1" started ended elapsed start_bytes end_bytes transferred alive index pid upload_file=""
     local -a pids=()
 
     traffic_budget_reached "$direction" && return 1
@@ -1989,9 +1884,7 @@ format_bandwidth_result() {
 }
 
 probe_cloudflare_bandwidth() {
-    local upload=""
-    local download=""
-    local crosscheck=""
+    local upload="" download="" crosscheck=""
 
     command -v curl >/dev/null 2>&1 || return 1
     CLOUDFLARE_IPV4=$(resolve_ipv4 speed.cloudflare.com || true)
@@ -2032,8 +1925,7 @@ probe_cloudflare_bandwidth() {
 }
 
 round_bandwidth() {
-    local measured="$1"
-    local rounded
+    local measured="$1" rounded
 
     if (( measured < 50 )); then
         rounded="$measured"
@@ -2048,13 +1940,7 @@ round_bandwidth() {
 }
 
 show_probe_environment() {
-    local iface="${1:-$PROBE_IFACE}"
-    local driver="virtual"
-    local rx_queues
-    local tx_queues
-    local current_cc
-    local default_qdisc
-    local root_qdisc
+    local iface="${1:-$PROBE_IFACE}" driver="virtual" rx_queues tx_queues current_cc default_qdisc root_qdisc
     local driver_path
 
     [[ -n "$iface" ]] || return 1
@@ -2086,8 +1972,7 @@ show_probe_environment_once() {
 }
 
 probe_bandwidth() {
-    local raw_download
-    local raw_upload
+    local raw_download raw_upload
 
     command -v ip >/dev/null 2>&1 || return 1
     traffic_mark
@@ -2119,12 +2004,7 @@ probe_bandwidth() {
 }
 
 calculate_buffer_max() {
-    local bandwidth_mbps="$1"
-    local rtt_ms="$2"
-    local memory_cap="$3"
-    local minimum=$((4 * 1024 * 1024))
-    local mib=$((1024 * 1024))
-    local desired
+    local bandwidth_mbps="$1" rtt_ms="$2" memory_cap="$3" minimum=$((4 * 1024 * 1024)) mib=$((1024 * 1024)) desired
 
     # 2 x BDP + 2 MiB，为 socket 记账和通告窗口保留余量。
     desired=$((bandwidth_mbps * rtt_ms * 250 + 2 * 1024 * 1024))
@@ -2135,12 +2015,7 @@ calculate_buffer_max() {
 }
 
 buffer_limit_reason() {
-    local bandwidth_mbps="$1"
-    local rtt_ms="$2"
-    local memory_cap="$3"
-    local minimum=$((4 * 1024 * 1024))
-    local mib=$((1024 * 1024))
-    local desired
+    local bandwidth_mbps="$1" rtt_ms="$2" memory_cap="$3" minimum=$((4 * 1024 * 1024)) mib=$((1024 * 1024)) desired
 
     desired=$((bandwidth_mbps * rtt_ms * 250 + 2 * 1024 * 1024))
     desired=$((((desired + mib - 1) / mib) * mib))
@@ -2188,9 +2063,7 @@ install_probe_dependencies() {
 }
 
 resolve_tuning_values() {
-    local download_mbps=""
-    local upload_mbps=""
-    local rtt_ms=""
+    local download_mbps="" upload_mbps="" rtt_ms=""
 
     PHYSICAL_RAM_MB=$(detect_memory_mb)
     is_positive_integer "$PHYSICAL_RAM_MB" 1 1073741824 || {
@@ -2317,18 +2190,8 @@ show_tuning_plan() {
 }
 
 network_health_snapshot() {
-    local iface="${1:-}"
-    local dropped=0
-    local squeezed=0
-    local rx_errors=0
-    local tx_errors=0
-    local rx_dropped=0
-    local tx_dropped=0
-    local rx_packets=0
-    local tx_packets=0
-    local retrans=0
-    local limited=0
-    local line drop_hex squeeze_hex
+    local iface="${1:-}" dropped=0 squeezed=0 rx_errors=0 tx_errors=0 rx_dropped=0 tx_dropped=0 rx_packets=0
+    local tx_packets=0 retrans=0 limited=0 line drop_hex squeeze_hex
 
     if [[ -r /proc/net/softnet_stat ]]; then
         while read -r line; do
@@ -2358,8 +2221,7 @@ network_health_snapshot() {
 }
 
 classify_network_health() {
-    local softnet_drop="$1" squeezed="$2" errors="$3" nic_drop="$4" packets="$5"
-    local drop_ppm=0
+    local softnet_drop="$1" squeezed="$2" errors="$3" nic_drop="$4" packets="$5" drop_ppm=0
 
     (( packets > 0 )) && drop_ppm=$((nic_drop * 1000000 / packets))
 
@@ -2380,8 +2242,7 @@ classify_network_health() {
 }
 
 nic_allowance_snapshot() {
-    local iface="${1:-}"
-    local output
+    local iface="${1:-}" output
 
     [[ -n "$iface" ]] || return 0
     command -v ethtool >/dev/null 2>&1 || return 0
@@ -2396,9 +2257,7 @@ nic_allowance_snapshot() {
 }
 
 format_nic_allowance_delta() {
-    local before="$1" after="$2"
-    local key value before_value after_value delta part
-    local output=""
+    local before="$1" after="$2" key value before_value after_value delta part output=""
     local -a keys=()
     local -A before_values=()
     local -A after_values=()
@@ -2488,8 +2347,7 @@ format_verify_health_delta() {
 }
 
 show_verify_health_since() {
-    local health_before="$1" allowance_before="$2"
-    local health_after allowance_after
+    local health_before="$1" allowance_before="$2" health_after allowance_after
 
     health_after=$(network_health_snapshot "$PROBE_IFACE")
     allowance_after=$(nic_allowance_snapshot "$PROBE_IFACE")
@@ -2503,15 +2361,11 @@ format_rtt_selection_summary() {
 }
 
 show_install_summary() {
-    local before="$1"
-    local bbr_enabled="$2"
-    local after
+    local before="$1" bbr_enabled="$2" after
     local b_drop b_squeeze b_rxerr b_txerr b_rxdrop b_txdrop b_retrans _ b_rxpkt b_txpkt
     local a_drop a_squeeze a_rxerr a_txerr a_rxdrop a_txdrop a_retrans a_limited a_rxpkt a_txpkt
-    local delta_drop delta_squeeze delta_rxerr delta_txerr delta_rxdrop delta_txdrop
-    local delta_packets health
-    local algorithm="当前拥塞控制"
-    local qdisc_state qdisc_detail
+    local delta_drop delta_squeeze delta_rxerr delta_txerr delta_rxdrop delta_txdrop delta_packets health
+    local algorithm="当前拥塞控制" qdisc_state qdisc_detail
 
     after=$(network_health_snapshot "$PROBE_IFACE")
     read -r b_drop b_squeeze b_rxerr b_txerr b_rxdrop b_txdrop b_retrans _ b_rxpkt b_txpkt <<< "$before"
@@ -2575,8 +2429,7 @@ EOF
 }
 
 create_network_config() {
-    local target_file="$1"
-    local enable_bbr="$2"
+    local target_file="$1" enable_bbr="$2"
 
     cat > "$target_file" <<EOF
 # 由 network-optimize.sh 自动生成。
@@ -2673,10 +2526,7 @@ prepare_legacy_backup_state() {
 }
 
 merge_initial_runtime_values() {
-    local current_snapshot="$1"
-    local temp_file
-    local key
-    local value
+    local current_snapshot="$1" temp_file key value
 
     [[ ! -e "$RUNTIME_INITIAL_UNKNOWN" ]] || return 0
 
@@ -2735,9 +2585,7 @@ backup_network_state() {
 }
 
 capture_runtime_values_from_files() {
-    local output_file="$1"
-    local input_file
-    local key
+    local output_file="$1" input_file key
     shift
 
     : > "$output_file" || return 1
@@ -2762,12 +2610,7 @@ capture_runtime_values() {
 }
 
 apply_runtime_values_strict() {
-    local values_file="$1"
-    local key
-    local value
-    local expected
-    local actual
-    local failed=false
+    local values_file="$1" key value expected actual failed=false
 
     [[ -f "$values_file" ]] || return 0
     while IFS='=' read -r key value; do
@@ -2793,9 +2636,7 @@ apply_runtime_values_strict() {
 }
 
 restore_runtime_values() {
-    local values_file="$1"
-    local key
-    local value
+    local values_file="$1" key value
 
     while IFS='=' read -r key value; do
         [[ -n "$key" ]] || continue
@@ -2805,8 +2646,7 @@ restore_runtime_values() {
 }
 
 apply_network_config() {
-    local config_file="$1"
-    local output
+    local config_file="$1" output
 
     if [[ "${DEBUG:-}" == "1" ]]; then
         sysctl -p "$config_file"
@@ -2825,11 +2665,7 @@ normalize_sysctl_value() {
 }
 
 verify_network_config() {
-    local config_file="$1"
-    local key
-    local expected
-    local actual
-    local failed="false"
+    local config_file="$1" key expected actual failed="false"
 
     while IFS='=' read -r key expected; do
         key="${key//[[:space:]]/}"
@@ -2871,10 +2707,7 @@ rollback_initcwnd_install() {
 }
 
 install_optimization() {
-    local temp_config
-    local runtime_backup
-    local bbr_enabled="false"
-    local health_before
+    local temp_config runtime_backup bbr_enabled="false" health_before
 
     info "开始配置网络优化..."
 
@@ -2977,11 +2810,7 @@ install_optimization() {
 
 # Capture operation-before state for compensating rollback on restore failure.
 begin_restore_transaction() {
-    local config_backup="$1"
-    local runtime_backup="$2"
-    local transaction_dir=""
-    local route=""
-    local query_status=0
+    local config_backup="$1" runtime_backup="$2" transaction_dir="" route="" query_status=0
 
     install -d -m 0755 "$NETWORK_OPTIMIZE_STATE_DIR" || return 1
     transaction_dir=$(mktemp -d \
@@ -3031,11 +2860,7 @@ begin_restore_transaction() {
 }
 
 restore_captured_default_route() {
-    local transaction_dir="$1"
-    local target_route_file="$2"
-    local current_route=""
-    local expected_route=""
-    local query_status=0
+    local transaction_dir="$1" target_route_file="$2" current_route="" expected_route="" query_status=0
     local -a route_args=()
 
     if [[ -f "$transaction_dir/route" ]]; then
@@ -3070,8 +2895,7 @@ restore_captured_default_route() {
 }
 
 rollback_restore_transaction() {
-    local transaction_dir="$1"
-    local target_route_file="$2"
+    local transaction_dir="$1" target_route_file="$2"
 
     RESTORE_ROLLBACK_FAILED_ITEMS=()
     if ! restore_managed_file \
@@ -3097,10 +2921,8 @@ rollback_restore_transaction() {
 }
 
 restore_optimization() {
-    local scope="${1:-previous}"
-    local config_backup config_absent modules_backup modules_absent
-    local hook_backup hook_absent runtime_backup route_backup route_absent route_owned
-    local transaction_dir
+    local scope="${1:-previous}" config_backup config_absent modules_backup modules_absent
+    local hook_backup hook_absent runtime_backup route_backup route_absent route_owned transaction_dir
     local sysctl_failed="false"
     local -a failed_items=()
     RESTORE_ROLLBACK_FAILED_ITEMS=()
@@ -3223,9 +3045,7 @@ restore_optimization() {
 }
 
 read_sysctl_or() {
-    local key="$1"
-    local fallback="${2:-不可用}"
-    local value
+    local key="$1" fallback="${2:-不可用}" value
 
     if value=$(sysctl -n "$key" 2>/dev/null); then
         printf '%s\n' "${value:-$fallback}"
@@ -3235,10 +3055,7 @@ read_sysctl_or() {
 }
 
 print_sysctl_rows() {
-    local spec
-    local label
-    local key
-    local fallback
+    local spec label key fallback
 
     for spec in "$@"; do
         IFS='|' read -r label key fallback <<< "$spec"
@@ -3247,10 +3064,7 @@ print_sysctl_rows() {
 }
 
 file_handle_status() {
-    local source_file="${NETWORK_OPTIMIZE_FILE_NR:-/proc/sys/fs/file-nr}"
-    local allocated
-    local unused
-    local maximum
+    local source_file="${NETWORK_OPTIMIZE_FILE_NR:-/proc/sys/fs/file-nr}" allocated unused maximum
 
     if read -r allocated unused maximum 2>/dev/null < "$source_file"; then
         printf '%s allocated / %s unused / %s max\n' "$allocated" "$unused" "$maximum"
@@ -3260,16 +3074,8 @@ file_handle_status() {
 }
 
 show_status() {
-    local available_cc
-    local current_cc
-    local current_qdisc
-    local default_iface
-    local active_qdisc
-    local active_qdisc_state_name
-    local active_qdisc_detail
-    local initcwnd_state
-    local initcwnd_state_name
-    local initcwnd_detail
+    local available_cc current_cc current_qdisc default_iface active_qdisc active_qdisc_state_name
+    local active_qdisc_detail initcwnd_state initcwnd_state_name initcwnd_detail
 
     available_cc=$(cat /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null || echo "未知")
     current_cc=$(read_sysctl_or net.ipv4.tcp_congestion_control "未知")
@@ -3431,8 +3237,7 @@ EOF
 }
 
 main() {
-    local required_command
-    local selection_rc=0
+    local required_command selection_rc=0
 
     if ! parse_arguments "$@"; then
         show_help
