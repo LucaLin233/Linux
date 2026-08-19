@@ -134,10 +134,7 @@ for diagnostic_key in \
         fail "status omits read-only diagnostic $diagnostic_key"
 done
 printf 'PASS: status includes read-only kernel capacity diagnostics\n'
-status_output=$(show_status)
-grep -Fq '转发与 RA（只读，本模块不管理）:' <<< "$status_output" ||
-    fail "status does not mark forwarding and RA as unmanaged read-only values"
-printf 'PASS: status labels forwarding and RA as unmanaged read-only values\n'
+show_status >/dev/null || fail "status fails when optional diagnostics are unavailable"
 printf 'PASS: status succeeds when optional diagnostics are unavailable\n'
 
 TUNING_MODE=probe
