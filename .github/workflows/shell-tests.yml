@@ -16,8 +16,13 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Install test dependencies
-        run: sudo apt-get update && sudo apt-get install -y shellcheck jq iproute2 rsync openssh-client
+      - name: Verify test dependencies
+        run: |
+          command -v shellcheck
+          command -v jq
+          command -v ip
+          command -v rsync
+          command -v ssh
 
       - name: Check Bash syntax
         run: find . -type f -name '*.sh' -print0 | xargs -0 -n1 bash -n
