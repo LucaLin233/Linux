@@ -42,8 +42,8 @@ jobs:
       - name: Install test dependencies
         run: |
           apt-get update
-          DEBIAN_FRONTEND=noninteractive apt-get install -y \
-            bash ca-certificates coreutils git iproute2 jq openssh-client rsync util-linux
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            ca-certificates git iproute2 jq openssh-client rsync
 
       - uses: actions/checkout@v7
 
