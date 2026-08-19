@@ -64,16 +64,50 @@ assert_eq "268435456" "$(calculate_memory_cap 16384)" \
 assert_eq "2097152" "$TCP_BUFFER_DEFAULT_BYTES" \
     "TCP receive and send defaults stay fixed at 2 MiB"
 (
+    mock_page_size=4096
     getconf() {
         [[ "$1" == "PAGESIZE" ]] || return 1
-        printf '%s\n' 4096
+        printf '%s\n' "$mock_page_size"
     }
-    assert_eq '16384 32768 65536' "$(calculate_tcp_mem 1024)" \
-        "1 GiB RAM derives tcp_mem at 1/16, 1/8, and 1/4"
-    assert_eq '8192 16384 32768' "$(calculate_tcp_mem 512)" \
-        "512 MiB RAM derives tcp_mem pages"
     assert_eq '4096 8192 16384' "$(calculate_tcp_mem 128)" \
-        "128 MiB RAM keeps tcp_mem page floors"
+        "128 MiB RAM keeps tcp_mem byte floors with 4 KiB pages"
+    assert_eq '8192 16384 32768' "$(calculate_tcp_mem 512)" \
+        "512 MiB RAM derives tcp_mem with 4 KiB pages"
+    assert_eq '16384 32768 65536' "$(calculate_tcp_mem 1024)" \
+        "1 GiB RAM derives tcp_mem with 4 KiB pages"
+    assert_eq '16.0 MiB / 32.0 MiB / 64.0 MiB' \
+        "$(format_tcp_mem_bytes '4096 8192 16384')" \
+        "4 KiB tcp_mem floors display fixed MiB values"
+
+    mock_page_size=16384
+    assert_eq '1024 2048 4096' "$(calculate_tcp_mem 128)" \
+        "128 MiB RAM keeps tcp_mem byte floors with 16 KiB pages"
+    assert_eq '16.0 MiB / 32.0 MiB / 64.0 MiB' \
+        "$(format_tcp_mem_bytes '1024 2048 4096')" \
+        "16 KiB tcp_mem floors display fixed MiB values"
+
+    mock_page_size=65536
+    assert_eq '256 512 1024' "$(calculate_tcp_mem 128)" \
+        "128 MiB RAM keeps tcp_mem byte floors with 64 KiB pages"
+    assert_eq '512 1024 2048' "$(calculate_tcp_mem 512)" \
+        "512 MiB RAM derives tcp_mem with 64 KiB pages"
+    assert_eq '1024 2048 4096' "$(calculate_tcp_mem 1024)" \
+        "1 GiB RAM derives tcp_mem with 64 KiB pages"
+    assert_eq '16.0 MiB / 32.0 MiB / 64.0 MiB' \
+        "$(format_tcp_mem_bytes '256 512 1024')" \
+        "64 KiB tcp_mem floors display fixed MiB values"
+    assert_eq '32.0 MiB / 64.0 MiB / 128.0 MiB' \
+        "$(format_tcp_mem_bytes '512 1024 2048')" \
+        "64 KiB 512 MiB ratios display expected MiB values"
+    assert_eq '64.0 MiB / 128.0 MiB / 256.0 MiB' \
+        "$(format_tcp_mem_bytes '1024 2048 4096')" \
+        "64 KiB 1 GiB ratios display expected MiB values"
+
+    read -r low pressure maximum <<< "$(calculate_tcp_mem 128)"
+    (( low > 0 && low < pressure && pressure < maximum )) ||
+        fail "tcp_mem values are not strictly increasing"
+    printf 'PASS: tcp_mem values are strictly increasing\n'
+
     assert_fail "zero RAM is rejected for tcp_mem" calculate_tcp_mem 0
     assert_fail "non-numeric RAM is rejected for tcp_mem" calculate_tcp_mem invalid
 )

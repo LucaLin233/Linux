@@ -674,6 +674,8 @@ calculate_memory_cap() {
 
 calculate_tcp_mem() {
     local ram_mb="$1" page_size total_pages low pressure maximum
+    local low_floor pressure_floor maximum_floor
+    local mib=$((1024 * 1024))
 
     is_positive_integer "$ram_mb" 1 1073741824 || return 1
     page_size=$(getconf PAGESIZE 2>/dev/null) || return 1
@@ -686,12 +688,15 @@ calculate_tcp_mem() {
     low=$((total_pages / 16))
     pressure=$((total_pages / 8))
     maximum=$((total_pages / 4))
-    (( low >= 4096 )) || low=4096
-    (( pressure >= 8192 )) || pressure=8192
-    (( maximum >= 16384 )) || maximum=16384
-    (( pressure > low )) || pressure=$((low + 1))
-    (( maximum > pressure )) || maximum=$((pressure + 1))
-    (( low > 0 && pressure > 0 && maximum > 0 )) || return 1
+    low_floor=$(((16 * mib + page_size - 1) / page_size))
+    pressure_floor=$(((32 * mib + page_size - 1) / page_size))
+    maximum_floor=$(((64 * mib + page_size - 1) / page_size))
+    (( low >= low_floor )) || low=$low_floor
+    (( pressure >= pressure_floor )) || pressure=$pressure_floor
+    (( maximum >= maximum_floor )) || maximum=$maximum_floor
+    (( low > 0 )) || return 1
+    (( low < pressure )) || return 1
+    (( pressure < maximum )) || return 1
 
     printf '%s %s %s\n' "$low" "$pressure" "$maximum"
 }

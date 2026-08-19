@@ -240,8 +240,9 @@ bash <(curl -fsSL "$RAW_BASE/network-optimize.sh") help
 网络模块默认面向同时承载 TCP、UDP 与 Docker 流量的代理节点：连接队列使用
 `somaxconn=65535`、`tcp_max_syn_backlog=16384`。基础内存模型兼容 tcpfit v0.5.6 的 mixed role：
 TCP 与 core socket default 固定为 2 MiB，长流继续依赖 autotuning；core default 同时影响 TCP、
-UDP 和其他未显式设置缓冲区的 socket。`tcp_mem` 的 low/pressure/max 以 pages 为单位，按有效
-RAM（物理 RAM 与当前轻量 cgroup 根限制的较小值）的 1/16、1/8、1/4 推导并设置安全下限。
+UDP 和其他未显式设置缓冲区的 socket。`tcp_mem` 的 low/pressure/max 比例值按有效 RAM
+（物理 RAM 与当前轻量 cgroup 根限制的较小值）的 1/16、1/8、1/4 推导；低内存 floor 固定为
+16/32/64 MiB，最终写入 sysctl 时转换为当前内核 page 数，不假设 page size 固定为 4 KiB。
 
 动态 socket 最大值仍按 `2 × BDP + 2 MiB` 计算，并受有效 RAM / 32 限制；RAM cap 最低
 8 MiB、最高 256 MiB，动态最大值另保留 4 MiB 绝对下限。下游继续保留严格应用与验证事务、
