@@ -4,7 +4,7 @@
 # linux-setup:depends=
 # linux-setup:enabled=true
 # 网络优化模块
-# TCP 调优仅覆盖 IPv4；forwarding/RA 仅在 status 中只读显示。
+# TCP 调优仅覆盖 IPv4。
 # 基础调优移植或参考 Kylin010/tcpfit v0.5.6（MIT，提交 67c0bdfb35dd98e86982600298237b6ecc08ebe4）。
 # 事务备份、交互与验证为本仓库下游扩展。
 # 功能：配置 BBR、fq 与 TCP 缓冲区；主动探测必须明确选择。
@@ -2648,19 +2648,6 @@ EOF
     chmod 644 "$target_file"
 }
 
-managed_config_has_retired_forwarding() {
-    [[ -f "$NETWORK_CONF" ]] || return 1
-    grep -Fq '# 由 network-optimize.sh 自动生成。' "$NETWORK_CONF" || return 1
-    grep -Eq '^[[:space:]]*net\.(ipv4\.ip_forward|ipv6\.conf\.[^.]+\.(accept_ra|forwarding))[[:space:]]*=' \
-        "$NETWORK_CONF"
-}
-
-warn_retired_forwarding_management() {
-    managed_config_has_retired_forwarding || return 0
-    warn "已停止持久管理 IPv4/IPv6 forwarding 与 RA；当前运行值保持不变。"
-    warn "后续值由系统、网络管理器或其他 sysctl 配置决定。"
-}
-
 prepare_legacy_backup_state() {
     # 旧版没有 absent 标记。检测到脚本生成的现有文件时，无法证明它在
     # 第一次运行前是否存在，因此标记 unknown，绝不把当前受管状态冒充初始状态。
@@ -2920,18 +2907,10 @@ install_optimization() {
         return 1
     }
 
-    if [[ -f "$NETWORK_CONF" ]] &&
-        grep -Fq '# 由 network-optimize.sh 自动生成。' "$NETWORK_CONF"; then
-        capture_runtime_values_from_files \
-            "$runtime_backup" "$temp_config" "$NETWORK_CONF" || {
-            rm -f "$temp_config" "$runtime_backup"
-            return 1
-        }
-    elif ! capture_runtime_values "$temp_config" "$runtime_backup"; then
+    if ! capture_runtime_values "$temp_config" "$runtime_backup"; then
         rm -f "$temp_config" "$runtime_backup"
         return 1
     fi
-    warn_retired_forwarding_management
     prepare_legacy_backup_state
 
     install -d -m 0755 "$NETWORK_OPTIMIZE_STATE_DIR"
@@ -3327,13 +3306,10 @@ show_status() {
     print_sysctl_rows "TCP Fast Open|net.ipv4.tcp_fastopen|未知"
 
     echo
-    echo "转发与 RA（只读，本模块不管理）:"
+    echo "兼容性诊断（只读）:"
     print_sysctl_rows \
-        "IPv4 转发|net.ipv4.ip_forward|未知" \
         "rp_filter(all)|net.ipv4.conf.all.rp_filter|未知" \
-        "rp_filter(default)|net.ipv4.conf.default.rp_filter|未知" \
-        "IPv6 转发|net.ipv6.conf.all.forwarding|不可用" \
-        "IPv6 RA(all)|net.ipv6.conf.all.accept_ra|不可用"
+        "rp_filter(default)|net.ipv4.conf.default.rp_filter|未知"
     echo "  route_localnet: 未由本模块配置"
     echo "  MPTCP: 未由本模块配置"
 
@@ -3433,7 +3409,7 @@ verify 选项：
   - 只有 --probe 或交互确认后才主动探测并安装缺失依赖
   - 探测失败时，交互终端转为手填；非交互终端在写配置、sysctl 或路由前失败
   - 自动探测仅测量 IPv4 公网带宽，使用公共 iperf3 与 Cloudflare
-  - TCP 调优仅覆盖 IPv4；forwarding 与 RA 只读显示，不由本模块配置
+  - TCP 调优仅覆盖 IPv4
   - 自动测速在单方向 40 GB 或合计 85 GB 时提前停止，硬上限仍为 45/90 GB
   - 流量按实际 IPv4 测速目标的路由接口分别计量并汇总，接口计数包含后台流量
   - 默认不持久管理 ECN；只在传入 --disable-ecn 时写入 tcp_ecn=0

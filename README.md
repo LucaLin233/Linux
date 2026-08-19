@@ -78,7 +78,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/linux_
 | ---: | --- | --- | --- |
 | 1 | `system-optimize.sh` | Zram、系统 sysctl、journald、THP、时区和 Chrony | 为 headless VPS 设置 Panic 恢复、日志上限和低干扰 THP 策略；Ubuntu 可能安装内核模块、固件与 CPU 微码 |
 | 2 | `system-customize.sh` | 动态 MOTD、中文 Locale、可选 XanMod | 可能修改 Locale、欢迎信息和内核 |
-| 3 | `network-optimize.sh` | BBR、fq、按需禁用 ECN、动态 TCP/UDP 缓冲区 | 交互时先询问是否测速，拒绝后手填带宽；单方向 40 GB 或合计 85 GB 时提前停止；只读显示 forwarding/RA，不代管转发 |
+| 3 | `network-optimize.sh` | BBR、fq、按需禁用 ECN、动态 TCP/UDP 缓冲区 | 交互时先询问是否测速，拒绝后手填带宽；单方向 40 GB 或合计 85 GB 时提前停止 |
 | 4 | `zsh-setup.sh` | Zsh、Oh My Zsh、Powerlevel10k 和插件 | 备份后重写 root 的 `.zshrc`，可修改默认 Shell |
 | 5 | `mise-setup.sh` | Mise、Python、Node.js 和依赖迁移 | 配置 Shell 集成及每周 Mise 自动更新 |
 | 6 | `tools-setup.sh` | NextTrace、Speedtest、htop、jq、tree 等 | 可能添加 NextTrace 第三方 APT 源 |
@@ -222,8 +222,6 @@ bash <(curl -fsSL "$RAW_BASE/network-optimize.sh") help
 `initcwnd` 默认为 `auto`：已知上传带宽不高于 100 Mbps 时保留内核默认，否则在默认路由设置 `initcwnd/initrwnd=32`；`--enable-initcwnd` 和 `--disable-initcwnd` 可显式覆盖。`status` 同时检查 ownership marker 与真实默认路由，并把 marker/路由不一致报告为漂移；也会区分 `default qdisc` 和默认出口实际 `active qdisc`，能识别 root `fq`、`mq` + 全 `fq` leaves、`htb` + 全 `fq` leaves，以及混合或不可读状态。`verify` 自动选择附近公共 iperf3 对端和可用端口，只有交互确认或非交互显式 `--yes` 后才测试；比较 1 流与 4 流 sender/receiver goodput、重传率和 CPU，并报告测试期间 softnet、网卡丢包/错误、全机 TCP 重传及可用的驱动 allowance 增量。全程不修改 sysctl、路由或 qdisc，也不自动安装依赖。
 
 默认不写入 `net.ipv4.tcp_ecn`；只有显式传入 `--disable-ecn` 时才持久写入 `0`。
-
-网络模块不再持久或运行时修改 IPv4/IPv6 forwarding 与 RA；`status` 仅只读显示这些值。升级时，旧受管配置中的相关行会从新配置自然移除，但当前运行值保持不变，直到重启、网络管理器或其他 sysctl 配置接管。Docker、NAT、VPN、Tailscale exit node、WireGuard 路由和 IPv6 路由环境必须由对应组件显式配置转发。`restore previous` 仍可显式恢复含旧 forwarding/RA 行的上次配置；模块不会自动恢复旧运行行为。
 
 网络模块默认面向同时承载 TCP、UDP 与 Docker 流量的代理节点：连接队列使用
 `somaxconn=65535`、`tcp_max_syn_backlog=16384`，TCP 缓冲起点固定为 2 MiB，长流继续依赖
@@ -430,16 +428,14 @@ sudo bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/t
 | 仅安装 XanMod | `xanmod-install.sh` | 同时让多个脚本反复管理内核源 |
 
 `network-optimize.sh` 与 `traffic-shape.sh` 职责不同，可以配合：前者管理 BBR、缓冲区、默认
-`fq` 和按内核能力启用的 TCP 参数，只读显示 IPv4/IPv6 forwarding 与 RA。转发应由 Docker、
-NAT、VPN、路由器、网络管理器或独立 sysctl 配置负责。后者在确实检测到 policer 后才使用 HTB
-控制聚合出口速率，并保留 fq 叶子 pacing。
+`fq` 和按内核能力启用的 TCP 参数；后者在确实检测到 policer 后才使用 HTB 控制聚合出口速率，
+并保留 fq 叶子 pacing。
 
 ## 高风险提醒
 
 - **SSH**：修改端口或认证前，先放行云安全组/防火墙，并保持当前会话直到新连接验证成功；
 - **自动更新**：系统或内核更新后可能自动重启；
 - **系统优化**：首次写入 journald 限额时会重启 `systemd-journald`，并设置 Kernel Panic 30 秒后重启；
-- **转发职责**：网络模块不代管 forwarding/RA；重启后 Docker、NAT、VPN、Tailscale exit node、WireGuard 或 IPv6 路由所需转发必须由对应组件显式启用；
 - **网络测速**：`network-optimize` 和 tcshape 都可能产生大量流量；
 - **qdisc**：不要叠加多个整形工具；tcshape 遇到高级或未知 qdisc 会拒绝覆盖；
 - **内核**：安装新内核前确认磁盘空间、架构和可用的旧内核；
