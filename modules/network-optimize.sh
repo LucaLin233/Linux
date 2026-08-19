@@ -2170,9 +2170,7 @@ show_tuning_plan() {
     echo "下载带宽: ${DETECTED_DOWNLOAD_MBPS:-未知} Mbps"
     echo "上传带宽: ${DETECTED_UPLOAD_MBPS:-未知} Mbps"
     echo "带宽来源: $BANDWIDTH_SOURCE"
-    echo "计算 RTT: ${DETECTED_RTT_MS:-未知} ms"
-    echo "RTT 来源: $RTT_SOURCE"
-    echo "RTT 策略: $RTT_POLICY"
+    format_rtt_selection_summary
     echo "接收 BDP: $((RX_BDP_BYTES / 1024)) KiB"
     echo "发送 BDP: $((TX_BDP_BYTES / 1024)) KiB"
     echo "rmem_max: $(format_buffer_size "$RMEM_MAX_BYTES")"
@@ -2293,55 +2291,57 @@ format_nic_allowance_delta() {
     fi
 }
 
-format_verify_health_delta() {
-    local before="$1" after="$2" allowance_before="$3" allowance_after="$4"
+health_delta() {
+    local before="$1" after="$2" value
     local b_drop b_squeeze b_rxerr b_txerr b_rxdrop b_txdrop b_retrans _ b_rxpkt b_txpkt
     local a_drop a_squeeze a_rxerr a_txerr a_rxdrop a_txdrop a_retrans a_limited a_rxpkt a_txpkt
-    local delta_drop delta_squeeze delta_rxerr delta_txerr delta_rxdrop delta_txdrop
-    local delta_retrans delta_rxpkt delta_txpkt delta_packets health value
 
     read -r b_drop b_squeeze b_rxerr b_txerr b_rxdrop b_txdrop b_retrans _ b_rxpkt b_txpkt <<< "$before"
     read -r a_drop a_squeeze a_rxerr a_txerr a_rxdrop a_txdrop a_retrans a_limited a_rxpkt a_txpkt <<< "$after"
     for value in "$b_drop" "$b_squeeze" "$b_rxerr" "$b_txerr" "$b_rxdrop" "$b_txdrop" \
         "$b_retrans" "$b_rxpkt" "$b_txpkt" "$a_drop" "$a_squeeze" "$a_rxerr" \
         "$a_txerr" "$a_rxdrop" "$a_txdrop" "$a_retrans" "$a_limited" "$a_rxpkt" "$a_txpkt"; do
-        [[ "$value" =~ ^[0-9]+$ ]] || {
-            printf '网络健康：计数器不可读，无法计算 verify 增量\n'
-            format_nic_allowance_delta "$allowance_before" "$allowance_after"
-            return 0
-        }
+        [[ "$value" =~ ^[0-9]+$ ]] || { printf '%s\n' unreadable; return; }
     done
     if (( a_drop < b_drop || a_squeeze < b_squeeze || a_rxerr < b_rxerr ||
           a_txerr < b_txerr || a_rxdrop < b_rxdrop || a_txdrop < b_txdrop ||
           a_retrans < b_retrans || a_rxpkt < b_rxpkt || a_txpkt < b_txpkt )); then
-        printf '网络健康：测试期间计数器重置，无法计算可靠增量\n'
+        printf '%s\n' reset
+        return
+    fi
+    printf 'ok %s %s %s %s %s %s %s %s %s %s\n' \
+        "$((a_drop - b_drop))" "$((a_squeeze - b_squeeze))" \
+        "$((a_rxerr - b_rxerr))" "$((a_txerr - b_txerr))" \
+        "$((a_rxdrop - b_rxdrop))" "$((a_txdrop - b_txdrop))" \
+        "$((a_retrans - b_retrans))" "$a_limited" \
+        "$((a_rxpkt - b_rxpkt))" "$((a_txpkt - b_txpkt))"
+}
+
+format_verify_health_delta() {
+    local before="$1" after="$2" allowance_before="$3" allowance_after="$4"
+    local status delta_drop delta_squeeze delta_rxerr delta_txerr delta_rxdrop delta_txdrop
+    local delta_retrans limited delta_rxpkt delta_txpkt delta_packets health
+
+    read -r status delta_drop delta_squeeze delta_rxerr delta_txerr delta_rxdrop delta_txdrop \
+        delta_retrans limited delta_rxpkt delta_txpkt <<< "$(health_delta "$before" "$after")"
+    if [[ "$status" != "ok" ]]; then
+        [[ "$status" == "reset" ]] &&
+            printf '网络健康：测试期间计数器重置，无法计算可靠增量\n' ||
+            printf '网络健康：计数器不可读，无法计算 verify 增量\n'
         format_nic_allowance_delta "$allowance_before" "$allowance_after"
         return 0
     fi
 
-    delta_drop=$((a_drop - b_drop))
-    delta_squeeze=$((a_squeeze - b_squeeze))
-    delta_rxerr=$((a_rxerr - b_rxerr))
-    delta_txerr=$((a_txerr - b_txerr))
-    delta_rxdrop=$((a_rxdrop - b_rxdrop))
-    delta_txdrop=$((a_txdrop - b_txdrop))
-    delta_retrans=$((a_retrans - b_retrans))
-    delta_rxpkt=$((a_rxpkt - b_rxpkt))
-    delta_txpkt=$((a_txpkt - b_txpkt))
     delta_packets=$((delta_rxpkt + delta_txpkt))
     health=$(classify_network_health "$delta_drop" "$delta_squeeze" \
-        "$((delta_rxerr + delta_txerr))" "$((delta_rxdrop + delta_txdrop))" \
-        "$delta_packets")
-
+        "$((delta_rxerr + delta_txerr))" "$((delta_rxdrop + delta_txdrop))" "$delta_packets")
     printf '系统计数增量：softnet_dropped +%s / time_squeeze +%s / 全机 TCP 重传 +%s\n' \
         "$delta_drop" "$delta_squeeze" "$delta_retrans"
     printf '网卡计数增量：drops rx +%s tx +%s / errors rx +%s tx +%s / packets rx +%s tx +%s\n' \
-        "$delta_rxdrop" "$delta_txdrop" "$delta_rxerr" "$delta_txerr" \
-        "$delta_rxpkt" "$delta_txpkt"
-    printf '网络健康：%s；当前受限 socket %s\n' "$health" "$a_limited"
+        "$delta_rxdrop" "$delta_txdrop" "$delta_rxerr" "$delta_txerr" "$delta_rxpkt" "$delta_txpkt"
+    printf '网络健康：%s；当前受限 socket %s\n' "$health" "$limited"
     format_nic_allowance_delta "$allowance_before" "$allowance_after"
 }
-
 show_verify_health_since() {
     local health_before="$1" allowance_before="$2" health_after allowance_after
 
@@ -2357,26 +2357,22 @@ format_rtt_selection_summary() {
 }
 
 show_install_summary() {
-    local before="$1" bbr_enabled="$2" after
-    local b_drop b_squeeze b_rxerr b_txerr b_rxdrop b_txdrop b_retrans _ b_rxpkt b_txpkt
-    local a_drop a_squeeze a_rxerr a_txerr a_rxdrop a_txdrop a_retrans a_limited a_rxpkt a_txpkt
-    local delta_drop delta_squeeze delta_rxerr delta_txerr delta_rxdrop delta_txdrop delta_packets health
+    local before="$1" bbr_enabled="$2" after status delta_drop delta_squeeze delta_rxerr delta_txerr
+    local delta_rxdrop delta_txdrop delta_retrans limited delta_rxpkt delta_txpkt delta_packets health
     local algorithm="当前拥塞控制" qdisc_state qdisc_detail
 
     after=$(network_health_snapshot "$PROBE_IFACE")
-    read -r b_drop b_squeeze b_rxerr b_txerr b_rxdrop b_txdrop b_retrans _ b_rxpkt b_txpkt <<< "$before"
-    read -r a_drop a_squeeze a_rxerr a_txerr a_rxdrop a_txdrop a_retrans a_limited a_rxpkt a_txpkt <<< "$after"
-    delta_drop=$((a_drop - b_drop))
-    delta_squeeze=$((a_squeeze - b_squeeze))
-    delta_rxerr=$((a_rxerr - b_rxerr))
-    delta_txerr=$((a_txerr - b_txerr))
-    delta_rxdrop=$((a_rxdrop - b_rxdrop))
-    delta_txdrop=$((a_txdrop - b_txdrop))
-    delta_packets=$((a_rxpkt - b_rxpkt + a_txpkt - b_txpkt))
-    (( delta_packets < 0 )) && delta_packets=0
-    health=$(classify_network_health \
-        "$delta_drop" "$delta_squeeze" "$((delta_rxerr + delta_txerr))" \
-        "$((delta_rxdrop + delta_txdrop))" "$delta_packets")
+    read -r status delta_drop delta_squeeze delta_rxerr delta_txerr delta_rxdrop delta_txdrop \
+        delta_retrans limited delta_rxpkt delta_txpkt <<< "$(health_delta "$before" "$after")"
+    if [[ "$status" == "ok" ]]; then
+        delta_packets=$((delta_rxpkt + delta_txpkt))
+        health=$(classify_network_health "$delta_drop" "$delta_squeeze" \
+            "$((delta_rxerr + delta_txerr))" "$((delta_rxdrop + delta_txdrop))" "$delta_packets")
+    else
+        health=$([[ "$status" == "reset" ]] && echo "计数器已重置" || echo "计数器不可读")
+        delta_retrans="?"
+        limited="?"
+    fi
     [[ "$bbr_enabled" == "true" ]] && algorithm="BBR"
     IFS='|' read -r qdisc_state qdisc_detail <<< \
         "$(active_qdisc_state "${PROBE_IFACE:-}")"
@@ -2391,7 +2387,7 @@ show_install_summary() {
     printf '缓冲：TCP 起点 %s / 最大 %s\n' \
         "$(format_buffer_size "$WMEM_DEFAULT_BYTES")" "$(format_buffer_size "$WMEM_MAX_BYTES")"
     printf '网络健康：%s；TCP 重传新增 %s；受限 socket %s\n' \
-        "$health" "$((a_retrans - b_retrans))" "$a_limited"
+        "$health" "$delta_retrans" "$limited"
     printf '应用：%s + ECN %s，配置成功；fq %s\n' \
         "$algorithm" "$([[ "$ECN_DISABLED" == "true" ]] && echo 已禁用 || echo 未接管)" \
         "$(format_qdisc_state "$qdisc_state" "$qdisc_detail")"
