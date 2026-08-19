@@ -55,7 +55,8 @@ readonly TRAFFIC_TOTAL_LIMIT_BYTES=25000000000
 readonly TRAFFIC_DIRECTION_LIMIT_BYTES=12500000000
 readonly CACHE_FRESH_MAX_AGE_SECONDS=$((7 * 24 * 60 * 60))
 readonly CACHE_STALE_MAX_AGE_SECONDS=$((30 * 24 * 60 * 60))
-readonly CACHE_FORMAT_VERSION=1
+readonly CACHE_FORMAT_VERSION=2
+readonly MEASUREMENT_ROUTE_PROBE_TARGET="1.1.1.1"
 
 # 公共节点参考 tcpfit，覆盖常见 VPS 机房区域。端口范围为 5201–5210，并兼容 5200。
 readonly IPERF_PEER_POOL='speedtest.hkg12.hk.leaseweb.net|香港|Leaseweb
@@ -89,6 +90,7 @@ RESTORE_SCOPE="previous"
 TUNING_MODE=""
 TUNING_SELECTION_EXPLICIT="false"
 AUTO_MODE_REQUESTED="false"
+FORCE_REFRESH="false"
 INITCWND_MODE="auto"
 INITCWND_ENABLED="true"
 INITCWND_POLICY="unknown"
@@ -113,6 +115,7 @@ MEASUREMENT_CONFIDENCE="unknown"
 MEASUREMENT_WARNINGS=""
 MEASUREMENT_ROUTE_TARGET=""
 MEASUREMENT_ROUTE_IDENTITY=""
+MEASUREMENT_CACHE_PENDING="false"
 PHYSICAL_RAM_MB=0
 RAM_MB=0
 MEMORY_CAP_BYTES=0
@@ -133,7 +136,10 @@ declare -A TRAFFIC_TX_START_BY_IFACE=()
 # PID arrays are accessed through namerefs.
 # shellcheck disable=SC2034
 declare -a IPERF_RUNNER_PIDS=()
-declare -a INITCWND_ROLLBACK_FAILED_ITEMS=()
+declare -a PROBE_TEMP_PATHS=()
+declare -a INSTALL_ROLLBACK_FAILED_ITEMS=()
+IPERF_TEST_RESULT=""
+RANKED_IPERF_PEERS=""
 PREFERRED_IPERF_PORT=""
 
 # === 日志函数 ===
@@ -175,7 +181,8 @@ detail() {
     if [[ "${DEBUG:-}" == "1" ]]; then
         info "$message"
     elif [[ -w "$NETWORK_DETAIL_LOG" || ( ! -e "$NETWORK_DETAIL_LOG" && -w "$(dirname "$NETWORK_DETAIL_LOG")" ) ]]; then
-        printf '%s network-optimize: %s\n' "$(date '+%F %T')" "$message" >> "$NETWORK_DETAIL_LOG"
+        printf '%s network-optimize: %s\n' "$(date '+%F %T')" "$message" \
+            2>/dev/null >> "$NETWORK_DETAIL_LOG" || true
     fi
 }
 
@@ -446,6 +453,11 @@ parse_arguments() {
                 AUTO_MODE_REQUESTED="true"
                 shift
                 ;;
+            --refresh)
+                FORCE_REFRESH="true"
+                TUNING_SELECTION_EXPLICIT="true"
+                shift
+                ;;
             --bandwidth-mbps|--download-mbps|--upload-mbps|--rtt-ms)
                 if (( $# < 2 )); then
                     error "参数 $1 缺少值"
@@ -517,6 +529,11 @@ parse_arguments() {
     if [[ "$AUTO_MODE_REQUESTED" == "true" ]] &&
         [[ -n "$MANUAL_BANDWIDTH_MBPS$MANUAL_DOWNLOAD_MBPS$MANUAL_UPLOAD_MBPS" ]]; then
         error "--auto 不能与手动带宽参数同时使用"
+        return 1
+    fi
+
+    if [[ "$FORCE_REFRESH" == "true" && "$AUTO_MODE_REQUESTED" != "true" ]]; then
+        error "--refresh 必须与 --auto 同时使用"
         return 1
     fi
 
@@ -662,6 +679,41 @@ cleanup_temp_dir() {
         rm -f "$file"
     done
     rmdir "$directory" 2>/dev/null || true
+}
+
+register_probe_temp_path() {
+    PROBE_TEMP_PATHS+=("$1")
+}
+
+unregister_probe_temp_path() {
+    local wanted="$1" path
+    local -a remaining=()
+
+    for path in "${PROBE_TEMP_PATHS[@]}"; do
+        [[ "$path" == "$wanted" ]] || remaining+=("$path")
+    done
+    PROBE_TEMP_PATHS=("${remaining[@]}")
+}
+
+cleanup_probe_temp_paths() {
+    local path
+    local -a paths=("${PROBE_TEMP_PATHS[@]}")
+
+    for path in "${paths[@]}"; do
+        if [[ -d "$path" ]]; then
+            cleanup_temp_dir "$path"
+        else
+            rm -f -- "$path"
+        fi
+        unregister_probe_temp_path "$path"
+    done
+}
+
+remove_probe_temp_path() {
+    local path="$1"
+
+    rm -f -- "$path"
+    unregister_probe_temp_path "$path"
 }
 
 measure_ping_target() {
@@ -1062,11 +1114,11 @@ apply_initcwnd() {
             return 1
         fi
         if [[ -z "$route" ]]; then
-            success "已移除 initcwnd 持久化状态；当前没有 IPv4 默认路由需要清理"
+            info "已移除 initcwnd 持久化状态；当前没有 IPv4 默认路由需要清理"
         elif [[ -n "$clean" ]]; then
-            success "已移除本脚本设置的 initcwnd/initrwnd，恢复内核默认值"
+            info "已移除本脚本设置的 initcwnd/initrwnd，恢复内核默认值"
         else
-            success "已清理本脚本 initcwnd ownership 状态；路由已使用内核默认值"
+            info "已清理本脚本 initcwnd ownership 状态；路由已使用内核默认值"
         fi
         return 0
     fi
@@ -1093,9 +1145,9 @@ apply_initcwnd() {
         return 1
     fi
     if is_managed_initcwnd_hook; then
-        success "默认路由已设置 initcwnd/initrwnd = 32，并通过 networkd-dispatcher 持久化"
+        info "默认路由已设置 initcwnd/initrwnd = 32，并通过 networkd-dispatcher 持久化"
     else
-        success "默认路由已设置 initcwnd/initrwnd = 32（当前系统没有可用持久化钩子）"
+        info "默认路由已设置 initcwnd/initrwnd = 32（当前系统没有可用持久化钩子）"
     fi
 }
 
@@ -1246,15 +1298,24 @@ unregister_tracked_pid() {
 }
 
 terminate_recorded_pid() {
-    local pid="$1" kill_after="${2:-$IPERF_KILL_AFTER_SECONDS}" attempt
+    local pid="$1" kill_after="${2:-$IPERF_KILL_AFTER_SECONDS}" attempt state=""
+    local running="true"
 
     [[ "$pid" =~ ^[0-9]+$ ]] || return 0
     kill -TERM "$pid" 2>/dev/null || true
     for ((attempt = 0; attempt < kill_after * 10; attempt++)); do
-        kill -0 "$pid" 2>/dev/null || break
+        if ! kill -0 "$pid" 2>/dev/null; then
+            running="false"
+            break
+        fi
+        state=$(awk '{print $3}' "/proc/$pid/stat" 2>/dev/null || true)
+        if [[ "$state" == "Z" ]]; then
+            running="false"
+            break
+        fi
         sleep 0.1
     done
-    kill -KILL "$pid" 2>/dev/null || true
+    [[ "$running" != "true" ]] || kill -KILL "$pid" 2>/dev/null || true
     wait "$pid" 2>/dev/null || true
 }
 
@@ -1272,6 +1333,7 @@ cleanup_tracked_pids() {
 
 cleanup_probe_processes() {
     cleanup_tracked_pids IPERF_RUNNER_PIDS
+    cleanup_probe_temp_paths
 }
 
 run_iperf_runner() {
@@ -1325,6 +1387,7 @@ rank_iperf_peers() {
 
     command -v ping >/dev/null 2>&1 || return 1
     temp_dir=$(mktemp -d) || return 1
+    register_probe_temp_path "$temp_dir"
 
     while IFS='|' read -r host location provider; do
         [[ -n "$host" ]] || continue
@@ -1332,6 +1395,7 @@ rank_iperf_peers() {
         (
             peer_ip=$(resolve_ipv4 "$host" || true)
             [[ -n "$peer_ip" ]] || exit 0
+            measurement_peer_route_matches "$peer_ip" || exit 0
             local_rtt=$(measure_ping_target "$peer_ip" || true)
             [[ -n "$local_rtt" ]] &&
                 printf '%s|%s|%s|%s|%s\n' \
@@ -1341,11 +1405,12 @@ rank_iperf_peers() {
     done <<< "$IPERF_PEER_POOL"
     wait || true
 
-    for file in "$temp_dir"/*; do
+    RANKED_IPERF_PEERS=$(for file in "$temp_dir"/*; do
         [[ -s "$file" ]] || continue
         cat "$file"
-    done | sort -t '|' -k1,1n
+    done | sort -t '|' -k1,1n)
     cleanup_temp_dir "$temp_dir"
+    unregister_probe_temp_path "$temp_dir"
 }
 
 tcp_port_open() {
@@ -1357,24 +1422,26 @@ run_iperf_test() {
     local host="$1" port="$2" direction="$3" output stats rc=0 reverse_mode="false"
     local receiver retransmits retransmit_percent cpu remote_cpu
 
+    IPERF_TEST_RESULT=""
     [[ "$direction" == "download" ]] && reverse_mode="true"
     output=$(mktemp) || return 1
+    register_probe_temp_path "$output"
     run_iperf_runner "$output" "$host" "$port" "$IPERF_DURATION" \
         "$IPERF_PARALLEL" "$direction" "$reverse_mode" || rc=$?
     if (( rc != 0 )); then
-        rm -f "$output"
+        remove_probe_temp_path "$output"
         return "$rc"
     fi
     stats=$(parse_iperf_metrics "$output") || {
-        rm -f "$output"
+        remove_probe_temp_path "$output"
         return 1
     }
-    rm -f "$output"
+    remove_probe_temp_path "$output"
     IFS='|' read -r _ receiver retransmits retransmit_percent cpu remote_cpu <<< "$stats"
 
     # goodput、CPU、重传与 loss 全部取自同一份完整 JSON 结果。
-    printf '%s|%s|%s|%s\n' \
-        "$receiver" "$cpu" "$retransmits" "$retransmit_percent"
+    IPERF_TEST_RESULT=$(printf '%s|%s|%s|%s\n' \
+        "$receiver" "$cpu" "$retransmits" "$retransmit_percent")
 }
 
 format_cpu_percent() {
@@ -1434,6 +1501,7 @@ add_measurement_warning() {
     [[ -n "$message" ]] || return 0
     if [[ "; $MEASUREMENT_WARNINGS; " != *"; $message; "* ]]; then
         MEASUREMENT_WARNINGS="${MEASUREMENT_WARNINGS:+$MEASUREMENT_WARNINGS; }$message"
+        detail "measurement warning: $message"
     fi
     MEASUREMENT_CONFIDENCE="low"
 }
@@ -1465,6 +1533,28 @@ route_identity_for_target() {
     printf '%s|%s|%s|%s\n' "$ifindex" "$iface" "$gateway" "$source"
 }
 
+validate_measurement_route() {
+    local current_identity
+
+    [[ "$TUNING_MODE" == "manual" ]] && return 0
+    [[ "$TUNING_MODE" == "auto" ]] || return 1
+    [[ "$MEASUREMENT_ROUTE_TARGET" == "$MEASUREMENT_ROUTE_PROBE_TARGET" ]] || return 1
+    [[ -n "$MEASUREMENT_ROUTE_IDENTITY" ]] || return 1
+    current_identity=$(route_identity_for_target "$MEASUREMENT_ROUTE_TARGET" || true)
+    [[ -n "$current_identity" && "$current_identity" == "$MEASUREMENT_ROUTE_IDENTITY" ]]
+}
+
+measurement_peer_route_matches() {
+    local peer_ip="$1" peer_identity current_identity
+
+    [[ -n "$MEASUREMENT_ROUTE_IDENTITY" ]] || return 1
+    peer_identity=$(route_identity_for_target "$peer_ip" || true)
+    current_identity=$(route_identity_for_target \
+        "$MEASUREMENT_ROUTE_TARGET" || true)
+    [[ -n "$peer_identity" && "$peer_identity" == "$MEASUREMENT_ROUTE_IDENTITY" &&
+        "$current_identity" == "$MEASUREMENT_ROUTE_IDENTITY" ]]
+}
+
 cache_field() {
     local file="$1" key="$2"
 
@@ -1483,7 +1573,8 @@ sanitize_cache_value() {
 write_measurement_cache() {
     local ifindex iface gateway source warnings content
 
-    [[ -n "$MEASUREMENT_ROUTE_TARGET" && -n "$MEASUREMENT_ROUTE_IDENTITY" ]] || return 1
+    [[ "$MEASUREMENT_ROUTE_TARGET" == "$MEASUREMENT_ROUTE_PROBE_TARGET" &&
+        -n "$MEASUREMENT_ROUTE_IDENTITY" ]] || return 1
     IFS='|' read -r ifindex iface gateway source <<< "$MEASUREMENT_ROUTE_IDENTITY"
     [[ "$ifindex" =~ ^[0-9]+$ && -n "$iface" && -n "$gateway" && -n "$source" ]] || return 1
     warnings=${MEASUREMENT_WARNINGS:-none}
@@ -1504,8 +1595,16 @@ source_address=$source"
     atomic_write_file "$MEASUREMENT_CACHE" "$content" 0600
 }
 
+persist_pending_measurement_cache() {
+    [[ "$MEASUREMENT_CACHE_PENDING" == "true" ]] || return 0
+    MEASUREMENT_CACHE_PENDING="false"
+    if ! write_measurement_cache; then
+        add_measurement_warning "failed to persist the route-bound measurement cache"
+    fi
+}
+
 load_measurement_cache() {
-    local max_age="$1" mode="$2" now saved_at age version download upload source nodes
+    local mode="$2" now saved_at age version download upload source nodes
     local confidence warnings target ifindex iface gateway source_address cached_identity current_identity measured_at
 
     [[ -f "$MEASUREMENT_CACHE" ]] || return 1
@@ -1522,16 +1621,27 @@ load_measurement_cache() {
     is_positive_integer "$saved_at" 1 9223372036854775807 || return 1
     is_positive_integer "$download" 1 100000 || return 1
     is_positive_integer "$upload" 1 100000 || return 1
-    [[ "$ifindex" =~ ^[0-9]+$ && -n "$target" && -n "$iface" &&
+    [[ "$target" == "$MEASUREMENT_ROUTE_PROBE_TARGET" ]] || return 1
+    [[ "$ifindex" =~ ^[0-9]+$ && -n "$iface" &&
         -n "$gateway" && -n "$source_address" ]] || return 1
 
     now=$(current_epoch)
     is_positive_integer "$now" 1 9223372036854775807 || return 1
     age=$((now - saved_at))
-    (( age >= 0 && age <= max_age )) || return 1
-    if [[ "$mode" == "stale" ]] && (( age <= CACHE_FRESH_MAX_AGE_SECONDS )); then
-        return 1
-    fi
+    (( age >= 0 )) || return 1
+    case "$mode" in
+        fresh)
+            (( age <= CACHE_FRESH_MAX_AGE_SECONDS )) || return 1
+            ;;
+        stale)
+            (( age > CACHE_FRESH_MAX_AGE_SECONDS &&
+               age <= CACHE_STALE_MAX_AGE_SECONDS )) || return 1
+            ;;
+        fallback)
+            (( age <= CACHE_STALE_MAX_AGE_SECONDS )) || return 1
+            ;;
+        *) return 1 ;;
+    esac
 
     cached_identity="$ifindex|$iface|$gateway|$source_address"
     current_identity=$(route_identity_for_target "$target" || true)
@@ -1556,6 +1666,7 @@ load_measurement_cache() {
     MEASUREMENT_WARNINGS="$warnings"
     MEASUREMENT_ROUTE_TARGET="$target"
     MEASUREMENT_ROUTE_IDENTITY="$current_identity"
+    MEASUREMENT_CACHE_PENDING="false"
     PROBE_IFACE="$iface"
     if [[ "$mode" == "fresh" ]]; then
         MEASUREMENT_SOURCE="7-day route-bound cache (${source:-public iperf3})"
@@ -1592,23 +1703,31 @@ probe_iperf_bandwidth() {
     local ranked rtt host peer_ip location provider port upload_result download_result
     local upload upload_cpu upload_retransmits upload_retransmit_percent
     local download download_cpu download_retransmits download_retransmit_percent
-    local upload_rc download_rc node node_detail route_identity first_route_identity="" budget_stopped="false"
-    local route_binding_valid="true" successful_peers=0
+    local upload_rc download_rc node node_detail budget_stopped="false"
+    local successful_peers=0
     local -a upload_values=() download_values=() nodes=()
 
     command -v iperf3 >/dev/null 2>&1 || return 1
     command -v jq >/dev/null 2>&1 || return 1
     command -v timeout >/dev/null 2>&1 || return 1
 
-    ranked=$(rank_iperf_peers || true)
-    [[ -n "$ranked" ]] || return 1
     MEASUREMENT_WARNINGS=""
     MEASUREMENT_CONFIDENCE="high"
-    MEASUREMENT_ROUTE_TARGET=""
-    MEASUREMENT_ROUTE_IDENTITY=""
+    MEASUREMENT_CACHE_PENDING="false"
+    MEASUREMENT_ROUTE_TARGET="$MEASUREMENT_ROUTE_PROBE_TARGET"
+    MEASUREMENT_ROUTE_IDENTITY=$(route_identity_for_target \
+        "$MEASUREMENT_ROUTE_TARGET" || true)
+    [[ -n "$MEASUREMENT_ROUTE_IDENTITY" ]] || return 1
+    rank_iperf_peers || return 1
+    ranked="$RANKED_IPERF_PEERS"
+    [[ -n "$ranked" ]] || return 1
 
     while IFS='|' read -r rtt host peer_ip location provider; do
         [[ -n "$host" && -n "$peer_ip" ]] || continue
+        if ! measurement_peer_route_matches "$peer_ip"; then
+            detail "skip cross-route iperf3 peer before test: $peer_ip"
+            continue
+        fi
         if traffic_budget_reached upload && traffic_budget_reached download; then
             budget_stopped="true"
             break
@@ -1626,14 +1745,35 @@ probe_iperf_bandwidth() {
             if traffic_budget_reached upload; then
                 upload_rc=75
             else
-                upload_result=$(run_iperf_test "$peer_ip" "$port" upload) || upload_rc=$?
+                if ! measurement_peer_route_matches "$peer_ip"; then
+                    detail "skip iperf3 upload after route identity changed: $peer_ip"
+                    break
+                fi
+                if run_iperf_test "$peer_ip" "$port" upload; then
+                    upload_result="$IPERF_TEST_RESULT"
+                else
+                    upload_rc=$?
+                fi
             fi
             if traffic_budget_reached download; then
                 download_rc=75
             else
-                download_result=$(run_iperf_test "$peer_ip" "$port" download) || download_rc=$?
+                if ! measurement_peer_route_matches "$peer_ip"; then
+                    detail "skip iperf3 download after route identity changed: $peer_ip"
+                    break
+                fi
+                if run_iperf_test "$peer_ip" "$port" download; then
+                    download_result="$IPERF_TEST_RESULT"
+                else
+                    download_rc=$?
+                fi
             fi
             (( upload_rc != 75 && download_rc != 75 )) || budget_stopped="true"
+
+            if ! measurement_peer_route_matches "$peer_ip"; then
+                detail "skip iperf3 sample after route identity changed: $peer_ip"
+                break
+            fi
 
             upload=""
             upload_cpu=""
@@ -1672,20 +1812,6 @@ probe_iperf_bandwidth() {
             node_detail+="[${upload_retransmits:-?}])"
             detail "node result: $node_detail"
 
-            route_identity=$(route_identity_for_target "$peer_ip" || true)
-            if [[ "$route_binding_valid" != "true" || -z "$route_identity" ]]; then
-                route_binding_valid="false"
-            elif [[ -z "$first_route_identity" ]]; then
-                first_route_identity="$route_identity"
-                MEASUREMENT_ROUTE_TARGET="$peer_ip"
-            elif [[ "$route_identity" != "$first_route_identity" ]]; then
-                route_binding_valid="false"
-            fi
-            if [[ "$route_binding_valid" != "true" ]]; then
-                MEASUREMENT_ROUTE_TARGET=""
-                first_route_identity=""
-                add_measurement_warning "selected peers did not share one complete route identity, cache disabled"
-            fi
             break
         done < <(ordered_iperf_ports)
 
@@ -1693,9 +1819,9 @@ probe_iperf_bandwidth() {
     done <<< "$ranked"
 
     (( ${#upload_values[@]} > 0 && ${#download_values[@]} > 0 )) || return 1
+    validate_measurement_route || return 1
     DETECTED_UPLOAD_MBPS=$(max_integer_value "${upload_values[@]}")
     DETECTED_DOWNLOAD_MBPS=$(max_integer_value "${download_values[@]}")
-    MEASUREMENT_ROUTE_IDENTITY="$first_route_identity"
     MEASUREMENT_NODES=$(IFS='; '; printf '%s' "${nodes[*]}")
     MEASUREMENT_EPOCH=$(current_epoch)
     MEASUREMENT_TIME=$(format_measurement_epoch "$MEASUREMENT_EPOCH")
@@ -1717,9 +1843,6 @@ probe_iperf_bandwidth() {
     fi
     [[ "$budget_stopped" != "true" ]] ||
         add_measurement_warning "traffic budget stopped additional public iperf3 tests"
-    if [[ -z "$MEASUREMENT_ROUTE_TARGET" || -z "$MEASUREMENT_ROUTE_IDENTITY" ]]; then
-        add_measurement_warning "ifindex/interface/gateway/source route binding unavailable, cache not written"
-    fi
 }
 
 round_bandwidth() {
@@ -1752,12 +1875,10 @@ show_probe_environment() {
 
     detail "测速环境：接口 $iface / 驱动 $driver / RX-TX 队列 ${rx_queues}-${tx_queues}"
     detail "测速前网络栈：CC $current_cc / default_qdisc $default_qdisc / root_qdisc ${root_qdisc:-unknown}"
-    if [[ "$root_qdisc" == "htb" &&
-        -f "${NETWORK_OPTIMIZE_TCSHAPE_CONFIG_FILE:-/etc/tcshape.conf}" ]]; then
-        BANDWIDTH_PROBE_NOTE="tcshape HTB 整形状态下测得（可能偏低）"
+    if [[ "$root_qdisc" == "htb" ]]; then
+        BANDWIDTH_PROBE_NOTE="检测到 active root HTB，当前限速可能导致测速偏低。"
         add_measurement_warning "$BANDWIDTH_PROBE_NOTE"
-        warn "检测到 tcshape HTB 正在限制 $iface，主动测速结果可能偏低"
-        warn "建议先执行 tcshape off，再重新运行 network-optimize 主动测速"
+        warn "$BANDWIDTH_PROBE_NOTE"
     fi
 }
 
@@ -1787,9 +1908,7 @@ probe_bandwidth() {
     raw_upload="$DETECTED_UPLOAD_MBPS"
     DETECTED_DOWNLOAD_MBPS=$(round_bandwidth "$DETECTED_DOWNLOAD_MBPS")
     DETECTED_UPLOAD_MBPS=$(round_bandwidth "$DETECTED_UPLOAD_MBPS")
-    if [[ -n "$MEASUREMENT_ROUTE_IDENTITY" ]] && ! write_measurement_cache; then
-        add_measurement_warning "failed to persist the route-bound measurement cache"
-    fi
+    MEASUREMENT_CACHE_PENDING="true"
 
     detail "raw measurement: download $raw_download Mbps, upload $raw_upload Mbps"
     detail "calculation bandwidth: download $DETECTED_DOWNLOAD_MBPS Mbps, upload $DETECTED_UPLOAD_MBPS Mbps"
@@ -1856,10 +1975,12 @@ set_manual_measurement_metadata() {
     MEASUREMENT_WARNINGS=""
     MEASUREMENT_ROUTE_TARGET=""
     MEASUREMENT_ROUTE_IDENTITY=""
+    MEASUREMENT_CACHE_PENDING="false"
 }
 
 resolve_tuning_values() {
     local download_mbps="" upload_mbps="" rtt_ms="" live_ready="true"
+    local cache_fallback_mode="stale"
 
     PHYSICAL_RAM_MB=$(detect_memory_mb)
     is_positive_integer "$PHYSICAL_RAM_MB" 1 1073741824 || {
@@ -1885,7 +2006,9 @@ resolve_tuning_values() {
             error "缺少有效上下行带宽，拒绝生成或应用配置"
             return 1
         fi
-        if load_measurement_cache "$CACHE_FRESH_MAX_AGE_SECONDS" fresh; then
+        [[ "$FORCE_REFRESH" != "true" ]] || cache_fallback_mode="fallback"
+        if [[ "$FORCE_REFRESH" != "true" ]] &&
+            load_measurement_cache "$CACHE_FRESH_MAX_AGE_SECONDS" fresh; then
             download_mbps="$DETECTED_DOWNLOAD_MBPS"
             upload_mbps="$DETECTED_UPLOAD_MBPS"
         else
@@ -1895,7 +2018,8 @@ resolve_tuning_values() {
             if [[ "$live_ready" == "true" ]] && probe_bandwidth; then
                 download_mbps="$DETECTED_DOWNLOAD_MBPS"
                 upload_mbps="$DETECTED_UPLOAD_MBPS"
-            elif load_measurement_cache "$CACHE_STALE_MAX_AGE_SECONDS" stale; then
+            elif load_measurement_cache "$CACHE_STALE_MAX_AGE_SECONDS" \
+                "$cache_fallback_mode"; then
                 download_mbps="$DETECTED_DOWNLOAD_MBPS"
                 upload_mbps="$DETECTED_UPLOAD_MBPS"
             else
@@ -2262,7 +2386,7 @@ verify_network_config() {
     done < "$config_file"
 
     [[ "$failed" == "false" ]] || return 1
-    success "运行时 sysctl 已与生成配置一致"
+    info "运行时 sysctl 已与生成配置一致"
 }
 
 record_restore_failure() {
@@ -2273,22 +2397,35 @@ record_restore_failure() {
     "$@" || failures+=("$label")
 }
 
-rollback_initcwnd_install() {
-    INITCWND_ROLLBACK_FAILED_ITEMS=()
+rollback_install() {
+    INSTALL_ROLLBACK_FAILED_ITEMS=()
 
-    record_restore_failure INITCWND_ROLLBACK_FAILED_ITEMS route \
-        restore_default_route "$ROUTE_PREVIOUS_BACKUP" \
-        "$ROUTE_PREVIOUS_OWNED" "$ROUTE_PREVIOUS_ABSENT"
-    record_restore_failure INITCWND_ROLLBACK_FAILED_ITEMS hook \
-        restore_managed_file "$INITCWND_ROUTE_HOOK" \
-        "$ROUTE_HOOK_PREVIOUS_BACKUP" "$ROUTE_HOOK_PREVIOUS_ABSENT"
-    record_restore_failure INITCWND_ROLLBACK_FAILED_ITEMS runtime \
-        apply_runtime_values_strict "$RUNTIME_PREVIOUS_BACKUP"
-    record_restore_failure INITCWND_ROLLBACK_FAILED_ITEMS config \
+    record_restore_failure INSTALL_ROLLBACK_FAILED_ITEMS config \
         restore_managed_file "$NETWORK_CONF" \
         "$NETWORK_PREVIOUS_BACKUP" "$NETWORK_PREVIOUS_ABSENT"
+    record_restore_failure INSTALL_ROLLBACK_FAILED_ITEMS modules \
+        restore_managed_file "$BBR_MODULES_FILE" \
+        "$BBR_MODULES_PREVIOUS_BACKUP" "$BBR_MODULES_PREVIOUS_ABSENT"
+    record_restore_failure INSTALL_ROLLBACK_FAILED_ITEMS runtime \
+        apply_runtime_values_strict "$RUNTIME_PREVIOUS_BACKUP"
+    record_restore_failure INSTALL_ROLLBACK_FAILED_ITEMS route \
+        restore_default_route "$ROUTE_PREVIOUS_BACKUP" \
+        "$ROUTE_PREVIOUS_OWNED" "$ROUTE_PREVIOUS_ABSENT"
+    record_restore_failure INSTALL_ROLLBACK_FAILED_ITEMS hook \
+        restore_managed_file "$INITCWND_ROUTE_HOOK" \
+        "$ROUTE_HOOK_PREVIOUS_BACKUP" "$ROUTE_HOOK_PREVIOUS_ABSENT"
 
-    (( ${#INITCWND_ROLLBACK_FAILED_ITEMS[@]} == 0 ))
+    (( ${#INSTALL_ROLLBACK_FAILED_ITEMS[@]} == 0 ))
+}
+
+report_install_failure() {
+    local message="$1"
+
+    if rollback_install; then
+        error "$message，已回滚 config、modules、runtime、route、hook"
+    else
+        error "$message，且回滚不完整：失败项 ${INSTALL_ROLLBACK_FAILED_ITEMS[*]}"
+    fi
 }
 
 install_optimization() {
@@ -2301,6 +2438,12 @@ install_optimization() {
     fi
 
     resolve_tuning_values || return 1
+    if ! validate_measurement_route; then
+        error "测速绑定的默认 IPv4 出口已变化，拒绝写入系统状态"
+        return 1
+    fi
+    persist_pending_measurement_cache
+
     [[ -n "$PROBE_IFACE" ]] || PROBE_IFACE=$(detect_default_iface || true)
     if [[ "${DEBUG:-}" == "1" ]]; then
         show_tuning_plan
@@ -2337,38 +2480,43 @@ install_optimization() {
     fi
 
     # 应用前已保存全部涉及参数的运行值，失败时逐项回滚。
-    if ! apply_network_config "$temp_config" || ! verify_network_config "$temp_config"; then
-        restore_runtime_values "$runtime_backup"
+    if ! apply_network_config "$temp_config" ||
+        ! verify_network_config "$temp_config"; then
+        report_install_failure "网络 sysctl 应用或验证失败"
         rm -f "$temp_config" "$runtime_backup"
         return 1
     fi
 
     if ! mv "$temp_config" "$NETWORK_CONF"; then
-        error "写入网络配置文件失败"
-        restore_runtime_values "$runtime_backup"
+        report_install_failure "写入网络配置文件失败"
+        rm -f "$temp_config" "$runtime_backup"
+        return 1
+    fi
+    if ! validate_measurement_route; then
+        report_install_failure "应用 initcwnd 前默认 IPv4 出口已变化"
         rm -f "$temp_config" "$runtime_backup"
         return 1
     fi
 
     if ! apply_initcwnd; then
-        if rollback_initcwnd_install; then
-            error "initcwnd 应用失败，已回滚 route、hook、runtime、config"
-        else
-            error "initcwnd 应用失败，且回滚不完整：失败项 ${INITCWND_ROLLBACK_FAILED_ITEMS[*]}"
-        fi
+        report_install_failure "initcwnd 应用失败"
         rm -f "$temp_config" "$runtime_backup"
         return 1
+    fi
+
+    if [[ "$bbr_enabled" == "true" ]]; then
+        if ! persist_bbr_module; then
+            report_install_failure "BBR 模块开机加载配置写入失败"
+            rm -f "$temp_config" "$runtime_backup"
+            return 1
+        fi
     fi
 
     rm -f "$runtime_backup"
     success "网络优化配置已写入：$NETWORK_CONF"
 
     if [[ "$bbr_enabled" == "true" ]]; then
-        if persist_bbr_module; then
-            success "BBR 模块已设置为开机加载：$BBR_MODULES_FILE"
-        else
-            warn "无法写入 BBR 模块开机加载配置；当前运行不受影响"
-        fi
+        success "BBR 模块已设置为开机加载：$BBR_MODULES_FILE"
     else
         warn "BBR 未启用；其余网络参数已正常应用"
     fi
@@ -2702,6 +2850,7 @@ install/plan 选项：
   --bandwidth-mbps N      指定对称带宽，单位 Mbps
   --download-mbps N       指定下载带宽，单位 Mbps
   --upload-mbps N         指定上传带宽，单位 Mbps
+  --refresh               与 --auto 同用；绕过 7 天缓存，现场测速失败可回退到 30 天内缓存
   --rtt-ms N              指定 RTT，单位 ms
   --enable-initcwnd       强制把默认路由 initcwnd/initrwnd 设置为 32
   --disable-initcwnd      强制保留内核默认初始拥塞窗口
@@ -2709,19 +2858,21 @@ install/plan 选项：
 示例：
   network-optimize.sh                  # 交互询问测速，回车默认 Y
   network-optimize.sh install --auto   # 非交互自动测速并应用
+  network-optimize.sh install --auto --refresh  # 强制重新测速
   network-optimize.sh plan --bandwidth-mbps 1000 --rtt-ms 180
   network-optimize.sh install --download-mbps 1000 --upload-mbps 500 --rtt-ms 180
   network-optimize.sh status
-
 默认行为：
+
   - 无参数交互询问公共 iperf3 测速，默认 Y；选择 N 后手填完整上下行带宽
   - 非交互必须使用 --auto，或提供对称带宽/完整上下行带宽
   - install --auto 可通过系统配置的 APT 软件源非交互安装缺失测速依赖
   - 自动测速仅使用 IPv4 公共 iperf3；最多 2 个节点，每方向 P=4、t=5 秒
   - 每方向取有效较高结果；节点差异超过 30% 仅降低可信度并警告
   - 上传、下载各 12.5 GB，合计 25 GB；接口计数包含测试期间后台流量
-  - 7 天内缓存可直接复用；主动测速失败时，仅回退到 30 天内同路由缓存
-  - 缓存严格绑定 ifindex、接口、网关、源地址和测速目标
+  - 7 天内缓存可直接复用；--auto --refresh 绕过该缓存并强制现场测速
+  - 主动测速失败时回退到 30 天内同路由缓存；refresh 也可回退到 7 天内缓存
+  - 测速和缓存固定绑定 1.1.1.1 的 ifindex、接口、网关与源地址
   - 只有完整上下行输入才生成配置；低可信度会警告并持久化，但不改变成功退出码
   - 手填带宽缺少 RTT 时按 150 ms 计算；自动测速不采集 RTT
   - 主动测速失败且无缓存时，交互可转手填；非交互在系统写入前失败
@@ -2762,6 +2913,11 @@ main() {
             require_commands flock getent || exit 1
             take_lock
             resolve_tuning_values
+            if ! validate_measurement_route; then
+                error "测速绑定的默认 IPv4 出口已变化，拒绝保存测量缓存"
+                return 1
+            fi
+            persist_pending_measurement_cache
             show_tuning_plan
             ;;
         restore)
@@ -2779,9 +2935,16 @@ main() {
     esac
 }
 
+run_network_command() {
+    trap 'cleanup_probe_processes' EXIT
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    main "$@"
+}
+
 trap 'error "网络优化脚本在第 $LINENO 行执行失败"' ERR
 
 if [[ "${BASH_SOURCE[0]:-$0}" == "$0" ]]; then
-    trap 'cleanup_probe_processes' EXIT
-    main "$@"
+    run_network_command "$@"
 fi

@@ -200,6 +200,9 @@ sudo bash <(curl -fsSL "$RAW_BASE/network-optimize.sh")
 # 非交互自动测速；install 模式可通过 APT 安装缺失的 iperf3 等依赖
 sudo bash <(curl -fsSL "$RAW_BASE/network-optimize.sh") install --auto
 
+# 绕过 7 天缓存强制现场测速；失败时仍可回退到 30 天内同路由缓存
+sudo bash <(curl -fsSL "$RAW_BASE/network-optimize.sh") install --auto --refresh
+
 # 非交互手动提供完整上下行带宽
 bash <(curl -fsSL "$RAW_BASE/network-optimize.sh") \
   plan --download-mbps 1000 --upload-mbps 500
@@ -218,12 +221,16 @@ bash <(curl -fsSL "$RAW_BASE/network-optimize.sh") help
 无 TTY 时只接受 `--auto`、`--bandwidth-mbps` 或完整的 `--download-mbps` 与
 `--upload-mbps`。自动测速仅使用 IPv4 公共 iperf3，最多选择两个节点，每方向固定
 `P=4`、`t=5` 秒并采用有效较高结果；同方向节点差异超过 30% 时只降低可信度并警告。
-上传、下载预算各为 12.5 GB，总预算 25 GB，按实际出口接口计数并包含同期后台流量。
+上传、下载预算各为 12.5 GB，总预算 25 GB，按实际出口接口计数并包含同期后台流量。自动测速
+先记录 `1.1.1.1` 对应的默认 IPv4 出口身份，只测试并采纳 ifindex、接口、网关和源地址完全
+一致的公共节点；应用前会再次校验，避免路由切换后写入失真的调优值。
 
-成功测量会写入严格绑定测速目标、ifindex、接口、网关和源地址的缓存。7 天内缓存可直接复用；
-现场测速失败时，只允许回退到 30 天内且路由身份完全一致的旧缓存。单节点、结果分歧、预算停止
-或旧缓存回退属于低可信度：只要上下行输入完整且应用验证成功，命令仍返回 0，并把来源、时间、
-节点、可信度和警告写入配置供 `status` 显示。缺少任一方向、应用验证失败或触发回滚返回 1。
+成功测量通过路由复核后写入 v2 缓存，固定绑定 `1.1.1.1` 的 ifindex、接口、网关和源地址；旧版
+缓存会被忽略。7 天内缓存可直接复用；`--auto --refresh` 会绕过它并强制现场测速。现场测速失败
+时，只允许回退到 30 天内且路由身份完全一致的缓存；refresh 回退范围也包含 7 天内缓存。单节点、
+结果分歧、预算停止或缓存回退属于低可信度：只要上下行输入完整且应用验证成功，命令仍返回 0，
+并把来源、时间、节点、可信度和警告写入配置供 `status` 显示。缺少任一方向、应用验证失败或触发
+回滚返回 1。
 
 `initcwnd` 默认为 `auto`：上传带宽不高于 100 Mbps 时保留内核默认，否则在默认路由设置
 `initcwnd/initrwnd=32`；`--enable-initcwnd` 和 `--disable-initcwnd` 可显式覆盖。持久化 hook

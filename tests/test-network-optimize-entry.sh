@@ -10,6 +10,7 @@ export NETWORK_OPTIMIZE_BBR_MODULES_FILE="$TEMP_DIR/etc/modules-load.d/network-o
 export NETWORK_OPTIMIZE_INITCWND_HOOK="$TEMP_DIR/networkd-dispatcher/routable.d/50-network-optimize-initcwnd"
 export NETWORK_OPTIMIZE_CACHE_FILE="$TEMP_DIR/state/network-optimize.bandwidth-cache"
 export NETWORK_OPTIMIZE_LOCK_FILE="$TEMP_DIR/network-optimize.lock"
+export NETWORK_OPTIMIZE_LOG="$TEMP_DIR/network-optimize.log"
 
 # shellcheck source=../modules/network-optimize.sh
 source "$ROOT_DIR/modules/network-optimize.sh"
@@ -74,6 +75,7 @@ reset_selection() {
     TUNING_MODE=""
     TUNING_SELECTION_EXPLICIT=false
     AUTO_MODE_REQUESTED=false
+    FORCE_REFRESH=false
     INITCWND_MODE=auto
     INITCWND_ENABLED=true
     INITCWND_POLICY=unknown
@@ -97,6 +99,7 @@ reset_selection() {
     MEASUREMENT_WARNINGS=""
     MEASUREMENT_ROUTE_TARGET=""
     MEASUREMENT_ROUTE_IDENTITY=""
+    MEASUREMENT_CACHE_PENDING=false
 }
 
 is_interactive_terminal() { return 1; }
@@ -130,6 +133,24 @@ select_tuning_mode
 unset -f read
 assert_eq auto "$TUNING_MODE" "--auto selects non-interactive automatic mode"
 assert_eq true "$TUNING_SELECTION_EXPLICIT" "--auto bypasses the prompt"
+
+for refresh_args in '--auto --refresh' '--refresh --auto'; do
+    reset_selection
+    read -r -a parsed_refresh_args <<< "$refresh_args"
+    parse_arguments install "${parsed_refresh_args[@]}"
+    assert_eq true "$FORCE_REFRESH" "refresh is accepted regardless of argument order"
+    assert_eq auto "$TUNING_MODE" "refresh keeps automatic mode"
+done
+reset_selection
+assert_fail "reject --refresh without --auto" parse_arguments install --refresh
+reset_selection
+assert_fail "reject --refresh before manual bandwidth" \
+    parse_arguments install --refresh --bandwidth-mbps 1000
+reset_selection
+assert_fail "reject manual bandwidth before --refresh" \
+    parse_arguments install --bandwidth-mbps 1000 --refresh
+reset_selection
+assert_fail "reject --refresh on status" parse_arguments status --refresh --auto
 
 for retired in --probe --yes --disable-ecn; do
     reset_selection
@@ -332,6 +353,244 @@ printf 'PASS: generic health panel is absent\n'
     probe_bandwidth() { return 1; }
     is_interactive_terminal() { return 1; }
     assert_fail "missing complete measurement returns failure" resolve_tuning_values >/dev/null 2>&1
+)
+
+(
+    reset_selection
+    COMMAND=plan
+    TUNING_MODE=auto
+    AUTO_MODE_REQUESTED=true
+    FORCE_REFRESH=true
+    detect_memory_mb() { printf '%s\n' 8192; }
+    detect_cgroup_memory_limit_mb() { return 1; }
+    cache_modes=""
+    probe_calls=0
+    load_measurement_cache() {
+        cache_modes="${cache_modes:+$cache_modes }$2"
+        return 1
+    }
+    probe_bandwidth() {
+        ((probe_calls += 1))
+        DETECTED_DOWNLOAD_MBPS=1000
+        DETECTED_UPLOAD_MBPS=500
+        MEASUREMENT_SOURCE='refreshed public iperf3'
+        MEASUREMENT_EPOCH=2000000000
+        MEASUREMENT_TIME='2033-05-18T03:33:20Z'
+        MEASUREMENT_NODES='one.example'
+        MEASUREMENT_CONFIDENCE=high
+        MEASUREMENT_WARNINGS=''
+        MEASUREMENT_ROUTE_TARGET=1.1.1.1
+        MEASUREMENT_ROUTE_IDENTITY='2|eth0|192.0.2.1|192.0.2.2'
+        MEASUREMENT_CACHE_PENDING=true
+    }
+    is_interactive_terminal() { return 1; }
+    resolve_tuning_values >/dev/null
+    assert_eq 1 "$probe_calls" "refresh forces a live measurement"
+    assert_eq '' "$cache_modes" "successful refresh bypasses the fresh cache"
+    assert_eq 'refreshed public iperf3' "$MEASUREMENT_SOURCE" \
+        "successful refresh keeps live measurement metadata"
+)
+
+(
+    reset_selection
+    COMMAND=plan
+    TUNING_MODE=auto
+    AUTO_MODE_REQUESTED=true
+    FORCE_REFRESH=true
+    detect_memory_mb() { printf '%s\n' 8192; }
+    detect_cgroup_memory_limit_mb() { return 1; }
+    cache_modes=""
+    probe_calls=0
+    load_measurement_cache() {
+        cache_modes="${cache_modes:+$cache_modes }$2"
+        [[ "$2" == "fallback" ]] || return 1
+        DETECTED_DOWNLOAD_MBPS=900
+        DETECTED_UPLOAD_MBPS=450
+        MEASUREMENT_SOURCE='same-route stale cache (public iperf3)'
+        MEASUREMENT_EPOCH=1999999940
+        MEASUREMENT_TIME='2033-05-18T03:32:20Z'
+        MEASUREMENT_NODES='cached.example'
+        MEASUREMENT_CONFIDENCE=low
+        MEASUREMENT_WARNINGS='live measurement failed'
+        MEASUREMENT_ROUTE_TARGET=1.1.1.1
+        MEASUREMENT_ROUTE_IDENTITY='2|eth0|192.0.2.1|192.0.2.2'
+        return 0
+    }
+    probe_bandwidth() {
+        ((probe_calls += 1))
+        return 1
+    }
+    is_interactive_terminal() { return 1; }
+    resolve_tuning_values >/dev/null
+    assert_eq 1 "$probe_calls" "refresh attempts live measurement before fallback"
+    assert_eq fallback "$cache_modes" \
+        "refresh failure accepts the full thirty-day fallback window"
+    assert_eq 900 "$DETECTED_DOWNLOAD_MBPS" \
+        "refresh failure reuses route-matched fallback download"
+    assert_eq low "$MEASUREMENT_CONFIDENCE" \
+        "refresh fallback remains low confidence"
+)
+
+(
+    FAIL_STAGE=""
+    BBR_AVAILABLE=true
+    PERSIST_FAIL=false
+    VALIDATION_CALLS=0
+    APPLY_NETWORK_CALLS=0
+    APPLY_INITCWND_CALLS=0
+    PERSIST_CALLS=0
+    RUNTIME_STATE=""
+    CURRENT_ROUTE=""
+    SUCCESS_LOG="$TEMP_DIR/install-success.log"
+
+    seed_install_fixture() {
+        rm -rf -- \
+            "$(dirname "$NETWORK_CONF")" "$(dirname "$BBR_MODULES_FILE")" \
+            "$(dirname "$INITCWND_ROUTE_HOOK")" "$NETWORK_OPTIMIZE_STATE_DIR"
+        mkdir -p \
+            "$(dirname "$NETWORK_CONF")" "$(dirname "$BBR_MODULES_FILE")" \
+            "$(dirname "$INITCWND_ROUTE_HOOK")" "$NETWORK_OPTIMIZE_STATE_DIR"
+        printf '%s\n' 'old config' > "$NETWORK_CONF"
+        printf '%s\n' 'old modules' > "$BBR_MODULES_FILE"
+        printf '%s\n' 'old hook' > "$INITCWND_ROUTE_HOOK"
+        printf '%s\n' 'old config' > "$NETWORK_PREVIOUS_BACKUP"
+        printf '%s\n' 'old modules' > "$BBR_MODULES_PREVIOUS_BACKUP"
+        printf '%s\n' 'old runtime' > "$RUNTIME_PREVIOUS_BACKUP"
+        printf '%s\n' 'old route' > "$ROUTE_PREVIOUS_BACKUP"
+        printf '%s\n' 'old hook' > "$ROUTE_HOOK_PREVIOUS_BACKUP"
+        rm -f -- \
+            "$NETWORK_PREVIOUS_ABSENT" "$BBR_MODULES_PREVIOUS_ABSENT" \
+            "$ROUTE_PREVIOUS_ABSENT" "$ROUTE_PREVIOUS_OWNED" \
+            "$ROUTE_HOOK_PREVIOUS_ABSENT" "$ROUTE_OWNED_MARKER"
+        VALIDATION_CALLS=0
+        APPLY_NETWORK_CALLS=0
+        APPLY_INITCWND_CALLS=0
+        PERSIST_CALLS=0
+        RUNTIME_STATE='old runtime'
+        CURRENT_ROUTE='old route'
+        PROBE_IFACE=""
+        : > "$SUCCESS_LOG"
+    }
+
+    assert_install_fixture_old() {
+        local name="$1"
+
+        assert_eq 'old config' "$(<"$NETWORK_CONF")" "$name restores config"
+        assert_eq 'old modules' "$(<"$BBR_MODULES_FILE")" "$name restores modules"
+        assert_eq 'old runtime' "$RUNTIME_STATE" "$name restores runtime"
+        assert_eq 'old route' "$CURRENT_ROUTE" "$name restores route"
+        assert_eq 'old hook' "$(<"$INITCWND_ROUTE_HOOK")" "$name restores hook"
+    }
+
+    detect_container() { return 1; }
+    resolve_tuning_values() {
+        TUNING_MODE=auto
+        MEASUREMENT_ROUTE_TARGET="$MEASUREMENT_ROUTE_PROBE_TARGET"
+        MEASUREMENT_ROUTE_IDENTITY='2|eth0|192.0.2.1|192.0.2.2'
+        MEASUREMENT_CACHE_PENDING=false
+        return 0
+    }
+    validate_measurement_route() {
+        ((VALIDATION_CALLS += 1))
+        case "$FAIL_STAGE" in
+            first-route) return 1 ;;
+            second-route) (( VALIDATION_CALLS == 1 )) ;;
+            *) return 0 ;;
+        esac
+    }
+    persist_pending_measurement_cache() { return 0; }
+    detect_default_iface() { printf '%s\n' eth0; }
+    create_network_config() { printf '%s\n' 'new config' > "$1"; }
+    capture_runtime_values_from_files() { printf '%s\n' 'old runtime' > "$1"; }
+    prepare_legacy_backup_state() { return 0; }
+    merge_initial_runtime_values() { return 0; }
+    backup_previous_state_set() { return 0; }
+    ensure_bbr_available() { [[ "$BBR_AVAILABLE" == "true" ]]; }
+    apply_network_config() {
+        ((APPLY_NETWORK_CALLS += 1))
+        RUNTIME_STATE='new runtime'
+    }
+    verify_network_config() { return 0; }
+    apply_initcwnd() {
+        ((APPLY_INITCWND_CALLS += 1))
+        CURRENT_ROUTE='new route'
+        printf '%s\n' 'new hook' > "$INITCWND_ROUTE_HOOK"
+    }
+    persist_bbr_module() {
+        ((PERSIST_CALLS += 1))
+        printf '%s\n' 'new modules' > "$BBR_MODULES_FILE"
+        [[ "$PERSIST_FAIL" != "true" ]]
+    }
+    apply_runtime_values_strict() { RUNTIME_STATE=$(<"$1"); }
+    restore_default_route() { CURRENT_ROUTE=$(<"$1"); }
+    show_install_summary() { return 0; }
+    info() { return 0; }
+    warn() { return 0; }
+    error() { return 0; }
+    success() { printf '%s\n' "$1" >> "$SUCCESS_LOG"; }
+
+    seed_install_fixture
+    FAIL_STAGE=first-route
+    if install_optimization; then
+        fail "first route validation failure unexpectedly succeeded"
+    fi
+    assert_install_fixture_old "first route validation failure"
+    assert_eq 1 "$VALIDATION_CALLS" \
+        "first route validation fails before the second check"
+    assert_eq 0 "$APPLY_NETWORK_CALLS" \
+        "first route validation performs no runtime write"
+    assert_eq 0 "$APPLY_INITCWND_CALLS" \
+        "first route validation performs no route or hook write"
+    assert_eq 0 "$PERSIST_CALLS" \
+        "first route validation performs no module write"
+
+    seed_install_fixture
+    FAIL_STAGE=second-route
+    if install_optimization; then
+        fail "second route validation failure unexpectedly succeeded"
+    fi
+    assert_install_fixture_old "second route validation failure"
+    assert_eq 2 "$VALIDATION_CALLS" \
+        "second route validation runs immediately before initcwnd"
+    assert_eq 1 "$APPLY_NETWORK_CALLS" \
+        "second route validation occurs after runtime apply"
+    assert_eq 0 "$APPLY_INITCWND_CALLS" \
+        "second route validation blocks initcwnd"
+    assert_eq 0 "$PERSIST_CALLS" \
+        "second route validation blocks BBR persistence"
+
+    seed_install_fixture
+    FAIL_STAGE=""
+    BBR_AVAILABLE=true
+    PERSIST_FAIL=true
+    if install_optimization; then
+        fail "BBR persistence failure unexpectedly succeeded"
+    fi
+    assert_install_fixture_old "BBR persistence failure"
+    assert_eq 2 "$VALIDATION_CALLS" \
+        "BBR failure follows both route validations"
+    assert_eq 1 "$APPLY_INITCWND_CALLS" \
+        "BBR failure occurs after initcwnd apply"
+    assert_eq 1 "$PERSIST_CALLS" \
+        "BBR persistence failure is observed"
+    assert_eq 0 "${#INSTALL_ROLLBACK_FAILED_ITEMS[@]}" \
+        "BBR persistence failure completes all five rollback items"
+    [[ ! -s "$SUCCESS_LOG" ]] ||
+        fail "BBR persistence failure emitted a success message before rollback"
+
+    seed_install_fixture
+    FAIL_STAGE=""
+    BBR_AVAILABLE=false
+    PERSIST_FAIL=false
+    install_optimization
+    assert_eq 'new config' "$(<"$NETWORK_CONF")" \
+        "unsupported BBR still applies non-BBR config"
+    assert_eq 'old modules' "$(<"$BBR_MODULES_FILE")" \
+        "unsupported BBR leaves module persistence unchanged"
+    assert_eq 0 "$PERSIST_CALLS" \
+        "unsupported BBR remains a successful warning path"
+    grep -Fqx "网络优化配置已写入：$NETWORK_CONF" "$SUCCESS_LOG" ||
+        fail "unsupported BBR path omitted final configuration success"
 )
 
 SYSCTL_TCP_ECN='1'

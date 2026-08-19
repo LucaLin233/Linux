@@ -10,6 +10,7 @@ export NETWORK_OPTIMIZE_BBR_MODULES_FILE="$TEMP_DIR/etc/modules-load.d/network-o
 export NETWORK_OPTIMIZE_INITCWND_HOOK="$TEMP_DIR/networkd-dispatcher/routable.d/50-network-optimize-initcwnd"
 export NETWORK_OPTIMIZE_CACHE_FILE="$TEMP_DIR/state/network-optimize.bandwidth-cache"
 export NETWORK_OPTIMIZE_LOCK_FILE="$TEMP_DIR/network-optimize.lock"
+export NETWORK_OPTIMIZE_LOG="$TEMP_DIR/network-optimize.log"
 # shellcheck source=../modules/network-optimize.sh
 source "$ROOT_DIR/modules/network-optimize.sh"
 
@@ -125,6 +126,7 @@ EOF
 )" "classify traffic-shape HTB with fq leaf as effective"
 
 setup_probe_mocks() {
+    TUNING_MODE=auto
     command() { return 0; }
     ordered_iperf_ports() { printf '%s\n' 5201; }
     traffic_add_target() { PROBE_IFACE=eth0; return 0; }
@@ -141,18 +143,18 @@ setup_probe_mocks() {
     calls="$TEMP_DIR/dual-peer.calls"
     : > "$calls"
     rank_iperf_peers() {
-        printf '%s\n' \
+        RANKED_IPERF_PEERS=$(printf '%s\n' \
             '10|one.example|192.0.2.10|A|ProviderA' \
             '20|two.example|192.0.2.20|B|ProviderB' \
-            '30|three.example|192.0.2.30|C|ProviderC'
+            '30|three.example|192.0.2.30|C|ProviderC')
     }
     run_iperf_test() {
         printf '%s:%s\n' "$1" "$3" >> "$calls"
         case "$1:$3" in
-            192.0.2.10:upload) printf '%s\n' '500|10|1|0.01' ;;
-            192.0.2.10:download) printf '%s\n' '800|10|1|0.01' ;;
-            192.0.2.20:upload) printf '%s\n' '600|10|1|0.01' ;;
-            192.0.2.20:download) printf '%s\n' '700|10|1|0.01' ;;
+            192.0.2.10:upload) IPERF_TEST_RESULT='500|10|1|0.01' ;;
+            192.0.2.10:download) IPERF_TEST_RESULT='800|10|1|0.01' ;;
+            192.0.2.20:upload) IPERF_TEST_RESULT='600|10|1|0.01' ;;
+            192.0.2.20:download) IPERF_TEST_RESULT='700|10|1|0.01' ;;
             *) fail "third peer was tested" ;;
         esac
     }
@@ -162,16 +164,56 @@ setup_probe_mocks() {
     assert_eq high "$MEASUREMENT_CONFIDENCE" "consistent dual-peer result is high confidence"
     assert_eq 4 "$(wc -l < "$calls" | tr -d ' ')" "only two peers are tested in both directions"
 )
+(
+    setup_probe_mocks
+    calls="$TEMP_DIR/same-route-peer.calls"
+    : > "$calls"
+    rank_iperf_peers() {
+        RANKED_IPERF_PEERS=$(printf '%s\n' \
+            '10|one.example|192.0.2.10|A|ProviderA' \
+            '20|two.example|198.51.100.20|B|ProviderB' \
+            '30|three.example|192.0.2.30|C|ProviderC')
+    }
+    route_identity_for_target() {
+        case "$1" in
+            198.51.100.20) printf '%s\n' '3|eth1|198.51.100.1|198.51.100.2' ;;
+            *) printf '%s\n' '2|eth0|192.0.2.1|192.0.2.2' ;;
+        esac
+    }
+    run_iperf_test() {
+        printf '%s:%s\n' "$1" "$3" >> "$calls"
+        case "$1:$3" in
+            192.0.2.10:upload) IPERF_TEST_RESULT='500|10|1|0.01' ;;
+            192.0.2.10:download) IPERF_TEST_RESULT='800|10|1|0.01' ;;
+            192.0.2.30:upload) IPERF_TEST_RESULT='650|10|1|0.01' ;;
+            192.0.2.30:download) IPERF_TEST_RESULT='750|10|1|0.01' ;;
+            *) fail "cross-route peer was tested" ;;
+        esac
+    }
+    probe_iperf_bandwidth
+    assert_eq 650 "$DETECTED_UPLOAD_MBPS" \
+        "later same-route peer replaces skipped cross-route peer"
+    assert_eq 800 "$DETECTED_DOWNLOAD_MBPS" \
+        "cross-route peer does not affect selected download"
+    assert_eq 4 "$(wc -l < "$calls" | tr -d ' ')" \
+        "only two same-route peers are tested"
+    if grep -Fq 'two.example' <<< "$MEASUREMENT_NODES"; then
+        fail "cross-route peer was included in measurement metadata"
+    fi
+    assert_eq 1.1.1.1 "$MEASUREMENT_ROUTE_TARGET" \
+        "automatic measurement binds the fixed default-route target"
+)
+
 
 (
     setup_probe_mocks
     rank_iperf_peers() {
-        printf '%s\n' '10|one.example|192.0.2.10|A|ProviderA'
+        RANKED_IPERF_PEERS='10|one.example|192.0.2.10|A|ProviderA'
     }
     run_iperf_test() {
         case "$3" in
-            upload) printf '%s\n' '500|10|1|0.01' ;;
-            download) printf '%s\n' '800|10|1|0.01' ;;
+            upload) IPERF_TEST_RESULT='500|10|1|0.01' ;;
+            download) IPERF_TEST_RESULT='800|10|1|0.01' ;;
         esac
     }
     probe_iperf_bandwidth
@@ -184,16 +226,16 @@ setup_probe_mocks() {
 (
     setup_probe_mocks
     rank_iperf_peers() {
-        printf '%s\n' \
+        RANKED_IPERF_PEERS=$(printf '%s\n' \
             '10|one.example|192.0.2.10|A|ProviderA' \
-            '20|two.example|192.0.2.20|B|ProviderB'
+            '20|two.example|192.0.2.20|B|ProviderB')
     }
     run_iperf_test() {
         case "$1:$3" in
-            192.0.2.10:upload) printf '%s\n' '500|10|1|0.01' ;;
-            192.0.2.10:download) printf '%s\n' '1000|10|1|0.01' ;;
-            192.0.2.20:upload) printf '%s\n' '800|10|1|0.01' ;;
-            192.0.2.20:download) printf '%s\n' '1200|10|1|0.01' ;;
+            192.0.2.10:upload) IPERF_TEST_RESULT='500|10|1|0.01' ;;
+            192.0.2.10:download) IPERF_TEST_RESULT='1000|10|1|0.01' ;;
+            192.0.2.20:upload) IPERF_TEST_RESULT='800|10|1|0.01' ;;
+            192.0.2.20:download) IPERF_TEST_RESULT='1200|10|1|0.01' ;;
         esac
     }
     probe_iperf_bandwidth
@@ -207,17 +249,17 @@ setup_probe_mocks() {
 (
     setup_probe_mocks
     rank_iperf_peers() {
-        printf '%s\n' \
+        RANKED_IPERF_PEERS=$(printf '%s\n' \
             '10|one.example|192.0.2.10|A|ProviderA' \
-            '20|two.example|192.0.2.20|B|ProviderB'
+            '20|two.example|192.0.2.20|B|ProviderB')
     }
     run_iperf_test() {
         if [[ "$1" == 192.0.2.20 ]]; then
             return 75
         fi
         case "$3" in
-            upload) printf '%s\n' '500|10|1|0.01' ;;
-            download) printf '%s\n' '800|10|1|0.01' ;;
+            upload) IPERF_TEST_RESULT='500|10|1|0.01' ;;
+            download) IPERF_TEST_RESULT='800|10|1|0.01' ;;
         esac
     }
     probe_iperf_bandwidth
@@ -229,6 +271,43 @@ setup_probe_mocks() {
 )
 
 (
+    setup_probe_mocks
+    route_calls="$TEMP_DIR/route-change.calls"
+    printf '%s\n' 0 > "$route_calls"
+    rm -f "$MEASUREMENT_CACHE"
+    rank_iperf_peers() {
+        RANKED_IPERF_PEERS='10|one.example|192.0.2.10|A|ProviderA'
+    }
+    route_identity_for_target() {
+        local count
+
+        if [[ "$1" == "$MEASUREMENT_ROUTE_PROBE_TARGET" ]]; then
+            printf '%s\n' '2|eth0|192.0.2.1|192.0.2.2'
+            return 0
+        fi
+        count=$(<"$route_calls")
+        ((count += 1))
+        printf '%s\n' "$count" > "$route_calls"
+        if (( count <= 3 )); then
+            printf '%s\n' '2|eth0|192.0.2.1|192.0.2.2'
+        else
+            printf '%s\n' '3|eth1|198.51.100.1|198.51.100.2'
+        fi
+    }
+    run_iperf_test() {
+        case "$3" in
+            upload) IPERF_TEST_RESULT='500|10|1|0.01' ;;
+            download) IPERF_TEST_RESULT='800|10|1|0.01' ;;
+        esac
+    }
+    assert_fail "route change before sample adoption rejects live measurement" \
+        probe_bandwidth >/dev/null 2>&1
+    [[ ! -e "$MEASUREMENT_CACHE" ]] || fail "route-changed result wrote a cache"
+    assert_eq false "$MEASUREMENT_CACHE_PENDING" \
+        "route-changed result leaves no pending cache"
+)
+
+(
     mkdir -p "$(dirname "$MEASUREMENT_CACHE")"
     current_epoch() { printf '%s\n' 2000000000; }
     CURRENT_IDENTITY='2|eth0|192.0.2.1|192.0.2.2'
@@ -236,7 +315,7 @@ setup_probe_mocks() {
     seed_cache() {
         local saved_at="$1"
         cat > "$MEASUREMENT_CACHE" <<EOF
-version=1
+version=2
 saved_at=$saved_at
 measured_at=2033-05-18T03:33:20Z
 download_mbps=1000
@@ -245,7 +324,7 @@ source=public iperf3 IPv4
 nodes=one.example;two.example
 confidence=high
 warnings=none
-route_target=192.0.2.10
+route_target=1.1.1.1
 ifindex=2
 iface=eth0
 gateway=192.0.2.1
@@ -257,6 +336,16 @@ EOF
     assert_ok "seven-day cache is fresh" \
         load_measurement_cache "$CACHE_FRESH_MAX_AGE_SECONDS" fresh
     assert_eq 1000 "$DETECTED_DOWNLOAD_MBPS" "fresh cache restores download"
+    sed -i 's/^version=2$/version=1/' "$MEASUREMENT_CACHE"
+    assert_fail "legacy v1 cache is ignored" \
+        load_measurement_cache "$CACHE_FRESH_MAX_AGE_SECONDS" fresh
+
+    seed_cache $((2000000000 - 60))
+    assert_ok "refresh fallback accepts a cache newer than seven days" \
+        load_measurement_cache "$CACHE_STALE_MAX_AGE_SECONDS" fallback
+    assert_eq low "$MEASUREMENT_CONFIDENCE" \
+        "refresh fallback marks reused fresh cache low confidence"
+
 
     seed_cache $((2000000000 - CACHE_FRESH_MAX_AGE_SECONDS - 1))
     assert_fail "cache older than seven days is not fresh" \
@@ -264,6 +353,9 @@ EOF
     assert_ok "same-route cache just older than seven days is stale fallback" \
         load_measurement_cache "$CACHE_STALE_MAX_AGE_SECONDS" stale
     assert_eq low "$MEASUREMENT_CONFIDENCE" "stale fallback lowers confidence"
+    assert_ok "refresh fallback accepts a cache older than seven days" \
+        load_measurement_cache "$CACHE_STALE_MAX_AGE_SECONDS" fallback
+
 
     seed_cache $((2000000000 - CACHE_STALE_MAX_AGE_SECONDS))
     assert_ok "thirty-day same-route cache is accepted" \
@@ -271,6 +363,8 @@ EOF
     seed_cache $((2000000000 - CACHE_STALE_MAX_AGE_SECONDS - 1))
     assert_fail "cache older than thirty days is rejected" \
         load_measurement_cache "$CACHE_STALE_MAX_AGE_SECONDS" stale
+    assert_fail "refresh fallback rejects cache older than thirty days" \
+        load_measurement_cache "$CACHE_STALE_MAX_AGE_SECONDS" fallback
 
     seed_cache $((2000000000 - 60))
     CURRENT_IDENTITY='2|eth0|198.51.100.1|192.0.2.2'
@@ -286,7 +380,7 @@ EOF
     MEASUREMENT_NODES='one.example'
     MEASUREMENT_CONFIDENCE=low
     MEASUREMENT_WARNINGS='only one peer'
-    MEASUREMENT_ROUTE_TARGET=192.0.2.10
+    MEASUREMENT_ROUTE_TARGET=1.1.1.1
     MEASUREMENT_ROUTE_IDENTITY="$CURRENT_IDENTITY"
     write_measurement_cache
     grep -Fqx 'ifindex=2' "$MEASUREMENT_CACHE" || fail "cache omits ifindex"
@@ -296,11 +390,146 @@ EOF
     printf 'PASS: cache persists complete route binding\n'
 )
 
+(
+    : > "$NETWORK_DETAIL_LOG"
+    MEASUREMENT_WARNINGS=""
+    MEASUREMENT_CONFIDENCE=high
+    add_measurement_warning "duplicate warning"
+    add_measurement_warning "duplicate warning"
+    assert_eq "duplicate warning" "$MEASUREMENT_WARNINGS" \
+        "measurement warning metadata is deduplicated"
+    assert_eq 1 "$(grep -Fc 'measurement warning: duplicate warning' \
+        "$NETWORK_DETAIL_LOG")" \
+        "measurement warning detail log is deduplicated"
+
+    rm -f "$NETWORK_DETAIL_LOG"
+    mkdir "$NETWORK_DETAIL_LOG"
+    add_measurement_warning "unwritable detail log" ||
+        fail "unwritable detail log changed warning result"
+    rmdir "$NETWORK_DETAIL_LOG"
+    : > "$NETWORK_DETAIL_LOG"
+    assert_eq low "$MEASUREMENT_CONFIDENCE" \
+        "unwritable detail log does not change measurement confidence"
+)
+
+if grep -Eq 'NETWORK_OPTIMIZE_TCSHAPE_CONFIG_FILE|/etc/tcshape[.]conf|tcshape HTB|tcshape off' \
+    "$ROOT_DIR/modules/network-optimize.sh"; then
+    fail "network-optimize retains tcshape-specific runtime coupling"
+fi
+grep -Fq '检测到 active root HTB，当前限速可能导致测速偏低。' \
+    "$ROOT_DIR/modules/network-optimize.sh" ||
+    fail "generic active root HTB warning is missing"
+printf 'PASS: network-optimize keeps only generic active root HTB diagnostics\n'
+
 if grep -Eq '(^|[[:space:]])(return|exit)[[:space:]]+2([[:space:]]|$)' \
     "$ROOT_DIR/modules/network-optimize.sh"; then
     fail "network-optimize still returns exit code 2"
 fi
 printf 'PASS: network-optimize has no exit code 2 path\n'
+
+(
+    timeout_args="$TEMP_DIR/iperf-timeout.args"
+    output_file="$TEMP_DIR/iperf-timeout.output"
+    traffic_add_target() { return 0; }
+    traffic_budget_reached() { return 1; }
+    timeout() {
+        builtin printf '%s\n' "$*" > "$timeout_args"
+        return 124
+    }
+    rc=0
+    run_iperf_runner "$output_file" 192.0.2.10 5201 \
+        "$IPERF_DURATION" "$IPERF_PARALLEL" upload false || rc=$?
+    assert_eq 124 "$rc" "iperf deadline status is preserved"
+    assert_eq '--foreground --signal=TERM --kill-after=3s 20s iperf3 -4 -c 192.0.2.10 -p 5201 -t 5 -P 4 -J' \
+        "$(<"$timeout_args")" "iperf runner enforces deadline and kill grace"
+)
+
+(
+    bash -c 'trap "" TERM; while :; do :; done' &
+    stubborn_pid=$!
+    terminate_recorded_pid "$stubborn_pid" 1
+    if kill -0 "$stubborn_pid" 2>/dev/null; then
+        kill -KILL "$stubborn_pid" 2>/dev/null || true
+        fail "TERM-resistant child survived KILL escalation"
+    fi
+    printf 'PASS: TERM-resistant child is escalated to KILL\n'
+)
+
+signal_bin="$TEMP_DIR/signal-bin"
+signal_helper="$TEMP_DIR/signal-helper.sh"
+mkdir -p "$signal_bin"
+cat > "$signal_bin/iperf3" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$$" > "$IPERF_PID_FILE"
+trap 'exit 0' HUP INT
+if [[ "${IPERF_IGNORE_TERM:-false}" == "true" ]]; then
+    trap '' TERM
+else
+    trap 'exit 0' TERM
+fi
+while :; do sleep 0.05; done
+EOF
+chmod 0755 "$signal_bin/iperf3"
+cat > "$signal_helper" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+# shellcheck source=/dev/null
+source "$NETWORK_MODULE"
+traffic_add_target() { return 0; }
+traffic_budget_reached() { return 1; }
+main() {
+    local probe_dir
+
+    probe_dir=$(mktemp -d)
+    register_probe_temp_path "$probe_dir"
+    run_iperf_test 192.0.2.10 5201 upload
+}
+run_network_command
+EOF
+chmod 0755 "$signal_helper"
+
+for signal_case in HUP INT TERM; do
+    case "$signal_case" in
+        HUP) expected_rc=129 ;;
+        INT) expected_rc=130 ;;
+        TERM) expected_rc=143 ;;
+    esac
+    ignore_term=false
+    [[ "$signal_case" != "TERM" ]] || ignore_term=true
+    case_dir="$TEMP_DIR/signal-$signal_case"
+    case_tmp="$case_dir/tmp"
+    pid_file="$case_dir/iperf.pid"
+    mkdir -p "$case_tmp"
+
+    signal_rc=0
+    PATH="$signal_bin:$PATH" \
+        NETWORK_MODULE="$ROOT_DIR/modules/network-optimize.sh" \
+        IPERF_PID_FILE="$pid_file" TMPDIR="$case_tmp" \
+        IPERF_IGNORE_TERM="$ignore_term" \
+        timeout --foreground --preserve-status --signal="$signal_case" \
+        --kill-after=10s 1s bash "$signal_helper" >/dev/null 2>&1 || signal_rc=$?
+
+    assert_eq "$expected_rc" "$signal_rc" \
+        "$signal_case returns the conventional signal status"
+    [[ -s "$pid_file" ]] || fail "$signal_case did not start fake iperf3"
+    iperf_pid=$(<"$pid_file")
+    if kill -0 "$iperf_pid" 2>/dev/null; then
+        kill -KILL "$iperf_pid" 2>/dev/null || true
+        fail "$signal_case left an orphan iperf3 process"
+    fi
+    if find "$case_tmp" -mindepth 1 -print -quit | grep -q .; then
+        find "$case_tmp" -mindepth 1 -print >&2
+        fail "$signal_case left temporary probe resources"
+    fi
+    printf 'PASS: %s cleans iperf3 and temporary probe resources\n' "$signal_case"
+done
+
+if grep -Eq '(^|[^[:alnum:]_])pkill([^[:alnum:]_]|$)' \
+    "$ROOT_DIR/modules/network-optimize.sh"; then
+    fail "probe cleanup uses broad pkill"
+fi
+printf 'PASS: probe cleanup targets recorded PIDs without broad pkill\n'
 
 CURRENT_ROUTE="default via 192.0.2.1 dev eth0 proto dhcp src 192.0.2.10 metric 100 onlink"
 LAST_ROUTE_ARGS=""
@@ -603,18 +832,18 @@ persist_bbr_module
 assert_eq tcp_bbr "$(cat "$BBR_MODULES_FILE")" "persist BBR module atomically"
 assert_eq 644 "$(stat -c '%a' "$BBR_MODULES_FILE")" "persist BBR module mode"
 
-# Rollback collects every failed initcwnd recovery item in execution order.
+# Rollback collects every failed install recovery item in execution order.
 (
     restore_default_route() { return 1; }
     restore_managed_file() { return 1; }
     apply_runtime_values_strict() { return 1; }
-    if rollback_initcwnd_install; then
-        fail "incomplete initcwnd rollback unexpectedly succeeded"
+    if rollback_install; then
+        fail "incomplete install rollback unexpectedly succeeded"
     fi
-    assert_eq 'route hook runtime config' "${INITCWND_ROLLBACK_FAILED_ITEMS[*]}" \
-        "summarize all initcwnd rollback failures"
+    assert_eq 'config modules runtime route hook' "${INSTALL_ROLLBACK_FAILED_ITEMS[*]}" \
+        "summarize all install rollback failures"
 )
-printf 'PASS: initcwnd rollback reports route, hook, runtime, and config failures\n'
+printf 'PASS: install rollback reports all five failed state classes\n'
 
 CURRENT_ROUTE="default via 192.0.2.1 dev eth0 proto dhcp metric 100"
 create_initcwnd_ownership_marker
