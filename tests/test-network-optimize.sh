@@ -558,6 +558,38 @@ EOF
     printf 'PASS: all measurement warning values use Chinese display mappings\n'
 )
 
+(
+    warning_file="$TEMP_DIR/active-root-htb-warning.out"
+    MEASUREMENT_WARNINGS=""
+    MEASUREMENT_CONFIDENCE=high
+    readlink() { return 1; }
+    find() { return 0; }
+    sysctl() {
+        [[ "$1" == "-n" ]] || return 1
+        case "$2" in
+            net.ipv4.tcp_congestion_control) printf '%s\n' cubic ;;
+            net.core.default_qdisc) printf '%s\n' fq ;;
+            *) return 1 ;;
+        esac
+    }
+    tc() { printf '%s\n' 'qdisc htb 1: root refcnt 2 default 10'; }
+    detail() { return 0; }
+    warn() { printf '%s\n' "$1"; }
+
+    show_probe_environment eth0 > "$warning_file"
+    show_measurement_warnings >> "$warning_file"
+    warning_output=$(<"$warning_file")
+    expected_warning='检测到活动的根 HTB 队列，当前限速可能导致测速结果偏低。'
+    assert_eq 1 "$(grep -Fc "$expected_warning" <<< "$warning_output")" \
+        "active root HTB warning is displayed once"
+    grep -Fqx "警告：$expected_warning" <<< "$warning_output" ||
+        fail "active root HTB warning lacks the unified prefix"
+    assert_eq "$expected_warning" "$MEASUREMENT_WARNINGS" \
+        "active root HTB warning remains persisted"
+    assert_eq low "$MEASUREMENT_CONFIDENCE" \
+        "active root HTB warning still lowers confidence"
+)
+
 if grep -Eq 'NETWORK_OPTIMIZE_TCSHAPE_CONFIG_FILE|/etc/tcshape[.]conf|tcshape HTB|tcshape off' \
     "$ROOT_DIR/modules/network-optimize.sh"; then
     fail "network-optimize retains tcshape-specific runtime coupling"

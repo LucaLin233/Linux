@@ -1904,7 +1904,6 @@ show_probe_environment() {
     if [[ "$root_qdisc" == "htb" ]]; then
         BANDWIDTH_PROBE_NOTE="检测到活动的根 HTB 队列，当前限速可能导致测速结果偏低。"
         add_measurement_warning "$BANDWIDTH_PROBE_NOTE"
-        warn "$BANDWIDTH_PROBE_NOTE"
     fi
 }
 
