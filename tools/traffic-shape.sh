@@ -21,7 +21,7 @@ readonly SERVICE_FILE="${TCSHAPE_SERVICE_FILE:-/etc/systemd/system/tcshape.servi
 readonly LOCK_FILE="${TCSHAPE_LOCK_FILE:-/run/lock/tcshape.lock}"
 readonly PID_FILE="/run/tcshape-$$.iperf.pid"
 
-# 与 modules/network-optimize.sh 保持一致。
+# tcshape 使用独立预算，不读取或共享其他工具的状态。
 readonly TRAFFIC_TOTAL_LIMIT_BYTES=90000000000
 readonly TRAFFIC_DIRECTION_LIMIT_BYTES=45000000000
 readonly TRAFFIC_MIN_RESERVE_BYTES=1000000000

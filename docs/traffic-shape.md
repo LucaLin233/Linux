@@ -6,8 +6,8 @@ Sweep 与 Shape 核心逻辑，用于检测 VPS 出口 policer 的限速拐点�
 `HTB + fq` 出口整形。tcshape 是独立、安全边界更严格的工具，不追求完整复制 tcpfit 的命令、
 交互流程或 TCP/sysctl 调优功能。
 
-基础 BBR、TCP 缓冲区与 sysctl 调优仍由 `modules/network-optimize.sh` 管理；tcshape 不修改
-任何 sysctl。
+tcshape 不调用或读取 `modules/network-optimize.sh`，也不共享状态、缓存、锁或运行库；
+它只管理自身的 Sweep、iperf3 测量、qdisc 状态与恢复流程，并且不修改任何 sysctl。
 
 ## 系统要求
 
@@ -147,7 +147,7 @@ sudo tcshape --version
 
 ## 流量限制
 
-与 `modules/network-optimize.sh` 保持一致：
+tcshape 使用自身独立的流量上限：
 
 ```text
 单方向：45,000,000,000 字节

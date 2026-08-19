@@ -78,7 +78,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/linux_
 | ---: | --- | --- | --- |
 | 1 | `system-optimize.sh` | Zram、系统 sysctl、journald、THP、时区和 Chrony | 为 headless VPS 设置 Panic 恢复、日志上限和低干扰 THP 策略；Ubuntu 可能安装内核模块、固件与 CPU 微码 |
 | 2 | `system-customize.sh` | 动态 MOTD、中文 Locale、可选 XanMod | 可能修改 Locale、欢迎信息和内核 |
-| 3 | `network-optimize.sh` | BBR、fq、按需禁用 ECN、动态 TCP/UDP 缓冲区 | 交互时先询问是否测速，拒绝后手填带宽；单方向 40 GB 或合计 85 GB 时提前停止 |
+| 3 | `network-optimize.sh` | BBR、fq、动态 TCP 缓冲区与 initcwnd | 交互测速默认 Y；上传、下载各 12.5 GB，合计 25 GB |
 | 4 | `zsh-setup.sh` | Zsh、Oh My Zsh、Powerlevel10k 和插件 | 备份后重写 root 的 `.zshrc`，可修改默认 Shell |
 | 5 | `mise-setup.sh` | Mise、Python、Node.js 和依赖迁移 | 配置 Shell 集成及每周 Mise 自动更新 |
 | 6 | `tools-setup.sh` | NextTrace、Speedtest、htop、jq、tree 等 | 可能添加 NextTrace 第三方 APT 源 |
@@ -190,26 +190,26 @@ sudo bash <(curl -fsSL "$RAW_BASE/system-customize.sh") help
 `restore` 会统一恢复 MOTD、Locale 和 XanMod 软件源文件；默认恢复上一次运行前状态，
 `restore initial` 恢复首次运行前的可信状态。已安装的 XanMod 内核包不会被卸载。
 
-`network-optimize.sh` 支持先计算、手动指定参数、查看状态和恢复配置：
+`network-optimize.sh` 支持自动测速、手动指定参数、查看状态和恢复配置：
 
 ```bash
 RAW_BASE="https://raw.githubusercontent.com/LucaLin233/Linux/main/modules"
-# 交互终端无参数运行：选择测速，或拒绝后手填上下行带宽
+# 交互终端无参数运行：回车默认执行公共 iperf3 测速，选择 N 后手填带宽
 sudo bash <(curl -fsSL "$RAW_BASE/network-optimize.sh")
 
-# 非交互必须明确指定完整带宽或使用 --probe
+# 非交互自动测速；install 模式可通过 APT 安装缺失的 iperf3 等依赖
+sudo bash <(curl -fsSL "$RAW_BASE/network-optimize.sh") install --auto
+
+# 绕过 7 天缓存强制现场测速；失败时仍可回退到 30 天内同路由缓存
+sudo bash <(curl -fsSL "$RAW_BASE/network-optimize.sh") install --auto --refresh
+
+# 非交互手动提供完整上下行带宽
 bash <(curl -fsSL "$RAW_BASE/network-optimize.sh") \
   plan --download-mbps 1000 --upload-mbps 500
-
-# 明确允许主动探测
-sudo bash <(curl -fsSL "$RAW_BASE/network-optimize.sh") install --probe
 
 # 使用明确的带宽和 RTT，避免自动测速
 sudo bash <(curl -fsSL "$RAW_BASE/network-optimize.sh") \
   install --download-mbps 1000 --upload-mbps 500 --rtt-ms 180
-
-# 只读性能验证；交互确认后比较 1 流与 4 流
-bash <(curl -fsSL "$RAW_BASE/network-optimize.sh") verify
 
 bash <(curl -fsSL "$RAW_BASE/network-optimize.sh") status
 sudo bash <(curl -fsSL "$RAW_BASE/network-optimize.sh") restore
@@ -217,21 +217,39 @@ sudo bash <(curl -fsSL "$RAW_BASE/network-optimize.sh") restore initial
 bash <(curl -fsSL "$RAW_BASE/network-optimize.sh") help
 ```
 
-主脚本交互运行到网络模块时只询问是否执行主动测速；选择多个模块也不会跳过该确认。拒绝测速后必须手填下载和上传带宽，RTT 缺省按 150 ms 计算；显式 `--rtt-ms` 严格使用用户值。无 TTY 时只接受 `--probe`、`--bandwidth-mbps` 或完整的 `--download-mbps` 与 `--upload-mbps`。主动探测失败时，有 TTY 会转为手填，无 TTY 则在写配置、sysctl 或路由前失败。主动探测只测带宽、不采集 RTT；未显式提供 `--rtt-ms` 时，BDP 按 150 ms 计算。
+主脚本仍以无参数方式调用网络模块，因此进入该模块后会显示同一交互问题，直接回车走默认 Y。
+无 TTY 时只接受 `--auto`、`--bandwidth-mbps` 或完整的 `--download-mbps` 与
+`--upload-mbps`。自动测速仅使用 IPv4 公共 iperf3，最多选择两个节点，每方向固定
+`P=4`、`t=5` 秒并采用有效较高结果；同方向节点差异超过 30% 时只降低可信度并警告。
+上传、下载预算各为 12.5 GB，总预算 25 GB，按实际出口接口计数并包含同期后台流量。自动测速
+先记录 `1.1.1.1` 对应的默认 IPv4 出口身份，只测试并采纳 ifindex、接口、网关和源地址完全
+一致的公共节点；应用前会再次校验，避免路由切换后写入失真的调优值。
 
-`initcwnd` 默认为 `auto`：已知上传带宽不高于 100 Mbps 时保留内核默认，否则在默认路由设置 `initcwnd/initrwnd=32`；`--enable-initcwnd` 和 `--disable-initcwnd` 可显式覆盖。`status` 同时检查 ownership marker 与真实默认路由，并把 marker/路由不一致报告为漂移；也会区分 `default qdisc` 和默认出口实际 `active qdisc`，能识别 root `fq`、`mq` + 全 `fq` leaves、`htb` + 全 `fq` leaves，以及混合或不可读状态。`verify` 自动选择附近公共 iperf3 对端和可用端口，只有交互确认或非交互显式 `--yes` 后才测试；比较 1 流与 4 流 sender/receiver goodput、重传率和 CPU，并报告测试期间 softnet、网卡丢包/错误、全机 TCP 重传及可用的驱动 allowance 增量。全程不修改 sysctl、路由或 qdisc，也不自动安装依赖。
+成功测量通过路由复核后写入 v2 缓存，固定绑定 `1.1.1.1` 的 ifindex、接口、网关和源地址；旧版
+缓存会被忽略。7 天内缓存可直接复用；`--auto --refresh` 会绕过它并强制现场测速。现场测速失败
+时，只允许回退到 30 天内且路由身份完全一致的缓存；refresh 回退范围也包含 7 天内缓存。单节点、
+结果分歧、预算停止或缓存回退属于低可信度：只要上下行输入完整且应用验证成功，命令仍返回 0，
+并把来源、时间、节点、可信度和警告写入配置供 `status` 显示。缺少任一方向、应用验证失败或触发
+回滚返回 1。
 
-默认不写入 `net.ipv4.tcp_ecn`；只有显式传入 `--disable-ecn` 时才持久写入 `0`。
+`initcwnd` 默认为 `auto`：上传带宽不高于 100 Mbps 时保留内核默认，否则在默认路由设置
+`initcwnd/initrwnd=32`；`--enable-initcwnd` 和 `--disable-initcwnd` 可显式覆盖。持久化 hook
+在最终写路由前会再次检查 ownership marker。模块不接管 ECN、forwarding 或 IPv6 RA。
+`verify`、`--probe`、`--yes` 和 `--disable-ecn` 已退休并会被拒绝。
 
 网络模块默认面向同时承载 TCP、UDP 与 Docker 流量的代理节点：连接队列使用
-`somaxconn=65535`、`tcp_max_syn_backlog=16384`，TCP 缓冲起点固定为 2 MiB，长流继续依赖
-autotuning。动态最大值按 `2 × BDP + 2 MiB`
-计算，并限制为有效 RAM（物理 RAM 与有限 cgroup memory limit 的较小值）的 1/32；RAM cap
-最低 8 MiB、最高 256 MiB，动态 socket 最大值另保留 4 MiB 绝对下限。模块启用 TCP receive
-autotuning、window scaling、SACK、DSACK、时间戳和 syncookies，但保留内核或发行版管理的
-`tcp_mem`、core socket 默认值、`netdev_budget` 与 `netdev_budget_usecs`。`status` 只读显示这些
-参数，并补充 `tcp_tw_reuse`、`min_free_kbytes`、`file-max`、`nr_open` 与 `file-nr`，供出现端口、
-内存、NAPI 或 file handle 压力时按证据判断，而不是无条件写入固定优化值。
+`somaxconn=65535`、`tcp_max_syn_backlog=16384`。基础内存模型兼容 tcpfit v0.5.6 的 mixed role：
+TCP 与 core socket default 固定为 2 MiB，长流继续依赖 autotuning；core default 同时影响 TCP、
+UDP 和其他未显式设置缓冲区的 socket。`tcp_mem` 的 low/pressure/max 比例值按有效 RAM
+（物理 RAM 与当前轻量 cgroup 根限制的较小值）的 1/16、1/8、1/4 推导；低内存 floor 固定为
+16/32/64 MiB，最终写入 sysctl 时转换为当前内核 page 数，不假设 page size 固定为 4 KiB。
+
+动态 socket 最大值仍按 `2 × BDP + 2 MiB` 计算，并受有效 RAM / 32 限制；RAM cap 最低
+8 MiB、最高 256 MiB，动态最大值另保留 4 MiB 绝对下限。下游继续保留严格应用与验证事务、
+initial/previous 双备份，以及 cgroup 根限制增强。模块启用 TCP receive autotuning、window
+scaling、SACK、DSACK、时间戳和 syncookies，但保留内核或发行版管理的 `netdev_budget` 与
+`netdev_budget_usecs`。`status` 聚焦当前测量记录、BBR/fq、受管缓冲区和 initcwnd 状态，不再
+提供通用系统健康面板。
 
 > `RAW_BASE` 只在当前 Shell 会话有效。上述进程替换语法需要 Bash 或 Zsh；不要改成
 > `curl ... | sudo bash`，否则交互模块可能无法正常读取终端输入。SSH、自动更新、内核和网络

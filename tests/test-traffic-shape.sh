@@ -203,6 +203,18 @@ grep -Fqx "qdisc replace dev eth0 root fq" "$MQ_CALL_LOG" ||
 printf 'PASS: simple qdisc restore uses replace\n'
 unset -f tc root_qdisc_kind
 
+if grep -Fq 'network-optimize' "$ROOT_DIR/tools/traffic-shape.sh"; then
+    fail "traffic-shape code still references network-optimize"
+fi
+if grep -Eq '/var/lib/linux-setup|network-optimize[.]lock|network-optimize[.]bandwidth-cache' \
+    "$ROOT_DIR/tools/traffic-shape.sh"; then
+    fail "traffic-shape shares state, cache, or lock paths"
+fi
+grep -Fq 'tcshape 使用自身独立的流量上限' "$ROOT_DIR/docs/traffic-shape.md" ||
+    fail "traffic-shape documentation still couples its budget"
+printf 'PASS: traffic-shape keeps independent code, state, lock, and budget
+'
+
 assert_eq "1.0.13" "$(script_version "$ROOT_DIR/tools/traffic-shape.sh")" \
     "extract update version"
 assert_ok "validate install source" validate_install_file \
