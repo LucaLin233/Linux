@@ -255,6 +255,12 @@ assert_eq 手动启用 "$(format_initcwnd_policy 'explicit enabled')" \
     "format explicit initcwnd enablement"
 assert_eq 手动禁用 "$(format_initcwnd_policy 'explicit disabled')" \
     "format explicit initcwnd disablement"
+assert_eq '存在所有权标记，但默认路由缺少 initcwnd/initrwnd=32' \
+    "$(format_initcwnd_state_detail 'ownership marker exists but default route lacks initcwnd/initrwnd 32')" \
+    "format ownership drift state"
+assert_eq '内核默认，无所有权标记' \
+    "$(format_initcwnd_state_detail 'kernel default; no ownership marker')" \
+    "format default ownership state"
 assert_eq 1 "$(grep -Fc '警告：未检测到 networkd-dispatcher；initcwnd=32 仅对当前默认路由生效' \
     "$ROOT_DIR/modules/network-optimize.sh")" \
     "missing networkd-dispatcher warning has one output path"
@@ -390,15 +396,38 @@ unset -f traffic_used_bytes
         "generated config writes effective-RAM tcp_mem pages"
 
     plan_output=$(show_tuning_plan)
+    grep -Fq 'TCP 缓冲：默认 2.0 MiB / 接收上限 45.0 MiB / 发送上限 24.0 MiB' \
+        <<< "$plan_output" || fail "plan collapses asymmetric buffer limits"
     grep -Fq 'TCP 内存：131072 / 262144 / 524288 页（512.0 MiB / 1024.0 MiB / 2048.0 MiB）' \
         <<< "$plan_output" || fail "plan omits combined TCP memory summary"
+    sysctl() {
+        [[ "$1" == "-n" && "$2" == "net.ipv4.tcp_congestion_control" ]] || return 1
+        printf '%s\n' cubic
+    }
     active_qdisc_state() { printf '%s\n' 'effective|root fq'; }
     install_summary=$(show_install_summary false)
+    grep -Fq 'TCP 缓冲：默认 2.0 MiB / 接收上限 45.0 MiB / 发送上限 24.0 MiB' \
+        <<< "$install_summary" || fail "install summary collapses asymmetric buffer limits"
+    grep -Fq '拥塞控制：cubic' <<< "$install_summary" ||
+        fail "non-BBR summary omits active congestion control"
+    sysctl() { return 1; }
+    unknown_cc_summary=$(show_install_summary false)
+    grep -Fq '拥塞控制：未知' <<< "$unknown_cc_summary" ||
+        fail "non-BBR summary does not handle congestion-control read failure"
     grep -Fq 'TCP 内存：131072 / 262144 / 524288 页（512.0 MiB / 1024.0 MiB / 2048.0 MiB）' \
         <<< "$install_summary" || fail "install summary omits combined TCP memory summary"
+    for manual_output in "$plan_output" "$install_summary"; do
+        grep -Fq '  节点：' <<< "$manual_output" ||
+            fail "manual output omits node label"
+        grep -Fq '    无（手动输入）' <<< "$manual_output" ||
+            fail "manual input is not shown as no measurement node"
+        if grep -Fq '1. 手动输入' <<< "$manual_output"; then
+            fail "manual input is still shown as a numbered measurement node"
+        fi
+    done
     assert_eq 1 "$(grep -Fc 'TCP 内存：' <<< "$install_summary")" \
         "install summary reports TCP memory once"
-    printf 'PASS: plan and install summary report one combined TCP memory line\n'
+    printf 'PASS: plan and install summary preserve directional limits and manual-node semantics\n'
 
     (
         sysctl() {
@@ -459,8 +488,11 @@ unset -f traffic_used_bytes
         fail "status omits formatted measurement source"
     grep -Fq '时间：2033-05-18T03:33:20Z' <<< "$status_output" ||
         fail "status omits measurement time"
-    grep -Fq '1. 手动输入' <<< "$status_output" ||
-        fail "status omits formatted measurement node"
+    grep -Fq '无（手动输入）' <<< "$status_output" ||
+        fail "status omits manual no-node display"
+    if grep -Fq '1. 手动输入' <<< "$status_output"; then
+        fail "status numbers manual input as a measurement node"
+    fi
     grep -Fq '可信度：手动输入' <<< "$status_output" ||
         fail "status omits formatted confidence"
     grep -Fq '警告：无' <<< "$status_output" ||
@@ -523,6 +555,16 @@ unset -f traffic_used_bytes
     plan_output=$(show_tuning_plan)
     install_output=$(show_install_summary true)
     status_output=$(show_status)
+    grep -Fq 'RTT：150 ms（自动固定值）' <<< "$status_output" ||
+        fail "status omits single RTT label"
+    if grep -Fq 'RTT：RTT：' <<< "$status_output"; then
+        fail "status repeats the RTT label"
+    fi
+    grep -Fq '内核默认，无所有权标记' <<< "$status_output" ||
+        fail "status omits localized ownership state"
+    if grep -Fq 'ownership 标记' <<< "$status_output"; then
+        fail "status leaks the old ownership wording"
+    fi
     for display_output in "$plan_output" "$install_output" "$status_output"; do
         grep -Fq '7 天内同路由缓存（公共 IPv4 iperf3 测速（4 并发 × 5 秒））' \
             <<< "$display_output" || fail "display surface omitted formatted cache source"

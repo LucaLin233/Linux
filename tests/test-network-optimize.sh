@@ -562,10 +562,17 @@ if grep -Eq 'NETWORK_OPTIMIZE_TCSHAPE_CONFIG_FILE|/etc/tcshape[.]conf|tcshape HT
     "$ROOT_DIR/modules/network-optimize.sh"; then
     fail "network-optimize retains tcshape-specific runtime coupling"
 fi
-grep -Fq '检测到 active root HTB，当前限速可能导致测速偏低。' \
+grep -Fq '检测到活动的根 HTB 队列，当前限速可能导致测速结果偏低。' \
     "$ROOT_DIR/modules/network-optimize.sh" ||
-    fail "generic active root HTB warning is missing"
-printf 'PASS: network-optimize keeps only generic active root HTB diagnostics\n'
+    fail "localized active root HTB warning is missing"
+assert_eq '检测到活动的根 HTB 队列，当前限速可能导致测速结果偏低。' \
+    "$(format_measurement_warning '检测到 active root HTB，当前限速可能导致测速偏低。')" \
+    "legacy active root HTB warning is formatted in Chinese"
+if grep -Fq '检测到 active root HTB，当前限速可能导致测速偏低。' \
+    <<< "$(format_measurement_warning '检测到 active root HTB，当前限速可能导致测速偏低。')"; then
+    fail "warning output retains active root HTB wording"
+fi
+printf 'PASS: network-optimize localizes active root HTB diagnostics\n'
 
 if grep -Eq '(^|[[:space:]])(return|exit)[[:space:]]+2([[:space:]]|$)' \
     "$ROOT_DIR/modules/network-optimize.sh"; then
