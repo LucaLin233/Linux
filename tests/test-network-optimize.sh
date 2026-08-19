@@ -309,6 +309,11 @@ grep -Fq '# network-optimize:initcwnd-hook:v1' "$INITCWND_ROUTE_HOOK" ||
 initcwnd_settings_owned || fail "ownership marker is not accepted as ownership evidence"
 printf 'PASS: marker ownership evidence is accepted\n'
 bash -n "$INITCWND_ROUTE_HOOK" || fail "generated initcwnd route hook has invalid syntax"
+(
+    install() { fail "hook write attempted to normalize existing parent directory"; }
+    write_initcwnd_hook
+)
+printf 'PASS: initcwnd hook write preserves existing parent directory\n'
 printf 'PASS: apply initcwnd installs managed persistence hook\n'
 
 backup_default_route

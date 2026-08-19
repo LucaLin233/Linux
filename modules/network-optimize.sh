@@ -217,9 +217,10 @@ atomic_install_file() {
 }
 
 atomic_write_file() {
-    local destination="$1" content="$2" mode="${3:-0600}" stage
+    local destination="$1" content="$2" mode="${3:-0600}" create_parent="${4:-true}" stage
 
-    install -d -m 0755 "$(dirname "$destination")" || return 1
+    [[ "$create_parent" == "false" ]] ||
+        install -d -m 0755 "$(dirname "$destination")" || return 1
     stage=$(mktemp "${destination}.new.XXXXXX") || return 1
     if ! printf '%s\n' "$content" > "$stage" || ! chmod "$mode" "$stage" ||
         ! mv -f -- "$stage" "$destination"; then
@@ -1059,7 +1060,7 @@ write_initcwnd_hook() {
     fi
 
     content=$(render_initcwnd_hook) || return 1
-    atomic_write_file "$INITCWND_ROUTE_HOOK" "$content" 0755
+    atomic_write_file "$INITCWND_ROUTE_HOOK" "$content" 0755 false
 }
 
 # Generated hook uses clean as an array; apply path intentionally shadows it as a string.
