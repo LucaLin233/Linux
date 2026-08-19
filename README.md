@@ -144,7 +144,7 @@ sudo bash <(curl -fsSL "$RAW_BASE/system-optimize.sh")
 # 2. 欢迎信息、中文环境和可选 XanMod
 sudo bash <(curl -fsSL "$RAW_BASE/system-customize.sh")
 
-# 3. 网络优化；默认会自动探测并应用，可能产生大量流量
+# 3. 网络优化；交互选择是否测速，测速可能产生大量流量
 sudo bash <(curl -fsSL "$RAW_BASE/network-optimize.sh")
 
 # 4. Zsh、Oh My Zsh、Powerlevel10k 和插件
