@@ -1670,8 +1670,12 @@ load_measurement_cache() {
     PROBE_IFACE="$iface"
     if [[ "$mode" == "fresh" ]]; then
         MEASUREMENT_SOURCE="7-day route-bound cache (${source:-public iperf3})"
+    elif (( age <= CACHE_FRESH_MAX_AGE_SECONDS )); then
+        MEASUREMENT_SOURCE="same-route fresh cache fallback (${source:-public iperf3})"
     else
         MEASUREMENT_SOURCE="same-route stale cache (${source:-public iperf3})"
+    fi
+    if [[ "$mode" != "fresh" ]]; then
         add_measurement_warning "live public iperf3 measurement failed, reused same-route cache no older than 30 days"
     fi
     BANDWIDTH_SOURCE="$MEASUREMENT_SOURCE"

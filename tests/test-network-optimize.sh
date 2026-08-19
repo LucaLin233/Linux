@@ -341,11 +341,42 @@ EOF
         load_measurement_cache "$CACHE_FRESH_MAX_AGE_SECONDS" fresh
 
     seed_cache $((2000000000 - 60))
+    assert_ok "fresh mode accepts a sixty-second cache" \
+        load_measurement_cache "$CACHE_FRESH_MAX_AGE_SECONDS" fresh
+    grep -Fq '7-day route-bound cache' <<< "$MEASUREMENT_SOURCE" ||
+        fail "fresh mode mislabeled a sixty-second cache"
+    assert_eq '' "$MEASUREMENT_WARNINGS" \
+        "fresh mode adds no live-measurement failure warning"
+
+    seed_cache $((2000000000 - 60))
     assert_ok "refresh fallback accepts a cache newer than seven days" \
         load_measurement_cache "$CACHE_STALE_MAX_AGE_SECONDS" fallback
+    grep -Fq 'fresh cache fallback' <<< "$MEASUREMENT_SOURCE" ||
+        fail "refresh fallback mislabeled a sixty-second cache"
     assert_eq low "$MEASUREMENT_CONFIDENCE" \
         "refresh fallback marks reused fresh cache low confidence"
+    grep -Fq 'live public iperf3 measurement failed' <<< "$MEASUREMENT_WARNINGS" ||
+        fail "refresh fresh-cache fallback omitted the live failure warning"
 
+    seed_cache $((2000000000 - 8 * 24 * 60 * 60))
+    assert_ok "refresh fallback accepts an eight-day cache" \
+        load_measurement_cache "$CACHE_STALE_MAX_AGE_SECONDS" fallback
+    grep -Fq 'same-route stale cache' <<< "$MEASUREMENT_SOURCE" ||
+        fail "refresh fallback mislabeled an eight-day cache"
+    assert_eq low "$MEASUREMENT_CONFIDENCE" \
+        "refresh fallback marks an eight-day cache low confidence"
+    grep -Fq 'live public iperf3 measurement failed' <<< "$MEASUREMENT_WARNINGS" ||
+        fail "refresh stale-cache fallback omitted the live failure warning"
+
+    seed_cache $((2000000000 - 8 * 24 * 60 * 60))
+    assert_ok "stale mode accepts an eight-day cache" \
+        load_measurement_cache "$CACHE_STALE_MAX_AGE_SECONDS" stale
+    grep -Fq 'same-route stale cache' <<< "$MEASUREMENT_SOURCE" ||
+        fail "stale mode mislabeled an eight-day cache"
+    assert_eq low "$MEASUREMENT_CONFIDENCE" \
+        "stale mode keeps an eight-day cache low confidence"
+    grep -Fq 'live public iperf3 measurement failed' <<< "$MEASUREMENT_WARNINGS" ||
+        fail "stale mode omitted the live failure warning"
 
     seed_cache $((2000000000 - CACHE_FRESH_MAX_AGE_SECONDS - 1))
     assert_fail "cache older than seven days is not fresh" \
