@@ -143,8 +143,9 @@ declare -A PROBE_ENVIRONMENT_SHOWN_BY_IFACE=()
 declare -a TRAFFIC_IFACES=()
 declare -A TRAFFIC_RX_START_BY_IFACE=()
 declare -A TRAFFIC_TX_START_BY_IFACE=()
-declare -a IPERF_RUNNER_PIDS=()
-declare -a CLOUDFLARE_WORKER_PIDS=()
+# PID arrays are accessed through namerefs.
+# shellcheck disable=SC2034
+declare -a IPERF_RUNNER_PIDS=() CLOUDFLARE_WORKER_PIDS=()
 declare -a INITCWND_ROLLBACK_FAILED_ITEMS=()
 PREFERRED_IPERF_PORT=""
 CLOUDFLARE_IPV4=""
@@ -285,19 +286,22 @@ backup_managed_file() {
     stage_managed_state "$target" "$previous_backup" "$previous_absent"
 }
 
+managed_file_specs() {
+    cat <<EOF
+network|$NETWORK_CONF|$NETWORK_INITIAL_BACKUP|$NETWORK_PREVIOUS_BACKUP|$NETWORK_INITIAL_ABSENT|$NETWORK_PREVIOUS_ABSENT
+modules|$BBR_MODULES_FILE|$BBR_MODULES_INITIAL_BACKUP|$BBR_MODULES_PREVIOUS_BACKUP|$BBR_MODULES_INITIAL_ABSENT|$BBR_MODULES_PREVIOUS_ABSENT
+hook|$INITCWND_ROUTE_HOOK|$ROUTE_HOOK_INITIAL_BACKUP|$ROUTE_HOOK_PREVIOUS_BACKUP|$ROUTE_HOOK_INITIAL_ABSENT|$ROUTE_HOOK_PREVIOUS_ABSENT
+EOF
+}
+
 # Multi-file guard for command/function failures; not a power-loss transaction.
 previous_state_paths() {
     printf '%s\n' \
-        "$NETWORK_PREVIOUS_BACKUP" \
-        "$NETWORK_PREVIOUS_ABSENT" \
-        "$BBR_MODULES_PREVIOUS_BACKUP" \
-        "$BBR_MODULES_PREVIOUS_ABSENT" \
-        "$RUNTIME_PREVIOUS_BACKUP" \
-        "$ROUTE_PREVIOUS_BACKUP" \
-        "$ROUTE_PREVIOUS_ABSENT" \
-        "$ROUTE_PREVIOUS_OWNED" \
-        "$ROUTE_HOOK_PREVIOUS_BACKUP" \
-        "$ROUTE_HOOK_PREVIOUS_ABSENT"
+        "$NETWORK_PREVIOUS_BACKUP" "$NETWORK_PREVIOUS_ABSENT" \
+        "$BBR_MODULES_PREVIOUS_BACKUP" "$BBR_MODULES_PREVIOUS_ABSENT" \
+        "$RUNTIME_PREVIOUS_BACKUP" "$ROUTE_PREVIOUS_BACKUP" \
+        "$ROUTE_PREVIOUS_ABSENT" "$ROUTE_PREVIOUS_OWNED" \
+        "$ROUTE_HOOK_PREVIOUS_BACKUP" "$ROUTE_HOOK_PREVIOUS_ABSENT"
 }
 
 begin_previous_state_transaction() {
@@ -384,6 +388,17 @@ restore_managed_file() {
     fi
 
     return 1
+}
+
+require_commands() {
+    local command_name
+
+    for command_name in "$@"; do
+        command -v "$command_name" >/dev/null 2>&1 || {
+            error "缺少必要命令: $command_name"
+            return 1
+        }
+    done
 }
 
 require_root() {
@@ -1322,18 +1337,21 @@ traffic_budget_reached() {
     (( total >= total_stop || directional >= direction_stop ))
 }
 
-register_iperf_runner() {
-    IPERF_RUNNER_PIDS+=("$1")
+register_tracked_pid() {
+    local -n tracked="$1"
+    tracked+=("$2")
 }
 
-unregister_iperf_runner() {
-    local wanted="$1" pid
+# shellcheck disable=SC2178
+unregister_tracked_pid() {
+    local list_name="$1" wanted="$2" pid
+    local -n tracked="$list_name"
     local -a remaining=()
 
-    for pid in "${IPERF_RUNNER_PIDS[@]}"; do
+    for pid in "${tracked[@]}"; do
         [[ "$pid" == "$wanted" ]] || remaining+=("$pid")
     done
-    IPERF_RUNNER_PIDS=("${remaining[@]}")
+    tracked=("${remaining[@]}")
 }
 
 terminate_recorded_pid() {
@@ -1349,43 +1367,21 @@ terminate_recorded_pid() {
     wait "$pid" 2>/dev/null || true
 }
 
-cleanup_iperf_runners() {
-    local pid
-    local -a pids=("${IPERF_RUNNER_PIDS[@]}")
+# shellcheck disable=SC2178
+cleanup_tracked_pids() {
+    local list_name="$1" pid
+    local -n tracked="$list_name"
+    local -a pids=("${tracked[@]}")
 
     for pid in "${pids[@]}"; do
         terminate_recorded_pid "$pid"
-        unregister_iperf_runner "$pid"
-    done
-}
-
-register_cloudflare_worker() {
-    CLOUDFLARE_WORKER_PIDS+=("$1")
-}
-
-unregister_cloudflare_worker() {
-    local wanted="$1" pid
-    local -a remaining=()
-
-    for pid in "${CLOUDFLARE_WORKER_PIDS[@]}"; do
-        [[ "$pid" == "$wanted" ]] || remaining+=("$pid")
-    done
-    CLOUDFLARE_WORKER_PIDS=("${remaining[@]}")
-}
-
-cleanup_cloudflare_workers() {
-    local pid
-    local -a pids=("${CLOUDFLARE_WORKER_PIDS[@]}")
-
-    for pid in "${pids[@]}"; do
-        terminate_recorded_pid "$pid"
-        unregister_cloudflare_worker "$pid"
+        unregister_tracked_pid "$list_name" "$pid"
     done
 }
 
 cleanup_probe_processes() {
-    cleanup_iperf_runners
-    cleanup_cloudflare_workers
+    cleanup_tracked_pids IPERF_RUNNER_PIDS
+    cleanup_tracked_pids CLOUDFLARE_WORKER_PIDS
 }
 
 run_iperf_runner() {
@@ -1401,7 +1397,7 @@ run_iperf_runner() {
         "${deadline}s" iperf3 -4 -c "$host" -p "$port" -t "$duration" \
         -P "$streams" "${reverse[@]}" -J > "$output_file" 2>&1 &
     pid=$!
-    register_iperf_runner "$pid"
+    register_tracked_pid IPERF_RUNNER_PIDS "$pid"
 
     while kill -0 "$pid" 2>/dev/null; do
         if traffic_budget_reached "$direction"; then
@@ -1416,7 +1412,7 @@ run_iperf_runner() {
     else
         rc=75
     fi
-    unregister_iperf_runner "$pid"
+    unregister_tracked_pid IPERF_RUNNER_PIDS "$pid"
     return "$rc"
 }
 
@@ -1572,7 +1568,7 @@ run_verify_iperf() {
 }
 
 cleanup_verify() {
-    cleanup_iperf_runners
+    cleanup_tracked_pids IPERF_RUNNER_PIDS
     [[ -z "${VERIFY_TEMP_DIR:-}" ]] || rm -rf "$VERIFY_TEMP_DIR"
     VERIFY_TEMP_DIR=""
 }
@@ -1833,7 +1829,7 @@ probe_cloudflare_direction() {
         cloudflare_worker "$direction" "$upload_file" &
         pid=$!
         pids+=("$pid")
-        register_cloudflare_worker "$pid"
+        register_tracked_pid CLOUDFLARE_WORKER_PIDS "$pid"
     done
 
     while true; do
@@ -1847,7 +1843,7 @@ probe_cloudflare_direction() {
         [[ "$alive" == "true" ]] || break
 
         if traffic_budget_reached "$direction"; then
-            cleanup_cloudflare_workers
+            cleanup_tracked_pids CLOUDFLARE_WORKER_PIDS
             break
         fi
         sleep 0.05
@@ -1856,7 +1852,7 @@ probe_cloudflare_direction() {
         if ! wait "$pid" 2>/dev/null; then
             detail "Cloudflare worker $pid 已停止或失败"
         fi
-        unregister_cloudflare_worker "$pid"
+        unregister_tracked_pid CLOUDFLARE_WORKER_PIDS "$pid"
     done
     [[ -n "$upload_file" ]] && rm -f "$upload_file"
 
@@ -2556,32 +2552,15 @@ merge_initial_runtime_values() {
 }
 
 backup_network_state() {
+    local label target initial previous initial_absent previous_absent
+
     install -d -m 0755 "$NETWORK_OPTIMIZE_STATE_DIR"
     prepare_legacy_backup_state
-
-    PREVIOUS_BACKUP_FAILED_ITEM="network"
-    backup_managed_file \
-        "$NETWORK_CONF" \
-        "$NETWORK_INITIAL_BACKUP" \
-        "$NETWORK_PREVIOUS_BACKUP" \
-        "$NETWORK_INITIAL_ABSENT" \
-        "$NETWORK_PREVIOUS_ABSENT" || return 1
-
-    PREVIOUS_BACKUP_FAILED_ITEM="modules"
-    backup_managed_file \
-        "$BBR_MODULES_FILE" \
-        "$BBR_MODULES_INITIAL_BACKUP" \
-        "$BBR_MODULES_PREVIOUS_BACKUP" \
-        "$BBR_MODULES_INITIAL_ABSENT" \
-        "$BBR_MODULES_PREVIOUS_ABSENT" || return 1
-
-    PREVIOUS_BACKUP_FAILED_ITEM="hook"
-    backup_managed_file \
-        "$INITCWND_ROUTE_HOOK" \
-        "$ROUTE_HOOK_INITIAL_BACKUP" \
-        "$ROUTE_HOOK_PREVIOUS_BACKUP" \
-        "$ROUTE_HOOK_INITIAL_ABSENT" \
-        "$ROUTE_HOOK_PREVIOUS_ABSENT"
+    while IFS='|' read -r label target initial previous initial_absent previous_absent; do
+        PREVIOUS_BACKUP_FAILED_ITEM="$label"
+        backup_managed_file "$target" "$initial" "$previous" \
+            "$initial_absent" "$previous_absent" || return 1
+    done < <(managed_file_specs)
 }
 
 capture_runtime_values_from_files() {
@@ -2920,6 +2899,35 @@ rollback_restore_transaction() {
     (( ${#RESTORE_ROLLBACK_FAILED_ITEMS[@]} == 0 ))
 }
 
+restore_scope_paths() {
+    local scope="${1^^}"
+    local config_backup="NETWORK_${scope}_BACKUP" config_absent="NETWORK_${scope}_ABSENT"
+    local modules_backup="BBR_MODULES_${scope}_BACKUP" modules_absent="BBR_MODULES_${scope}_ABSENT"
+    local hook_backup="ROUTE_HOOK_${scope}_BACKUP" hook_absent="ROUTE_HOOK_${scope}_ABSENT"
+    local runtime="RUNTIME_${scope}_BACKUP" route="ROUTE_${scope}_BACKUP"
+    local route_absent="ROUTE_${scope}_ABSENT" route_owned="ROUTE_${scope}_OWNED"
+
+    [[ "$scope" == "PREVIOUS" || "$scope" == "INITIAL" ]] || return 1
+    printf '%s|' "${!config_backup}" "${!config_absent}" "${!modules_backup}" "${!modules_absent}" \
+        "${!hook_backup}" "${!hook_absent}" "${!runtime}" "${!route}" "${!route_absent}"
+    printf '%s\n' "${!route_owned}"
+}
+
+restore_optional_managed_item() {
+    local label="$1" target="$2" backup="$3" absent="$4"
+
+    if [[ ! -e "$backup" && ! -e "$absent" ]]; then
+        warn "恢复项 $label：无可信快照，保留当前文件"
+        return 0
+    fi
+    if restore_managed_file "$target" "$backup" "$absent"; then
+        info "恢复项 $label：成功"
+        return 0
+    fi
+    error "恢复项 $label：失败"
+    return 1
+}
+
 restore_optimization() {
     local scope="${1:-previous}" config_backup config_absent modules_backup modules_absent
     local hook_backup hook_absent runtime_backup route_backup route_absent route_owned transaction_dir
@@ -2927,36 +2935,12 @@ restore_optimization() {
     local -a failed_items=()
     RESTORE_ROLLBACK_FAILED_ITEMS=()
 
-    case "$scope" in
-        previous)
-            config_backup="$NETWORK_PREVIOUS_BACKUP"
-            config_absent="$NETWORK_PREVIOUS_ABSENT"
-            modules_backup="$BBR_MODULES_PREVIOUS_BACKUP"
-            modules_absent="$BBR_MODULES_PREVIOUS_ABSENT"
-            hook_backup="$ROUTE_HOOK_PREVIOUS_BACKUP"
-            hook_absent="$ROUTE_HOOK_PREVIOUS_ABSENT"
-            runtime_backup="$RUNTIME_PREVIOUS_BACKUP"
-            route_backup="$ROUTE_PREVIOUS_BACKUP"
-            route_absent="$ROUTE_PREVIOUS_ABSENT"
-            route_owned="$ROUTE_PREVIOUS_OWNED"
-            ;;
-        initial)
-            config_backup="$NETWORK_INITIAL_BACKUP"
-            config_absent="$NETWORK_INITIAL_ABSENT"
-            modules_backup="$BBR_MODULES_INITIAL_BACKUP"
-            modules_absent="$BBR_MODULES_INITIAL_ABSENT"
-            hook_backup="$ROUTE_HOOK_INITIAL_BACKUP"
-            hook_absent="$ROUTE_HOOK_INITIAL_ABSENT"
-            runtime_backup="$RUNTIME_INITIAL_BACKUP"
-            route_backup="$ROUTE_INITIAL_BACKUP"
-            route_absent="$ROUTE_INITIAL_ABSENT"
-            route_owned="$ROUTE_INITIAL_OWNED"
-            ;;
-        *)
-            error "恢复范围必须是 previous 或 initial"
-            return 1
-            ;;
-    esac
+    if ! IFS='|' read -r config_backup config_absent modules_backup modules_absent \
+        hook_backup hook_absent runtime_backup route_backup route_absent route_owned \
+        < <(restore_scope_paths "$scope"); then
+        error "恢复范围必须是 previous 或 initial"
+        return 1
+    fi
 
     if [[ ! -e "$config_backup" && ! -e "$config_absent" ]]; then
         error "未找到可信的 $scope 网络配置状态，拒绝推测"
@@ -2986,16 +2970,8 @@ restore_optimization() {
         info "恢复项 sysctl：成功"
     fi
 
-    if [[ -e "$modules_backup" || -e "$modules_absent" ]]; then
-        if restore_managed_file "$BBR_MODULES_FILE" "$modules_backup" "$modules_absent"; then
-            info "恢复项 modules：成功"
-        else
-            error "恢复项 modules：失败"
-            failed_items+=(modules)
-        fi
-    else
-        warn "恢复项 modules：无可信快照，保留当前文件"
-    fi
+    restore_optional_managed_item modules "$BBR_MODULES_FILE" \
+        "$modules_backup" "$modules_absent" || failed_items+=(modules)
 
     if [[ -f "$runtime_backup" ]]; then
         if apply_runtime_values_strict "$runtime_backup"; then
@@ -3017,16 +2993,8 @@ restore_optimization() {
         failed_items+=(route)
     fi
 
-    if [[ -e "$hook_backup" || -e "$hook_absent" ]]; then
-        if restore_managed_file "$INITCWND_ROUTE_HOOK" "$hook_backup" "$hook_absent"; then
-            info "恢复项 hook：成功"
-        else
-            error "恢复项 hook：失败"
-            failed_items+=(hook)
-        fi
-    else
-        warn "恢复项 hook：无可信快照，保留当前文件"
-    fi
+    restore_optional_managed_item hook "$INITCWND_ROUTE_HOOK" \
+        "$hook_backup" "$hook_absent" || failed_items+=(hook)
 
     if (( ${#failed_items[@]} > 0 )); then
         if rollback_restore_transaction "$transaction_dir" "$route_backup"; then
@@ -3237,7 +3205,7 @@ EOF
 }
 
 main() {
-    local required_command selection_rc=0
+    local selection_rc=0
 
     if ! parse_arguments "$@"; then
         show_help
@@ -3247,40 +3215,25 @@ main() {
     select_tuning_mode || selection_rc=$?
     (( selection_rc == 0 )) || exit 1
 
-    for required_command in awk grep sort mktemp; do
-        if ! command -v "$required_command" >/dev/null 2>&1; then
-            error "缺少必要命令: $required_command"
-            exit 1
-        fi
-    done
+    require_commands awk grep sort mktemp || exit 1
 
     case "$COMMAND" in
         install)
             require_root
-            for required_command in sysctl mv cp find modprobe ip flock getent install dirname getconf; do
-                if ! command -v "$required_command" >/dev/null 2>&1; then
-                    error "缺少必要命令: $required_command"
-                    exit 1
-                fi
-            done
+            require_commands sysctl mv cp find modprobe ip flock getent install dirname getconf || exit 1
             take_lock
             install_optimization
             ;;
         plan)
-            command -v flock >/dev/null 2>&1 || { error "缺少必要命令: flock"; exit 1; }
-            command -v getent >/dev/null 2>&1 || { error "缺少必要命令: getent"; exit 1; }
+            require_commands flock getent || exit 1
             take_lock
             resolve_tuning_values
             show_tuning_plan
             ;;
         restore)
             require_root
-            command -v flock >/dev/null 2>&1 || { error "缺少必要命令: flock"; exit 1; }
+            require_commands flock sysctl || exit 1
             take_lock
-            command -v sysctl >/dev/null 2>&1 || {
-                error "缺少必要命令: sysctl"
-                exit 1
-            }
             restore_optimization "$RESTORE_SCOPE"
             ;;
         status)

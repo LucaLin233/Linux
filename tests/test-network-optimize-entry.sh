@@ -381,9 +381,9 @@ mkdir -p "$cloudflare_signal_pid_dir"
     export PATH TEST_CURL_PID_DIR
     CLOUDFLARE_IPV4=192.0.2.81
     CLOUDFLARE_WORKER_PIDS=()
-    trap 'cleanup_cloudflare_workers; exit 143' TERM
+    trap 'cleanup_tracked_pids CLOUDFLARE_WORKER_PIDS; exit 143' TERM
     cloudflare_worker download &
-    register_cloudflare_worker "$!"
+    register_tracked_pid CLOUDFLARE_WORKER_PIDS "$!"
     while true; do sleep 0.1; done
 ) &
 cloudflare_wrapper_pid=$!
@@ -706,6 +706,22 @@ run_previous_failure_case "$INITCWND_ROUTE_HOOK" false \
 printf 'PASS: previous rollback retains successful initial backups\n'
 run_previous_failure_case "" true \
     "route failure after hook previous write"
+
+previous_scope_paths="$NETWORK_PREVIOUS_BACKUP|$NETWORK_PREVIOUS_ABSENT|"
+previous_scope_paths+="$BBR_MODULES_PREVIOUS_BACKUP|$BBR_MODULES_PREVIOUS_ABSENT|"
+previous_scope_paths+="$ROUTE_HOOK_PREVIOUS_BACKUP|$ROUTE_HOOK_PREVIOUS_ABSENT|"
+previous_scope_paths+="$RUNTIME_PREVIOUS_BACKUP|$ROUTE_PREVIOUS_BACKUP|"
+previous_scope_paths+="$ROUTE_PREVIOUS_ABSENT|$ROUTE_PREVIOUS_OWNED"
+initial_scope_paths="$NETWORK_INITIAL_BACKUP|$NETWORK_INITIAL_ABSENT|"
+initial_scope_paths+="$BBR_MODULES_INITIAL_BACKUP|$BBR_MODULES_INITIAL_ABSENT|"
+initial_scope_paths+="$ROUTE_HOOK_INITIAL_BACKUP|$ROUTE_HOOK_INITIAL_ABSENT|"
+initial_scope_paths+="$RUNTIME_INITIAL_BACKUP|$ROUTE_INITIAL_BACKUP|"
+initial_scope_paths+="$ROUTE_INITIAL_ABSENT|$ROUTE_INITIAL_OWNED"
+assert_eq "$previous_scope_paths" "$(restore_scope_paths previous)" \
+    "resolve previous restore scope paths"
+assert_eq "$initial_scope_paths" "$(restore_scope_paths initial)" \
+    "resolve initial restore scope paths"
+assert_fail "reject invalid restore scope paths" restore_scope_paths invalid
 
 # Restore failures roll every changed item back to the operation-before snapshot.
 apply_network_config() {
