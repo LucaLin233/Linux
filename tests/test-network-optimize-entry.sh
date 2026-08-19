@@ -51,6 +51,13 @@ getent() { deny_real_network getent "$@"; }
 apt-get() { deny_real_network apt-get "$@"; }
 ip() { deny_real_network ip "$@"; }
 read_iface_counter() { deny_real_network interface-counter "$@"; }
+getconf() {
+    case "$1" in
+        PAGESIZE) printf '%s\n' 4096 ;;
+        _NPROCESSORS_ONLN) printf '%s\n' 4 ;;
+        *) return 1 ;;
+    esac
+}
 
 read_config_value() {
     local file="$1" wanted_key="$2"
@@ -100,6 +107,7 @@ reset_selection() {
     MEASUREMENT_ROUTE_TARGET=""
     MEASUREMENT_ROUTE_IDENTITY=""
     MEASUREMENT_CACHE_PENDING=false
+    TCP_MEM_PAGES=""
 }
 
 is_interactive_terminal() { return 1; }
@@ -237,6 +245,23 @@ NETWORK_TEST_UPLOAD=0
 NETWORK_TEST_TOTAL=25000000000
 assert_ok "budget stops at 25 GB total limit" traffic_budget_reached upload
 unset -f traffic_used_bytes
+(
+    reset_selection
+    detect_memory_mb() { printf '%s\n' 1024; }
+    detect_cgroup_memory_limit_mb() { printf '%s\n' 512; }
+    current_epoch() { printf '%s\n' 2000000000; }
+    format_measurement_epoch() { printf '%s\n' '2033-05-18T03:33:20Z'; }
+    TUNING_MODE=manual
+    MANUAL_DOWNLOAD_MBPS=1000
+    MANUAL_UPLOAD_MBPS=500
+    MANUAL_RTT_MS=180
+    resolve_tuning_values >/dev/null
+    assert_eq 512 "$RAM_MB" \
+        "tuning uses cgroup-limited effective RAM"
+    assert_eq '8192 16384 32768' "$TCP_MEM_PAGES" \
+        "tcp_mem uses effective RAM instead of physical RAM"
+)
+
 
 (
     reset_selection
@@ -266,6 +291,14 @@ unset -f traffic_used_bytes
         fail "generated config omits warnings"
 
     for forbidden_key in \
+        net.ipv4.tcp_adv_win_scale \
+        net.core.netdev_budget \
+        net.core.netdev_budget_usecs \
+        net.ipv4.ip_local_port_range \
+        net.ipv4.tcp_no_metrics_save \
+        net.ipv4.tcp_tw_reuse \
+        vm.min_free_kbytes \
+        fs.file-max \
         net.ipv4.tcp_ecn \
         net.ipv4.tcp_shrink_window \
         net.ipv4.tcp_collapse_max_bytes \
@@ -279,18 +312,88 @@ unset -f traffic_used_bytes
             fail "generated config still writes $forbidden_key"
         fi
     done
+    assert_eq 2097152 \
+        "$(read_config_value "$generated_config" net.core.rmem_default)" \
+        "generated config fixes core receive default at 2 MiB"
+    assert_eq 2097152 \
+        "$(read_config_value "$generated_config" net.core.wmem_default)" \
+        "generated config fixes core send default at 2 MiB"
     assert_eq '4096 2097152 47185920' \
         "$(read_config_value "$generated_config" net.ipv4.tcp_rmem)" \
         "generated config keeps receive buffer calculation"
     assert_eq '4096 2097152 25165824' \
         "$(read_config_value "$generated_config" net.ipv4.tcp_wmem)" \
         "generated config keeps send buffer calculation"
+    assert_eq '131072 262144 524288' \
+        "$(read_config_value "$generated_config" net.ipv4.tcp_mem)" \
+        "generated config writes effective-RAM tcp_mem pages"
+
+    plan_output=$(show_tuning_plan)
+    grep -Fq 'tcp_mem: 131072 / 262144 / 524288 pages' <<< "$plan_output" ||
+        fail "plan omits tcp_mem pages"
+    grep -Fq 'tcp_mem bytes: 512.0 MiB / 1024.0 MiB / 2048.0 MiB' \
+        <<< "$plan_output" || fail "plan omits tcp_mem MiB values"
+    active_qdisc_state() { printf '%s\n' 'effective|root fq'; }
+    install_summary=$(show_install_summary false)
+    grep -Fq 'tcp_mem: 131072 / 262144 / 524288 pages' \
+        <<< "$install_summary" || fail "install summary omits tcp_mem pages"
+    grep -Fq 'tcp_mem bytes: 512.0 MiB / 1024.0 MiB / 2048.0 MiB' \
+        <<< "$install_summary" || fail "install summary omits tcp_mem MiB values"
+    printf 'PASS: plan and install summary report tcp_mem pages and MiB\n'
+
+    (
+        sysctl() {
+            [[ "$1" == "-n" ]] || return 1
+            case "$2" in
+                net.core.rmem_default) printf '%s\n' 1048576 ;;
+                net.core.wmem_default) printf '%s\n' 1572864 ;;
+                net.ipv4.tcp_mem) printf '%s\n' '11111 22222 44444' ;;
+                *) printf '%s\n' 0 ;;
+            esac
+        }
+        runtime_snapshot="$TEMP_DIR/generated-runtime.snapshot"
+        capture_runtime_values_from_files "$runtime_snapshot" \
+            "$generated_config" "$generated_config"
+        assert_eq 1 "$(grep -Fc 'net.core.rmem_default=' "$runtime_snapshot")" \
+            "runtime snapshot captures rmem_default once"
+        assert_eq 1 "$(grep -Fc 'net.core.wmem_default=' "$runtime_snapshot")" \
+            "runtime snapshot captures wmem_default once"
+        assert_eq 1 "$(grep -Fc 'net.ipv4.tcp_mem=' "$runtime_snapshot")" \
+            "runtime snapshot captures tcp_mem once"
+        grep -Fqx 'net.core.rmem_default=1048576' "$runtime_snapshot" ||
+            fail "runtime snapshot lost old rmem_default"
+        grep -Fqx 'net.core.wmem_default=1572864' "$runtime_snapshot" ||
+            fail "runtime snapshot lost old wmem_default"
+        grep -Fqx 'net.ipv4.tcp_mem=11111 22222 44444' "$runtime_snapshot" ||
+            fail "runtime snapshot lost old tcp_mem"
+        mkdir -p "$NETWORK_OPTIMIZE_STATE_DIR"
+        rm -f "$RUNTIME_INITIAL_UNKNOWN"
+        printf '%s\n' 'net.core.rmem_max=8388608' > "$RUNTIME_INITIAL_BACKUP"
+        merge_initial_runtime_values "$runtime_snapshot"
+        merge_initial_runtime_values "$runtime_snapshot"
+        assert_eq 1 "$(grep -Fc 'net.core.rmem_default=' \
+            "$RUNTIME_INITIAL_BACKUP")" \
+            "initial runtime merge adds rmem_default once"
+        assert_eq 1 "$(grep -Fc 'net.core.wmem_default=' \
+            "$RUNTIME_INITIAL_BACKUP")" \
+            "initial runtime merge adds wmem_default once"
+        assert_eq 1 "$(grep -Fc 'net.ipv4.tcp_mem=' "$RUNTIME_INITIAL_BACKUP")" \
+            "initial runtime merge adds tcp_mem once"
+    )
 
     mkdir -p "$(dirname "$NETWORK_CONF")"
     cp "$generated_config" "$NETWORK_CONF"
     detect_default_iface() { return 1; }
     default_ipv4_route() { printf '\n'; }
-    sysctl() { return 1; }
+    sysctl() {
+        [[ "$1" == "-n" ]] || return 1
+        case "$2" in
+            net.core.rmem_default) printf '%s\n' 2097152 ;;
+            net.core.wmem_default) printf '%s\n' 2097152 ;;
+            net.ipv4.tcp_mem) printf '%s\n' '131072 262144 524288' ;;
+            *) return 1 ;;
+        esac
+    }
     tc() { return 1; }
     status_output=$(show_status)
     grep -Fq '测量来源: command line manual input' <<< "$status_output" ||
@@ -303,6 +406,12 @@ unset -f traffic_used_bytes
         fail "status omits confidence"
     grep -Fq '测量警告: none' <<< "$status_output" ||
         fail "status omits warnings"
+    grep -Fq 'rmem_default: 2097152' <<< "$status_output" ||
+        fail "status omits rmem_default"
+    grep -Fq 'wmem_default: 2097152' <<< "$status_output" ||
+        fail "status omits wmem_default"
+    grep -Fq 'tcp_mem: 131072 262144 524288' <<< "$status_output" ||
+        fail "status omits tcp_mem"
     printf 'PASS: status reports persisted measurement metadata\n'
 )
 
@@ -433,10 +542,12 @@ printf 'PASS: generic health panel is absent\n'
 
 (
     FAIL_STAGE=""
+    APPLY_FAIL_KEY=""
     BBR_AVAILABLE=true
     PERSIST_FAIL=false
     VALIDATION_CALLS=0
     APPLY_NETWORK_CALLS=0
+    TCP_MEM_WRITE_ATTEMPTS=0
     APPLY_INITCWND_CALLS=0
     PERSIST_CALLS=0
     RUNTIME_STATE=""
@@ -464,6 +575,8 @@ printf 'PASS: generic health panel is absent\n'
             "$ROUTE_HOOK_PREVIOUS_ABSENT" "$ROUTE_OWNED_MARKER"
         VALIDATION_CALLS=0
         APPLY_NETWORK_CALLS=0
+        APPLY_FAIL_KEY=""
+        TCP_MEM_WRITE_ATTEMPTS=0
         APPLY_INITCWND_CALLS=0
         PERSIST_CALLS=0
         RUNTIME_STATE='old runtime'
@@ -500,7 +613,12 @@ printf 'PASS: generic health panel is absent\n'
     }
     persist_pending_measurement_cache() { return 0; }
     detect_default_iface() { printf '%s\n' eth0; }
-    create_network_config() { printf '%s\n' 'new config' > "$1"; }
+    create_network_config() {
+        printf '%s\n' 'new config' > "$1"
+        if [[ "$APPLY_FAIL_KEY" == "net.ipv4.tcp_mem" ]]; then
+            printf '%s\n' 'net.ipv4.tcp_mem = 8192 16384 32768' >> "$1"
+        fi
+    }
     capture_runtime_values_from_files() { printf '%s\n' 'old runtime' > "$1"; }
     prepare_legacy_backup_state() { return 0; }
     merge_initial_runtime_values() { return 0; }
@@ -509,6 +627,11 @@ printf 'PASS: generic health panel is absent\n'
     apply_network_config() {
         ((APPLY_NETWORK_CALLS += 1))
         RUNTIME_STATE='new runtime'
+        if [[ -n "$APPLY_FAIL_KEY" ]] &&
+            grep -Eq "^${APPLY_FAIL_KEY//./[.]}[[:space:]]*=" "$1"; then
+            ((TCP_MEM_WRITE_ATTEMPTS += 1))
+            return 1
+        fi
     }
     verify_network_config() { return 0; }
     apply_initcwnd() {
@@ -558,6 +681,24 @@ printf 'PASS: generic health panel is absent\n'
         "second route validation blocks initcwnd"
     assert_eq 0 "$PERSIST_CALLS" \
         "second route validation blocks BBR persistence"
+
+    seed_install_fixture
+    FAIL_STAGE=""
+    APPLY_FAIL_KEY=net.ipv4.tcp_mem
+    BBR_AVAILABLE=true
+    PERSIST_FAIL=false
+    if install_optimization; then
+        fail "tcp_mem write failure unexpectedly succeeded"
+    fi
+    assert_install_fixture_old "tcp_mem write failure"
+    assert_eq 1 "$TCP_MEM_WRITE_ATTEMPTS" \
+        "tcp_mem write failure is observed"
+    assert_eq 0 "$APPLY_INITCWND_CALLS" \
+        "tcp_mem write failure blocks initcwnd"
+    assert_eq 0 "$PERSIST_CALLS" \
+        "tcp_mem write failure blocks BBR persistence"
+    assert_eq 0 "${#INSTALL_ROLLBACK_FAILED_ITEMS[@]}" \
+        "tcp_mem write failure completes all five rollback items"
 
     seed_install_fixture
     FAIL_STAGE=""
@@ -634,6 +775,80 @@ restore_runtime_values "$transaction_current"
 assert_eq 1 "$SYSCTL_TCP_ECN" "transaction rollback restores ECN after partial failure"
 assert_eq 262144 "$SYSCTL_CONNTRACK_MAX" \
     "transaction rollback preserves Conntrack max after partial failure"
+
+(
+    SYS_RMEM_DEFAULT=2097152
+    SYS_WMEM_DEFAULT=2097152
+    SYS_TCP_MEM='8192 16384 32768'
+    sysctl() {
+        local key value
+
+        case "$1" in
+            -n)
+                case "$2" in
+                    net.core.rmem_default) printf '%s\n' "$SYS_RMEM_DEFAULT" ;;
+                    net.core.wmem_default) printf '%s\n' "$SYS_WMEM_DEFAULT" ;;
+                    net.ipv4.tcp_mem) printf '%s\n' "$SYS_TCP_MEM" ;;
+                    *) return 1 ;;
+                esac
+                ;;
+            -w)
+                key=${2%%=*}
+                value=${2#*=}
+                case "$key" in
+                    net.core.rmem_default) SYS_RMEM_DEFAULT="$value" ;;
+                    net.core.wmem_default) SYS_WMEM_DEFAULT="$value" ;;
+                    net.ipv4.tcp_mem) SYS_TCP_MEM="$value" ;;
+                    *) return 1 ;;
+                esac
+                ;;
+            *) return 1 ;;
+        esac
+    }
+    begin_restore_transaction() {
+        RESTORE_TRANSACTION_DIR=$(mktemp -d "$TEMP_DIR/runtime-restore.XXXXXX")
+    }
+    apply_network_config() { return 0; }
+    restore_managed_file() { return 0; }
+    restore_default_route() { return 0; }
+    info() { return 0; }
+    warn() { return 0; }
+    error() { return 0; }
+    success() { return 0; }
+
+    mkdir -p "$NETWORK_OPTIMIZE_STATE_DIR" "$(dirname "$NETWORK_CONF")"
+    printf '%s\n' '# previous target' > "$NETWORK_PREVIOUS_BACKUP"
+    printf '%s\n' '# initial target' > "$NETWORK_INITIAL_BACKUP"
+    cat > "$RUNTIME_PREVIOUS_BACKUP" <<'EOF'
+net.core.rmem_default=1111111
+net.core.wmem_default=1222222
+net.ipv4.tcp_mem=100 200 400
+EOF
+    cat > "$RUNTIME_INITIAL_BACKUP" <<'EOF'
+net.core.rmem_default=524288
+net.core.wmem_default=786432
+net.ipv4.tcp_mem=50 100 200
+EOF
+
+    restore_optimization previous
+    assert_eq 1111111 "$SYS_RMEM_DEFAULT" \
+        "restore previous recovers exact rmem_default"
+    assert_eq 1222222 "$SYS_WMEM_DEFAULT" \
+        "restore previous recovers exact wmem_default"
+    assert_eq '100 200 400' "$SYS_TCP_MEM" \
+        "restore previous recovers exact tcp_mem"
+
+    SYS_RMEM_DEFAULT=2097152
+    SYS_WMEM_DEFAULT=2097152
+    SYS_TCP_MEM='8192 16384 32768'
+    restore_optimization initial
+    assert_eq 524288 "$SYS_RMEM_DEFAULT" \
+        "restore initial recovers exact rmem_default"
+    assert_eq 786432 "$SYS_WMEM_DEFAULT" \
+        "restore initial recovers exact wmem_default"
+    assert_eq '50 100 200' "$SYS_TCP_MEM" \
+        "restore initial recovers exact tcp_mem"
+)
 
 # Failed staging must not destroy the prior previous-backup snapshot.
 mkdir -p "$(dirname "$NETWORK_CONF")"

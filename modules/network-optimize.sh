@@ -125,6 +125,7 @@ RMEM_MAX_BYTES=0
 WMEM_MAX_BYTES=0
 RMEM_DEFAULT_BYTES=$TCP_BUFFER_DEFAULT_BYTES
 WMEM_DEFAULT_BYTES=$TCP_BUFFER_DEFAULT_BYTES
+TCP_MEM_PAGES=""
 CALCULATION_REASON="pending bandwidth"
 RMEM_REASON="pending bandwidth"
 WMEM_REASON="pending bandwidth"
@@ -669,6 +670,30 @@ calculate_memory_cap() {
     (( cap < minimum )) && cap=$minimum
     (( cap > maximum )) && cap=$maximum
     echo "$cap"
+}
+
+calculate_tcp_mem() {
+    local ram_mb="$1" page_size total_pages low pressure maximum
+
+    is_positive_integer "$ram_mb" 1 1073741824 || return 1
+    page_size=$(getconf PAGESIZE 2>/dev/null) || return 1
+    is_positive_integer "$page_size" 1 1073741824 || return 1
+    ram_mb=$((10#$ram_mb))
+    page_size=$((10#$page_size))
+    total_pages=$((ram_mb * 1024 * 1024 / page_size))
+    (( total_pages > 0 )) || return 1
+
+    low=$((total_pages / 16))
+    pressure=$((total_pages / 8))
+    maximum=$((total_pages / 4))
+    (( low >= 4096 )) || low=4096
+    (( pressure >= 8192 )) || pressure=8192
+    (( maximum >= 16384 )) || maximum=16384
+    (( pressure > low )) || pressure=$((low + 1))
+    (( maximum > pressure )) || maximum=$((pressure + 1))
+    (( low > 0 && pressure > 0 && maximum > 0 )) || return 1
+
+    printf '%s %s %s\n' "$low" "$pressure" "$maximum"
 }
 
 cleanup_temp_dir() {
@@ -1997,6 +2022,10 @@ resolve_tuning_values() {
         return 1
     }
     MEMORY_CAP_BYTES=$(calculate_memory_cap "$RAM_MB")
+    TCP_MEM_PAGES=$(calculate_tcp_mem "$RAM_MB") || {
+        error "无法根据有效内存和系统页大小计算 tcp_mem"
+        return 1
+    }
 
     download_mbps="$MANUAL_DOWNLOAD_MBPS"
     upload_mbps="$MANUAL_UPLOAD_MBPS"
@@ -2090,6 +2119,33 @@ format_buffer_size() {
     }'
 }
 
+format_tcp_mem_pages() {
+    local pages="$1" low pressure maximum extra=""
+
+    read -r low pressure maximum extra <<< "$pages"
+    [[ -z "$extra" ]] || return 1
+    is_positive_integer "$low" 1 9223372036854775807 || return 1
+    is_positive_integer "$pressure" 1 9223372036854775807 || return 1
+    is_positive_integer "$maximum" 1 9223372036854775807 || return 1
+    (( 10#$low < 10#$pressure && 10#$pressure < 10#$maximum )) || return 1
+    printf '%s / %s / %s pages\n' "$low" "$pressure" "$maximum"
+}
+
+format_tcp_mem_bytes() {
+    local pages="$1" low pressure maximum page_size
+
+    format_tcp_mem_pages "$pages" >/dev/null || return 1
+    read -r low pressure maximum <<< "$pages"
+    page_size=$(getconf PAGESIZE 2>/dev/null) || return 1
+    is_positive_integer "$page_size" 1 1073741824 || return 1
+    awk -v low="$low" -v pressure="$pressure" -v maximum="$maximum" \
+        -v page_size="$page_size" 'BEGIN {
+            printf "%.1f MiB / %.1f MiB / %.1f MiB", \
+                low * page_size / 1048576, pressure * page_size / 1048576, \
+                maximum * page_size / 1048576
+        }'
+}
+
 show_tuning_plan() {
     echo "========== 网络动态配置计划 =========="
     echo "模式: $TUNING_MODE"
@@ -2110,6 +2166,8 @@ show_tuning_plan() {
     echo "wmem_max: $(format_buffer_size "$WMEM_MAX_BYTES")"
     echo "tcp_rmem default: $(format_buffer_size "$RMEM_DEFAULT_BYTES")"
     echo "tcp_wmem default: $(format_buffer_size "$WMEM_DEFAULT_BYTES")"
+    echo "tcp_mem: $(format_tcp_mem_pages "$TCP_MEM_PAGES")"
+    echo "tcp_mem bytes: $(format_tcp_mem_bytes "$TCP_MEM_PAGES")"
     echo "计算依据: $CALCULATION_REASON"
     echo "initcwnd 模式: $INITCWND_MODE"
     echo "initcwnd/initrwnd: $([[ "$INITCWND_ENABLED" == "true" ]] && echo "32" || echo "内核默认")（策略: $INITCWND_POLICY）"
@@ -2140,6 +2198,10 @@ show_install_summary() {
     format_rtt_selection_summary
     printf '缓冲：TCP 起点 %s / 最大 %s\n' \
         "$(format_buffer_size "$WMEM_DEFAULT_BYTES")" "$(format_buffer_size "$WMEM_MAX_BYTES")"
+    printf 'tcp_mem: %s\n' \
+        "$(format_tcp_mem_pages "$TCP_MEM_PAGES")"
+    printf 'tcp_mem bytes: %s\n' \
+        "$(format_tcp_mem_bytes "$TCP_MEM_PAGES")"
     printf '应用：%s + ECN 未接管，配置成功；fq %s\n' \
         "$algorithm" "$(format_qdisc_state "$qdisc_state" "$qdisc_detail")"
     printf 'initcwnd：%s（策略 %s）\n' \
@@ -2199,12 +2261,17 @@ net.ipv4.tcp_max_syn_backlog = 16384
 net.core.netdev_max_backlog = 16384
 net.core.optmem_max = 65536
 
-# 4. TCP/UDP 缓冲区；TCP 初始默认固定 2 MiB，长流继续依赖 autotuning
-# core default 与全局 tcp_mem 保留内核或发行版值，避免放大所有 socket 的内存承诺
+# 4. tcpfit v0.5.6 mixed 基础内存模型；默认缓冲固定 2 MiB
+# core default 影响 TCP、UDP 和其他未自行设置 socket buffer 的协议
+# rmem/wmem max 仍按 2 x BDP + 2 MiB 计算，并受 effective RAM / 32 限制
+# tcp_mem 按 effective RAM 推导，单位为 pages
+net.core.rmem_default = $RMEM_DEFAULT_BYTES
+net.core.wmem_default = $WMEM_DEFAULT_BYTES
 net.core.rmem_max = $RMEM_MAX_BYTES
 net.core.wmem_max = $WMEM_MAX_BYTES
 net.ipv4.tcp_rmem = 4096 $RMEM_DEFAULT_BYTES $RMEM_MAX_BYTES
 net.ipv4.tcp_wmem = 4096 $WMEM_DEFAULT_BYTES $WMEM_MAX_BYTES
+net.ipv4.tcp_mem = $TCP_MEM_PAGES
 
 # 5. 长连接、连接回收与复杂路径
 net.ipv4.tcp_fin_timeout = 30
@@ -2826,10 +2893,13 @@ show_status() {
         "default qdisc|$(read_sysctl_or net.core.default_qdisc 未知)" \
         "active qdisc (${default_iface:-未知接口})|$(format_qdisc_state "$active_qdisc_state_name" "$active_qdisc_detail")"
     print_status_section "受管缓冲区" \
+        "rmem_default|sysctl:net.core.rmem_default|未知" \
+        "wmem_default|sysctl:net.core.wmem_default|未知" \
         "rmem_max|sysctl:net.core.rmem_max|未知" \
         "wmem_max|sysctl:net.core.wmem_max|未知" \
         "tcp_rmem|sysctl:net.ipv4.tcp_rmem|未知" \
         "tcp_wmem|sysctl:net.ipv4.tcp_wmem|未知" \
+        "tcp_mem|sysctl:net.ipv4.tcp_mem|未知" \
         "tcp_moderate_rcvbuf|sysctl:net.ipv4.tcp_moderate_rcvbuf|未知"
     print_status_section "初始拥塞窗口" \
         "ownership marker|$([[ -e "$ROUTE_OWNED_MARKER" ]] && echo 存在 || echo 不存在)" \
@@ -2914,7 +2984,7 @@ main() {
             install_optimization
             ;;
         plan)
-            require_commands flock getent || exit 1
+            require_commands flock getent getconf || exit 1
             take_lock
             resolve_tuning_values
             if ! validate_measurement_route; then

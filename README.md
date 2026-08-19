@@ -238,13 +238,17 @@ bash <(curl -fsSL "$RAW_BASE/network-optimize.sh") help
 `verify`、`--probe`、`--yes` 和 `--disable-ecn` 已退休并会被拒绝。
 
 网络模块默认面向同时承载 TCP、UDP 与 Docker 流量的代理节点：连接队列使用
-`somaxconn=65535`、`tcp_max_syn_backlog=16384`，TCP 缓冲起点固定为 2 MiB，长流继续依赖
-autotuning。动态最大值按 `2 × BDP + 2 MiB`
-计算，并限制为有效 RAM（物理 RAM 与有限 cgroup memory limit 的较小值）的 1/32；RAM cap
-最低 8 MiB、最高 256 MiB，动态 socket 最大值另保留 4 MiB 绝对下限。模块启用 TCP receive
-autotuning、window scaling、SACK、DSACK、时间戳和 syncookies，但保留内核或发行版管理的
-`tcp_mem`、core socket 默认值、`netdev_budget` 与 `netdev_budget_usecs`。`status` 聚焦当前
-测量记录、BBR/fq、受管缓冲区和 initcwnd 状态，不再提供通用系统健康面板。
+`somaxconn=65535`、`tcp_max_syn_backlog=16384`。基础内存模型兼容 tcpfit v0.5.6 的 mixed role：
+TCP 与 core socket default 固定为 2 MiB，长流继续依赖 autotuning；core default 同时影响 TCP、
+UDP 和其他未显式设置缓冲区的 socket。`tcp_mem` 的 low/pressure/max 以 pages 为单位，按有效
+RAM（物理 RAM 与当前轻量 cgroup 根限制的较小值）的 1/16、1/8、1/4 推导并设置安全下限。
+
+动态 socket 最大值仍按 `2 × BDP + 2 MiB` 计算，并受有效 RAM / 32 限制；RAM cap 最低
+8 MiB、最高 256 MiB，动态最大值另保留 4 MiB 绝对下限。下游继续保留严格应用与验证事务、
+initial/previous 双备份，以及 cgroup 根限制增强。模块启用 TCP receive autotuning、window
+scaling、SACK、DSACK、时间戳和 syncookies，但保留内核或发行版管理的 `netdev_budget` 与
+`netdev_budget_usecs`。`status` 聚焦当前测量记录、BBR/fq、受管缓冲区和 initcwnd 状态，不再
+提供通用系统健康面板。
 
 > `RAW_BASE` 只在当前 Shell 会话有效。上述进程替换语法需要 Bash 或 Zsh；不要改成
 > `curl ... | sudo bash`，否则交互模块可能无法正常读取终端输入。SSH、自动更新、内核和网络

@@ -63,6 +63,26 @@ assert_eq "268435456" "$(calculate_memory_cap 16384)" \
     "large-memory cap keeps 256 MiB ceiling"
 assert_eq "2097152" "$TCP_BUFFER_DEFAULT_BYTES" \
     "TCP receive and send defaults stay fixed at 2 MiB"
+(
+    getconf() {
+        [[ "$1" == "PAGESIZE" ]] || return 1
+        printf '%s\n' 4096
+    }
+    assert_eq '16384 32768 65536' "$(calculate_tcp_mem 1024)" \
+        "1 GiB RAM derives tcp_mem at 1/16, 1/8, and 1/4"
+    assert_eq '8192 16384 32768' "$(calculate_tcp_mem 512)" \
+        "512 MiB RAM derives tcp_mem pages"
+    assert_eq '4096 8192 16384' "$(calculate_tcp_mem 128)" \
+        "128 MiB RAM keeps tcp_mem page floors"
+    assert_fail "zero RAM is rejected for tcp_mem" calculate_tcp_mem 0
+    assert_fail "non-numeric RAM is rejected for tcp_mem" calculate_tcp_mem invalid
+)
+(
+    getconf() { printf '%s\n' invalid; }
+    assert_fail "non-numeric page size is rejected" calculate_tcp_mem 1024
+    getconf() { printf '%s\n' 0; }
+    assert_fail "zero page size is rejected" calculate_tcp_mem 1024
+)
 detect_cgroup_memory_limit_mb() { printf '%s\n' 512; }
 assert_eq '512' "$(detect_effective_memory_mb 1024)" \
     "effective memory honors a smaller cgroup limit"
