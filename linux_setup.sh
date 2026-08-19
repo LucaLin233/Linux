@@ -929,8 +929,6 @@ execute_module() {
         return 1
     fi
 
-    log "执行模块：${MODULES[$module]}"
-
     start_time=$(date +%s)
 
     if bash "$module_file"; then
@@ -1362,7 +1360,7 @@ main() {
         fi
 
         echo
-        echo "[$current/$total] 执行模块：${MODULES[$module]}"
+        echo "[$current/$total] ${MODULES[$module]}"
 
         if ! execute_module "$module"; then
             log "模块失败，但继续执行后续模块：$module" "warn"

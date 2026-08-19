@@ -162,7 +162,7 @@ read_iface_counter() {
         *) return 1 ;;
     esac
 }
-assert_eq '流量（接口 eth0,eth1；含测试期间后台流量，按保守安全预算累计）：上传 2.75 GB / 下载 1.75 GB / 合计 4.50 GB' \
+assert_eq '流量：eth0,eth1；上传 2.75 GB / 下载 1.75 GB / 合计 4.50 GB（包含同期后台流量）' \
     "$(traffic_report)" "traffic report sums mocked target interfaces"
 read_iface_counter() { deny_real_network interface-counter "$@"; }
 
@@ -178,6 +178,30 @@ qdisc htb 1: root refcnt 2 default 10
 qdisc fq 10: parent 1:10 limit 10000p
 EOF
 )" "classify traffic-shape HTB with fq leaf as effective"
+assert_eq '生效（根队列 fq）' \
+    "$(format_qdisc_state effective 'root fq')" \
+    "format root fq detail in Chinese"
+assert_eq '生效（根队列 mq，1 个叶子队列均为 fq）' \
+    "$(format_qdisc_state effective 'root mq; all 1 leaves fq')" \
+    "format mq leaf detail in Chinese"
+assert_eq '不可读（根队列 mq，无可读叶子队列）' \
+    "$(format_qdisc_state unreadable 'root mq; no readable leaves')" \
+    "format unreadable qdisc leaves in Chinese"
+assert_eq '不可读（无法读取 qdisc）' \
+    "$(format_qdisc_state unreadable 'tc qdisc read failed')" \
+    "format qdisc read failure in Chinese"
+
+node_output=$(print_measurement_nodes \
+    '新加坡/OVH sgp.proof.ovh.net [15.235.182.181]:5201 (IPv4 RTT 1 ms);新加坡/Leaseweb speedtest.sin1.sg.leaseweb.net [23.108.99.54]:5201 (IPv4 RTT 1 ms)' \
+    '    ')
+grep -Fq '    1. 新加坡 / OVH / sgp.proof.ovh.net [15.235.182.181]:5201 / RTT 1 ms' \
+    <<< "$node_output" || fail "first measurement node is not formatted on its own line"
+grep -Fq '    2. 新加坡 / Leaseweb / speedtest.sin1.sg.leaseweb.net [23.108.99.54]:5201 / RTT 1 ms' \
+    <<< "$node_output" || fail "second measurement node is not formatted on its own line"
+if grep -Fq ';新加坡' <<< "$node_output"; then
+    fail "measurement node display retains a semicolon separator"
+fi
+printf 'PASS: measurement nodes use numbered Chinese display lines\n'
 
 setup_probe_mocks() {
     TUNING_MODE=auto
@@ -401,12 +425,23 @@ EOF
         fail "fresh mode mislabeled a sixty-second cache"
     assert_eq '' "$MEASUREMENT_WARNINGS" \
         "fresh mode adds no live-measurement failure warning"
+    assert_eq '7 天内同路由缓存（公共 IPv4 iperf3 测速）' \
+        "$(format_measurement_source "$MEASUREMENT_SOURCE")" \
+        "legacy English fresh cache source is formatted in Chinese"
+    assert_eq '测速：复用 7 天内同路由缓存，不执行现场测速' \
+        "$(format_cache_reuse_summary "$MEASUREMENT_SOURCE")" \
+        "fresh cache explicitly skips live measurement"
+    grep -Fqx 'source=public iperf3 IPv4' "$MEASUREMENT_CACHE" ||
+        fail "display formatting rewrote the legacy English cache source"
 
     seed_cache $((2000000000 - 60))
     assert_ok "refresh fallback accepts a cache newer than seven days" \
         load_measurement_cache "$CACHE_STALE_MAX_AGE_SECONDS" fallback
     grep -Fq 'fresh cache fallback' <<< "$MEASUREMENT_SOURCE" ||
         fail "refresh fallback mislabeled a sixty-second cache"
+    grep -Fq '同路由缓存回退（公共 IPv4 iperf3 测速）' \
+        <<< "$(format_measurement_source "$MEASUREMENT_SOURCE")" ||
+        fail "fresh cache fallback label was not formatted in Chinese"
     assert_eq low "$MEASUREMENT_CONFIDENCE" \
         "refresh fallback marks reused fresh cache low confidence"
     grep -Fq 'live public iperf3 measurement failed' <<< "$MEASUREMENT_WARNINGS" ||
@@ -417,6 +452,9 @@ EOF
         load_measurement_cache "$CACHE_STALE_MAX_AGE_SECONDS" fallback
     grep -Fq 'same-route stale cache' <<< "$MEASUREMENT_SOURCE" ||
         fail "refresh fallback mislabeled an eight-day cache"
+    grep -Fq '同路由过期缓存（公共 IPv4 iperf3 测速）' \
+        <<< "$(format_measurement_source "$MEASUREMENT_SOURCE")" ||
+        fail "stale cache label was not formatted in Chinese"
     assert_eq low "$MEASUREMENT_CONFIDENCE" \
         "refresh fallback marks an eight-day cache low confidence"
     grep -Fq 'live public iperf3 measurement failed' <<< "$MEASUREMENT_WARNINGS" ||
@@ -495,6 +533,29 @@ EOF
     : > "$NETWORK_DETAIL_LOG"
     assert_eq low "$MEASUREMENT_CONFIDENCE" \
         "unwritable detail log does not change measurement confidence"
+)
+
+(
+    warn() { printf '%s\n' "$1"; }
+    MEASUREMENT_WARNINGS='failed to persist the route-bound measurement cache; live public iperf3 measurement failed, reused same-route cache no older than 30 days; only one public iperf3 peer produced a usable result; upload has fewer than two valid peer samples; upload peer results differ by more than 30%, using the higher valid result; download has fewer than two valid peer samples; download peer results differ by more than 30%, using the higher valid result; traffic budget stopped additional public iperf3 tests'
+    warning_output=$(show_measurement_warnings)
+    for expected_warning in \
+        '警告：无法保存同路由测速缓存' \
+        '警告：现场公共 iperf3 测速失败，复用 30 天内同路由缓存' \
+        '警告：仅一个公共 iperf3 节点返回可用结果' \
+        '警告：上传有效节点样本少于两个' \
+        '警告：上传节点结果差异超过 30%，采用较高有效值' \
+        '警告：下载有效节点样本少于两个' \
+        '警告：下载节点结果差异超过 30%，采用较高有效值' \
+        '警告：流量预算已停止后续公共 iperf3 测试'; do
+        assert_eq 1 "$(grep -Fxc "$expected_warning" <<< "$warning_output")" \
+            "each mapped warning appears exactly once"
+    done
+    if grep -Eq 'peer results differ|failed to persist|fewer than two|traffic budget stopped' \
+        <<< "$warning_output"; then
+        fail "measurement warning display leaked internal English values"
+    fi
+    printf 'PASS: all measurement warning values use Chinese display mappings\n'
 )
 
 if grep -Eq 'NETWORK_OPTIMIZE_TCSHAPE_CONFIG_FILE|/etc/tcshape[.]conf|tcshape HTB|tcshape off' \
