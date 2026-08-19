@@ -86,11 +86,12 @@ assert_eq 'none' "$(read_sysctl_or net.test.empty none)" \
     "use fallback for an empty sysctl value"
 assert_eq 'fallback' "$(read_sysctl_or net.test.missing fallback)" \
     "use explicit fallback for unavailable sysctl"
-assert_eq $'  Present: 42\n  Missing: unavailable' \
-    "$(print_sysctl_rows \
-        'Present|net.test.present|unavailable' \
-        'Missing|net.test.missing|unavailable')" \
-    "format table-driven sysctl status rows"
+assert_eq $'\nStatus:\n  Direct: value\n  Present: 42\n  Missing: unavailable' \
+    "$(print_status_section Status \
+        'Direct|value' '' \
+        'Present|sysctl:net.test.present|unavailable' \
+        'Missing|sysctl:net.test.missing|unavailable')" \
+    "format mixed table-driven status section"
 unset -f sysctl
 
 file_nr_fixture="$TEMP_DIR/file-nr"

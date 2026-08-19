@@ -2270,7 +2270,7 @@ format_nic_allowance_delta() {
 }
 
 health_delta() {
-    local before="$1" after="$2" value
+    local before="$1" after="$2" value health
     local b_drop b_squeeze b_rxerr b_txerr b_rxdrop b_txdrop b_retrans _ b_rxpkt b_txpkt
     local a_drop a_squeeze a_rxerr a_txerr a_rxdrop a_txdrop a_retrans a_limited a_rxpkt a_txpkt
 
@@ -2279,15 +2279,20 @@ health_delta() {
     for value in "$b_drop" "$b_squeeze" "$b_rxerr" "$b_txerr" "$b_rxdrop" "$b_txdrop" \
         "$b_retrans" "$b_rxpkt" "$b_txpkt" "$a_drop" "$a_squeeze" "$a_rxerr" \
         "$a_txerr" "$a_rxdrop" "$a_txdrop" "$a_retrans" "$a_limited" "$a_rxpkt" "$a_txpkt"; do
-        [[ "$value" =~ ^[0-9]+$ ]] || { printf '%s\n' unreadable; return; }
+        [[ "$value" =~ ^[0-9]+$ ]] || { printf '%s\n' 'unreadable|计数器不可读'; return; }
     done
     if (( a_drop < b_drop || a_squeeze < b_squeeze || a_rxerr < b_rxerr ||
           a_txerr < b_txerr || a_rxdrop < b_rxdrop || a_txdrop < b_txdrop ||
           a_retrans < b_retrans || a_rxpkt < b_rxpkt || a_txpkt < b_txpkt )); then
-        printf '%s\n' reset
+        printf '%s\n' 'reset|计数器已重置'
         return
     fi
-    printf 'ok %s %s %s %s %s %s %s %s %s %s\n' \
+    health=$(classify_network_health \
+        "$((a_drop - b_drop))" "$((a_squeeze - b_squeeze))" \
+        "$((a_rxerr - b_rxerr + a_txerr - b_txerr))" \
+        "$((a_rxdrop - b_rxdrop + a_txdrop - b_txdrop))" \
+        "$((a_rxpkt - b_rxpkt + a_txpkt - b_txpkt))")
+    printf 'ok|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' "$health" \
         "$((a_drop - b_drop))" "$((a_squeeze - b_squeeze))" \
         "$((a_rxerr - b_rxerr))" "$((a_txerr - b_txerr))" \
         "$((a_rxdrop - b_rxdrop))" "$((a_txdrop - b_txdrop))" \
@@ -2297,11 +2302,12 @@ health_delta() {
 
 format_verify_health_delta() {
     local before="$1" after="$2" allowance_before="$3" allowance_after="$4"
-    local status delta_drop delta_squeeze delta_rxerr delta_txerr delta_rxdrop delta_txdrop
-    local delta_retrans limited delta_rxpkt delta_txpkt delta_packets health
+    local status health delta_drop delta_squeeze delta_rxerr delta_txerr delta_rxdrop delta_txdrop
+    local delta_retrans limited delta_rxpkt delta_txpkt
 
-    read -r status delta_drop delta_squeeze delta_rxerr delta_txerr delta_rxdrop delta_txdrop \
-        delta_retrans limited delta_rxpkt delta_txpkt <<< "$(health_delta "$before" "$after")"
+    IFS='|' read -r status health delta_drop delta_squeeze delta_rxerr delta_txerr \
+        delta_rxdrop delta_txdrop delta_retrans limited delta_rxpkt delta_txpkt \
+        <<< "$(health_delta "$before" "$after")"
     if [[ "$status" != "ok" ]]; then
         [[ "$status" == "reset" ]] &&
             printf '网络健康：测试期间计数器重置，无法计算可靠增量\n' ||
@@ -2310,9 +2316,6 @@ format_verify_health_delta() {
         return 0
     fi
 
-    delta_packets=$((delta_rxpkt + delta_txpkt))
-    health=$(classify_network_health "$delta_drop" "$delta_squeeze" \
-        "$((delta_rxerr + delta_txerr))" "$((delta_rxdrop + delta_txdrop))" "$delta_packets")
     printf '系统计数增量：softnet_dropped +%s / time_squeeze +%s / 全机 TCP 重传 +%s\n' \
         "$delta_drop" "$delta_squeeze" "$delta_retrans"
     printf '网卡计数增量：drops rx +%s tx +%s / errors rx +%s tx +%s / packets rx +%s tx +%s\n' \
@@ -2335,19 +2338,13 @@ format_rtt_selection_summary() {
 }
 
 show_install_summary() {
-    local before="$1" bbr_enabled="$2" after status delta_drop delta_squeeze delta_rxerr delta_txerr
-    local delta_rxdrop delta_txdrop delta_retrans limited delta_rxpkt delta_txpkt delta_packets health
+    local before="$1" bbr_enabled="$2" after status health delta_retrans limited
     local algorithm="当前拥塞控制" qdisc_state qdisc_detail
 
     after=$(network_health_snapshot "$PROBE_IFACE")
-    read -r status delta_drop delta_squeeze delta_rxerr delta_txerr delta_rxdrop delta_txdrop \
-        delta_retrans limited delta_rxpkt delta_txpkt <<< "$(health_delta "$before" "$after")"
-    if [[ "$status" == "ok" ]]; then
-        delta_packets=$((delta_rxpkt + delta_txpkt))
-        health=$(classify_network_health "$delta_drop" "$delta_squeeze" \
-            "$((delta_rxerr + delta_txerr))" "$((delta_rxdrop + delta_txdrop))" "$delta_packets")
-    else
-        health=$([[ "$status" == "reset" ]] && echo "计数器已重置" || echo "计数器不可读")
+    IFS='|' read -r status health _ _ _ _ _ _ delta_retrans limited _ _ \
+        <<< "$(health_delta "$before" "$after")"
+    if [[ "$status" != "ok" ]]; then
         delta_retrans="?"
         limited="?"
     fi
@@ -2691,26 +2688,19 @@ install_optimization() {
     # 完成全部备份后再尝试加载模块；不可用时重生成不接管拥塞控制的配置。
     create_network_config "$temp_config" true
 
-    runtime_backup=$(mktemp) || {
-        rm -f "$temp_config"
-        return 1
-    }
-
-    if ! capture_runtime_values "$temp_config" "$runtime_backup"; then
-        rm -f "$temp_config" "$runtime_backup"
+    if ! runtime_backup=$(mktemp) ||
+        ! capture_runtime_values "$temp_config" "$runtime_backup"; then
+        rm -f "$temp_config" "${runtime_backup:-}"
         return 1
     fi
     prepare_legacy_backup_state
 
     install -d -m 0755 "$NETWORK_OPTIMIZE_STATE_DIR"
-    merge_initial_runtime_values "$runtime_backup" || {
+    if ! merge_initial_runtime_values "$runtime_backup" ||
+        ! backup_previous_state_set "$runtime_backup"; then
         rm -f "$temp_config" "$runtime_backup"
         return 1
-    }
-    backup_previous_state_set "$runtime_backup" || {
-        rm -f "$temp_config" "$runtime_backup"
-        return 1
-    }
+    fi
 
     if ensure_bbr_available; then
         bbr_enabled="true"
@@ -2720,12 +2710,7 @@ install_optimization() {
     fi
 
     # 应用前已保存全部涉及参数的运行值，失败时逐项回滚。
-    if ! apply_network_config "$temp_config"; then
-        restore_runtime_values "$runtime_backup"
-        rm -f "$temp_config" "$runtime_backup"
-        return 1
-    fi
-    if ! verify_network_config "$temp_config"; then
+    if ! apply_network_config "$temp_config" || ! verify_network_config "$temp_config"; then
         restore_runtime_values "$runtime_backup"
         rm -f "$temp_config" "$runtime_backup"
         return 1
@@ -2983,12 +2968,18 @@ read_sysctl_or() {
     fi
 }
 
-print_sysctl_rows() {
-    local spec label key fallback
+print_status_section() {
+    local title="$1" spec label value fallback
+    shift
 
+    printf '\n%s:\n' "$title"
     for spec in "$@"; do
-        IFS='|' read -r label key fallback <<< "$spec"
-        printf '  %s: %s\n' "$label" "$(read_sysctl_or "$key" "${fallback:-不可用}")"
+        [[ -n "$spec" ]] || continue
+        IFS='|' read -r label value fallback <<< "$spec"
+        if [[ "$value" == sysctl:* ]]; then
+            value=$(read_sysctl_or "${value#sysctl:}" "${fallback:-不可用}")
+        fi
+        printf '  %s: %s\n' "$label" "$value"
     done
 }
 
@@ -3003,17 +2994,15 @@ file_handle_status() {
 }
 
 show_status() {
-    local available_cc current_cc current_qdisc default_iface active_qdisc active_qdisc_state_name
-    local active_qdisc_detail initcwnd_state initcwnd_state_name initcwnd_detail
+    local available_cc default_iface active_qdisc_state_name active_qdisc_detail
+    local initcwnd_state_name initcwnd_detail drift_status=""
 
     available_cc=$(cat /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null || echo "未知")
-    current_cc=$(read_sysctl_or net.ipv4.tcp_congestion_control "未知")
-    current_qdisc=$(read_sysctl_or net.core.default_qdisc "未知")
     default_iface=$(detect_default_iface || true)
-    active_qdisc=$(active_qdisc_state "$default_iface")
-    IFS='|' read -r active_qdisc_state_name active_qdisc_detail <<< "$active_qdisc"
-    initcwnd_state=$(detect_initcwnd_state)
-    IFS='|' read -r initcwnd_state_name initcwnd_detail <<< "$initcwnd_state"
+    IFS='|' read -r active_qdisc_state_name active_qdisc_detail <<< \
+        "$(active_qdisc_state "$default_iface")"
+    IFS='|' read -r initcwnd_state_name initcwnd_detail <<< "$(detect_initcwnd_state)"
+    [[ "$initcwnd_state_name" != "drift" ]] || drift_status="initcwnd 状态|漂移"
 
     echo "========== 网络优化状态 =========="
     echo "配置文件: $NETWORK_CONF"
@@ -3026,80 +3015,59 @@ show_status() {
     [[ -f "$NETWORK_INITIAL_UNKNOWN" ]] && echo "初始状态: 旧版未记录，无法安全推测"
     [[ -f "$NETWORK_PREVIOUS_BACKUP" ]] && echo "上次备份: $NETWORK_PREVIOUS_BACKUP"
 
-    echo
-    echo "系统资源:"
-    echo "  RAM: $(memory_status_summary)"
-    echo "  Swap: $(swap_status_summary)"
-    echo "  最近一小时 OOM: $(recent_oom_event_count)"
-
-    echo
-    echo "拥塞控制:"
-    echo "  可用算法: $available_cc"
-    echo "  当前算法: $current_cc"
-    echo "  default qdisc: $current_qdisc"
-    echo "  active qdisc (${default_iface:-未知接口}): $(format_qdisc_state "$active_qdisc_state_name" "$active_qdisc_detail")"
-    print_sysctl_rows "TCP Fast Open|net.ipv4.tcp_fastopen|未知"
-
-    echo
-    echo "兼容性诊断（只读）:"
-    print_sysctl_rows \
-        "rp_filter(all)|net.ipv4.conf.all.rp_filter|未知" \
-        "rp_filter(default)|net.ipv4.conf.default.rp_filter|未知"
-    echo "  route_localnet: 未由本模块配置"
-    echo "  MPTCP: 未由本模块配置"
-
-    echo
-    echo "连接容量:"
-    print_sysctl_rows \
-        "somaxconn|net.core.somaxconn|未知" \
-        "tcp_max_syn_backlog|net.ipv4.tcp_max_syn_backlog|未知" \
-        "netdev_max_backlog|net.core.netdev_max_backlog|未知" \
-        "optmem_max|net.core.optmem_max|不可用" \
-        "临时端口范围|net.ipv4.ip_local_port_range|未知" \
-        "保留本地端口|net.ipv4.ip_local_reserved_ports|未配置"
-    echo "  Conntrack 使用量: $(read_sysctl_or net.netfilter.nf_conntrack_count) / $(read_sysctl_or net.netfilter.nf_conntrack_max)"
-    print_sysctl_rows "Conntrack buckets|net.netfilter.nf_conntrack_buckets|不可用"
-
-    echo
-    echo "缓冲区:"
-    print_sysctl_rows \
-        "rmem_default|net.core.rmem_default|未知" \
-        "wmem_default|net.core.wmem_default|未知" \
-        "rmem_max|net.core.rmem_max|未知" \
-        "wmem_max|net.core.wmem_max|未知" \
-        "tcp_rmem|net.ipv4.tcp_rmem|未知" \
-        "tcp_wmem|net.ipv4.tcp_wmem|未知" \
-        "tcp_mem（内核管理）|net.ipv4.tcp_mem|未知" \
-        "tcp_moderate_rcvbuf|net.ipv4.tcp_moderate_rcvbuf|未知"
-
-    echo
-    echo "TCP 行为:"
-    print_sysctl_rows \
-        "fin_timeout|net.ipv4.tcp_fin_timeout|未知" \
-        "slow_start_after_idle|net.ipv4.tcp_slow_start_after_idle|未知" \
-        "mtu_probing|net.ipv4.tcp_mtu_probing|未知" \
-        "keepalive_time|net.ipv4.tcp_keepalive_time|不可用" \
-        "tcp_tw_reuse（只读）|net.ipv4.tcp_tw_reuse|不可用" \
-        "ECN|net.ipv4.tcp_ecn|不可用"
-    echo "  initcwnd ownership marker: $([[ -e "$ROUTE_OWNED_MARKER" ]] && echo 存在 || echo 不存在)"
-    echo "  initcwnd 持久化钩子: $(initcwnd_hook_status)"
-    echo "  默认路由窗口: $initcwnd_detail"
-    [[ "$initcwnd_state_name" != "drift" ]] || echo "  initcwnd 状态: 漂移"
-
-    echo
-    echo "内核容量诊断（只读）:"
-    print_sysctl_rows \
-        "min_free_kbytes|vm.min_free_kbytes|不可用" \
-        "file-max|fs.file-max|不可用" \
-        "nr_open|fs.nr_open|不可用" \
-        "netdev_budget|net.core.netdev_budget|不可用" \
-        "netdev_budget_usecs|net.core.netdev_budget_usecs|不可用"
-    echo "  file-nr: $(file_handle_status)"
-
-    echo
-    echo "网络健康:"
-    echo "  健康快照字段: softnet_dropped time_squeeze rx_errors tx_errors rx_dropped tx_dropped tcp_retrans limited_sockets rx_packets tx_packets"
-    echo "  健康快照累计值: $(network_health_snapshot "$(detect_default_iface || true)")"
+    print_status_section "系统资源" \
+        "RAM|$(memory_status_summary)" \
+        "Swap|$(swap_status_summary)" \
+        "最近一小时 OOM|$(recent_oom_event_count)"
+    print_status_section "拥塞控制" \
+        "可用算法|$available_cc" \
+        "当前算法|$(read_sysctl_or net.ipv4.tcp_congestion_control 未知)" \
+        "default qdisc|$(read_sysctl_or net.core.default_qdisc 未知)" \
+        "active qdisc (${default_iface:-未知接口})|$(format_qdisc_state "$active_qdisc_state_name" "$active_qdisc_detail")" \
+        "TCP Fast Open|sysctl:net.ipv4.tcp_fastopen|未知"
+    print_status_section "兼容性诊断（只读）" \
+        "rp_filter(all)|sysctl:net.ipv4.conf.all.rp_filter|未知" \
+        "rp_filter(default)|sysctl:net.ipv4.conf.default.rp_filter|未知" \
+        "route_localnet|未由本模块配置" \
+        "MPTCP|未由本模块配置"
+    print_status_section "连接容量" \
+        "somaxconn|sysctl:net.core.somaxconn|未知" \
+        "tcp_max_syn_backlog|sysctl:net.ipv4.tcp_max_syn_backlog|未知" \
+        "netdev_max_backlog|sysctl:net.core.netdev_max_backlog|未知" \
+        "optmem_max|sysctl:net.core.optmem_max|不可用" \
+        "临时端口范围|sysctl:net.ipv4.ip_local_port_range|未知" \
+        "保留本地端口|sysctl:net.ipv4.ip_local_reserved_ports|未配置" \
+        "Conntrack 使用量|$(read_sysctl_or net.netfilter.nf_conntrack_count) / $(read_sysctl_or net.netfilter.nf_conntrack_max)" \
+        "Conntrack buckets|sysctl:net.netfilter.nf_conntrack_buckets|不可用"
+    print_status_section "缓冲区" \
+        "rmem_default|sysctl:net.core.rmem_default|未知" \
+        "wmem_default|sysctl:net.core.wmem_default|未知" \
+        "rmem_max|sysctl:net.core.rmem_max|未知" \
+        "wmem_max|sysctl:net.core.wmem_max|未知" \
+        "tcp_rmem|sysctl:net.ipv4.tcp_rmem|未知" \
+        "tcp_wmem|sysctl:net.ipv4.tcp_wmem|未知" \
+        "tcp_mem（内核管理）|sysctl:net.ipv4.tcp_mem|未知" \
+        "tcp_moderate_rcvbuf|sysctl:net.ipv4.tcp_moderate_rcvbuf|未知"
+    print_status_section "TCP 行为" \
+        "fin_timeout|sysctl:net.ipv4.tcp_fin_timeout|未知" \
+        "slow_start_after_idle|sysctl:net.ipv4.tcp_slow_start_after_idle|未知" \
+        "mtu_probing|sysctl:net.ipv4.tcp_mtu_probing|未知" \
+        "keepalive_time|sysctl:net.ipv4.tcp_keepalive_time|不可用" \
+        "tcp_tw_reuse（只读）|sysctl:net.ipv4.tcp_tw_reuse|不可用" \
+        "ECN|sysctl:net.ipv4.tcp_ecn|不可用" \
+        "initcwnd ownership marker|$([[ -e "$ROUTE_OWNED_MARKER" ]] && echo 存在 || echo 不存在)" \
+        "initcwnd 持久化钩子|$(initcwnd_hook_status)" \
+        "默认路由窗口|$initcwnd_detail" "$drift_status"
+    print_status_section "内核容量诊断（只读）" \
+        "min_free_kbytes|sysctl:vm.min_free_kbytes|不可用" \
+        "file-max|sysctl:fs.file-max|不可用" \
+        "nr_open|sysctl:fs.nr_open|不可用" \
+        "netdev_budget|sysctl:net.core.netdev_budget|不可用" \
+        "netdev_budget_usecs|sysctl:net.core.netdev_budget_usecs|不可用" \
+        "file-nr|$(file_handle_status)"
+    print_status_section "网络健康" \
+        "健康快照字段|softnet_dropped time_squeeze rx_errors tx_errors rx_dropped tx_dropped tcp_retrans limited_sockets rx_packets tx_packets" \
+        "健康快照累计值|$(network_health_snapshot "$(detect_default_iface || true)")"
 
     return 0
 }
