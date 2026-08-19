@@ -8,23 +8,7 @@
 # 基础调优移植或参考 Kylin010/tcpfit v0.5.6（MIT，提交 67c0bdfb35dd98e86982600298237b6ecc08ebe4）。
 # 事务备份、交互与验证为本仓库下游扩展。
 # 功能：配置 BBR、fq 与 TCP 缓冲区；主动探测必须明确选择。
-#
-# 用法：
-#   bash network-optimize.sh [install] [选项]  # 自动计算并应用
-#   bash network-optimize.sh plan [选项]       # 只计算，不修改系统
-#   bash network-optimize.sh restore           # 恢复上一次配置
-#   bash network-optimize.sh status            # 查看当前状态
-#   bash network-optimize.sh verify [--yes]    # 确认后只读验证网络性能
-#
-# install/plan 可选参数：
-#   --probe                      明确执行自动探测
-#   --bandwidth-mbps N           手动指定对称带宽
-#   --download-mbps N            手动指定下载带宽
-#   --upload-mbps N              手动指定上传带宽
-#   --rtt-ms N                   手动指定 RTT
-#   --disable-ecn                禁用 ECN，回退到传统丢包信号
-#   --enable-initcwnd            强制设置初始拥塞窗口为 32
-#   --disable-initcwnd           强制保留内核默认初始拥塞窗口
+# 完整用法与选项由 show_help 输出。
 
 set -euo pipefail
 
@@ -205,22 +189,14 @@ stage_managed_state() {
     if [[ -e "$target" || -L "$target" ]]; then
         stage=$(mktemp "${backup}.new.XXXXXX") || return 1
         rm -f "$stage"
-        if ! cp -a -- "$target" "$stage"; then
-            rm -f "$stage"
-            return 1
-        fi
-        if ! mv -f -- "$stage" "$backup"; then
+        if ! cp -a -- "$target" "$stage" || ! mv -f -- "$stage" "$backup"; then
             rm -f "$stage"
             return 1
         fi
         rm -f "$absent"
     else
         stage=$(mktemp "${absent}.new.XXXXXX") || return 1
-        chmod 600 "$stage" || {
-            rm -f "$stage"
-            return 1
-        }
-        if ! mv -f -- "$stage" "$absent"; then
+        if ! chmod 600 "$stage" || ! mv -f -- "$stage" "$absent"; then
             rm -f "$stage"
             return 1
         fi
@@ -233,26 +209,21 @@ atomic_install_file() {
 
     install -d -m 0755 "$(dirname "$destination")" || return 1
     stage=$(mktemp "${destination}.new.XXXXXX") || return 1
-    if ! install -m "$mode" "$source_file" "$stage"; then
-        rm -f "$stage"
-        return 1
-    fi
-    if ! mv -f -- "$stage" "$destination"; then
+    if ! install -m "$mode" "$source_file" "$stage" ||
+        ! mv -f -- "$stage" "$destination"; then
         rm -f "$stage"
         return 1
     fi
 }
 
 atomic_write_file() {
-    local destination="$1" content="$2" mode="${3:-0600}" stage
+    local destination="$1" content="$2" mode="${3:-0600}" create_parent="${4:-true}" stage
 
-    install -d -m 0755 "$(dirname "$destination")" || return 1
+    [[ "$create_parent" == "false" ]] ||
+        install -d -m 0755 "$(dirname "$destination")" || return 1
     stage=$(mktemp "${destination}.new.XXXXXX") || return 1
-    if ! printf '%s\n' "$content" > "$stage" || ! chmod "$mode" "$stage"; then
-        rm -f "$stage"
-        return 1
-    fi
-    if ! mv -f -- "$stage" "$destination"; then
+    if ! printf '%s\n' "$content" > "$stage" || ! chmod "$mode" "$stage" ||
+        ! mv -f -- "$stage" "$destination"; then
         rm -f "$stage"
         return 1
     fi
@@ -264,11 +235,7 @@ atomic_restore_file() {
     install -d -m 0755 "$(dirname "$destination")" || return 1
     stage=$(mktemp "${destination}.rollback.XXXXXX") || return 1
     rm -f -- "$stage" || return 1
-    if ! cp -a -- "$source_file" "$stage"; then
-        rm -f -- "$stage"
-        return 1
-    fi
-    if ! mv -f -- "$stage" "$destination"; then
+    if ! cp -a -- "$source_file" "$stage" || ! mv -f -- "$stage" "$destination"; then
         rm -f -- "$stage"
         return 1
     fi
@@ -379,15 +346,11 @@ restore_managed_file() {
 
     if [[ -e "$backup" || -L "$backup" ]]; then
         atomic_restore_file "$backup" "$target"
-        return $?
+    elif [[ -e "$absent" ]]; then
+        rm -f "$target"
+    else
+        return 1
     fi
-
-    if [[ -e "$absent" ]]; then
-        rm -f "$target" || return 1
-        return 0
-    fi
-
-    return 1
 }
 
 require_commands() {
@@ -470,6 +433,8 @@ is_positive_integer() {
 }
 
 parse_arguments() {
+    local desired_mode spec option value max
+
     if (( $# > 0 )) && [[ "$1" != -* ]]; then
         COMMAND="$1"
         shift
@@ -501,20 +466,14 @@ parse_arguments() {
                 ECN_DISABLED="true"
                 shift
                 ;;
-            --enable-initcwnd)
-                if [[ "$INITCWND_MODE" == "disabled" ]]; then
+            --enable-initcwnd|--disable-initcwnd)
+                desired_mode="enabled"
+                [[ "$1" != "--disable-initcwnd" ]] || desired_mode="disabled"
+                if [[ "$INITCWND_MODE" != "auto" && "$INITCWND_MODE" != "$desired_mode" ]]; then
                     error "--enable-initcwnd 不能与 --disable-initcwnd 同时使用"
                     return 1
                 fi
-                INITCWND_MODE="enabled"
-                shift
-                ;;
-            --disable-initcwnd)
-                if [[ "$INITCWND_MODE" == "enabled" ]]; then
-                    error "--enable-initcwnd 不能与 --disable-initcwnd 同时使用"
-                    return 1
-                fi
-                INITCWND_MODE="disabled"
+                INITCWND_MODE="$desired_mode"
                 shift
                 ;;
             --yes)
@@ -549,26 +508,18 @@ parse_arguments() {
             ;;
     esac
 
-    if [[ -n "$MANUAL_BANDWIDTH_MBPS" ]] &&
-        ! is_positive_integer "$MANUAL_BANDWIDTH_MBPS" 1 100000; then
-        error "--bandwidth-mbps 必须是 1–100000 的整数"
-        return 1
-    fi
-    if [[ -n "$MANUAL_DOWNLOAD_MBPS" ]] &&
-        ! is_positive_integer "$MANUAL_DOWNLOAD_MBPS" 1 100000; then
-        error "--download-mbps 必须是 1–100000 的整数"
-        return 1
-    fi
-    if [[ -n "$MANUAL_UPLOAD_MBPS" ]] &&
-        ! is_positive_integer "$MANUAL_UPLOAD_MBPS" 1 100000; then
-        error "--upload-mbps 必须是 1–100000 的整数"
-        return 1
-    fi
-    if [[ -n "$MANUAL_RTT_MS" ]] &&
-        ! is_positive_integer "$MANUAL_RTT_MS" 1 5000; then
-        error "--rtt-ms 必须是 1–5000 的整数"
-        return 1
-    fi
+    for spec in \
+        "--bandwidth-mbps|$MANUAL_BANDWIDTH_MBPS|100000" \
+        "--download-mbps|$MANUAL_DOWNLOAD_MBPS|100000" \
+        "--upload-mbps|$MANUAL_UPLOAD_MBPS|100000" \
+        "--rtt-ms|$MANUAL_RTT_MS|5000"; do
+        IFS='|' read -r option value max <<< "$spec"
+        [[ -z "$value" ]] && continue
+        if ! is_positive_integer "$value" 1 "$max"; then
+            error "$option 必须是 1–$max 的整数"
+            return 1
+        fi
+    done
 
     if [[ "$ACTIVE_PROBE_REQUESTED" == "true" ]] &&
         [[ -n "$MANUAL_BANDWIDTH_MBPS$MANUAL_DOWNLOAD_MBPS$MANUAL_UPLOAD_MBPS" ]]; then
@@ -874,18 +825,14 @@ query_default_ipv4_route() {
 }
 
 default_ipv4_route() {
-    local route query_status
+    local route="" query_status=0
 
-    if route=$(query_default_ipv4_route); then
-        printf '%s\n' "$route"
-        return 0
-    fi
-    query_status=$?
-    if (( query_status == 2 )); then
-        printf '\n'
-        return 0
-    fi
-    return 1
+    route=$(query_default_ipv4_route) || query_status=$?
+    case "$query_status" in
+        0) printf '%s\n' "$route" ;;
+        2) printf '\n' ;;
+        *) return 1 ;;
+    esac
 }
 
 strip_route_window_fields() {
@@ -914,43 +861,39 @@ remove_initcwnd_ownership_marker() {
     rm -f -- "$ROUTE_OWNED_MARKER" || return 1
 }
 
+write_route_snapshot() {
+    local route="$1" backup="$2" absent="$3" owned="$4"
+
+    if [[ -n "$route" ]]; then
+        atomic_write_file "$backup" "$route" 0600 || return 1
+        if [[ -e "$ROUTE_OWNED_MARKER" ]]; then
+            atomic_write_file "$owned" "owned" 0600 || return 1
+        else
+            rm -f "$owned" || return 1
+        fi
+        rm -f "$absent"
+    else
+        atomic_write_file "$absent" "absent" 0600 || return 1
+        rm -f "$backup" "$owned"
+    fi
+}
+
 backup_default_route() {
     local route="" query_status=0
 
     route=$(query_default_ipv4_route) || query_status=$?
-    if (( query_status != 0 )); then
-        if (( query_status != 2 )); then
-            error "读取 IPv4 默认路由失败"
-            return 1
-        fi
+    if (( query_status != 0 && query_status != 2 )); then
+        error "读取 IPv4 默认路由失败"
+        return 1
     fi
     install -d -m 0755 "$NETWORK_OPTIMIZE_STATE_DIR" || return 1
-    if [[ -n "$route" ]]; then
-        atomic_write_file "$ROUTE_PREVIOUS_BACKUP" "$route" 0600 || return 1
-        if [[ -e "$ROUTE_OWNED_MARKER" ]]; then
-            atomic_write_file "$ROUTE_PREVIOUS_OWNED" "owned" 0600 || return 1
-        else
-            rm -f "$ROUTE_PREVIOUS_OWNED" || return 1
-        fi
-        rm -f "$ROUTE_PREVIOUS_ABSENT" || return 1
-    else
-        atomic_write_file "$ROUTE_PREVIOUS_ABSENT" "absent" 0600 || return 1
-        rm -f "$ROUTE_PREVIOUS_BACKUP" "$ROUTE_PREVIOUS_OWNED" || return 1
-    fi
+    write_route_snapshot "$route" "$ROUTE_PREVIOUS_BACKUP" \
+        "$ROUTE_PREVIOUS_ABSENT" "$ROUTE_PREVIOUS_OWNED" || return 1
 
     if [[ ! -e "$ROUTE_INITIAL_BACKUP" && ! -e "$ROUTE_INITIAL_ABSENT" &&
         ! -e "$ROUTE_INITIAL_UNKNOWN" ]]; then
-        if [[ -n "$route" ]]; then
-            atomic_write_file "$ROUTE_INITIAL_BACKUP" "$route" 0600 || return 1
-            if [[ -e "$ROUTE_OWNED_MARKER" ]]; then
-                atomic_write_file "$ROUTE_INITIAL_OWNED" "owned" 0600 || return 1
-            else
-                rm -f "$ROUTE_INITIAL_OWNED" || return 1
-            fi
-        else
-            atomic_write_file "$ROUTE_INITIAL_ABSENT" "absent" 0600 || return 1
-            rm -f "$ROUTE_INITIAL_OWNED" || return 1
-        fi
+        write_route_snapshot "$route" "$ROUTE_INITIAL_BACKUP" \
+            "$ROUTE_INITIAL_ABSENT" "$ROUTE_INITIAL_OWNED"
     fi
 }
 
@@ -1103,7 +1046,7 @@ remove_initcwnd_hook() {
 }
 
 write_initcwnd_hook() {
-    local hook_dir temp_hook
+    local hook_dir content
 
     hook_dir=$(dirname "$INITCWND_ROUTE_HOOK")
     if [[ ! -d "$hook_dir" ]]; then
@@ -1116,26 +1059,18 @@ write_initcwnd_hook() {
         return 1
     fi
 
-    temp_hook=$(mktemp "${INITCWND_ROUTE_HOOK}.new.XXXXXX") || return 1
-    if ! render_initcwnd_hook > "$temp_hook" || ! chmod 0755 "$temp_hook"; then
-        rm -f "$temp_hook"
-        return 1
-    fi
-    if ! mv -f -- "$temp_hook" "$INITCWND_ROUTE_HOOK"; then
-        rm -f "$temp_hook"
-        return 1
-    fi
+    content=$(render_initcwnd_hook) || return 1
+    atomic_write_file "$INITCWND_ROUTE_HOOK" "$content" 0755 false
 }
 
 # Generated hook uses clean as an array; apply path intentionally shadows it as a string.
 # shellcheck disable=SC2128,SC2178
 apply_initcwnd() {
-    local route="" clean="" owned="false"
+    local route="" clean=""
     local -a route_args=()
 
     if [[ "$INITCWND_ENABLED" != "true" ]]; then
-        initcwnd_settings_owned && owned="true"
-        if [[ "$owned" != "true" ]]; then
+        if ! initcwnd_settings_owned; then
             warn "当前默认路由的 initcwnd/initrwnd 无本脚本 ownership 证据，保留不动"
             return 0
         fi
@@ -1179,23 +1114,22 @@ apply_initcwnd() {
     }
     clean=$(strip_route_window_fields "$route")
     read -r -a route_args <<< "$clean"
-    if ip -4 route replace "${route_args[@]}" initcwnd 32 initrwnd 32; then
-        if ! create_initcwnd_ownership_marker; then
-            error "创建 initcwnd ownership marker 失败"
-            return 1
-        fi
-        if ! write_initcwnd_hook; then
-            error "无法写入 initcwnd 持久化钩子"
-            return 1
-        fi
-        if is_managed_initcwnd_hook; then
-            success "默认路由已设置 initcwnd/initrwnd = 32，并通过 networkd-dispatcher 持久化"
-        else
-            success "默认路由已设置 initcwnd/initrwnd = 32（当前系统没有可用持久化钩子）"
-        fi
-    else
+    if ! ip -4 route replace "${route_args[@]}" initcwnd 32 initrwnd 32; then
         error "默认路由不支持 initcwnd/initrwnd，网络 sysctl 已应用但路由优化失败"
         return 1
+    fi
+    if ! create_initcwnd_ownership_marker; then
+        error "创建 initcwnd ownership marker 失败"
+        return 1
+    fi
+    if ! write_initcwnd_hook; then
+        error "无法写入 initcwnd 持久化钩子"
+        return 1
+    fi
+    if is_managed_initcwnd_hook; then
+        success "默认路由已设置 initcwnd/initrwnd = 32，并通过 networkd-dispatcher 持久化"
+    else
+        success "默认路由已设置 initcwnd/initrwnd = 32（当前系统没有可用持久化钩子）"
     fi
 }
 
@@ -1203,32 +1137,25 @@ restore_default_route() {
     local route_file="$1" owned_file="${2:-}" absent_file="${3:-}" route="" clean=""
     local -a route_args=()
 
-    if [[ ! -f "$route_file" && -n "$absent_file" && -e "$absent_file" ]]; then
+    if [[ ! -f "$route_file" ]]; then
         initcwnd_settings_owned || return 0
         route=$(default_ipv4_route) || return 1
         if [[ -z "$route" ]]; then
             remove_initcwnd_ownership_marker || return 1
             return 0
         fi
-        if grep -Eq '(^| )(initcwnd|initrwnd) [0-9]+( |$)' <<< "$route"; then
-            clean=$(strip_route_window_fields "$route")
-            read -r -a route_args <<< "$clean"
-            (( ${#route_args[@]} > 0 )) || return 1
-            ip -4 route replace "${route_args[@]}" || return 1
-        fi
-        remove_initcwnd_ownership_marker || return 1
-        return 0
-    fi
-
-    [[ -f "$route_file" ]] || {
-        initcwnd_settings_owned || return 0
-        route=$(default_ipv4_route) || return 1
-        if [[ -z "$route" ]]; then
+        if [[ -n "$absent_file" && -e "$absent_file" ]]; then
+            if grep -Eq '(^| )(initcwnd|initrwnd) [0-9]+( |$)' <<< "$route"; then
+                clean=$(strip_route_window_fields "$route")
+                read -r -a route_args <<< "$clean"
+                (( ${#route_args[@]} > 0 )) || return 1
+                ip -4 route replace "${route_args[@]}" || return 1
+            fi
             remove_initcwnd_ownership_marker || return 1
             return 0
         fi
         route=$(strip_route_window_fields "$route")
-    }
+    fi
     [[ -n "$route" ]] || route=$(<"$route_file")
     read -r -a route_args <<< "$route"
     (( ${#route_args[@]} > 0 )) || return 1
@@ -1682,38 +1609,25 @@ verify_impl() {
 }
 
 run_verify_command() {
-    local rc=0 previous_exit_trap previous_hup_trap previous_int_trap previous_term_trap
+    local rc=0 signal index
+    local -a signals=(EXIT HUP INT TERM) saved_traps=()
 
-    previous_exit_trap=$(trap -p EXIT)
-    previous_hup_trap=$(trap -p HUP)
-    previous_int_trap=$(trap -p INT)
-    previous_term_trap=$(trap -p TERM)
+    for signal in "${signals[@]}"; do
+        saved_traps+=("$(trap -p "$signal")")
+    done
     trap 'cleanup_verify' EXIT
     trap 'cleanup_verify; exit 129' HUP
     trap 'cleanup_verify; exit 130' INT
     trap 'cleanup_verify; exit 143' TERM
     verify_impl || rc=$?
     cleanup_verify
-    if [[ -n "$previous_exit_trap" ]]; then
-        eval "$previous_exit_trap"
-    else
-        trap - EXIT
-    fi
-    if [[ -n "$previous_hup_trap" ]]; then
-        eval "$previous_hup_trap"
-    else
-        trap - HUP
-    fi
-    if [[ -n "$previous_int_trap" ]]; then
-        eval "$previous_int_trap"
-    else
-        trap - INT
-    fi
-    if [[ -n "$previous_term_trap" ]]; then
-        eval "$previous_term_trap"
-    else
-        trap - TERM
-    fi
+    for index in "${!signals[@]}"; do
+        if [[ -n "${saved_traps[$index]}" ]]; then
+            eval "${saved_traps[$index]}"
+        else
+            trap - "${signals[$index]}"
+        fi
+    done
     return "$rc"
 }
 
@@ -2080,21 +1994,6 @@ resolve_tuning_values() {
         [[ -n "$upload_mbps" ]] || upload_mbps="$MANUAL_BANDWIDTH_MBPS"
     fi
 
-    if [[ -n "$MANUAL_RTT_MS" ]]; then
-        rtt_ms="$MANUAL_RTT_MS"
-        if [[ "$MANUAL_RTT_DEFAULTED" == "true" ]]; then
-            RTT_SOURCE="default for manual bandwidth"
-            RTT_POLICY="fixed 150 ms default"
-        else
-            RTT_SOURCE="command line"
-            RTT_POLICY="manual override"
-        fi
-    else
-        rtt_ms="$DEFAULT_RTT_MS"
-        RTT_SOURCE="automatic policy"
-        RTT_POLICY="fixed 150 ms"
-    fi
-
     if [[ -z "$download_mbps" || -z "$upload_mbps" ]]; then
         if [[ "$TUNING_MODE" != "probe" ]]; then
             error "缺少有效上下行带宽，拒绝生成或应用配置"
@@ -2113,15 +2012,22 @@ resolve_tuning_values() {
             prompt_manual_bandwidth "interactive fallback after probe failure" || return 1
             download_mbps="$MANUAL_DOWNLOAD_MBPS"
             upload_mbps="$MANUAL_UPLOAD_MBPS"
-            rtt_ms="$MANUAL_RTT_MS"
-            if [[ "$MANUAL_RTT_DEFAULTED" == "true" ]]; then
-                RTT_SOURCE="default for manual bandwidth"
-                RTT_POLICY="fixed 150 ms default"
-            else
-                RTT_SOURCE="command line"
-                RTT_POLICY="manual override"
-            fi
         fi
+    fi
+
+    if [[ -n "$MANUAL_RTT_MS" ]]; then
+        rtt_ms="$MANUAL_RTT_MS"
+        if [[ "$MANUAL_RTT_DEFAULTED" == "true" ]]; then
+            RTT_SOURCE="default for manual bandwidth"
+            RTT_POLICY="fixed 150 ms default"
+        else
+            RTT_SOURCE="command line"
+            RTT_POLICY="manual override"
+        fi
+    else
+        rtt_ms="$DEFAULT_RTT_MS"
+        RTT_SOURCE="automatic policy"
+        RTT_POLICY="fixed 150 ms"
     fi
 
     if ! is_positive_integer "$download_mbps" 1 100000 ||
@@ -2150,10 +2056,6 @@ resolve_tuning_values() {
     resolve_initcwnd_policy
 }
 
-format_mib() {
-    awk -v bytes="$1" 'BEGIN {printf "%.1f", bytes / 1048576}'
-}
-
 format_buffer_size() {
     awk -v bytes="$1" 'BEGIN {
         if (bytes < 1048576) printf "%.0f KiB", bytes / 1024
@@ -2166,7 +2068,7 @@ show_tuning_plan() {
     echo "模式: $TUNING_MODE"
     echo "物理内存: ${PHYSICAL_RAM_MB} MiB"
     echo "有效内存: ${RAM_MB} MiB"
-    echo "单 socket 上限: $(format_mib "$MEMORY_CAP_BYTES") MiB（有效内存 / 32，绝对上限 256 MiB）"
+    echo "单 socket 上限: $(format_buffer_size "$MEMORY_CAP_BYTES")（有效内存 / 32，绝对上限 256 MiB）"
     echo "下载带宽: ${DETECTED_DOWNLOAD_MBPS:-未知} Mbps"
     echo "上传带宽: ${DETECTED_UPLOAD_MBPS:-未知} Mbps"
     echo "带宽来源: $BANDWIDTH_SOURCE"
@@ -2292,7 +2194,7 @@ format_nic_allowance_delta() {
 }
 
 health_delta() {
-    local before="$1" after="$2" value
+    local before="$1" after="$2" value health
     local b_drop b_squeeze b_rxerr b_txerr b_rxdrop b_txdrop b_retrans _ b_rxpkt b_txpkt
     local a_drop a_squeeze a_rxerr a_txerr a_rxdrop a_txdrop a_retrans a_limited a_rxpkt a_txpkt
 
@@ -2301,15 +2203,20 @@ health_delta() {
     for value in "$b_drop" "$b_squeeze" "$b_rxerr" "$b_txerr" "$b_rxdrop" "$b_txdrop" \
         "$b_retrans" "$b_rxpkt" "$b_txpkt" "$a_drop" "$a_squeeze" "$a_rxerr" \
         "$a_txerr" "$a_rxdrop" "$a_txdrop" "$a_retrans" "$a_limited" "$a_rxpkt" "$a_txpkt"; do
-        [[ "$value" =~ ^[0-9]+$ ]] || { printf '%s\n' unreadable; return; }
+        [[ "$value" =~ ^[0-9]+$ ]] || { printf '%s\n' 'unreadable|计数器不可读'; return; }
     done
     if (( a_drop < b_drop || a_squeeze < b_squeeze || a_rxerr < b_rxerr ||
           a_txerr < b_txerr || a_rxdrop < b_rxdrop || a_txdrop < b_txdrop ||
           a_retrans < b_retrans || a_rxpkt < b_rxpkt || a_txpkt < b_txpkt )); then
-        printf '%s\n' reset
+        printf '%s\n' 'reset|计数器已重置'
         return
     fi
-    printf 'ok %s %s %s %s %s %s %s %s %s %s\n' \
+    health=$(classify_network_health \
+        "$((a_drop - b_drop))" "$((a_squeeze - b_squeeze))" \
+        "$((a_rxerr - b_rxerr + a_txerr - b_txerr))" \
+        "$((a_rxdrop - b_rxdrop + a_txdrop - b_txdrop))" \
+        "$((a_rxpkt - b_rxpkt + a_txpkt - b_txpkt))")
+    printf 'ok|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' "$health" \
         "$((a_drop - b_drop))" "$((a_squeeze - b_squeeze))" \
         "$((a_rxerr - b_rxerr))" "$((a_txerr - b_txerr))" \
         "$((a_rxdrop - b_rxdrop))" "$((a_txdrop - b_txdrop))" \
@@ -2319,11 +2226,12 @@ health_delta() {
 
 format_verify_health_delta() {
     local before="$1" after="$2" allowance_before="$3" allowance_after="$4"
-    local status delta_drop delta_squeeze delta_rxerr delta_txerr delta_rxdrop delta_txdrop
-    local delta_retrans limited delta_rxpkt delta_txpkt delta_packets health
+    local status health delta_drop delta_squeeze delta_rxerr delta_txerr delta_rxdrop delta_txdrop
+    local delta_retrans limited delta_rxpkt delta_txpkt
 
-    read -r status delta_drop delta_squeeze delta_rxerr delta_txerr delta_rxdrop delta_txdrop \
-        delta_retrans limited delta_rxpkt delta_txpkt <<< "$(health_delta "$before" "$after")"
+    IFS='|' read -r status health delta_drop delta_squeeze delta_rxerr delta_txerr \
+        delta_rxdrop delta_txdrop delta_retrans limited delta_rxpkt delta_txpkt \
+        <<< "$(health_delta "$before" "$after")"
     if [[ "$status" != "ok" ]]; then
         [[ "$status" == "reset" ]] &&
             printf '网络健康：测试期间计数器重置，无法计算可靠增量\n' ||
@@ -2332,9 +2240,6 @@ format_verify_health_delta() {
         return 0
     fi
 
-    delta_packets=$((delta_rxpkt + delta_txpkt))
-    health=$(classify_network_health "$delta_drop" "$delta_squeeze" \
-        "$((delta_rxerr + delta_txerr))" "$((delta_rxdrop + delta_txdrop))" "$delta_packets")
     printf '系统计数增量：softnet_dropped +%s / time_squeeze +%s / 全机 TCP 重传 +%s\n' \
         "$delta_drop" "$delta_squeeze" "$delta_retrans"
     printf '网卡计数增量：drops rx +%s tx +%s / errors rx +%s tx +%s / packets rx +%s tx +%s\n' \
@@ -2357,19 +2262,13 @@ format_rtt_selection_summary() {
 }
 
 show_install_summary() {
-    local before="$1" bbr_enabled="$2" after status delta_drop delta_squeeze delta_rxerr delta_txerr
-    local delta_rxdrop delta_txdrop delta_retrans limited delta_rxpkt delta_txpkt delta_packets health
+    local before="$1" bbr_enabled="$2" after status health delta_retrans limited
     local algorithm="当前拥塞控制" qdisc_state qdisc_detail
 
     after=$(network_health_snapshot "$PROBE_IFACE")
-    read -r status delta_drop delta_squeeze delta_rxerr delta_txerr delta_rxdrop delta_txdrop \
-        delta_retrans limited delta_rxpkt delta_txpkt <<< "$(health_delta "$before" "$after")"
-    if [[ "$status" == "ok" ]]; then
-        delta_packets=$((delta_rxpkt + delta_txpkt))
-        health=$(classify_network_health "$delta_drop" "$delta_squeeze" \
-            "$((delta_rxerr + delta_txerr))" "$((delta_rxdrop + delta_txdrop))" "$delta_packets")
-    else
-        health=$([[ "$status" == "reset" ]] && echo "计数器已重置" || echo "计数器不可读")
+    IFS='|' read -r status health _ _ _ _ _ _ delta_retrans limited _ _ \
+        <<< "$(health_delta "$before" "$after")"
+    if [[ "$status" != "ok" ]]; then
         delta_retrans="?"
         limited="?"
     fi
@@ -2580,10 +2479,6 @@ capture_runtime_values_from_files() {
     done
 }
 
-capture_runtime_values() {
-    capture_runtime_values_from_files "$2" "$1"
-}
-
 apply_runtime_values_strict() {
     local values_file="$1" key value expected actual failed=false
 
@@ -2658,25 +2553,28 @@ verify_network_config() {
     success "运行时 sysctl 已与生成配置一致"
 }
 
+record_restore_failure() {
+    local -n failures="$1"
+    local label="$2"
+    shift 2
+
+    "$@" || failures+=("$label")
+}
+
 rollback_initcwnd_install() {
     INITCWND_ROLLBACK_FAILED_ITEMS=()
 
-    if ! restore_default_route \
-        "$ROUTE_PREVIOUS_BACKUP" "$ROUTE_PREVIOUS_OWNED" "$ROUTE_PREVIOUS_ABSENT"; then
-        INITCWND_ROLLBACK_FAILED_ITEMS+=(route)
-    fi
-    if ! restore_managed_file \
-        "$INITCWND_ROUTE_HOOK" "$ROUTE_HOOK_PREVIOUS_BACKUP" \
-        "$ROUTE_HOOK_PREVIOUS_ABSENT"; then
-        INITCWND_ROLLBACK_FAILED_ITEMS+=(hook)
-    fi
-    if ! apply_runtime_values_strict "$RUNTIME_PREVIOUS_BACKUP"; then
-        INITCWND_ROLLBACK_FAILED_ITEMS+=(runtime)
-    fi
-    if ! restore_managed_file \
-        "$NETWORK_CONF" "$NETWORK_PREVIOUS_BACKUP" "$NETWORK_PREVIOUS_ABSENT"; then
-        INITCWND_ROLLBACK_FAILED_ITEMS+=(config)
-    fi
+    record_restore_failure INITCWND_ROLLBACK_FAILED_ITEMS route \
+        restore_default_route "$ROUTE_PREVIOUS_BACKUP" \
+        "$ROUTE_PREVIOUS_OWNED" "$ROUTE_PREVIOUS_ABSENT"
+    record_restore_failure INITCWND_ROLLBACK_FAILED_ITEMS hook \
+        restore_managed_file "$INITCWND_ROUTE_HOOK" \
+        "$ROUTE_HOOK_PREVIOUS_BACKUP" "$ROUTE_HOOK_PREVIOUS_ABSENT"
+    record_restore_failure INITCWND_ROLLBACK_FAILED_ITEMS runtime \
+        apply_runtime_values_strict "$RUNTIME_PREVIOUS_BACKUP"
+    record_restore_failure INITCWND_ROLLBACK_FAILED_ITEMS config \
+        restore_managed_file "$NETWORK_CONF" \
+        "$NETWORK_PREVIOUS_BACKUP" "$NETWORK_PREVIOUS_ABSENT"
 
     (( ${#INITCWND_ROLLBACK_FAILED_ITEMS[@]} == 0 ))
 }
@@ -2710,26 +2608,19 @@ install_optimization() {
     # 完成全部备份后再尝试加载模块；不可用时重生成不接管拥塞控制的配置。
     create_network_config "$temp_config" true
 
-    runtime_backup=$(mktemp) || {
-        rm -f "$temp_config"
-        return 1
-    }
-
-    if ! capture_runtime_values "$temp_config" "$runtime_backup"; then
-        rm -f "$temp_config" "$runtime_backup"
+    if ! runtime_backup=$(mktemp) ||
+        ! capture_runtime_values_from_files "$runtime_backup" "$temp_config"; then
+        rm -f "$temp_config" "${runtime_backup:-}"
         return 1
     fi
     prepare_legacy_backup_state
 
     install -d -m 0755 "$NETWORK_OPTIMIZE_STATE_DIR"
-    merge_initial_runtime_values "$runtime_backup" || {
+    if ! merge_initial_runtime_values "$runtime_backup" ||
+        ! backup_previous_state_set "$runtime_backup"; then
         rm -f "$temp_config" "$runtime_backup"
         return 1
-    }
-    backup_previous_state_set "$runtime_backup" || {
-        rm -f "$temp_config" "$runtime_backup"
-        return 1
-    }
+    fi
 
     if ensure_bbr_available; then
         bbr_enabled="true"
@@ -2739,12 +2630,7 @@ install_optimization() {
     fi
 
     # 应用前已保存全部涉及参数的运行值，失败时逐项回滚。
-    if ! apply_network_config "$temp_config"; then
-        restore_runtime_values "$runtime_backup"
-        rm -f "$temp_config" "$runtime_backup"
-        return 1
-    fi
-    if ! verify_network_config "$temp_config"; then
+    if ! apply_network_config "$temp_config" || ! verify_network_config "$temp_config"; then
         restore_runtime_values "$runtime_backup"
         rm -f "$temp_config" "$runtime_backup"
         return 1
@@ -2806,32 +2692,29 @@ begin_restore_transaction() {
 
     route=$(query_default_ipv4_route) || query_status=$?
     case "$query_status" in
-        0)
-            if ! atomic_write_file "$transaction_dir/route" "$route" 0600; then
-                rm -rf -- "$transaction_dir"
-                return 1
-            fi
-            ;;
-        2)
-            atomic_write_file "$transaction_dir/route-absent" "absent" 0600 || {
-                rm -rf -- "$transaction_dir"
-                return 1
-            }
-            ;;
-        *)
-            rm -rf -- "$transaction_dir"
-            return 1
-            ;;
-    esac
+        0) atomic_write_file "$transaction_dir/route" "$route" 0600 ;;
+        2) atomic_write_file "$transaction_dir/route-absent" "absent" 0600 ;;
+        *) false ;;
+    esac || {
+        rm -rf -- "$transaction_dir"
+        return 1
+    }
 
-    if [[ -e "$ROUTE_OWNED_MARKER" ]]; then
-        atomic_write_file "$transaction_dir/route-owned" "owned" 0600 || {
-            rm -rf -- "$transaction_dir"
-            return 1
-        }
+    if [[ -e "$ROUTE_OWNED_MARKER" ]] &&
+        ! atomic_write_file "$transaction_dir/route-owned" "owned" 0600; then
+        rm -rf -- "$transaction_dir"
+        return 1
     fi
 
     RESTORE_TRANSACTION_DIR="$transaction_dir"
+}
+
+restore_captured_route_ownership() {
+    if [[ -e "$1/route-owned" ]]; then
+        create_initcwnd_ownership_marker
+    else
+        remove_initcwnd_ownership_marker
+    fi
 }
 
 restore_captured_default_route() {
@@ -2847,12 +2730,8 @@ restore_captured_default_route() {
 
     current_route=$(query_default_ipv4_route) || query_status=$?
     if (( query_status == 2 )); then
-        if [[ -e "$transaction_dir/route-owned" ]]; then
-            create_initcwnd_ownership_marker || return 1
-        else
-            remove_initcwnd_ownership_marker || return 1
-        fi
-        return $?
+        restore_captured_route_ownership "$transaction_dir"
+        return
     fi
     (( query_status == 0 )) || return 1
 
@@ -2862,35 +2741,26 @@ restore_captured_default_route() {
     read -r -a route_args <<< "$current_route"
     (( ${#route_args[@]} > 0 )) || return 1
     ip -4 route del "${route_args[@]}" || return 1
-    if [[ -e "$transaction_dir/route-owned" ]]; then
-        create_initcwnd_ownership_marker || return 1
-    else
-        remove_initcwnd_ownership_marker || return 1
-    fi
+    restore_captured_route_ownership "$transaction_dir"
 }
 
 rollback_restore_transaction() {
     local transaction_dir="$1" target_route_file="$2"
 
     RESTORE_ROLLBACK_FAILED_ITEMS=()
-    if ! restore_managed_file \
-        "$NETWORK_CONF" "$transaction_dir/network" "$transaction_dir/network-absent"; then
-        RESTORE_ROLLBACK_FAILED_ITEMS+=(sysctl)
-    fi
-    if ! restore_managed_file \
-        "$BBR_MODULES_FILE" "$transaction_dir/modules" "$transaction_dir/modules-absent"; then
-        RESTORE_ROLLBACK_FAILED_ITEMS+=(modules)
-    fi
-    if ! apply_runtime_values_strict "$transaction_dir/runtime"; then
-        RESTORE_ROLLBACK_FAILED_ITEMS+=(runtime)
-    fi
-    if ! restore_captured_default_route "$transaction_dir" "$target_route_file"; then
-        RESTORE_ROLLBACK_FAILED_ITEMS+=(route)
-    fi
-    if ! restore_managed_file \
-        "$INITCWND_ROUTE_HOOK" "$transaction_dir/hook" "$transaction_dir/hook-absent"; then
-        RESTORE_ROLLBACK_FAILED_ITEMS+=(hook)
-    fi
+    record_restore_failure RESTORE_ROLLBACK_FAILED_ITEMS sysctl \
+        restore_managed_file "$NETWORK_CONF" \
+        "$transaction_dir/network" "$transaction_dir/network-absent"
+    record_restore_failure RESTORE_ROLLBACK_FAILED_ITEMS modules \
+        restore_managed_file "$BBR_MODULES_FILE" \
+        "$transaction_dir/modules" "$transaction_dir/modules-absent"
+    record_restore_failure RESTORE_ROLLBACK_FAILED_ITEMS runtime \
+        apply_runtime_values_strict "$transaction_dir/runtime"
+    record_restore_failure RESTORE_ROLLBACK_FAILED_ITEMS route \
+        restore_captured_default_route "$transaction_dir" "$target_route_file"
+    record_restore_failure RESTORE_ROLLBACK_FAILED_ITEMS hook \
+        restore_managed_file "$INITCWND_ROUTE_HOOK" \
+        "$transaction_dir/hook" "$transaction_dir/hook-absent"
 
     (( ${#RESTORE_ROLLBACK_FAILED_ITEMS[@]} == 0 ))
 }
@@ -3009,21 +2879,24 @@ restore_optimization() {
 }
 
 read_sysctl_or() {
-    local key="$1" fallback="${2:-不可用}" value
+    local key="$1" fallback="${2:-不可用}" value=""
 
-    if value=$(sysctl -n "$key" 2>/dev/null); then
-        printf '%s\n' "${value:-$fallback}"
-    else
-        printf '%s\n' "$fallback"
-    fi
+    value=$(sysctl -n "$key" 2>/dev/null) || true
+    printf '%s\n' "${value:-$fallback}"
 }
 
-print_sysctl_rows() {
-    local spec label key fallback
+print_status_section() {
+    local title="$1" spec label value fallback
+    shift
 
+    printf '\n%s:\n' "$title"
     for spec in "$@"; do
-        IFS='|' read -r label key fallback <<< "$spec"
-        printf '  %s: %s\n' "$label" "$(read_sysctl_or "$key" "${fallback:-不可用}")"
+        [[ -n "$spec" ]] || continue
+        IFS='|' read -r label value fallback <<< "$spec"
+        if [[ "$value" == sysctl:* ]]; then
+            value=$(read_sysctl_or "${value#sysctl:}" "${fallback:-不可用}")
+        fi
+        printf '  %s: %s\n' "$label" "$value"
     done
 }
 
@@ -3038,17 +2911,15 @@ file_handle_status() {
 }
 
 show_status() {
-    local available_cc current_cc current_qdisc default_iface active_qdisc active_qdisc_state_name
-    local active_qdisc_detail initcwnd_state initcwnd_state_name initcwnd_detail
+    local available_cc default_iface active_qdisc_state_name active_qdisc_detail
+    local initcwnd_state_name initcwnd_detail drift_status=""
 
     available_cc=$(cat /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null || echo "未知")
-    current_cc=$(read_sysctl_or net.ipv4.tcp_congestion_control "未知")
-    current_qdisc=$(read_sysctl_or net.core.default_qdisc "未知")
     default_iface=$(detect_default_iface || true)
-    active_qdisc=$(active_qdisc_state "$default_iface")
-    IFS='|' read -r active_qdisc_state_name active_qdisc_detail <<< "$active_qdisc"
-    initcwnd_state=$(detect_initcwnd_state)
-    IFS='|' read -r initcwnd_state_name initcwnd_detail <<< "$initcwnd_state"
+    IFS='|' read -r active_qdisc_state_name active_qdisc_detail <<< \
+        "$(active_qdisc_state "$default_iface")"
+    IFS='|' read -r initcwnd_state_name initcwnd_detail <<< "$(detect_initcwnd_state)"
+    [[ "$initcwnd_state_name" != "drift" ]] || drift_status="initcwnd 状态|漂移"
 
     echo "========== 网络优化状态 =========="
     echo "配置文件: $NETWORK_CONF"
@@ -3061,80 +2932,59 @@ show_status() {
     [[ -f "$NETWORK_INITIAL_UNKNOWN" ]] && echo "初始状态: 旧版未记录，无法安全推测"
     [[ -f "$NETWORK_PREVIOUS_BACKUP" ]] && echo "上次备份: $NETWORK_PREVIOUS_BACKUP"
 
-    echo
-    echo "系统资源:"
-    echo "  RAM: $(memory_status_summary)"
-    echo "  Swap: $(swap_status_summary)"
-    echo "  最近一小时 OOM: $(recent_oom_event_count)"
-
-    echo
-    echo "拥塞控制:"
-    echo "  可用算法: $available_cc"
-    echo "  当前算法: $current_cc"
-    echo "  default qdisc: $current_qdisc"
-    echo "  active qdisc (${default_iface:-未知接口}): $(format_qdisc_state "$active_qdisc_state_name" "$active_qdisc_detail")"
-    print_sysctl_rows "TCP Fast Open|net.ipv4.tcp_fastopen|未知"
-
-    echo
-    echo "兼容性诊断（只读）:"
-    print_sysctl_rows \
-        "rp_filter(all)|net.ipv4.conf.all.rp_filter|未知" \
-        "rp_filter(default)|net.ipv4.conf.default.rp_filter|未知"
-    echo "  route_localnet: 未由本模块配置"
-    echo "  MPTCP: 未由本模块配置"
-
-    echo
-    echo "连接容量:"
-    print_sysctl_rows \
-        "somaxconn|net.core.somaxconn|未知" \
-        "tcp_max_syn_backlog|net.ipv4.tcp_max_syn_backlog|未知" \
-        "netdev_max_backlog|net.core.netdev_max_backlog|未知" \
-        "optmem_max|net.core.optmem_max|不可用" \
-        "临时端口范围|net.ipv4.ip_local_port_range|未知" \
-        "保留本地端口|net.ipv4.ip_local_reserved_ports|未配置"
-    echo "  Conntrack 使用量: $(read_sysctl_or net.netfilter.nf_conntrack_count) / $(read_sysctl_or net.netfilter.nf_conntrack_max)"
-    print_sysctl_rows "Conntrack buckets|net.netfilter.nf_conntrack_buckets|不可用"
-
-    echo
-    echo "缓冲区:"
-    print_sysctl_rows \
-        "rmem_default|net.core.rmem_default|未知" \
-        "wmem_default|net.core.wmem_default|未知" \
-        "rmem_max|net.core.rmem_max|未知" \
-        "wmem_max|net.core.wmem_max|未知" \
-        "tcp_rmem|net.ipv4.tcp_rmem|未知" \
-        "tcp_wmem|net.ipv4.tcp_wmem|未知" \
-        "tcp_mem（内核管理）|net.ipv4.tcp_mem|未知" \
-        "tcp_moderate_rcvbuf|net.ipv4.tcp_moderate_rcvbuf|未知"
-
-    echo
-    echo "TCP 行为:"
-    print_sysctl_rows \
-        "fin_timeout|net.ipv4.tcp_fin_timeout|未知" \
-        "slow_start_after_idle|net.ipv4.tcp_slow_start_after_idle|未知" \
-        "mtu_probing|net.ipv4.tcp_mtu_probing|未知" \
-        "keepalive_time|net.ipv4.tcp_keepalive_time|不可用" \
-        "tcp_tw_reuse（只读）|net.ipv4.tcp_tw_reuse|不可用" \
-        "ECN|net.ipv4.tcp_ecn|不可用"
-    echo "  initcwnd ownership marker: $([[ -e "$ROUTE_OWNED_MARKER" ]] && echo 存在 || echo 不存在)"
-    echo "  initcwnd 持久化钩子: $(initcwnd_hook_status)"
-    echo "  默认路由窗口: $initcwnd_detail"
-    [[ "$initcwnd_state_name" != "drift" ]] || echo "  initcwnd 状态: 漂移"
-
-    echo
-    echo "内核容量诊断（只读）:"
-    print_sysctl_rows \
-        "min_free_kbytes|vm.min_free_kbytes|不可用" \
-        "file-max|fs.file-max|不可用" \
-        "nr_open|fs.nr_open|不可用" \
-        "netdev_budget|net.core.netdev_budget|不可用" \
-        "netdev_budget_usecs|net.core.netdev_budget_usecs|不可用"
-    echo "  file-nr: $(file_handle_status)"
-
-    echo
-    echo "网络健康:"
-    echo "  健康快照字段: softnet_dropped time_squeeze rx_errors tx_errors rx_dropped tx_dropped tcp_retrans limited_sockets rx_packets tx_packets"
-    echo "  健康快照累计值: $(network_health_snapshot "$(detect_default_iface || true)")"
+    print_status_section "系统资源" \
+        "RAM|$(memory_status_summary)" \
+        "Swap|$(swap_status_summary)" \
+        "最近一小时 OOM|$(recent_oom_event_count)"
+    print_status_section "拥塞控制" \
+        "可用算法|$available_cc" \
+        "当前算法|$(read_sysctl_or net.ipv4.tcp_congestion_control 未知)" \
+        "default qdisc|$(read_sysctl_or net.core.default_qdisc 未知)" \
+        "active qdisc (${default_iface:-未知接口})|$(format_qdisc_state "$active_qdisc_state_name" "$active_qdisc_detail")" \
+        "TCP Fast Open|sysctl:net.ipv4.tcp_fastopen|未知"
+    print_status_section "兼容性诊断（只读）" \
+        "rp_filter(all)|sysctl:net.ipv4.conf.all.rp_filter|未知" \
+        "rp_filter(default)|sysctl:net.ipv4.conf.default.rp_filter|未知" \
+        "route_localnet|未由本模块配置" \
+        "MPTCP|未由本模块配置"
+    print_status_section "连接容量" \
+        "somaxconn|sysctl:net.core.somaxconn|未知" \
+        "tcp_max_syn_backlog|sysctl:net.ipv4.tcp_max_syn_backlog|未知" \
+        "netdev_max_backlog|sysctl:net.core.netdev_max_backlog|未知" \
+        "optmem_max|sysctl:net.core.optmem_max|不可用" \
+        "临时端口范围|sysctl:net.ipv4.ip_local_port_range|未知" \
+        "保留本地端口|sysctl:net.ipv4.ip_local_reserved_ports|未配置" \
+        "Conntrack 使用量|$(read_sysctl_or net.netfilter.nf_conntrack_count) / $(read_sysctl_or net.netfilter.nf_conntrack_max)" \
+        "Conntrack buckets|sysctl:net.netfilter.nf_conntrack_buckets|不可用"
+    print_status_section "缓冲区" \
+        "rmem_default|sysctl:net.core.rmem_default|未知" \
+        "wmem_default|sysctl:net.core.wmem_default|未知" \
+        "rmem_max|sysctl:net.core.rmem_max|未知" \
+        "wmem_max|sysctl:net.core.wmem_max|未知" \
+        "tcp_rmem|sysctl:net.ipv4.tcp_rmem|未知" \
+        "tcp_wmem|sysctl:net.ipv4.tcp_wmem|未知" \
+        "tcp_mem（内核管理）|sysctl:net.ipv4.tcp_mem|未知" \
+        "tcp_moderate_rcvbuf|sysctl:net.ipv4.tcp_moderate_rcvbuf|未知"
+    print_status_section "TCP 行为" \
+        "fin_timeout|sysctl:net.ipv4.tcp_fin_timeout|未知" \
+        "slow_start_after_idle|sysctl:net.ipv4.tcp_slow_start_after_idle|未知" \
+        "mtu_probing|sysctl:net.ipv4.tcp_mtu_probing|未知" \
+        "keepalive_time|sysctl:net.ipv4.tcp_keepalive_time|不可用" \
+        "tcp_tw_reuse（只读）|sysctl:net.ipv4.tcp_tw_reuse|不可用" \
+        "ECN|sysctl:net.ipv4.tcp_ecn|不可用" \
+        "initcwnd ownership marker|$([[ -e "$ROUTE_OWNED_MARKER" ]] && echo 存在 || echo 不存在)" \
+        "initcwnd 持久化钩子|$(initcwnd_hook_status)" \
+        "默认路由窗口|$initcwnd_detail" "$drift_status"
+    print_status_section "内核容量诊断（只读）" \
+        "min_free_kbytes|sysctl:vm.min_free_kbytes|不可用" \
+        "file-max|sysctl:fs.file-max|不可用" \
+        "nr_open|sysctl:fs.nr_open|不可用" \
+        "netdev_budget|sysctl:net.core.netdev_budget|不可用" \
+        "netdev_budget_usecs|sysctl:net.core.netdev_budget_usecs|不可用" \
+        "file-nr|$(file_handle_status)"
+    print_status_section "网络健康" \
+        "健康快照字段|softnet_dropped time_squeeze rx_errors tx_errors rx_dropped tx_dropped tcp_retrans limited_sockets rx_packets tx_packets" \
+        "健康快照累计值|$(network_health_snapshot "$(detect_default_iface || true)")"
 
     return 0
 }
@@ -3201,15 +3051,12 @@ EOF
 }
 
 main() {
-    local selection_rc=0
-
     if ! parse_arguments "$@"; then
         show_help
         exit 1
     fi
 
-    select_tuning_mode || selection_rc=$?
-    (( selection_rc == 0 )) || exit 1
+    select_tuning_mode || exit 1
 
     require_commands awk grep sort mktemp || exit 1
 
