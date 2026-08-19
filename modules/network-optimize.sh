@@ -205,22 +205,14 @@ stage_managed_state() {
     if [[ -e "$target" || -L "$target" ]]; then
         stage=$(mktemp "${backup}.new.XXXXXX") || return 1
         rm -f "$stage"
-        if ! cp -a -- "$target" "$stage"; then
-            rm -f "$stage"
-            return 1
-        fi
-        if ! mv -f -- "$stage" "$backup"; then
+        if ! cp -a -- "$target" "$stage" || ! mv -f -- "$stage" "$backup"; then
             rm -f "$stage"
             return 1
         fi
         rm -f "$absent"
     else
         stage=$(mktemp "${absent}.new.XXXXXX") || return 1
-        chmod 600 "$stage" || {
-            rm -f "$stage"
-            return 1
-        }
-        if ! mv -f -- "$stage" "$absent"; then
+        if ! chmod 600 "$stage" || ! mv -f -- "$stage" "$absent"; then
             rm -f "$stage"
             return 1
         fi
@@ -233,11 +225,8 @@ atomic_install_file() {
 
     install -d -m 0755 "$(dirname "$destination")" || return 1
     stage=$(mktemp "${destination}.new.XXXXXX") || return 1
-    if ! install -m "$mode" "$source_file" "$stage"; then
-        rm -f "$stage"
-        return 1
-    fi
-    if ! mv -f -- "$stage" "$destination"; then
+    if ! install -m "$mode" "$source_file" "$stage" ||
+        ! mv -f -- "$stage" "$destination"; then
         rm -f "$stage"
         return 1
     fi
@@ -248,11 +237,8 @@ atomic_write_file() {
 
     install -d -m 0755 "$(dirname "$destination")" || return 1
     stage=$(mktemp "${destination}.new.XXXXXX") || return 1
-    if ! printf '%s\n' "$content" > "$stage" || ! chmod "$mode" "$stage"; then
-        rm -f "$stage"
-        return 1
-    fi
-    if ! mv -f -- "$stage" "$destination"; then
+    if ! printf '%s\n' "$content" > "$stage" || ! chmod "$mode" "$stage" ||
+        ! mv -f -- "$stage" "$destination"; then
         rm -f "$stage"
         return 1
     fi
@@ -264,11 +250,7 @@ atomic_restore_file() {
     install -d -m 0755 "$(dirname "$destination")" || return 1
     stage=$(mktemp "${destination}.rollback.XXXXXX") || return 1
     rm -f -- "$stage" || return 1
-    if ! cp -a -- "$source_file" "$stage"; then
-        rm -f -- "$stage"
-        return 1
-    fi
-    if ! mv -f -- "$stage" "$destination"; then
+    if ! cp -a -- "$source_file" "$stage" || ! mv -f -- "$stage" "$destination"; then
         rm -f -- "$stage"
         return 1
     fi
@@ -379,15 +361,11 @@ restore_managed_file() {
 
     if [[ -e "$backup" || -L "$backup" ]]; then
         atomic_restore_file "$backup" "$target"
-        return $?
+    elif [[ -e "$absent" ]]; then
+        rm -f "$target"
+    else
+        return 1
     fi
-
-    if [[ -e "$absent" ]]; then
-        rm -f "$target" || return 1
-        return 0
-    fi
-
-    return 1
 }
 
 require_commands() {
@@ -2658,25 +2636,28 @@ verify_network_config() {
     success "运行时 sysctl 已与生成配置一致"
 }
 
+record_restore_failure() {
+    local -n failures="$1"
+    local label="$2"
+    shift 2
+
+    "$@" || failures+=("$label")
+}
+
 rollback_initcwnd_install() {
     INITCWND_ROLLBACK_FAILED_ITEMS=()
 
-    if ! restore_default_route \
-        "$ROUTE_PREVIOUS_BACKUP" "$ROUTE_PREVIOUS_OWNED" "$ROUTE_PREVIOUS_ABSENT"; then
-        INITCWND_ROLLBACK_FAILED_ITEMS+=(route)
-    fi
-    if ! restore_managed_file \
-        "$INITCWND_ROUTE_HOOK" "$ROUTE_HOOK_PREVIOUS_BACKUP" \
-        "$ROUTE_HOOK_PREVIOUS_ABSENT"; then
-        INITCWND_ROLLBACK_FAILED_ITEMS+=(hook)
-    fi
-    if ! apply_runtime_values_strict "$RUNTIME_PREVIOUS_BACKUP"; then
-        INITCWND_ROLLBACK_FAILED_ITEMS+=(runtime)
-    fi
-    if ! restore_managed_file \
-        "$NETWORK_CONF" "$NETWORK_PREVIOUS_BACKUP" "$NETWORK_PREVIOUS_ABSENT"; then
-        INITCWND_ROLLBACK_FAILED_ITEMS+=(config)
-    fi
+    record_restore_failure INITCWND_ROLLBACK_FAILED_ITEMS route \
+        restore_default_route "$ROUTE_PREVIOUS_BACKUP" \
+        "$ROUTE_PREVIOUS_OWNED" "$ROUTE_PREVIOUS_ABSENT"
+    record_restore_failure INITCWND_ROLLBACK_FAILED_ITEMS hook \
+        restore_managed_file "$INITCWND_ROUTE_HOOK" \
+        "$ROUTE_HOOK_PREVIOUS_BACKUP" "$ROUTE_HOOK_PREVIOUS_ABSENT"
+    record_restore_failure INITCWND_ROLLBACK_FAILED_ITEMS runtime \
+        apply_runtime_values_strict "$RUNTIME_PREVIOUS_BACKUP"
+    record_restore_failure INITCWND_ROLLBACK_FAILED_ITEMS config \
+        restore_managed_file "$NETWORK_CONF" \
+        "$NETWORK_PREVIOUS_BACKUP" "$NETWORK_PREVIOUS_ABSENT"
 
     (( ${#INITCWND_ROLLBACK_FAILED_ITEMS[@]} == 0 ))
 }
@@ -2806,32 +2787,29 @@ begin_restore_transaction() {
 
     route=$(query_default_ipv4_route) || query_status=$?
     case "$query_status" in
-        0)
-            if ! atomic_write_file "$transaction_dir/route" "$route" 0600; then
-                rm -rf -- "$transaction_dir"
-                return 1
-            fi
-            ;;
-        2)
-            atomic_write_file "$transaction_dir/route-absent" "absent" 0600 || {
-                rm -rf -- "$transaction_dir"
-                return 1
-            }
-            ;;
-        *)
-            rm -rf -- "$transaction_dir"
-            return 1
-            ;;
-    esac
+        0) atomic_write_file "$transaction_dir/route" "$route" 0600 ;;
+        2) atomic_write_file "$transaction_dir/route-absent" "absent" 0600 ;;
+        *) false ;;
+    esac || {
+        rm -rf -- "$transaction_dir"
+        return 1
+    }
 
-    if [[ -e "$ROUTE_OWNED_MARKER" ]]; then
-        atomic_write_file "$transaction_dir/route-owned" "owned" 0600 || {
-            rm -rf -- "$transaction_dir"
-            return 1
-        }
+    if [[ -e "$ROUTE_OWNED_MARKER" ]] &&
+        ! atomic_write_file "$transaction_dir/route-owned" "owned" 0600; then
+        rm -rf -- "$transaction_dir"
+        return 1
     fi
 
     RESTORE_TRANSACTION_DIR="$transaction_dir"
+}
+
+restore_captured_route_ownership() {
+    if [[ -e "$1/route-owned" ]]; then
+        create_initcwnd_ownership_marker
+    else
+        remove_initcwnd_ownership_marker
+    fi
 }
 
 restore_captured_default_route() {
@@ -2847,12 +2825,8 @@ restore_captured_default_route() {
 
     current_route=$(query_default_ipv4_route) || query_status=$?
     if (( query_status == 2 )); then
-        if [[ -e "$transaction_dir/route-owned" ]]; then
-            create_initcwnd_ownership_marker || return 1
-        else
-            remove_initcwnd_ownership_marker || return 1
-        fi
-        return $?
+        restore_captured_route_ownership "$transaction_dir"
+        return
     fi
     (( query_status == 0 )) || return 1
 
@@ -2862,35 +2836,26 @@ restore_captured_default_route() {
     read -r -a route_args <<< "$current_route"
     (( ${#route_args[@]} > 0 )) || return 1
     ip -4 route del "${route_args[@]}" || return 1
-    if [[ -e "$transaction_dir/route-owned" ]]; then
-        create_initcwnd_ownership_marker || return 1
-    else
-        remove_initcwnd_ownership_marker || return 1
-    fi
+    restore_captured_route_ownership "$transaction_dir"
 }
 
 rollback_restore_transaction() {
     local transaction_dir="$1" target_route_file="$2"
 
     RESTORE_ROLLBACK_FAILED_ITEMS=()
-    if ! restore_managed_file \
-        "$NETWORK_CONF" "$transaction_dir/network" "$transaction_dir/network-absent"; then
-        RESTORE_ROLLBACK_FAILED_ITEMS+=(sysctl)
-    fi
-    if ! restore_managed_file \
-        "$BBR_MODULES_FILE" "$transaction_dir/modules" "$transaction_dir/modules-absent"; then
-        RESTORE_ROLLBACK_FAILED_ITEMS+=(modules)
-    fi
-    if ! apply_runtime_values_strict "$transaction_dir/runtime"; then
-        RESTORE_ROLLBACK_FAILED_ITEMS+=(runtime)
-    fi
-    if ! restore_captured_default_route "$transaction_dir" "$target_route_file"; then
-        RESTORE_ROLLBACK_FAILED_ITEMS+=(route)
-    fi
-    if ! restore_managed_file \
-        "$INITCWND_ROUTE_HOOK" "$transaction_dir/hook" "$transaction_dir/hook-absent"; then
-        RESTORE_ROLLBACK_FAILED_ITEMS+=(hook)
-    fi
+    record_restore_failure RESTORE_ROLLBACK_FAILED_ITEMS sysctl \
+        restore_managed_file "$NETWORK_CONF" \
+        "$transaction_dir/network" "$transaction_dir/network-absent"
+    record_restore_failure RESTORE_ROLLBACK_FAILED_ITEMS modules \
+        restore_managed_file "$BBR_MODULES_FILE" \
+        "$transaction_dir/modules" "$transaction_dir/modules-absent"
+    record_restore_failure RESTORE_ROLLBACK_FAILED_ITEMS runtime \
+        apply_runtime_values_strict "$transaction_dir/runtime"
+    record_restore_failure RESTORE_ROLLBACK_FAILED_ITEMS route \
+        restore_captured_default_route "$transaction_dir" "$target_route_file"
+    record_restore_failure RESTORE_ROLLBACK_FAILED_ITEMS hook \
+        restore_managed_file "$INITCWND_ROUTE_HOOK" \
+        "$transaction_dir/hook" "$transaction_dir/hook-absent"
 
     (( ${#RESTORE_ROLLBACK_FAILED_ITEMS[@]} == 0 ))
 }
