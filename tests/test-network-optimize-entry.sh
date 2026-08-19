@@ -117,6 +117,17 @@ reset_selection
 assert_fail "reject removed --static option" parse_arguments install --static
 reset_selection
 assert_fail "reject removed --no-probe option" parse_arguments install --no-probe
+reset_selection
+assert_fail "reject zero symmetric bandwidth" parse_arguments plan --bandwidth-mbps 0
+reset_selection
+assert_fail "reject excessive download bandwidth" \
+    parse_arguments plan --download-mbps 100001 --upload-mbps 1
+reset_selection
+assert_fail "reject malformed upload bandwidth" \
+    parse_arguments plan --download-mbps 1 --upload-mbps invalid
+reset_selection
+assert_fail "reject excessive manual RTT" \
+    parse_arguments plan --bandwidth-mbps 1 --rtt-ms 5001
 
 reset_selection
 parse_arguments install --disable-ecn

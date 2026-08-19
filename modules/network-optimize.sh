@@ -8,23 +8,7 @@
 # 基础调优移植或参考 Kylin010/tcpfit v0.5.6（MIT，提交 67c0bdfb35dd98e86982600298237b6ecc08ebe4）。
 # 事务备份、交互与验证为本仓库下游扩展。
 # 功能：配置 BBR、fq 与 TCP 缓冲区；主动探测必须明确选择。
-#
-# 用法：
-#   bash network-optimize.sh [install] [选项]  # 自动计算并应用
-#   bash network-optimize.sh plan [选项]       # 只计算，不修改系统
-#   bash network-optimize.sh restore           # 恢复上一次配置
-#   bash network-optimize.sh status            # 查看当前状态
-#   bash network-optimize.sh verify [--yes]    # 确认后只读验证网络性能
-#
-# install/plan 可选参数：
-#   --probe                      明确执行自动探测
-#   --bandwidth-mbps N           手动指定对称带宽
-#   --download-mbps N            手动指定下载带宽
-#   --upload-mbps N              手动指定上传带宽
-#   --rtt-ms N                   手动指定 RTT
-#   --disable-ecn                禁用 ECN，回退到传统丢包信号
-#   --enable-initcwnd            强制设置初始拥塞窗口为 32
-#   --disable-initcwnd           强制保留内核默认初始拥塞窗口
+# 完整用法与选项由 show_help 输出。
 
 set -euo pipefail
 
@@ -448,6 +432,8 @@ is_positive_integer() {
 }
 
 parse_arguments() {
+    local desired_mode spec option value max
+
     if (( $# > 0 )) && [[ "$1" != -* ]]; then
         COMMAND="$1"
         shift
@@ -479,20 +465,14 @@ parse_arguments() {
                 ECN_DISABLED="true"
                 shift
                 ;;
-            --enable-initcwnd)
-                if [[ "$INITCWND_MODE" == "disabled" ]]; then
+            --enable-initcwnd|--disable-initcwnd)
+                desired_mode="enabled"
+                [[ "$1" != "--disable-initcwnd" ]] || desired_mode="disabled"
+                if [[ "$INITCWND_MODE" != "auto" && "$INITCWND_MODE" != "$desired_mode" ]]; then
                     error "--enable-initcwnd 不能与 --disable-initcwnd 同时使用"
                     return 1
                 fi
-                INITCWND_MODE="enabled"
-                shift
-                ;;
-            --disable-initcwnd)
-                if [[ "$INITCWND_MODE" == "enabled" ]]; then
-                    error "--enable-initcwnd 不能与 --disable-initcwnd 同时使用"
-                    return 1
-                fi
-                INITCWND_MODE="disabled"
+                INITCWND_MODE="$desired_mode"
                 shift
                 ;;
             --yes)
@@ -527,26 +507,18 @@ parse_arguments() {
             ;;
     esac
 
-    if [[ -n "$MANUAL_BANDWIDTH_MBPS" ]] &&
-        ! is_positive_integer "$MANUAL_BANDWIDTH_MBPS" 1 100000; then
-        error "--bandwidth-mbps 必须是 1–100000 的整数"
-        return 1
-    fi
-    if [[ -n "$MANUAL_DOWNLOAD_MBPS" ]] &&
-        ! is_positive_integer "$MANUAL_DOWNLOAD_MBPS" 1 100000; then
-        error "--download-mbps 必须是 1–100000 的整数"
-        return 1
-    fi
-    if [[ -n "$MANUAL_UPLOAD_MBPS" ]] &&
-        ! is_positive_integer "$MANUAL_UPLOAD_MBPS" 1 100000; then
-        error "--upload-mbps 必须是 1–100000 的整数"
-        return 1
-    fi
-    if [[ -n "$MANUAL_RTT_MS" ]] &&
-        ! is_positive_integer "$MANUAL_RTT_MS" 1 5000; then
-        error "--rtt-ms 必须是 1–5000 的整数"
-        return 1
-    fi
+    for spec in \
+        "--bandwidth-mbps|$MANUAL_BANDWIDTH_MBPS|100000" \
+        "--download-mbps|$MANUAL_DOWNLOAD_MBPS|100000" \
+        "--upload-mbps|$MANUAL_UPLOAD_MBPS|100000" \
+        "--rtt-ms|$MANUAL_RTT_MS|5000"; do
+        IFS='|' read -r option value max <<< "$spec"
+        [[ -z "$value" ]] && continue
+        if ! is_positive_integer "$value" 1 "$max"; then
+            error "$option 必须是 1–$max 的整数"
+            return 1
+        fi
+    done
 
     if [[ "$ACTIVE_PROBE_REQUESTED" == "true" ]] &&
         [[ -n "$MANUAL_BANDWIDTH_MBPS$MANUAL_DOWNLOAD_MBPS$MANUAL_UPLOAD_MBPS" ]]; then
@@ -852,18 +824,14 @@ query_default_ipv4_route() {
 }
 
 default_ipv4_route() {
-    local route query_status
+    local route="" query_status=0
 
-    if route=$(query_default_ipv4_route); then
-        printf '%s\n' "$route"
-        return 0
-    fi
-    query_status=$?
-    if (( query_status == 2 )); then
-        printf '\n'
-        return 0
-    fi
-    return 1
+    route=$(query_default_ipv4_route) || query_status=$?
+    case "$query_status" in
+        0) printf '%s\n' "$route" ;;
+        2) printf '\n' ;;
+        *) return 1 ;;
+    esac
 }
 
 strip_route_window_fields() {
@@ -892,43 +860,39 @@ remove_initcwnd_ownership_marker() {
     rm -f -- "$ROUTE_OWNED_MARKER" || return 1
 }
 
+write_route_snapshot() {
+    local route="$1" backup="$2" absent="$3" owned="$4"
+
+    if [[ -n "$route" ]]; then
+        atomic_write_file "$backup" "$route" 0600 || return 1
+        if [[ -e "$ROUTE_OWNED_MARKER" ]]; then
+            atomic_write_file "$owned" "owned" 0600 || return 1
+        else
+            rm -f "$owned" || return 1
+        fi
+        rm -f "$absent"
+    else
+        atomic_write_file "$absent" "absent" 0600 || return 1
+        rm -f "$backup" "$owned"
+    fi
+}
+
 backup_default_route() {
     local route="" query_status=0
 
     route=$(query_default_ipv4_route) || query_status=$?
-    if (( query_status != 0 )); then
-        if (( query_status != 2 )); then
-            error "读取 IPv4 默认路由失败"
-            return 1
-        fi
+    if (( query_status != 0 && query_status != 2 )); then
+        error "读取 IPv4 默认路由失败"
+        return 1
     fi
     install -d -m 0755 "$NETWORK_OPTIMIZE_STATE_DIR" || return 1
-    if [[ -n "$route" ]]; then
-        atomic_write_file "$ROUTE_PREVIOUS_BACKUP" "$route" 0600 || return 1
-        if [[ -e "$ROUTE_OWNED_MARKER" ]]; then
-            atomic_write_file "$ROUTE_PREVIOUS_OWNED" "owned" 0600 || return 1
-        else
-            rm -f "$ROUTE_PREVIOUS_OWNED" || return 1
-        fi
-        rm -f "$ROUTE_PREVIOUS_ABSENT" || return 1
-    else
-        atomic_write_file "$ROUTE_PREVIOUS_ABSENT" "absent" 0600 || return 1
-        rm -f "$ROUTE_PREVIOUS_BACKUP" "$ROUTE_PREVIOUS_OWNED" || return 1
-    fi
+    write_route_snapshot "$route" "$ROUTE_PREVIOUS_BACKUP" \
+        "$ROUTE_PREVIOUS_ABSENT" "$ROUTE_PREVIOUS_OWNED" || return 1
 
     if [[ ! -e "$ROUTE_INITIAL_BACKUP" && ! -e "$ROUTE_INITIAL_ABSENT" &&
         ! -e "$ROUTE_INITIAL_UNKNOWN" ]]; then
-        if [[ -n "$route" ]]; then
-            atomic_write_file "$ROUTE_INITIAL_BACKUP" "$route" 0600 || return 1
-            if [[ -e "$ROUTE_OWNED_MARKER" ]]; then
-                atomic_write_file "$ROUTE_INITIAL_OWNED" "owned" 0600 || return 1
-            else
-                rm -f "$ROUTE_INITIAL_OWNED" || return 1
-            fi
-        else
-            atomic_write_file "$ROUTE_INITIAL_ABSENT" "absent" 0600 || return 1
-            rm -f "$ROUTE_INITIAL_OWNED" || return 1
-        fi
+        write_route_snapshot "$route" "$ROUTE_INITIAL_BACKUP" \
+            "$ROUTE_INITIAL_ABSENT" "$ROUTE_INITIAL_OWNED"
     fi
 }
 
@@ -1081,7 +1045,7 @@ remove_initcwnd_hook() {
 }
 
 write_initcwnd_hook() {
-    local hook_dir temp_hook
+    local hook_dir content
 
     hook_dir=$(dirname "$INITCWND_ROUTE_HOOK")
     if [[ ! -d "$hook_dir" ]]; then
@@ -1094,26 +1058,18 @@ write_initcwnd_hook() {
         return 1
     fi
 
-    temp_hook=$(mktemp "${INITCWND_ROUTE_HOOK}.new.XXXXXX") || return 1
-    if ! render_initcwnd_hook > "$temp_hook" || ! chmod 0755 "$temp_hook"; then
-        rm -f "$temp_hook"
-        return 1
-    fi
-    if ! mv -f -- "$temp_hook" "$INITCWND_ROUTE_HOOK"; then
-        rm -f "$temp_hook"
-        return 1
-    fi
+    content=$(render_initcwnd_hook) || return 1
+    atomic_write_file "$INITCWND_ROUTE_HOOK" "$content" 0755
 }
 
 # Generated hook uses clean as an array; apply path intentionally shadows it as a string.
 # shellcheck disable=SC2128,SC2178
 apply_initcwnd() {
-    local route="" clean="" owned="false"
+    local route="" clean=""
     local -a route_args=()
 
     if [[ "$INITCWND_ENABLED" != "true" ]]; then
-        initcwnd_settings_owned && owned="true"
-        if [[ "$owned" != "true" ]]; then
+        if ! initcwnd_settings_owned; then
             warn "当前默认路由的 initcwnd/initrwnd 无本脚本 ownership 证据，保留不动"
             return 0
         fi
@@ -1157,23 +1113,22 @@ apply_initcwnd() {
     }
     clean=$(strip_route_window_fields "$route")
     read -r -a route_args <<< "$clean"
-    if ip -4 route replace "${route_args[@]}" initcwnd 32 initrwnd 32; then
-        if ! create_initcwnd_ownership_marker; then
-            error "创建 initcwnd ownership marker 失败"
-            return 1
-        fi
-        if ! write_initcwnd_hook; then
-            error "无法写入 initcwnd 持久化钩子"
-            return 1
-        fi
-        if is_managed_initcwnd_hook; then
-            success "默认路由已设置 initcwnd/initrwnd = 32，并通过 networkd-dispatcher 持久化"
-        else
-            success "默认路由已设置 initcwnd/initrwnd = 32（当前系统没有可用持久化钩子）"
-        fi
-    else
+    if ! ip -4 route replace "${route_args[@]}" initcwnd 32 initrwnd 32; then
         error "默认路由不支持 initcwnd/initrwnd，网络 sysctl 已应用但路由优化失败"
         return 1
+    fi
+    if ! create_initcwnd_ownership_marker; then
+        error "创建 initcwnd ownership marker 失败"
+        return 1
+    fi
+    if ! write_initcwnd_hook; then
+        error "无法写入 initcwnd 持久化钩子"
+        return 1
+    fi
+    if is_managed_initcwnd_hook; then
+        success "默认路由已设置 initcwnd/initrwnd = 32，并通过 networkd-dispatcher 持久化"
+    else
+        success "默认路由已设置 initcwnd/initrwnd = 32（当前系统没有可用持久化钩子）"
     fi
 }
 
@@ -1181,32 +1136,25 @@ restore_default_route() {
     local route_file="$1" owned_file="${2:-}" absent_file="${3:-}" route="" clean=""
     local -a route_args=()
 
-    if [[ ! -f "$route_file" && -n "$absent_file" && -e "$absent_file" ]]; then
+    if [[ ! -f "$route_file" ]]; then
         initcwnd_settings_owned || return 0
         route=$(default_ipv4_route) || return 1
         if [[ -z "$route" ]]; then
             remove_initcwnd_ownership_marker || return 1
             return 0
         fi
-        if grep -Eq '(^| )(initcwnd|initrwnd) [0-9]+( |$)' <<< "$route"; then
-            clean=$(strip_route_window_fields "$route")
-            read -r -a route_args <<< "$clean"
-            (( ${#route_args[@]} > 0 )) || return 1
-            ip -4 route replace "${route_args[@]}" || return 1
-        fi
-        remove_initcwnd_ownership_marker || return 1
-        return 0
-    fi
-
-    [[ -f "$route_file" ]] || {
-        initcwnd_settings_owned || return 0
-        route=$(default_ipv4_route) || return 1
-        if [[ -z "$route" ]]; then
+        if [[ -n "$absent_file" && -e "$absent_file" ]]; then
+            if grep -Eq '(^| )(initcwnd|initrwnd) [0-9]+( |$)' <<< "$route"; then
+                clean=$(strip_route_window_fields "$route")
+                read -r -a route_args <<< "$clean"
+                (( ${#route_args[@]} > 0 )) || return 1
+                ip -4 route replace "${route_args[@]}" || return 1
+            fi
             remove_initcwnd_ownership_marker || return 1
             return 0
         fi
         route=$(strip_route_window_fields "$route")
-    }
+    fi
     [[ -n "$route" ]] || route=$(<"$route_file")
     read -r -a route_args <<< "$route"
     (( ${#route_args[@]} > 0 )) || return 1
@@ -1660,38 +1608,25 @@ verify_impl() {
 }
 
 run_verify_command() {
-    local rc=0 previous_exit_trap previous_hup_trap previous_int_trap previous_term_trap
+    local rc=0 signal index
+    local -a signals=(EXIT HUP INT TERM) saved_traps=()
 
-    previous_exit_trap=$(trap -p EXIT)
-    previous_hup_trap=$(trap -p HUP)
-    previous_int_trap=$(trap -p INT)
-    previous_term_trap=$(trap -p TERM)
+    for signal in "${signals[@]}"; do
+        saved_traps+=("$(trap -p "$signal")")
+    done
     trap 'cleanup_verify' EXIT
     trap 'cleanup_verify; exit 129' HUP
     trap 'cleanup_verify; exit 130' INT
     trap 'cleanup_verify; exit 143' TERM
     verify_impl || rc=$?
     cleanup_verify
-    if [[ -n "$previous_exit_trap" ]]; then
-        eval "$previous_exit_trap"
-    else
-        trap - EXIT
-    fi
-    if [[ -n "$previous_hup_trap" ]]; then
-        eval "$previous_hup_trap"
-    else
-        trap - HUP
-    fi
-    if [[ -n "$previous_int_trap" ]]; then
-        eval "$previous_int_trap"
-    else
-        trap - INT
-    fi
-    if [[ -n "$previous_term_trap" ]]; then
-        eval "$previous_term_trap"
-    else
-        trap - TERM
-    fi
+    for index in "${!signals[@]}"; do
+        if [[ -n "${saved_traps[$index]}" ]]; then
+            eval "${saved_traps[$index]}"
+        else
+            trap - "${signals[$index]}"
+        fi
+    done
     return "$rc"
 }
 
@@ -2058,21 +1993,6 @@ resolve_tuning_values() {
         [[ -n "$upload_mbps" ]] || upload_mbps="$MANUAL_BANDWIDTH_MBPS"
     fi
 
-    if [[ -n "$MANUAL_RTT_MS" ]]; then
-        rtt_ms="$MANUAL_RTT_MS"
-        if [[ "$MANUAL_RTT_DEFAULTED" == "true" ]]; then
-            RTT_SOURCE="default for manual bandwidth"
-            RTT_POLICY="fixed 150 ms default"
-        else
-            RTT_SOURCE="command line"
-            RTT_POLICY="manual override"
-        fi
-    else
-        rtt_ms="$DEFAULT_RTT_MS"
-        RTT_SOURCE="automatic policy"
-        RTT_POLICY="fixed 150 ms"
-    fi
-
     if [[ -z "$download_mbps" || -z "$upload_mbps" ]]; then
         if [[ "$TUNING_MODE" != "probe" ]]; then
             error "缺少有效上下行带宽，拒绝生成或应用配置"
@@ -2091,15 +2011,22 @@ resolve_tuning_values() {
             prompt_manual_bandwidth "interactive fallback after probe failure" || return 1
             download_mbps="$MANUAL_DOWNLOAD_MBPS"
             upload_mbps="$MANUAL_UPLOAD_MBPS"
-            rtt_ms="$MANUAL_RTT_MS"
-            if [[ "$MANUAL_RTT_DEFAULTED" == "true" ]]; then
-                RTT_SOURCE="default for manual bandwidth"
-                RTT_POLICY="fixed 150 ms default"
-            else
-                RTT_SOURCE="command line"
-                RTT_POLICY="manual override"
-            fi
         fi
+    fi
+
+    if [[ -n "$MANUAL_RTT_MS" ]]; then
+        rtt_ms="$MANUAL_RTT_MS"
+        if [[ "$MANUAL_RTT_DEFAULTED" == "true" ]]; then
+            RTT_SOURCE="default for manual bandwidth"
+            RTT_POLICY="fixed 150 ms default"
+        else
+            RTT_SOURCE="command line"
+            RTT_POLICY="manual override"
+        fi
+    else
+        rtt_ms="$DEFAULT_RTT_MS"
+        RTT_SOURCE="automatic policy"
+        RTT_POLICY="fixed 150 ms"
     fi
 
     if ! is_positive_integer "$download_mbps" 1 100000 ||
@@ -2128,10 +2055,6 @@ resolve_tuning_values() {
     resolve_initcwnd_policy
 }
 
-format_mib() {
-    awk -v bytes="$1" 'BEGIN {printf "%.1f", bytes / 1048576}'
-}
-
 format_buffer_size() {
     awk -v bytes="$1" 'BEGIN {
         if (bytes < 1048576) printf "%.0f KiB", bytes / 1024
@@ -2144,7 +2067,7 @@ show_tuning_plan() {
     echo "模式: $TUNING_MODE"
     echo "物理内存: ${PHYSICAL_RAM_MB} MiB"
     echo "有效内存: ${RAM_MB} MiB"
-    echo "单 socket 上限: $(format_mib "$MEMORY_CAP_BYTES") MiB（有效内存 / 32，绝对上限 256 MiB）"
+    echo "单 socket 上限: $(format_buffer_size "$MEMORY_CAP_BYTES")（有效内存 / 32，绝对上限 256 MiB）"
     echo "下载带宽: ${DETECTED_DOWNLOAD_MBPS:-未知} Mbps"
     echo "上传带宽: ${DETECTED_UPLOAD_MBPS:-未知} Mbps"
     echo "带宽来源: $BANDWIDTH_SOURCE"
@@ -2555,10 +2478,6 @@ capture_runtime_values_from_files() {
     done
 }
 
-capture_runtime_values() {
-    capture_runtime_values_from_files "$2" "$1"
-}
-
 apply_runtime_values_strict() {
     local values_file="$1" key value expected actual failed=false
 
@@ -2689,7 +2608,7 @@ install_optimization() {
     create_network_config "$temp_config" true
 
     if ! runtime_backup=$(mktemp) ||
-        ! capture_runtime_values "$temp_config" "$runtime_backup"; then
+        ! capture_runtime_values_from_files "$runtime_backup" "$temp_config"; then
         rm -f "$temp_config" "${runtime_backup:-}"
         return 1
     fi
@@ -2959,13 +2878,10 @@ restore_optimization() {
 }
 
 read_sysctl_or() {
-    local key="$1" fallback="${2:-不可用}" value
+    local key="$1" fallback="${2:-不可用}" value=""
 
-    if value=$(sysctl -n "$key" 2>/dev/null); then
-        printf '%s\n' "${value:-$fallback}"
-    else
-        printf '%s\n' "$fallback"
-    fi
+    value=$(sysctl -n "$key" 2>/dev/null) || true
+    printf '%s\n' "${value:-$fallback}"
 }
 
 print_status_section() {
@@ -3134,15 +3050,12 @@ EOF
 }
 
 main() {
-    local selection_rc=0
-
     if ! parse_arguments "$@"; then
         show_help
         exit 1
     fi
 
-    select_tuning_mode || selection_rc=$?
-    (( selection_rc == 0 )) || exit 1
+    select_tuning_mode || exit 1
 
     require_commands awk grep sort mktemp || exit 1
 
