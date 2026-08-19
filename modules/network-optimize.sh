@@ -570,10 +570,10 @@ is_interactive_terminal() {
 }
 
 show_active_probe_warning() {
-    warn "公共测速使用 IPv4 iperf3，最多 2 个节点，每方向 4 并发、5 秒"
-    warn "缺少 iperf3 时可通过系统配置的 APT 软件源非交互安装"
-    warn "流量预算为上传 12.5 GB、下载 12.5 GB、合计 25 GB"
-    warn "流量按实际 IPv4 目标的路由接口汇总；接口计数包含后台流量"
+    printf '%s\n' \
+        "测速配置：IPv4 iperf3，最多 2 个节点，每方向 4 并发 × 5 秒" \
+        "流量上限：上传 12.5 GB / 下载 12.5 GB / 合计 25 GB（按出口接口统计，包含同期后台流量）" \
+        "依赖处理：缺少 iperf3 时通过 APT 自动安装"
 }
 
 prompt_manual_bandwidth() {
@@ -613,7 +613,7 @@ select_tuning_mode() {
     fi
 
     show_active_probe_warning
-    read -r -p "是否执行公共 iperf3 测速？[Y/n]: " answer || return 1
+    read -r -p "是否执行公共测速？[Y/n]: " answer || return 1
     case "$answer" in
         ""|[Yy])
             TUNING_MODE="auto"
@@ -804,7 +804,9 @@ active_qdisc_state() {
 }
 
 format_qdisc_state() {
-    local state="$1" detail_text="$2"
+    local state="$1" detail_text
+
+    detail_text=$(format_qdisc_detail "$2")
     case "$state" in
         effective) printf '生效（%s）\n' "$detail_text" ;;
         mixed) printf '混合/未完全生效（%s）\n' "$detail_text" ;;
@@ -1098,7 +1100,7 @@ write_initcwnd_hook() {
 
     hook_dir=$(dirname "$INITCWND_ROUTE_HOOK")
     if [[ ! -d "$hook_dir" ]]; then
-        warn "未检测到 networkd-dispatcher，initcwnd 仅对当前 IPv4 默认路由生效"
+        warn "警告：未检测到 networkd-dispatcher；initcwnd=32 仅对当前默认路由生效"
         return 0
     fi
     if [[ -e "$INITCWND_ROUTE_HOOK" || -L "$INITCWND_ROUTE_HOOK" ]] &&
@@ -1143,13 +1145,6 @@ apply_initcwnd() {
             error "移除本脚本 initcwnd 持久化钩子失败"
             return 1
         fi
-        if [[ -z "$route" ]]; then
-            info "已移除 initcwnd 持久化状态；当前没有 IPv4 默认路由需要清理"
-        elif [[ -n "$clean" ]]; then
-            info "已移除本脚本设置的 initcwnd/initrwnd，恢复内核默认值"
-        else
-            info "已清理本脚本 initcwnd ownership 状态；路由已使用内核默认值"
-        fi
         return 0
     fi
     if ! route=$(default_ipv4_route); then
@@ -1174,13 +1169,10 @@ apply_initcwnd() {
         error "无法写入 initcwnd 持久化钩子"
         return 1
     fi
-    if is_managed_initcwnd_hook; then
-        info "默认路由已设置 initcwnd/initrwnd = 32，并通过 networkd-dispatcher 持久化"
-    else
-        info "默认路由已设置 initcwnd/initrwnd = 32（当前系统没有可用持久化钩子）"
-    fi
 }
 
+# Generated hook uses clean as an array; restore path shadows it as a string.
+# shellcheck disable=SC2128,SC2178
 restore_default_route() {
     local route_file="$1" owned_file="${2:-}" absent_file="${3:-}" route="" clean=""
     local -a route_args=()
@@ -1297,7 +1289,7 @@ traffic_report() {
     tx=$(traffic_used_bytes upload || echo 0)
     total=$((rx + tx))
     interfaces=$(IFS=,; echo "${TRAFFIC_IFACES[*]}")
-    echo "流量（接口 $interfaces；含测试期间后台流量，按保守安全预算累计）：上传 $(format_bytes "$tx") / 下载 $(format_bytes "$rx") / 合计 $(format_bytes "$total")"
+    echo "流量：$interfaces；上传 $(format_bytes "$tx") / 下载 $(format_bytes "$rx") / 合计 $(format_bytes "$total")（包含同期后台流量）"
 }
 
 traffic_budget_reached() {
@@ -1541,8 +1533,8 @@ show_measurement_warnings() {
 
     [[ -n "$MEASUREMENT_WARNINGS" ]] || return 0
     while IFS= read -r warning; do
-        [[ -n "$warning" ]] && warn "$warning"
-    done < <(printf '%s\n' "$MEASUREMENT_WARNINGS" | sed 's/; /\n/g')
+        [[ -n "$warning" ]] && warn "警告：$(format_measurement_warning "$warning")"
+    done < <(printf '%s\n' "$MEASUREMENT_WARNINGS" | sed 's/;[[:space:]]*/\n/g')
 }
 
 read_iface_ifindex() {
@@ -1856,7 +1848,7 @@ probe_iperf_bandwidth() {
     validate_measurement_route || return 1
     DETECTED_UPLOAD_MBPS=$(max_integer_value "${upload_values[@]}")
     DETECTED_DOWNLOAD_MBPS=$(max_integer_value "${download_values[@]}")
-    MEASUREMENT_NODES=$(IFS='; '; printf '%s' "${nodes[*]}")
+    MEASUREMENT_NODES=$(IFS=';'; printf '%s' "${nodes[*]}")
     MEASUREMENT_EPOCH=$(current_epoch)
     MEASUREMENT_TIME=$(format_measurement_epoch "$MEASUREMENT_EPOCH")
     MEASUREMENT_SOURCE="public iperf3 IPv4 (P=$IPERF_PARALLEL, t=${IPERF_DURATION}s)"
@@ -1910,9 +1902,8 @@ show_probe_environment() {
     detail "测速环境：接口 $iface / 驱动 $driver / RX-TX 队列 ${rx_queues}-${tx_queues}"
     detail "测速前网络栈：CC $current_cc / default_qdisc $default_qdisc / root_qdisc ${root_qdisc:-unknown}"
     if [[ "$root_qdisc" == "htb" ]]; then
-        BANDWIDTH_PROBE_NOTE="检测到 active root HTB，当前限速可能导致测速偏低。"
+        BANDWIDTH_PROBE_NOTE="检测到活动的根 HTB 队列，当前限速可能导致测速结果偏低。"
         add_measurement_warning "$BANDWIDTH_PROBE_NOTE"
-        warn "$BANDWIDTH_PROBE_NOTE"
     fi
 }
 
@@ -2114,7 +2105,6 @@ resolve_tuning_values() {
     CALCULATION_REASON="rmem: $RMEM_REASON; wmem: $WMEM_REASON"
 
     resolve_initcwnd_policy
-    show_measurement_warnings
 }
 
 format_buffer_size() {
@@ -2151,67 +2141,358 @@ format_tcp_mem_bytes() {
         }'
 }
 
+# 持久化值保持不变；所有面向用户的转换集中在此展示层。
+format_display_value() {
+    case "${1:-unknown}" in
+        high) printf '%s\n' '高' ;;
+        low) printf '%s\n' '低' ;;
+        manual|"manual input") printf '%s\n' '手动输入' ;;
+        auto) printf '%s\n' '自动' ;;
+        unknown) printf '%s\n' '未知' ;;
+        none) printf '%s\n' '无' ;;
+        *) printf '%s\n' "$1" ;;
+    esac
+}
+
+format_tuning_mode() {
+    case "${1:-unknown}" in
+        auto) printf '%s\n' '自动测速' ;;
+        manual) printf '%s\n' '手动输入' ;;
+        *) format_display_value "${1:-unknown}" ;;
+    esac
+}
+
+format_measurement_source() {
+    local value="${1:-unknown}" inner
+
+    if [[ "$value" =~ ^7-day[[:space:]]route-bound[[:space:]]cache[[:space:]]\((.*)\)$ ]]; then
+        inner=${BASH_REMATCH[1]}
+        printf '7 天内同路由缓存（%s）\n' "$(format_measurement_source "$inner")"
+    elif [[ "$value" =~ ^same-route[[:space:]]fresh[[:space:]]cache[[:space:]]fallback[[:space:]]\((.*)\)$ ]]; then
+        inner=${BASH_REMATCH[1]}
+        printf '同路由缓存回退（%s）\n' "$(format_measurement_source "$inner")"
+    elif [[ "$value" =~ ^same-route[[:space:]]stale[[:space:]]cache[[:space:]]\((.*)\)$ ]]; then
+        inner=${BASH_REMATCH[1]}
+        printf '同路由过期缓存（%s）\n' "$(format_measurement_source "$inner")"
+    elif [[ "$value" =~ ^public[[:space:]]iperf3[[:space:]]IPv4[[:space:]]\(P=([0-9]+),[[:space:]]t=([0-9]+)s\)$ ]]; then
+        printf '公共 IPv4 iperf3 测速（%s 并发 × %s 秒）\n' \
+            "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
+    else
+        case "$value" in
+            "public iperf3 IPv4"|"public iperf3")
+                printf '%s\n' '公共 IPv4 iperf3 测速'
+                ;;
+            "command line manual input") printf '%s\n' '命令行手动输入' ;;
+            "interactive manual entry") printf '%s\n' '交互手动输入' ;;
+            "interactive fallback after public iperf3 failure")
+                printf '%s\n' '公共 iperf3 测速失败后手动输入'
+                ;;
+            *) format_display_value "$value" ;;
+        esac
+    fi
+}
+
+format_measurement_warning() {
+    case "$1" in
+        "failed to persist the route-bound measurement cache")
+            printf '%s\n' '无法保存同路由测速缓存'
+            ;;
+        "live public iperf3 measurement failed, reused same-route cache no older than 30 days")
+            printf '%s\n' '现场公共 iperf3 测速失败，复用 30 天内同路由缓存'
+            ;;
+        "only one public iperf3 peer produced a usable result")
+            printf '%s\n' '仅一个公共 iperf3 节点返回可用结果'
+            ;;
+        "upload has fewer than two valid peer samples")
+            printf '%s\n' '上传有效节点样本少于两个'
+            ;;
+        "upload peer results differ by more than 30%, using the higher valid result")
+            printf '%s\n' '上传节点结果差异超过 30%，采用较高有效值'
+            ;;
+        "download has fewer than two valid peer samples")
+            printf '%s\n' '下载有效节点样本少于两个'
+            ;;
+        "download peer results differ by more than 30%, using the higher valid result")
+            printf '%s\n' '下载节点结果差异超过 30%，采用较高有效值'
+            ;;
+        "traffic budget stopped additional public iperf3 tests")
+            printf '%s\n' '流量预算已停止后续公共 iperf3 测试'
+            ;;
+        "检测到 active root HTB，当前限速可能导致测速偏低。")
+            printf '%s\n' '检测到活动的根 HTB 队列，当前限速可能导致测速结果偏低。'
+            ;;
+        *) format_display_value "$1" ;;
+    esac
+}
+
+format_measurement_node() {
+    local measurement_node="$1"
+
+    if [[ "$measurement_node" =~ ^([^/]+)/([^[:space:]]+)[[:space:]]+(.+)[[:space:]]+\(IPv4[[:space:]]RTT[[:space:]]([0-9]+)[[:space:]]ms\)$ ]]; then
+        printf '%s / %s / %s / RTT %s ms\n' \
+            "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" \
+            "${BASH_REMATCH[3]}" "${BASH_REMATCH[4]}"
+    else
+        format_display_value "$measurement_node"
+    fi
+}
+
+print_measurement_nodes() {
+    local nodes_value="${1:-none}" indent="${2:-  }" node_entry count=0
+
+    if [[ "$nodes_value" == "manual input" ]]; then
+        printf '%s%s\n' "$indent" '无（手动输入）'
+        return 0
+    fi
+    if [[ -z "$nodes_value" || "$nodes_value" == "none" || "$nodes_value" == "unknown" ]]; then
+        printf '%s%s\n' "$indent" "$(format_display_value "${nodes_value:-none}")"
+        return 0
+    fi
+    while IFS= read -r node_entry; do
+        node_entry="${node_entry#"${node_entry%%[![:space:]]*}"}"
+        node_entry="${node_entry%"${node_entry##*[![:space:]]}"}"
+        [[ -n "$node_entry" ]] || continue
+        ((count += 1))
+        printf '%s%d. %s\n' "$indent" "$count" \
+            "$(format_measurement_node "$node_entry")"
+    done < <(printf '%s\n' "$nodes_value" | sed 's/;[[:space:]]*/\n/g')
+}
+
+format_rtt_source() {
+    case "${1:-unknown}" in
+        "automatic policy") printf '%s\n' '自动策略' ;;
+        "command line") printf '%s\n' '命令行指定' ;;
+        "default for manual bandwidth") printf '%s\n' '手动带宽默认值' ;;
+        *) format_display_value "${1:-unknown}" ;;
+    esac
+}
+
+format_rtt_policy() {
+    case "${1:-unknown}" in
+        "fixed 150 ms") printf '%s\n' '固定 150 ms' ;;
+        "fixed 150 ms default") printf '%s\n' '默认固定 150 ms' ;;
+        "manual override") printf '%s\n' '手动指定' ;;
+        *) format_display_value "${1:-unknown}" ;;
+    esac
+}
+
+format_rtt_summary() {
+    local rtt_ms="${1:-未知}" source="${2:-unknown}" policy="${3:-unknown}" reason
+
+    [[ "$rtt_ms" != "unknown" ]] || rtt_ms='未知'
+    case "$source|$policy" in
+        "automatic policy|fixed 150 ms") reason='自动固定值' ;;
+        "command line|manual override") reason='手动指定' ;;
+        "default for manual bandwidth|fixed 150 ms default") reason='手动带宽默认值' ;;
+        *) reason="$(format_rtt_source "$source")；$(format_rtt_policy "$policy")" ;;
+    esac
+    printf 'RTT：%s ms（%s）\n' "$rtt_ms" "$reason"
+}
+
+format_initcwnd_policy() {
+    case "${1:-unknown}" in
+        "auto: upload > 100 Mbps, set 32")
+            printf '%s\n' '自动：上传 > 100 Mbps，设置为 32'
+            ;;
+        "auto: upload <= 100 Mbps, preserve kernel default")
+            printf '%s\n' '自动：上传 ≤ 100 Mbps，保持内核默认'
+            ;;
+        "auto: upload unknown, preserve kernel default")
+            printf '%s\n' '自动：上传未知，保持内核默认'
+            ;;
+        "explicit enabled") printf '%s\n' '手动启用' ;;
+        "explicit disabled") printf '%s\n' '手动禁用' ;;
+        *) format_display_value "${1:-unknown}" ;;
+    esac
+}
+
+format_initcwnd_summary() {
+    local enabled="$1" policy="$2" persistence="${3:-}" target reason
+
+    [[ "$enabled" == "true" ]] && target=32 || target='内核默认'
+    case "$policy" in
+        "auto: upload > 100 Mbps, set 32") reason='自动：上传 > 100 Mbps' ;;
+        "auto: upload <= 100 Mbps, preserve kernel default") reason='自动：上传 ≤ 100 Mbps' ;;
+        "auto: upload unknown, preserve kernel default") reason='自动：上传未知' ;;
+        "explicit enabled") reason='手动启用' ;;
+        "explicit disabled") reason='手动禁用' ;;
+        *) reason=$(format_initcwnd_policy "$policy") ;;
+    esac
+    if [[ "$enabled" == "true" ]]; then
+        case "$persistence" in
+            persistent) reason+='；已持久化' ;;
+            current-route-only) reason+='；仅当前路由，未持久化' ;;
+        esac
+    fi
+    printf '%s（%s）\n' "$target" "$reason"
+}
+
+format_calculation_reason() {
+    local value="$1"
+
+    value=${value//4 MiB floor/4 MiB 下限}
+    value=${value//effective RAM \/ 32 cap/有效内存 \/ 32 上限}
+    value=${value//2 x BDP + 2 MiB headroom/2 × BDP + 2 MiB 余量}
+    value=${value//rmem: /接收：}
+    value=${value//; wmem: /；发送：}
+    printf '%s\n' "$value"
+}
+
+format_qdisc_detail() {
+    local detail_text="$1"
+
+    if [[ "$detail_text" =~ ^root[[:space:]]([^;]+)\;[[:space:]]all[[:space:]]([0-9]+)[[:space:]]leaves[[:space:]]fq$ ]]; then
+        printf '根队列 %s，%s 个叶子队列均为 fq\n' \
+            "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
+    elif [[ "$detail_text" =~ ^root[[:space:]]([^;]+)\;[[:space:]]no[[:space:]]readable[[:space:]]leaves$ ]]; then
+        printf '根队列 %s，无可读叶子队列\n' "${BASH_REMATCH[1]}"
+    elif [[ "$detail_text" =~ ^root[[:space:]]([^;]+)\;[[:space:]]fq[[:space:]]leaves[[:space:]]([0-9]+/[0-9]+)(\;[[:space:]]other:[[:space:]](.*))?$ ]]; then
+        printf '根队列 %s，fq 叶子队列 %s' \
+            "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
+        [[ -z "${BASH_REMATCH[4]:-}" ]] || printf '，其他：%s' "${BASH_REMATCH[4]}"
+        printf '\n'
+    elif [[ "$detail_text" =~ ^root[[:space:]](.+)$ ]]; then
+        printf '根队列 %s\n' "${BASH_REMATCH[1]}"
+    else
+        case "$detail_text" in
+            "no qdisc data") printf '%s\n' '无 qdisc 数据' ;;
+            "no readable leaves") printf '%s\n' '无可读叶子队列' ;;
+            "tc qdisc read failed") printf '%s\n' '无法读取 qdisc' ;;
+            "default interface unavailable") printf '%s\n' '默认接口不可用' ;;
+            *) format_display_value "$detail_text" ;;
+        esac
+    fi
+}
+
+format_initcwnd_state_detail() {
+    case "$1" in
+        "default route query failed") printf '%s\n' '无法读取默认路由' ;;
+        "owned default route has initcwnd/initrwnd 32")
+            printf '%s\n' '已接管默认路由，initcwnd/initrwnd=32'
+            ;;
+        "ownership marker exists but default route lacks initcwnd/initrwnd 32")
+            printf '%s\n' '存在所有权标记，但默认路由缺少 initcwnd/initrwnd=32'
+            ;;
+        "default route has unowned initcwnd/initrwnd settings")
+            printf '%s\n' '默认路由存在非本脚本管理的 initcwnd/initrwnd'
+            ;;
+        "kernel default; no ownership marker")
+            printf '%s\n' '内核默认，无所有权标记'
+            ;;
+        *) format_display_value "$1" ;;
+    esac
+}
+
+format_tcp_mem_summary() {
+    local pages
+
+    pages=$(format_tcp_mem_pages "$1") || return 1
+    pages=${pages% pages}
+    printf '%s 页（%s）\n' "$pages" "$(format_tcp_mem_bytes "$1")"
+}
+
+format_cache_reuse_summary() {
+    case "$1" in
+        "7-day route-bound cache ("*")")
+            printf '%s\n' '测速：复用 7 天内同路由缓存，不执行现场测速'
+            ;;
+        "same-route fresh cache fallback ("*")")
+            printf '%s\n' '测速：现场测速失败，复用 7 天内同路由缓存'
+            ;;
+        "same-route stale cache ("*")")
+            printf '%s\n' '测速：现场测速失败，复用 30 天内同路由过期缓存'
+            ;;
+    esac
+}
+
 show_tuning_plan() {
-    echo "========== 网络动态配置计划 =========="
-    echo "模式: $TUNING_MODE"
-    echo "物理内存: ${PHYSICAL_RAM_MB} MiB"
-    echo "有效内存: ${RAM_MB} MiB"
-    echo "单 socket 上限: $(format_buffer_size "$MEMORY_CAP_BYTES")（有效内存 / 32，绝对上限 256 MiB）"
-    echo "下载带宽: ${DETECTED_DOWNLOAD_MBPS:-未知} Mbps"
-    echo "上传带宽: ${DETECTED_UPLOAD_MBPS:-未知} Mbps"
-    echo "测量来源: $MEASUREMENT_SOURCE"
-    echo "测量时间: $MEASUREMENT_TIME"
-    echo "测量节点: $MEASUREMENT_NODES"
-    echo "测量可信度: $MEASUREMENT_CONFIDENCE"
-    echo "测量警告: ${MEASUREMENT_WARNINGS:-none}"
-    format_rtt_selection_summary
-    echo "接收 BDP: $((RX_BDP_BYTES / 1024)) KiB"
-    echo "发送 BDP: $((TX_BDP_BYTES / 1024)) KiB"
-    echo "rmem_max: $(format_buffer_size "$RMEM_MAX_BYTES")"
-    echo "wmem_max: $(format_buffer_size "$WMEM_MAX_BYTES")"
-    echo "tcp_rmem default: $(format_buffer_size "$RMEM_DEFAULT_BYTES")"
-    echo "tcp_wmem default: $(format_buffer_size "$WMEM_DEFAULT_BYTES")"
-    echo "tcp_mem: $(format_tcp_mem_pages "$TCP_MEM_PAGES")"
-    echo "tcp_mem bytes: $(format_tcp_mem_bytes "$TCP_MEM_PAGES")"
-    echo "计算依据: $CALCULATION_REASON"
-    echo "initcwnd 模式: $INITCWND_MODE"
-    echo "initcwnd/initrwnd: $([[ "$INITCWND_ENABLED" == "true" ]] && echo "32" || echo "内核默认")（策略: $INITCWND_POLICY）"
-    echo "ECN: 保留当前设置（不持久接管）"
+    local cache_summary
+
+    echo "计划："
+    printf '  模式：%s\n' "$(format_tuning_mode "$TUNING_MODE")"
+    printf '  内存：物理 %s MiB / 有效 %s MiB\n' "$PHYSICAL_RAM_MB" "$RAM_MB"
+    printf '  单 socket 上限：%s（有效内存 / 32，绝对上限 256 MiB）\n' \
+        "$(format_buffer_size "$MEMORY_CAP_BYTES")"
+    printf '  带宽：下载 %s Mbps / 上传 %s Mbps\n' \
+        "${DETECTED_DOWNLOAD_MBPS:-未知}" "${DETECTED_UPLOAD_MBPS:-未知}"
+    printf '  来源：%s\n' "$(format_measurement_source "$MEASUREMENT_SOURCE")"
+    cache_summary=$(format_cache_reuse_summary "$MEASUREMENT_SOURCE")
+    [[ -z "$cache_summary" ]] || printf '  %s\n' "$cache_summary"
+    printf '  时间：%s\n' "$(format_display_value "$MEASUREMENT_TIME")"
+    echo "  节点："
+    print_measurement_nodes "$MEASUREMENT_NODES" '    '
+    printf '  可信度：%s\n' "$(format_display_value "$MEASUREMENT_CONFIDENCE")"
+    printf '  %s\n' "$(format_rtt_selection_summary)"
+    printf '  BDP：接收 %s KiB / 发送 %s KiB\n' \
+        "$((RX_BDP_BYTES / 1024))" "$((TX_BDP_BYTES / 1024))"
+    printf '  TCP 缓冲：默认 %s / 接收上限 %s / 发送上限 %s\n' \
+        "$(format_buffer_size "$RMEM_DEFAULT_BYTES")" \
+        "$(format_buffer_size "$RMEM_MAX_BYTES")" \
+        "$(format_buffer_size "$WMEM_MAX_BYTES")"
+    printf '  TCP 内存：%s\n' "$(format_tcp_mem_summary "$TCP_MEM_PAGES")"
+    printf '  计算依据：%s\n' "$(format_calculation_reason "$CALCULATION_REASON")"
+    printf '  初始窗口：%s\n' \
+        "$(format_initcwnd_summary "$INITCWND_ENABLED" "$INITCWND_POLICY")"
+    echo "  ECN：保持现有设置"
 }
 
 format_rtt_selection_summary() {
-    printf 'RTT：计算 %s ms（来源 %s；策略 %s）\n' \
-        "${DETECTED_RTT_MS:-未知}" "${RTT_SOURCE:-unknown}" "${RTT_POLICY:-unknown}"
+    format_rtt_summary "${DETECTED_RTT_MS:-未知}" \
+        "${RTT_SOURCE:-unknown}" "${RTT_POLICY:-unknown}"
 }
 
 show_install_summary() {
-    local bbr_enabled="$1" algorithm="当前拥塞控制" qdisc_state qdisc_detail
+    local bbr_enabled="$1" algorithm qdisc_state qdisc_detail
+    local cache_summary initcwnd_persistence="" bbr_module_summary
 
-    [[ "$bbr_enabled" == "true" ]] && algorithm="BBR"
+    if [[ "$bbr_enabled" == "true" ]]; then
+        algorithm="BBR"
+    else
+        algorithm=$(read_sysctl_or net.ipv4.tcp_congestion_control 未知)
+    fi
     IFS='|' read -r qdisc_state qdisc_detail <<< \
         "$(active_qdisc_state "${PROBE_IFACE:-}")"
+    if [[ "$INITCWND_ENABLED" == "true" ]]; then
+        if is_managed_initcwnd_hook; then
+            initcwnd_persistence=persistent
+        else
+            initcwnd_persistence=current-route-only
+        fi
+    fi
+    if [[ "$bbr_enabled" == "true" ]]; then
+        bbr_module_summary=$BBR_MODULES_FILE
+    else
+        bbr_module_summary='未写入（当前内核不支持 BBR）'
+    fi
 
-    printf '环境：%s CPU / %.1f GiB / %s\n' \
+    echo '结果：'
+    printf '  环境：%s vCPU / %.1f GiB 内存 / %s\n' \
         "$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 未知)" \
         "$(awk -v mb="$RAM_MB" 'BEGIN {print mb / 1024}')" \
-        "${PROBE_IFACE:-unknown}"
-    printf '测量：%s↓ %s↑ Mbps；来源 %s；时间 %s\n' \
-        "${DETECTED_DOWNLOAD_MBPS:-未知}" "${DETECTED_UPLOAD_MBPS:-未知}" \
-        "$MEASUREMENT_SOURCE" "$MEASUREMENT_TIME"
-    printf '节点：%s；可信度 %s；警告 %s\n' \
-        "$MEASUREMENT_NODES" "$MEASUREMENT_CONFIDENCE" "${MEASUREMENT_WARNINGS:-none}"
-    format_rtt_selection_summary
-    printf '缓冲：TCP 起点 %s / 最大 %s\n' \
-        "$(format_buffer_size "$WMEM_DEFAULT_BYTES")" "$(format_buffer_size "$WMEM_MAX_BYTES")"
-    printf 'tcp_mem: %s\n' \
-        "$(format_tcp_mem_pages "$TCP_MEM_PAGES")"
-    printf 'tcp_mem bytes: %s\n' \
-        "$(format_tcp_mem_bytes "$TCP_MEM_PAGES")"
-    printf '应用：%s + ECN 未接管，配置成功；fq %s\n' \
-        "$algorithm" "$(format_qdisc_state "$qdisc_state" "$qdisc_detail")"
-    printf 'initcwnd：%s（策略 %s）\n' \
-        "$([[ "$INITCWND_ENABLED" == "true" ]] && echo 32 || echo 内核默认)" \
-        "$INITCWND_POLICY"
+        "$(format_display_value "${PROBE_IFACE:-unknown}")"
+    printf '  带宽：下载 %s Mbps / 上传 %s Mbps\n' \
+        "${DETECTED_DOWNLOAD_MBPS:-未知}" "${DETECTED_UPLOAD_MBPS:-未知}"
+    printf '  来源：%s\n' "$(format_measurement_source "$MEASUREMENT_SOURCE")"
+    cache_summary=$(format_cache_reuse_summary "$MEASUREMENT_SOURCE")
+    [[ -z "$cache_summary" ]] || printf '  %s\n' "$cache_summary"
+    printf '  时间：%s\n' "$(format_display_value "$MEASUREMENT_TIME")"
+    echo '  节点：'
+    print_measurement_nodes "$MEASUREMENT_NODES" '    '
+    printf '  可信度：%s\n' "$(format_display_value "$MEASUREMENT_CONFIDENCE")"
+    printf '  %s\n' "$(format_rtt_selection_summary)"
+    printf '  TCP 缓冲：默认 %s / 接收上限 %s / 发送上限 %s\n' \
+        "$(format_buffer_size "$RMEM_DEFAULT_BYTES")" \
+        "$(format_buffer_size "$RMEM_MAX_BYTES")" \
+        "$(format_buffer_size "$WMEM_MAX_BYTES")"
+    printf '  TCP 内存：%s\n' "$(format_tcp_mem_summary "$TCP_MEM_PAGES")"
+    printf '  拥塞控制：%s\n' "$algorithm"
+    printf '  队列：fq %s\n' "$(format_qdisc_state "$qdisc_state" "$qdisc_detail")"
+    echo '  ECN：保持现有设置'
+    printf '  初始窗口：%s\n' \
+        "$(format_initcwnd_summary "$INITCWND_ENABLED" "$INITCWND_POLICY" \
+            "$initcwnd_persistence")"
+    printf '  sysctl 配置：%s\n' "$NETWORK_CONF"
+    printf '  BBR 模块：%s\n' "$bbr_module_summary"
 }
 
 # === 新版网络配置 ===
@@ -2461,8 +2742,7 @@ verify_network_config() {
         fi
     done < "$config_file"
 
-    [[ "$failed" == "false" ]] || return 1
-    info "运行时 sysctl 已与生成配置一致"
+    [[ "$failed" == "false" ]]
 }
 
 record_restore_failure() {
@@ -2507,7 +2787,7 @@ report_install_failure() {
 install_optimization() {
     local temp_config runtime_backup bbr_enabled="false"
 
-    info "开始配置网络优化..."
+    info "阶段 1/3：获取测量数据并计算参数"
 
     if detect_container; then
         warn "检测到容器虚拟化环境，部分 sysctl 参数可能受宿主机限制"
@@ -2519,12 +2799,14 @@ install_optimization() {
         return 1
     fi
     persist_pending_measurement_cache
+    show_measurement_warnings
 
     [[ -n "$PROBE_IFACE" ]] || PROBE_IFACE=$(detect_default_iface || true)
     if [[ "${DEBUG:-}" == "1" ]]; then
         show_tuning_plan
     fi
 
+    info "阶段 2/3：备份并应用网络配置"
     if ! temp_config=$(mktemp "${NETWORK_CONF}.new.XXXXXX"); then
         error "无法创建网络配置临时文件"
         return 1
@@ -2550,7 +2832,6 @@ install_optimization() {
 
     if ensure_bbr_available; then
         bbr_enabled="true"
-        info "BBR 支持：可用"
     else
         create_network_config "$temp_config" false
     fi
@@ -2589,11 +2870,9 @@ install_optimization() {
     fi
 
     rm -f "$runtime_backup"
-    success "网络优化配置已写入：$NETWORK_CONF"
+    info "阶段 3/3：验证完成并汇总结果"
 
-    if [[ "$bbr_enabled" == "true" ]]; then
-        success "BBR 模块已设置为开机加载：$BBR_MODULES_FILE"
-    else
+    if [[ "$bbr_enabled" != "true" ]]; then
         warn "BBR 未启用；其余网络参数已正常应用"
     fi
 
@@ -2822,14 +3101,14 @@ print_status_section() {
     local title="$1" spec label value fallback
     shift
 
-    printf '\n%s:\n' "$title"
+    printf '\n%s：\n' "$title"
     for spec in "$@"; do
         [[ -n "$spec" ]] || continue
         IFS='|' read -r label value fallback <<< "$spec"
         if [[ "$value" == sysctl:* ]]; then
             value=$(read_sysctl_or "${value#sysctl:}" "${fallback:-不可用}")
         fi
-        printf '  %s: %s\n' "$label" "$value"
+        printf '  %s：%s\n' "$label" "$value"
     done
 }
 
@@ -2847,25 +3126,46 @@ config_comment_value() {
 
 show_status() {
     local available_cc default_iface active_qdisc_state_name active_qdisc_detail
-    local initcwnd_state_name initcwnd_detail drift_status=""
-    local measurement_source="未记录" measurement_time="未记录" measurement_nodes="未记录"
-    local measurement_confidence="未记录" measurement_warnings="none" cache_status="不存在"
+    local initcwnd_state_name initcwnd_detail drift_status="" cache_summary warning
+    local measurement_source="unknown" measurement_time="unknown" measurement_nodes="none"
+    local measurement_confidence="unknown" measurement_warnings="none" cache_status="不存在"
+    local config_mode="unknown" config_physical_ram="未记录" config_effective_ram="未记录"
+    local config_download="未记录" config_upload="未记录" config_rtt="unknown"
+    local config_rtt_source="unknown" config_rtt_policy="unknown" config_rtt_display=""
+    local config_initcwnd_mode="unknown" config_initcwnd_policy="unknown"
+    local config_calculation_reason="未记录"
 
     available_cc=$(cat /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null || echo "未知")
     default_iface=$(detect_default_iface || true)
     IFS='|' read -r active_qdisc_state_name active_qdisc_detail <<< \
         "$(active_qdisc_state "$default_iface")"
     IFS='|' read -r initcwnd_state_name initcwnd_detail <<< "$(detect_initcwnd_state)"
+    initcwnd_detail=$(format_initcwnd_state_detail "$initcwnd_detail")
     [[ "$initcwnd_state_name" != "drift" ]] || drift_status="initcwnd 状态|漂移"
 
     if [[ -f "$NETWORK_CONF" ]]; then
-        measurement_source=$(config_comment_value "$NETWORK_CONF" 测量来源)
-        measurement_time=$(config_comment_value "$NETWORK_CONF" 测量时间)
-        measurement_nodes=$(config_comment_value "$NETWORK_CONF" 测量节点)
-        measurement_confidence=$(config_comment_value "$NETWORK_CONF" 测量可信度)
+        config_mode=$(config_comment_value "$NETWORK_CONF" 模式 unknown)
+        config_physical_ram=$(config_comment_value "$NETWORK_CONF" 物理内存)
+        config_effective_ram=$(config_comment_value "$NETWORK_CONF" 有效内存)
+        config_download=$(config_comment_value "$NETWORK_CONF" 下载带宽)
+        config_upload=$(config_comment_value "$NETWORK_CONF" 上传带宽)
+        config_rtt=$(config_comment_value "$NETWORK_CONF" "计算 RTT" unknown)
+        config_rtt=${config_rtt% ms}
+        config_rtt_source=$(config_comment_value "$NETWORK_CONF" "RTT 来源" unknown)
+        config_rtt_policy=$(config_comment_value "$NETWORK_CONF" "RTT 策略" unknown)
+        config_rtt_display=$(format_rtt_summary \
+            "$config_rtt" "$config_rtt_source" "$config_rtt_policy")
+        config_rtt_display=${config_rtt_display#RTT：}
+        config_initcwnd_mode=$(config_comment_value "$NETWORK_CONF" "initcwnd 模式" unknown)
+        config_initcwnd_policy=$(config_comment_value "$NETWORK_CONF" "initcwnd 策略" unknown)
+        config_calculation_reason=$(config_comment_value "$NETWORK_CONF" 缓冲区依据)
+        measurement_source=$(config_comment_value "$NETWORK_CONF" 测量来源 unknown)
+        measurement_time=$(config_comment_value "$NETWORK_CONF" 测量时间 unknown)
+        measurement_nodes=$(config_comment_value "$NETWORK_CONF" 测量节点 none)
+        measurement_confidence=$(config_comment_value "$NETWORK_CONF" 测量可信度 unknown)
         measurement_warnings=$(config_comment_value "$NETWORK_CONF" 测量警告 none)
     elif [[ -f "$MEASUREMENT_CACHE" ]]; then
-        measurement_source="cache: $(cache_field "$MEASUREMENT_CACHE" source)"
+        measurement_source=$(cache_field "$MEASUREMENT_CACHE" source)
         measurement_time=$(cache_field "$MEASUREMENT_CACHE" measured_at)
         measurement_nodes=$(cache_field "$MEASUREMENT_CACHE" nodes)
         measurement_confidence=$(cache_field "$MEASUREMENT_CACHE" confidence)
@@ -2873,30 +3173,49 @@ show_status() {
     fi
     [[ -f "$MEASUREMENT_CACHE" ]] && cache_status="存在（$MEASUREMENT_CACHE）"
 
-    echo "========== 网络优化状态 =========="
-    echo "配置文件: $NETWORK_CONF"
-    [[ -f "$NETWORK_CONF" ]] && echo "配置状态: 已存在" || echo "配置状态: 未创建"
+    echo "网络优化状态："
+    echo "配置文件：$NETWORK_CONF"
+    [[ -f "$NETWORK_CONF" ]] && echo "配置状态：已存在" || echo "配置状态：未创建"
     if [[ -f "$NETWORK_CONF" ]]; then
-        grep -E '^# (模式|物理内存|有效内存|下载带宽|上传带宽|带宽测量环境|计算 RTT|RTT 来源|RTT 策略|initcwnd 模式|initcwnd 策略|缓冲区依据):' \
-            "$NETWORK_CONF" | sed 's/^# /  /'
+        print_status_section "配置记录" \
+            "模式|$(format_tuning_mode "$config_mode")" \
+            "物理内存|$config_physical_ram" \
+            "有效内存|$config_effective_ram" \
+            "下载带宽|$config_download" \
+            "上传带宽|$config_upload" \
+            "RTT|$config_rtt_display" \
+            "initcwnd 模式|$(format_display_value "$config_initcwnd_mode")" \
+            "initcwnd 策略|$(format_initcwnd_policy "$config_initcwnd_policy")" \
+            "缓冲区依据|$(format_calculation_reason "$config_calculation_reason")"
     fi
-    [[ -f "$NETWORK_INITIAL_BACKUP" ]] && echo "初始备份: $NETWORK_INITIAL_BACKUP"
-    [[ -f "$NETWORK_INITIAL_ABSENT" ]] && echo "初始状态: 配置文件原本不存在"
-    [[ -f "$NETWORK_INITIAL_UNKNOWN" ]] && echo "初始状态: 旧版未记录，无法安全推测"
-    [[ -f "$NETWORK_PREVIOUS_BACKUP" ]] && echo "上次备份: $NETWORK_PREVIOUS_BACKUP"
+    [[ -f "$NETWORK_INITIAL_BACKUP" ]] && echo "初始备份：$NETWORK_INITIAL_BACKUP"
+    [[ -f "$NETWORK_INITIAL_ABSENT" ]] && echo "初始状态：配置文件原本不存在"
+    [[ -f "$NETWORK_INITIAL_UNKNOWN" ]] && echo "初始状态：旧版未记录，无法安全推测"
+    [[ -f "$NETWORK_PREVIOUS_BACKUP" ]] && echo "上次备份：$NETWORK_PREVIOUS_BACKUP"
 
-    print_status_section "测量记录" \
-        "测量来源|${measurement_source:-未记录}" \
-        "测量时间|${measurement_time:-未记录}" \
-        "测量节点|${measurement_nodes:-未记录}" \
-        "测量可信度|${measurement_confidence:-未记录}" \
-        "测量警告|${measurement_warnings:-none}" \
-        "路由绑定缓存|$cache_status"
+    printf '\n测量记录：\n'
+    printf '  来源：%s\n' "$(format_measurement_source "${measurement_source:-unknown}")"
+    cache_summary=$(format_cache_reuse_summary "$measurement_source")
+    [[ -z "$cache_summary" ]] || printf '  %s\n' "$cache_summary"
+    printf '  时间：%s\n' "$(format_display_value "${measurement_time:-unknown}")"
+    printf '  节点：\n'
+    print_measurement_nodes "${measurement_nodes:-none}" '    '
+    printf '  可信度：%s\n' "$(format_display_value "${measurement_confidence:-unknown}")"
+    if [[ -z "$measurement_warnings" || "$measurement_warnings" == "none" ]]; then
+        printf '  警告：无\n'
+    else
+        while IFS= read -r warning; do
+            [[ -n "$warning" ]] || continue
+            printf '  警告：%s\n' "$(format_measurement_warning "$warning")"
+        done < <(printf '%s\n' "$measurement_warnings" | sed 's/;[[:space:]]*/\n/g')
+    fi
+    printf '  路由绑定缓存：%s\n' "$cache_status"
+
     print_status_section "拥塞与队列" \
         "可用算法|$available_cc" \
         "当前算法|$(read_sysctl_or net.ipv4.tcp_congestion_control 未知)" \
-        "default qdisc|$(read_sysctl_or net.core.default_qdisc 未知)" \
-        "active qdisc (${default_iface:-未知接口})|$(format_qdisc_state "$active_qdisc_state_name" "$active_qdisc_detail")"
+        "默认 qdisc|$(read_sysctl_or net.core.default_qdisc 未知)" \
+        "当前 qdisc（${default_iface:-未知接口}）|$(format_qdisc_state "$active_qdisc_state_name" "$active_qdisc_detail")"
     print_status_section "受管缓冲区" \
         "rmem_default|sysctl:net.core.rmem_default|未知" \
         "wmem_default|sysctl:net.core.wmem_default|未知" \
@@ -2907,7 +3226,7 @@ show_status() {
         "tcp_mem|sysctl:net.ipv4.tcp_mem|未知" \
         "tcp_moderate_rcvbuf|sysctl:net.ipv4.tcp_moderate_rcvbuf|未知"
     print_status_section "初始拥塞窗口" \
-        "ownership marker|$([[ -e "$ROUTE_OWNED_MARKER" ]] && echo 存在 || echo 不存在)" \
+        "所有权标记|$([[ -e "$ROUTE_OWNED_MARKER" ]] && echo 存在 || echo 不存在)" \
         "持久化钩子|$(initcwnd_hook_status)" \
         "默认路由窗口|$initcwnd_detail" "$drift_status"
 
@@ -2997,6 +3316,7 @@ main() {
                 return 1
             fi
             persist_pending_measurement_cache
+            show_measurement_warnings
             show_tuning_plan
             ;;
         restore)

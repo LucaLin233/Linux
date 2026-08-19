@@ -121,6 +121,17 @@ reset_selection
 select_tuning_mode >/dev/null <<< ""
 assert_eq auto "$TUNING_MODE" "interactive Enter selects default public speed test"
 assert_eq true "$AUTO_MODE_REQUESTED" "default Enter records automatic mode"
+probe_guidance=$(show_active_probe_warning)
+expected_probe_guidance=$(printf '%s\n' \
+    '测速配置：IPv4 iperf3，最多 2 个节点，每方向 4 并发 × 5 秒' \
+    '流量上限：上传 12.5 GB / 下载 12.5 GB / 合计 25 GB（按出口接口统计，包含同期后台流量）' \
+    '依赖处理：缺少 iperf3 时通过 APT 自动安装')
+assert_eq "$expected_probe_guidance" "$probe_guidance" \
+    "interactive speed-test guidance uses three plain lines"
+select_tuning_body=$(declare -f select_tuning_mode)
+grep -Fq 'read -r -p "是否执行公共测速？[Y/n]: " answer' \
+    <<< "$select_tuning_body" || fail "interactive speed-test prompt is not concise"
+printf 'PASS: interactive speed-test prompt uses concise wording\n'
 
 reset_selection
 select_tuning_mode >/dev/null <<'EOF'
@@ -207,7 +218,63 @@ fi
 execute_module_body=$(sed -n '/^execute_module() {/,/^}/p' "$ROOT_DIR/linux_setup.sh")
 grep -Fq 'if bash "$module_file"; then' <<< "$execute_module_body" ||
     fail "linux_setup no longer invokes modules without arguments"
+if grep -Fq '执行模块：${MODULES[$module]}' <<< "$execute_module_body"; then
+    fail "execute_module still repeats the user-visible module name"
+fi
+execution_loop=$(sed -n '/for module in "${SELECTED_MODULES\[@\]}"; do/,/generate_summary/p' \
+    "$ROOT_DIR/linux_setup.sh")
+assert_eq 1 "$(grep -Fc '${MODULES[$module]}' <<< "$execution_loop")" \
+    "selected module name appears once in the execution loop"
+grep -Fq 'echo "[$current/$total] ${MODULES[$module]}"' <<< "$execution_loop" ||
+    fail "module progress line no longer matches the concise format"
 printf 'PASS: linux_setup keeps generic no-argument module invocation\n'
+
+assert_eq 高 "$(format_display_value high)" "format high confidence"
+assert_eq 低 "$(format_display_value low)" "format low confidence"
+assert_eq 手动输入 "$(format_display_value manual)" "format manual confidence"
+assert_eq 未知 "$(format_display_value unknown)" "format unknown value"
+assert_eq 无 "$(format_display_value none)" "format none value"
+assert_eq '公共 IPv4 iperf3 测速（4 并发 × 5 秒）' \
+    "$(format_measurement_source 'public iperf3 IPv4 (P=4, t=5s)')" \
+    "format live measurement source"
+assert_eq 自动策略 "$(format_rtt_source 'automatic policy')" \
+    "format automatic RTT source"
+assert_eq 命令行指定 "$(format_rtt_source 'command line')" \
+    "format command-line RTT source"
+assert_eq '固定 150 ms' "$(format_rtt_policy 'fixed 150 ms')" \
+    "format fixed RTT policy"
+assert_eq 手动指定 "$(format_rtt_policy 'manual override')" \
+    "format manual RTT policy"
+assert_eq '自动：上传 > 100 Mbps，设置为 32' \
+    "$(format_initcwnd_policy 'auto: upload > 100 Mbps, set 32')" \
+    "format enabled automatic initcwnd policy"
+assert_eq '自动：上传 ≤ 100 Mbps，保持内核默认' \
+    "$(format_initcwnd_policy 'auto: upload <= 100 Mbps, preserve kernel default')" \
+    "format disabled automatic initcwnd policy"
+assert_eq 手动启用 "$(format_initcwnd_policy 'explicit enabled')" \
+    "format explicit initcwnd enablement"
+assert_eq 手动禁用 "$(format_initcwnd_policy 'explicit disabled')" \
+    "format explicit initcwnd disablement"
+assert_eq '存在所有权标记，但默认路由缺少 initcwnd/initrwnd=32' \
+    "$(format_initcwnd_state_detail 'ownership marker exists but default route lacks initcwnd/initrwnd 32')" \
+    "format ownership drift state"
+assert_eq '内核默认，无所有权标记' \
+    "$(format_initcwnd_state_detail 'kernel default; no ownership marker')" \
+    "format default ownership state"
+assert_eq 1 "$(grep -Fc '警告：未检测到 networkd-dispatcher；initcwnd=32 仅对当前默认路由生效' \
+    "$ROOT_DIR/modules/network-optimize.sh")" \
+    "missing networkd-dispatcher warning has one output path"
+for redundant_success in \
+    'BBR 支持：可用' \
+    '运行时 sysctl 已与生成配置一致' \
+    '默认路由已设置 initcwnd/initrwnd' \
+    '网络优化配置已写入' \
+    'BBR 模块已设置为开机加载'; do
+    if grep -Fq "$redundant_success" "$ROOT_DIR/modules/network-optimize.sh"; then
+        fail "normal path retains redundant success output: $redundant_success"
+    fi
+done
+printf 'PASS: normal install path keeps success state in one final summary\n'
 
 (
     apt_log="$TEMP_DIR/apt.log"
@@ -329,17 +396,38 @@ unset -f traffic_used_bytes
         "generated config writes effective-RAM tcp_mem pages"
 
     plan_output=$(show_tuning_plan)
-    grep -Fq 'tcp_mem: 131072 / 262144 / 524288 pages' <<< "$plan_output" ||
-        fail "plan omits tcp_mem pages"
-    grep -Fq 'tcp_mem bytes: 512.0 MiB / 1024.0 MiB / 2048.0 MiB' \
-        <<< "$plan_output" || fail "plan omits tcp_mem MiB values"
+    grep -Fq 'TCP 缓冲：默认 2.0 MiB / 接收上限 45.0 MiB / 发送上限 24.0 MiB' \
+        <<< "$plan_output" || fail "plan collapses asymmetric buffer limits"
+    grep -Fq 'TCP 内存：131072 / 262144 / 524288 页（512.0 MiB / 1024.0 MiB / 2048.0 MiB）' \
+        <<< "$plan_output" || fail "plan omits combined TCP memory summary"
+    sysctl() {
+        [[ "$1" == "-n" && "$2" == "net.ipv4.tcp_congestion_control" ]] || return 1
+        printf '%s\n' cubic
+    }
     active_qdisc_state() { printf '%s\n' 'effective|root fq'; }
     install_summary=$(show_install_summary false)
-    grep -Fq 'tcp_mem: 131072 / 262144 / 524288 pages' \
-        <<< "$install_summary" || fail "install summary omits tcp_mem pages"
-    grep -Fq 'tcp_mem bytes: 512.0 MiB / 1024.0 MiB / 2048.0 MiB' \
-        <<< "$install_summary" || fail "install summary omits tcp_mem MiB values"
-    printf 'PASS: plan and install summary report tcp_mem pages and MiB\n'
+    grep -Fq 'TCP 缓冲：默认 2.0 MiB / 接收上限 45.0 MiB / 发送上限 24.0 MiB' \
+        <<< "$install_summary" || fail "install summary collapses asymmetric buffer limits"
+    grep -Fq '拥塞控制：cubic' <<< "$install_summary" ||
+        fail "non-BBR summary omits active congestion control"
+    sysctl() { return 1; }
+    unknown_cc_summary=$(show_install_summary false)
+    grep -Fq '拥塞控制：未知' <<< "$unknown_cc_summary" ||
+        fail "non-BBR summary does not handle congestion-control read failure"
+    grep -Fq 'TCP 内存：131072 / 262144 / 524288 页（512.0 MiB / 1024.0 MiB / 2048.0 MiB）' \
+        <<< "$install_summary" || fail "install summary omits combined TCP memory summary"
+    for manual_output in "$plan_output" "$install_summary"; do
+        grep -Fq '  节点：' <<< "$manual_output" ||
+            fail "manual output omits node label"
+        grep -Fq '    无（手动输入）' <<< "$manual_output" ||
+            fail "manual input is not shown as no measurement node"
+        if grep -Fq '1. 手动输入' <<< "$manual_output"; then
+            fail "manual input is still shown as a numbered measurement node"
+        fi
+    done
+    assert_eq 1 "$(grep -Fc 'TCP 内存：' <<< "$install_summary")" \
+        "install summary reports TCP memory once"
+    printf 'PASS: plan and install summary preserve directional limits and manual-node semantics\n'
 
     (
         sysctl() {
@@ -396,23 +484,120 @@ unset -f traffic_used_bytes
     }
     tc() { return 1; }
     status_output=$(show_status)
-    grep -Fq '测量来源: command line manual input' <<< "$status_output" ||
-        fail "status omits measurement source"
-    grep -Fq '测量时间: 2033-05-18T03:33:20Z' <<< "$status_output" ||
+    grep -Fq '来源：命令行手动输入' <<< "$status_output" ||
+        fail "status omits formatted measurement source"
+    grep -Fq '时间：2033-05-18T03:33:20Z' <<< "$status_output" ||
         fail "status omits measurement time"
-    grep -Fq '测量节点: manual input' <<< "$status_output" ||
-        fail "status omits measurement nodes"
-    grep -Fq '测量可信度: manual' <<< "$status_output" ||
-        fail "status omits confidence"
-    grep -Fq '测量警告: none' <<< "$status_output" ||
-        fail "status omits warnings"
-    grep -Fq 'rmem_default: 2097152' <<< "$status_output" ||
+    grep -Fq '无（手动输入）' <<< "$status_output" ||
+        fail "status omits manual no-node display"
+    if grep -Fq '1. 手动输入' <<< "$status_output"; then
+        fail "status numbers manual input as a measurement node"
+    fi
+    grep -Fq '可信度：手动输入' <<< "$status_output" ||
+        fail "status omits formatted confidence"
+    grep -Fq '警告：无' <<< "$status_output" ||
+        fail "status omits formatted empty warnings"
+    grep -Fq 'rmem_default：2097152' <<< "$status_output" ||
         fail "status omits rmem_default"
-    grep -Fq 'wmem_default: 2097152' <<< "$status_output" ||
+    grep -Fq 'wmem_default：2097152' <<< "$status_output" ||
         fail "status omits wmem_default"
-    grep -Fq 'tcp_mem: 131072 262144 524288' <<< "$status_output" ||
+    grep -Fq 'tcp_mem：131072 262144 524288' <<< "$status_output" ||
         fail "status omits tcp_mem"
-    printf 'PASS: status reports persisted measurement metadata\n'
+    printf 'PASS: status reports persisted measurement metadata through display formatters\n'
+)
+
+(
+    reset_selection
+    TUNING_MODE=auto
+    PHYSICAL_RAM_MB=6144
+    RAM_MB=5222
+    MEMORY_CAP_BYTES=169659596
+    DETECTED_DOWNLOAD_MBPS=9400
+    DETECTED_UPLOAD_MBPS=9000
+    MEASUREMENT_SOURCE='7-day route-bound cache (public iperf3 IPv4 (P=4, t=5s))'
+    MEASUREMENT_TIME='2026-08-19T20:12:00Z'
+    MEASUREMENT_NODES='新加坡/OVH sgp.proof.ovh.net [15.235.182.181]:5201 (IPv4 RTT 1 ms);新加坡/Leaseweb speedtest.sin1.sg.leaseweb.net [23.108.99.54]:5201 (IPv4 RTT 1 ms)'
+    MEASUREMENT_CONFIDENCE=low
+    MEASUREMENT_WARNINGS='upload peer results differ by more than 30%, using the higher valid result; download peer results differ by more than 30%, using the higher valid result'
+    DETECTED_RTT_MS=150
+    RTT_SOURCE='automatic policy'
+    RTT_POLICY='fixed 150 ms'
+    RX_BDP_BYTES=176250000
+    TX_BDP_BYTES=168750000
+    RMEM_DEFAULT_BYTES=2097152
+    WMEM_DEFAULT_BYTES=2097152
+    RMEM_MAX_BYTES=169659596
+    WMEM_MAX_BYTES=169659596
+    TCP_MEM_PAGES='82816 165632 331264'
+    CALCULATION_REASON='rmem: effective RAM / 32 cap; wmem: effective RAM / 32 cap'
+    INITCWND_MODE=auto
+    INITCWND_ENABLED=true
+    INITCWND_POLICY='auto: upload > 100 Mbps, set 32'
+    PROBE_IFACE=eth0
+
+    active_qdisc_state() { printf '%s\n' 'effective|root mq; all 1 leaves fq'; }
+    is_managed_initcwnd_hook() { return 1; }
+    detect_default_iface() { printf '%s\n' eth0; }
+    detect_initcwnd_state() { printf '%s\n' 'default|kernel default; no ownership marker'; }
+    sysctl() {
+        [[ "$1" == "-n" ]] || return 1
+        case "$2" in
+            net.ipv4.tcp_congestion_control) printf '%s\n' bbr ;;
+            net.core.default_qdisc) printf '%s\n' fq ;;
+            net.core.rmem_default|net.core.wmem_default) printf '%s\n' 2097152 ;;
+            net.ipv4.tcp_mem) printf '%s\n' '82816 165632 331264' ;;
+            *) printf '%s\n' 0 ;;
+        esac
+    }
+
+    mkdir -p "$(dirname "$NETWORK_CONF")"
+    create_network_config "$NETWORK_CONF" true
+    plan_output=$(show_tuning_plan)
+    install_output=$(show_install_summary true)
+    status_output=$(show_status)
+    grep -Fq 'RTT：150 ms（自动固定值）' <<< "$status_output" ||
+        fail "status omits single RTT label"
+    if grep -Fq 'RTT：RTT：' <<< "$status_output"; then
+        fail "status repeats the RTT label"
+    fi
+    grep -Fq '内核默认，无所有权标记' <<< "$status_output" ||
+        fail "status omits localized ownership state"
+    if grep -Fq 'ownership 标记' <<< "$status_output"; then
+        fail "status leaks the old ownership wording"
+    fi
+    for display_output in "$plan_output" "$install_output" "$status_output"; do
+        grep -Fq '7 天内同路由缓存（公共 IPv4 iperf3 测速（4 并发 × 5 秒））' \
+            <<< "$display_output" || fail "display surface omitted formatted cache source"
+        grep -Fq '可信度：低' <<< "$display_output" ||
+            fail "display surface omitted formatted confidence"
+        grep -Fq '新加坡 / OVH / sgp.proof.ovh.net [15.235.182.181]:5201 / RTT 1 ms' \
+            <<< "$display_output" || fail "display surface omitted formatted node"
+        if grep -Eq '(^|[^[:alpha:]])(high|low|none)([^[:alpha:]]|$)|automatic policy|fixed 150 ms|peer results differ|root mq; all' \
+            <<< "$display_output"; then
+            fail "display surface leaked internal English metadata"
+        fi
+    done
+    grep -Fq '测速：复用 7 天内同路由缓存，不执行现场测速' \
+        <<< "$install_output" || fail "install summary omits fresh-cache reuse notice"
+    assert_eq 1 "$(grep -Fc 'TCP 内存：' <<< "$install_output")" \
+        "final install summary contains one TCP memory line"
+    assert_eq 0 "$(grep -Fc '警告：' <<< "$install_output")" \
+        "final install summary does not repeat measurement warnings"
+    grep -Fq '队列：fq 生效（根队列 mq，1 个叶子队列均为 fq）' \
+        <<< "$install_output" || fail "install summary omits formatted qdisc detail"
+    grep -Fq '警告：上传节点结果差异超过 30%，采用较高有效值' \
+        <<< "$status_output" || fail "status omits formatted upload warning"
+    grep -Fq '警告：下载节点结果差异超过 30%，采用较高有效值' \
+        <<< "$status_output" || fail "status omits formatted download warning"
+    grep -Fq '# 测量来源: 7-day route-bound cache (public iperf3 IPv4 (P=4, t=5s))' \
+        "$NETWORK_CONF" || fail "display layer changed persisted measurement source"
+    grep -Fq '# 测量可信度: low' "$NETWORK_CONF" ||
+        fail "display layer changed persisted confidence"
+    grep -Fq '# RTT 来源: automatic policy' "$NETWORK_CONF" ||
+        fail "display layer changed persisted RTT source"
+    grep -Fq '# initcwnd 策略: auto: upload > 100 Mbps, set 32' "$NETWORK_CONF" ||
+        fail "display layer changed persisted initcwnd policy"
+    printf 'PASS: plan, install summary, and status share Chinese display mappings\n'
 )
 
 if grep -Eq 'network_health_snapshot|classify_network_health|最近一小时 OOM|Conntrack 使用量|file_handle_status' \
@@ -730,8 +915,9 @@ printf 'PASS: generic health panel is absent\n'
         "unsupported BBR leaves module persistence unchanged"
     assert_eq 0 "$PERSIST_CALLS" \
         "unsupported BBR remains a successful warning path"
-    grep -Fqx "网络优化配置已写入：$NETWORK_CONF" "$SUCCESS_LOG" ||
-        fail "unsupported BBR path omitted final configuration success"
+    [[ ! -s "$SUCCESS_LOG" ]] ||
+        fail "successful install emitted redundant standalone success messages"
+    printf 'PASS: successful install defers success state to the final summary\n'
 )
 
 SYSCTL_TCP_ECN='1'
