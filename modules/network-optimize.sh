@@ -402,13 +402,14 @@ take_lock() {
 
 # === 环境与 BBR 检测 ===
 detect_container() {
-    if [[ -f /proc/user_beancounters ]] ||
-        [[ -d /proc/vz ]] ||
-        [[ "$(systemd-detect-virt 2>/dev/null || true)" == "lxc" ]]; then
+    local virt
+
+    if [[ -f /proc/user_beancounters ]] || [[ -d /proc/vz ]]; then
         return 0
     fi
 
-    return 1
+    virt=$(systemd-detect-virt --container 2>/dev/null || true)
+    [[ -n "$virt" && "$virt" != "none" ]]
 }
 
 bbr_available() {
@@ -1595,6 +1596,18 @@ cache_field() {
     ' "$file"
 }
 
+file_has_key() {
+    local file="$1" key="$2"
+
+    awk -v wanted="$key" '
+        index($0, wanted "=") == 1 {
+            found = 1
+            exit
+        }
+        END { exit !found }
+    ' "$file"
+}
+
 sanitize_cache_value() {
     printf '%s' "$1" | tr '\n\r' '  '
 }
@@ -1633,7 +1646,7 @@ persist_pending_measurement_cache() {
 }
 
 load_measurement_cache() {
-    local mode="$2" now saved_at age version download upload source nodes
+    local mode="$1" now saved_at age version download upload source nodes
     local confidence warnings target ifindex iface gateway source_address cached_identity current_identity measured_at
 
     [[ -f "$MEASUREMENT_CACHE" ]] || return 1
@@ -2044,7 +2057,7 @@ resolve_tuning_values() {
         fi
         [[ "$FORCE_REFRESH" != "true" ]] || cache_fallback_mode="fallback"
         if [[ "$FORCE_REFRESH" != "true" ]] &&
-            load_measurement_cache "$CACHE_FRESH_MAX_AGE_SECONDS" fresh; then
+            load_measurement_cache fresh; then
             download_mbps="$DETECTED_DOWNLOAD_MBPS"
             upload_mbps="$DETECTED_UPLOAD_MBPS"
         else
@@ -2054,8 +2067,7 @@ resolve_tuning_values() {
             if [[ "$live_ready" == "true" ]] && probe_bandwidth; then
                 download_mbps="$DETECTED_DOWNLOAD_MBPS"
                 upload_mbps="$DETECTED_UPLOAD_MBPS"
-            elif load_measurement_cache "$CACHE_STALE_MAX_AGE_SECONDS" \
-                "$cache_fallback_mode"; then
+            elif load_measurement_cache "$cache_fallback_mode"; then
                 download_mbps="$DETECTED_DOWNLOAD_MBPS"
                 upload_mbps="$DETECTED_UPLOAD_MBPS"
             else
@@ -2637,7 +2649,7 @@ merge_initial_runtime_values() {
 
     while IFS='=' read -r key value; do
         [[ -n "$key" ]] || continue
-        if ! grep -Fq "${key}=" "$temp_file"; then
+        if ! file_has_key "$temp_file" "$key"; then
             printf '%s=%s\n' "$key" "$value" >> "$temp_file"
         fi
     done < "$current_snapshot"
@@ -2671,7 +2683,7 @@ capture_runtime_values_from_files() {
         while IFS='=' read -r key _; do
             key="${key//[[:space:]]/}"
             [[ -z "$key" || "$key" == \#* ]] && continue
-            grep -Fq "${key}=" "$output_file" && continue
+            file_has_key "$output_file" "$key" && continue
             if sysctl -n "$key" >/dev/null 2>&1; then
                 printf '%s=%s\n' "$key" "$(sysctl -n "$key")" >> "$output_file" ||
                     return 1

@@ -126,6 +126,22 @@ assert_eq '1024' "$(detect_effective_memory_mb 1024)" \
 unset -f detect_cgroup_memory_limit_mb
 eval "$(sed -n '/^detect_cgroup_memory_limit_mb() {/,/^}/p' "$ROOT_DIR/modules/network-optimize.sh")"
 
+(
+    for container_virt in lxc docker podman; do
+        systemd-detect-virt() {
+            [[ "${1:-}" == "--container" ]] ||
+                fail "container detection omitted --container"
+            printf '%s\n' "$container_virt"
+        }
+        assert_ok "detect $container_virt container" detect_container
+    done
+
+    systemd-detect-virt() { printf '%s\n' none; }
+    assert_fail "bare metal is not a container" detect_container
+    systemd-detect-virt() { return 127; }
+    assert_fail "missing systemd-detect-virt is not a container" detect_container
+)
+
 fixture="$TEMP_DIR/iperf.json"
 cat > "$fixture" <<'JSON'
 {
@@ -446,15 +462,15 @@ EOF
 
     seed_cache $((2000000000 - CACHE_FRESH_MAX_AGE_SECONDS))
     assert_ok "seven-day cache is fresh" \
-        load_measurement_cache "$CACHE_FRESH_MAX_AGE_SECONDS" fresh
+        load_measurement_cache fresh
     assert_eq 1000 "$DETECTED_DOWNLOAD_MBPS" "fresh cache restores download"
     sed -i 's/^version=2$/version=1/' "$MEASUREMENT_CACHE"
     assert_fail "legacy v1 cache is ignored" \
-        load_measurement_cache "$CACHE_FRESH_MAX_AGE_SECONDS" fresh
+        load_measurement_cache fresh
 
     seed_cache $((2000000000 - 60))
     assert_ok "fresh mode accepts a sixty-second cache" \
-        load_measurement_cache "$CACHE_FRESH_MAX_AGE_SECONDS" fresh
+        load_measurement_cache fresh
     grep -Fq '7-day route-bound cache' <<< "$MEASUREMENT_SOURCE" ||
         fail "fresh mode mislabeled a sixty-second cache"
     assert_eq '' "$MEASUREMENT_WARNINGS" \
@@ -470,7 +486,7 @@ EOF
 
     seed_cache $((2000000000 - 60))
     assert_ok "refresh fallback accepts a cache newer than seven days" \
-        load_measurement_cache "$CACHE_STALE_MAX_AGE_SECONDS" fallback
+        load_measurement_cache fallback
     grep -Fq 'fresh cache fallback' <<< "$MEASUREMENT_SOURCE" ||
         fail "refresh fallback mislabeled a sixty-second cache"
     grep -Fq '同路由缓存回退（公共 IPv4 iperf3 测速）' \
@@ -483,7 +499,7 @@ EOF
 
     seed_cache $((2000000000 - 8 * 24 * 60 * 60))
     assert_ok "refresh fallback accepts an eight-day cache" \
-        load_measurement_cache "$CACHE_STALE_MAX_AGE_SECONDS" fallback
+        load_measurement_cache fallback
     grep -Fq 'same-route stale cache' <<< "$MEASUREMENT_SOURCE" ||
         fail "refresh fallback mislabeled an eight-day cache"
     grep -Fq '同路由过期缓存（公共 IPv4 iperf3 测速）' \
@@ -496,7 +512,7 @@ EOF
 
     seed_cache $((2000000000 - 8 * 24 * 60 * 60))
     assert_ok "stale mode accepts an eight-day cache" \
-        load_measurement_cache "$CACHE_STALE_MAX_AGE_SECONDS" stale
+        load_measurement_cache stale
     grep -Fq 'same-route stale cache' <<< "$MEASUREMENT_SOURCE" ||
         fail "stale mode mislabeled an eight-day cache"
     assert_eq low "$MEASUREMENT_CONFIDENCE" \
@@ -506,27 +522,27 @@ EOF
 
     seed_cache $((2000000000 - CACHE_FRESH_MAX_AGE_SECONDS - 1))
     assert_fail "cache older than seven days is not fresh" \
-        load_measurement_cache "$CACHE_FRESH_MAX_AGE_SECONDS" fresh
+        load_measurement_cache fresh
     assert_ok "same-route cache just older than seven days is stale fallback" \
-        load_measurement_cache "$CACHE_STALE_MAX_AGE_SECONDS" stale
+        load_measurement_cache stale
     assert_eq low "$MEASUREMENT_CONFIDENCE" "stale fallback lowers confidence"
     assert_ok "refresh fallback accepts a cache older than seven days" \
-        load_measurement_cache "$CACHE_STALE_MAX_AGE_SECONDS" fallback
+        load_measurement_cache fallback
 
 
     seed_cache $((2000000000 - CACHE_STALE_MAX_AGE_SECONDS))
     assert_ok "thirty-day same-route cache is accepted" \
-        load_measurement_cache "$CACHE_STALE_MAX_AGE_SECONDS" stale
+        load_measurement_cache stale
     seed_cache $((2000000000 - CACHE_STALE_MAX_AGE_SECONDS - 1))
     assert_fail "cache older than thirty days is rejected" \
-        load_measurement_cache "$CACHE_STALE_MAX_AGE_SECONDS" stale
+        load_measurement_cache stale
     assert_fail "refresh fallback rejects cache older than thirty days" \
-        load_measurement_cache "$CACHE_STALE_MAX_AGE_SECONDS" fallback
+        load_measurement_cache fallback
 
     seed_cache $((2000000000 - 60))
     CURRENT_IDENTITY='2|eth0|198.51.100.1|192.0.2.2'
     assert_fail "route-mismatched cache is rejected" \
-        load_measurement_cache "$CACHE_FRESH_MAX_AGE_SECONDS" fresh
+        load_measurement_cache fresh
 
     CURRENT_IDENTITY='2|eth0|192.0.2.1|192.0.2.2'
     DETECTED_DOWNLOAD_MBPS=900

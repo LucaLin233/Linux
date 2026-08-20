@@ -586,14 +586,30 @@ unset -f traffic_used_bytes
             fail "runtime snapshot lost old wmem_default"
         grep -Fqx 'net.ipv4.tcp_mem=11111 22222 44444' "$runtime_snapshot" ||
             fail "runtime snapshot lost old tcp_mem"
+
+        key_collision_config="$TEMP_DIR/runtime-key-collision.conf"
+        key_collision_snapshot="$TEMP_DIR/runtime-key-collision.snapshot"
+        printf '%s\n' \
+            'prefix.net.core.rmem_default = 1' \
+            'net.core.rmem_default = 2' > "$key_collision_config"
+        capture_runtime_values_from_files "$key_collision_snapshot" \
+            "$key_collision_config"
+        grep -Fqx 'net.core.rmem_default=1048576' "$key_collision_snapshot" ||
+            fail "runtime snapshot treated an embedded key as an exact match"
+
         mkdir -p "$NETWORK_OPTIMIZE_STATE_DIR"
         rm -f "$RUNTIME_INITIAL_UNKNOWN"
-        printf '%s\n' 'net.core.rmem_max=8388608' > "$RUNTIME_INITIAL_BACKUP"
+        printf '%s\n' \
+            'prefix.net.core.rmem_default=8388608' \
+            'net.core.rmem_max=8388608' > "$RUNTIME_INITIAL_BACKUP"
+        if file_has_key "$RUNTIME_INITIAL_BACKUP" net.core.rmem_default; then
+            fail "key matcher accepted a key embedded in another line"
+        fi
         merge_initial_runtime_values "$runtime_snapshot"
         merge_initial_runtime_values "$runtime_snapshot"
-        assert_eq 1 "$(grep -Fc 'net.core.rmem_default=' \
+        assert_eq 1 "$(grep -Fxc 'net.core.rmem_default=1048576' \
             "$RUNTIME_INITIAL_BACKUP")" \
-            "initial runtime merge adds rmem_default once"
+            "initial runtime merge ignores keys embedded in other lines"
         assert_eq 1 "$(grep -Fc 'net.core.wmem_default=' \
             "$RUNTIME_INITIAL_BACKUP")" \
             "initial runtime merge adds wmem_default once"
@@ -792,7 +808,7 @@ printf 'PASS: generic health panel is absent\n'
     cache_modes=""
     probe_calls=0
     load_measurement_cache() {
-        cache_modes="${cache_modes:+$cache_modes }$2"
+        cache_modes="${cache_modes:+$cache_modes }$1"
         return 1
     }
     probe_bandwidth() {
@@ -828,8 +844,8 @@ printf 'PASS: generic health panel is absent\n'
     cache_modes=""
     probe_calls=0
     load_measurement_cache() {
-        cache_modes="${cache_modes:+$cache_modes }$2"
-        [[ "$2" == "fallback" ]] || return 1
+        cache_modes="${cache_modes:+$cache_modes }$1"
+        [[ "$1" == "fallback" ]] || return 1
         DETECTED_DOWNLOAD_MBPS=900
         DETECTED_UPLOAD_MBPS=450
         MEASUREMENT_SOURCE='same-route stale cache (public iperf3)'
