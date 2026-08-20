@@ -123,7 +123,7 @@ assert_eq auto "$TUNING_MODE" "interactive Enter selects default public speed te
 assert_eq true "$AUTO_MODE_REQUESTED" "default Enter records automatic mode"
 probe_guidance=$(show_active_probe_warning)
 expected_probe_guidance=$(printf '%s\n' \
-    '测速配置：IPv4 iperf3，最多 2 个节点，每方向 4 并发 × 5 秒' \
+    '测速配置：IPv4 iperf3，最多 2 个节点，每方向 4 并发，预热 2 秒 + 计量 5 秒' \
     '流量上限：上传 12.5 GB / 下载 12.5 GB / 合计 25 GB（按出口接口统计，包含同期后台流量）' \
     '依赖处理：缺少 iperf3 时通过 APT 自动安装')
 assert_eq "$expected_probe_guidance" "$probe_guidance" \
@@ -337,6 +337,8 @@ grep -Fq 'network-optimize.sh plan [选项]       手动带宽只计算；自动
     <<< "$help_output" || fail "plan help omits manual and automatic side effects"
 grep -Fq '手动带宽 plan 只计算并显示；自动 plan 需要 root，可能更新测速缓存' \
     <<< "$help_output" || fail "plan help omits the automatic cache write warning"
+grep -Fq '自动测速仅使用 IPv4 公共 iperf3；最多 2 个节点，每方向 P=4、预热 2 秒 + 计量 5 秒' \
+    <<< "$help_output" || fail "help omits iperf3 warm-up and sample durations"
 printf 'PASS: plan help distinguishes manual calculation from root automatic cache use\n'
 
 if grep -Fq 'network-optimize' "$ROOT_DIR/linux_setup.sh"; then
@@ -361,9 +363,12 @@ assert_eq 低 "$(format_display_value low)" "format low confidence"
 assert_eq 手动输入 "$(format_display_value manual)" "format manual confidence"
 assert_eq 未知 "$(format_display_value unknown)" "format unknown value"
 assert_eq 无 "$(format_display_value none)" "format none value"
+assert_eq '公共 IPv4 iperf3 测速（4 并发，预热 2 秒 + 计量 5 秒）' \
+    "$(format_measurement_source 'public iperf3 IPv4 (P=4, O=2s, t=5s)')" \
+    "format live measurement source with warm-up"
 assert_eq '公共 IPv4 iperf3 测速（4 并发 × 5 秒）' \
     "$(format_measurement_source 'public iperf3 IPv4 (P=4, t=5s)')" \
-    "format live measurement source"
+    "format legacy live measurement source"
 assert_eq 自动策略 "$(format_rtt_source 'automatic policy')" \
     "format automatic RTT source"
 assert_eq 命令行指定 "$(format_rtt_source 'command line')" \

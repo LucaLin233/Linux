@@ -46,11 +46,13 @@ readonly LOCK_FILE="${NETWORK_OPTIMIZE_LOCK_FILE:-/run/lock/network-optimize.loc
 readonly NETWORK_DETAIL_LOG="${NETWORK_OPTIMIZE_LOG:-/var/log/linux-setup.log}"
 readonly MEASUREMENT_CACHE="${NETWORK_OPTIMIZE_CACHE_FILE:-${NETWORK_OPTIMIZE_STATE_DIR}/network-optimize.bandwidth-cache}"
 
-# 公共 iperf3 测速固定使用 IPv4、4 并发和 5 秒时长，最多采纳两个节点。
+# 公共 iperf3 测速固定使用 IPv4、4 并发、2 秒预热和 5 秒有效采样，最多采纳两个节点。
 readonly IPERF_DURATION=5
+readonly IPERF_OMIT_SECONDS=2
 readonly IPERF_PARALLEL=4
 readonly IPERF_MAX_PEERS=2
 readonly -a IPERF_PORTS=(5201 5202 5203 5204 5205 5206 5207 5208 5209 5210 5200)
+readonly TRAFFIC_POLL_INTERVAL_SECONDS=0.2
 readonly TRAFFIC_TOTAL_LIMIT_BYTES=25000000000
 readonly TRAFFIC_DIRECTION_LIMIT_BYTES=12500000000
 readonly CACHE_FRESH_MAX_AGE_SECONDS=$((7 * 24 * 60 * 60))
@@ -571,7 +573,7 @@ is_interactive_terminal() {
 
 show_active_probe_warning() {
     printf '%s\n' \
-        "测速配置：IPv4 iperf3，最多 2 个节点，每方向 4 并发 × 5 秒" \
+        "测速配置：IPv4 iperf3，最多 2 个节点，每方向 4 并发，预热 2 秒 + 计量 5 秒" \
         "流量上限：上传 12.5 GB / 下载 12.5 GB / 合计 25 GB（按出口接口统计，包含同期后台流量）" \
         "依赖处理：缺少 iperf3 时通过 APT 自动安装"
 }
@@ -1216,8 +1218,12 @@ detect_ipv4_iface_for_target() {
 }
 
 read_iface_counter() {
-    local iface="$1" direction="$2"
-    cat "/sys/class/net/$iface/statistics/${direction}_bytes" 2>/dev/null
+    local iface="$1" direction="$2" value
+
+    IFS= read -r value 2>/dev/null \
+        < "/sys/class/net/$iface/statistics/${direction}_bytes" ||
+        return 1
+    printf '%s\n' "$value"
 }
 
 traffic_reset() {
@@ -1360,7 +1366,7 @@ cleanup_probe_processes() {
 
 run_iperf_runner() {
     local output_file="$1" host="$2" port="$3" duration="$4" streams="$5" direction="$6" reverse_mode="${7:-false}"
-    local deadline=$((duration + IPERF_DEADLINE_GRACE_SECONDS)) pid rc=0 limited="false"
+    local deadline=$((duration + IPERF_OMIT_SECONDS + IPERF_DEADLINE_GRACE_SECONDS)) pid rc=0 limited="false"
     local -a reverse=()
 
     [[ "$reverse_mode" == "true" ]] && reverse=(-R)
@@ -1368,8 +1374,9 @@ run_iperf_runner() {
     traffic_budget_reached "$direction" && return 75
 
     timeout --foreground --signal=TERM --kill-after="${IPERF_KILL_AFTER_SECONDS}s" \
-        "${deadline}s" iperf3 -4 -c "$host" -p "$port" -t "$duration" \
-        -P "$streams" "${reverse[@]}" -J > "$output_file" 2>&1 &
+        "${deadline}s" iperf3 -4 -c "$host" -p "$port" \
+        -O "$IPERF_OMIT_SECONDS" -t "$duration" -P "$streams" \
+        "${reverse[@]}" -J > "$output_file" 2>&1 &
     pid=$!
     register_tracked_pid IPERF_RUNNER_PIDS "$pid"
 
@@ -1379,7 +1386,7 @@ run_iperf_runner() {
             terminate_recorded_pid "$pid"
             break
         fi
-        sleep 0.05
+        sleep "$TRAFFIC_POLL_INTERVAL_SECONDS"
     done
     if [[ "$limited" != "true" ]]; then
         wait "$pid" || rc=$?
@@ -1851,7 +1858,7 @@ probe_iperf_bandwidth() {
     MEASUREMENT_NODES=$(IFS=';'; printf '%s' "${nodes[*]}")
     MEASUREMENT_EPOCH=$(current_epoch)
     MEASUREMENT_TIME=$(format_measurement_epoch "$MEASUREMENT_EPOCH")
-    MEASUREMENT_SOURCE="public iperf3 IPv4 (P=$IPERF_PARALLEL, t=${IPERF_DURATION}s)"
+    MEASUREMENT_SOURCE="public iperf3 IPv4 (P=$IPERF_PARALLEL, O=${IPERF_OMIT_SECONDS}s, t=${IPERF_DURATION}s)"
     BANDWIDTH_SOURCE="$MEASUREMENT_SOURCE"
 
     if (( successful_peers < IPERF_MAX_PEERS )); then
@@ -2174,6 +2181,9 @@ format_measurement_source() {
     elif [[ "$value" =~ ^same-route[[:space:]]stale[[:space:]]cache[[:space:]]\((.*)\)$ ]]; then
         inner=${BASH_REMATCH[1]}
         printf '同路由过期缓存（%s）\n' "$(format_measurement_source "$inner")"
+    elif [[ "$value" =~ ^public[[:space:]]iperf3[[:space:]]IPv4[[:space:]]\(P=([0-9]+),[[:space:]]O=([0-9]+)s,[[:space:]]t=([0-9]+)s\)$ ]]; then
+        printf '公共 IPv4 iperf3 测速（%s 并发，预热 %s 秒 + 计量 %s 秒）\n' \
+            "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}"
     elif [[ "$value" =~ ^public[[:space:]]iperf3[[:space:]]IPv4[[:space:]]\(P=([0-9]+),[[:space:]]t=([0-9]+)s\)$ ]]; then
         printf '公共 IPv4 iperf3 测速（%s 并发 × %s 秒）\n' \
             "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
@@ -3266,7 +3276,7 @@ install/plan 选项：
   - 非交互必须使用 --auto，或提供对称带宽/完整上下行带宽
   - 手动带宽 plan 只计算并显示；自动 plan 需要 root，可能更新测速缓存
   - install --auto 可通过系统配置的 APT 软件源非交互安装缺失测速依赖
-  - 自动测速仅使用 IPv4 公共 iperf3；最多 2 个节点，每方向 P=4、t=5 秒
+  - 自动测速仅使用 IPv4 公共 iperf3；最多 2 个节点，每方向 P=4、预热 2 秒 + 计量 5 秒
   - 每方向取有效较高结果；节点差异超过 30% 仅降低可信度并警告
   - 上传、下载各 12.5 GB，合计 25 GB；接口计数包含测试期间后台流量
   - 7 天内缓存可直接复用；--auto --refresh 绕过该缓存并强制现场测速

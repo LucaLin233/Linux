@@ -143,11 +143,43 @@ traffic_reset
 assert_fail "empty interface accounting does not preempt the first peer" \
     traffic_budget_reached upload
 assert_eq 4 "$IPERF_PARALLEL" "public measurement uses four parallel streams"
-assert_eq 5 "$IPERF_DURATION" "public measurement uses five-second tests"
+assert_eq 2 "$IPERF_OMIT_SECONDS" "public measurement warms up for two seconds"
+assert_eq 5 "$IPERF_DURATION" "public measurement uses five-second samples"
+assert_eq 0.2 "$TRAFFIC_POLL_INTERVAL_SECONDS" \
+    "traffic budget polling uses the configured interval"
 assert_eq 2 "$IPERF_MAX_PEERS" "public measurement selects at most two peers"
-grep -Fq 'iperf3 -4 -c "$host"' <<< "$(declare -f run_iperf_runner)" ||
+iperf_runner_body=$(declare -f run_iperf_runner)
+grep -Fq 'iperf3 -4 -c "$host"' <<< "$iperf_runner_body" ||
     fail "iperf3 runner is not forced to IPv4"
-printf 'PASS: public iperf3 runner is IPv4 only\n'
+grep -Fq 'sleep "$TRAFFIC_POLL_INTERVAL_SECONDS"' <<< "$iperf_runner_body" ||
+    fail "iperf3 runner does not use the traffic polling interval"
+printf 'PASS: public iperf3 runner is IPv4 only and budget-polled\n'
+
+counter_reader_body=$(sed -n '/^read_iface_counter() {/,/^}/p' \
+    "$ROOT_DIR/modules/network-optimize.sh")
+grep -Fq 'IFS= read -r value 2>/dev/null \' <<< "$counter_reader_body" ||
+    fail "interface counter does not silence Bash read errors"
+grep -Fq '< "/sys/class/net/$iface/statistics/${direction}_bytes"' \
+    <<< "$counter_reader_body" || fail "interface counter does not use Bash read"
+if grep -Eq '(^|[[:space:]])cat([[:space:]]|$)' <<< "$counter_reader_body"; then
+    fail "interface counter still forks cat"
+fi
+printf 'PASS: interface counter uses Bash built-in read\n'
+
+(
+    eval "$(sed -n '/^read_iface_counter() {/,/^}/p' \
+        "$ROOT_DIR/modules/network-optimize.sh")"
+    missing_iface="network-optimize-missing-iface-$$"
+    missing_counter_stderr="$TEMP_DIR/missing-interface-counter.stderr"
+
+    if read_iface_counter "$missing_iface" rx \
+        2>"$missing_counter_stderr"; then
+        fail "missing interface counter unexpectedly succeeded"
+    fi
+    [[ ! -s "$missing_counter_stderr" ]] ||
+        fail "missing interface counter emitted raw shell diagnostics"
+    printf 'PASS: missing interface counter fails silently\n'
+)
 
 PROBE_IFACE=eth0
 TRAFFIC_IFACES=(eth0 eth1)
@@ -240,6 +272,8 @@ setup_probe_mocks() {
     assert_eq 600 "$DETECTED_UPLOAD_MBPS" "dual-peer upload keeps higher valid result"
     assert_eq 800 "$DETECTED_DOWNLOAD_MBPS" "dual-peer download keeps higher valid result"
     assert_eq high "$MEASUREMENT_CONFIDENCE" "consistent dual-peer result is high confidence"
+    assert_eq 'public iperf3 IPv4 (P=4, O=2s, t=5s)' "$MEASUREMENT_SOURCE" \
+        "live measurement records warm-up and sample durations"
     assert_eq 4 "$(wc -l < "$calls" | tr -d ' ')" "only two peers are tested in both directions"
 )
 (
@@ -625,7 +659,7 @@ printf 'PASS: network-optimize has no exit code 2 path\n'
     run_iperf_runner "$output_file" 192.0.2.10 5201 \
         "$IPERF_DURATION" "$IPERF_PARALLEL" upload false || rc=$?
     assert_eq 124 "$rc" "iperf deadline status is preserved"
-    assert_eq '--foreground --signal=TERM --kill-after=3s 20s iperf3 -4 -c 192.0.2.10 -p 5201 -t 5 -P 4 -J' \
+    assert_eq '--foreground --signal=TERM --kill-after=3s 22s iperf3 -4 -c 192.0.2.10 -p 5201 -O 2 -t 5 -P 4 -J' \
         "$(<"$timeout_args")" "iperf runner enforces deadline and kill grace"
 )
 
