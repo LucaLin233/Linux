@@ -243,6 +243,102 @@ printf 'PASS: network-optimize leaves ERR handling to explicit failures\n'
     fi
 )
 
+(
+    reset_selection
+    root_checks=0
+    lock_calls=0
+    resolve_calls=0
+    auto_plan_log="$TEMP_DIR/non-root-auto-plan.log"
+    auto_plan_rc=0
+    require_commands() { return 0; }
+    require_root() {
+        ((root_checks += 1))
+        error "需要 root 权限运行"
+        return 1
+    }
+    take_lock() { ((lock_calls += 1)); }
+    resolve_tuning_values() { ((resolve_calls += 1)); }
+
+    main plan --auto > "$auto_plan_log" 2>&1 || auto_plan_rc=$?
+    assert_eq 1 "$auto_plan_rc" "non-root automatic plan fails"
+    assert_eq 1 "$root_checks" "automatic plan checks root once"
+    assert_eq 0 "$lock_calls" "non-root automatic plan fails before locking"
+    assert_eq 0 "$resolve_calls" "non-root automatic plan fails before measurement"
+    assert_eq 1 "$(grep -Fc '需要 root 权限运行' "$auto_plan_log")" \
+        "non-root automatic plan reports the root requirement"
+)
+
+(
+    reset_selection
+    lock_calls=0
+    require_commands() { return 0; }
+    require_root() { fail "manual plan unexpectedly required root"; }
+    take_lock() { ((lock_calls += 1)); }
+    detect_memory_mb() { printf '%s\n' 8192; }
+    detect_cgroup_memory_limit_mb() { return 1; }
+    current_epoch() { printf '%s\n' 2000000000; }
+    format_measurement_epoch() { printf '%s\n' '2033-05-18T03:33:20Z'; }
+
+    main plan --download-mbps 1000 --upload-mbps 500 >/dev/null
+    assert_eq 1 "$lock_calls" "manual plan remains available without root"
+)
+
+(
+    reset_selection
+    shared_lock_log="$TEMP_DIR/shared-root-lock.log"
+    : > "$shared_lock_log"
+    root_checks=0
+    require_commands() { return 0; }
+    require_root() { ((root_checks += 1)); }
+    take_lock() { printf '%s\n' "$LOCK_FILE" >> "$shared_lock_log"; }
+    resolve_tuning_values() { return 0; }
+    validate_measurement_route() { return 0; }
+    persist_pending_measurement_cache() { return 0; }
+    show_measurement_warnings() { return 0; }
+    show_tuning_plan() { return 0; }
+    install_optimization() { return 0; }
+
+    main plan --auto
+    reset_selection
+    main install --auto
+    assert_eq 2 "$root_checks" "automatic plan and install both require root"
+    assert_eq 2 "$(wc -l < "$shared_lock_log" | tr -d ' ')" \
+        "automatic plan and install both take a lock"
+    assert_eq 1 "$(sort -u "$shared_lock_log" | wc -l | tr -d ' ')" \
+        "automatic plan and install use the same root lock"
+    assert_eq "$LOCK_FILE" "$(head -n 1 "$shared_lock_log")" \
+        "automatic plan uses the configured root lock"
+)
+
+(
+    downstream_calls=0
+    require_commands() { return 0; }
+    require_root() { return 0; }
+    take_lock() { return 1; }
+    install_optimization() { ((downstream_calls += 1)); }
+    resolve_tuning_values() { ((downstream_calls += 1)); }
+    restore_optimization() { ((downstream_calls += 1)); }
+
+    for invocation in \
+        'install --download-mbps 1000 --upload-mbps 500' \
+        'plan --download-mbps 1000 --upload-mbps 500' \
+        'restore'; do
+        reset_selection
+        read -r -a invocation_args <<< "$invocation"
+        if main "${invocation_args[@]}" >/dev/null 2>&1; then
+            fail "$invocation continued after lock failure"
+        fi
+    done
+    assert_eq 0 "$downstream_calls" "lock failure stops every mutating or cache-capable path"
+)
+
+help_output=$(show_help)
+grep -Fq 'network-optimize.sh plan [选项]       手动带宽只计算；自动测速需 root，可能更新缓存' \
+    <<< "$help_output" || fail "plan help omits manual and automatic side effects"
+grep -Fq '手动带宽 plan 只计算并显示；自动 plan 需要 root，可能更新测速缓存' \
+    <<< "$help_output" || fail "plan help omits the automatic cache write warning"
+printf 'PASS: plan help distinguishes manual calculation from root automatic cache use\n'
+
 if grep -Fq 'network-optimize' "$ROOT_DIR/linux_setup.sh"; then
     fail "linux_setup contains a network-optimize special case"
 fi

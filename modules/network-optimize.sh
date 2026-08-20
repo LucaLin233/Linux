@@ -3237,14 +3237,14 @@ show_help() {
     cat <<'EOF'
 用法：
   network-optimize.sh [install] [选项]  计算并应用网络优化
-  network-optimize.sh plan [选项]       只计算并显示计划，不修改系统
+  network-optimize.sh plan [选项]       手动带宽只计算；自动测速需 root，可能更新缓存
   network-optimize.sh restore           恢复上一次运行前的配置
   network-optimize.sh restore initial   恢复首次运行前的可信配置
   network-optimize.sh status            查看优化与测量状态
   network-optimize.sh help              显示帮助
 
 install/plan 选项：
-  --auto                  非交互使用公共 IPv4 iperf3 自动测速
+  --auto                  非交互使用公共 IPv4 iperf3 自动测速；plan 同样需要 root
   --bandwidth-mbps N      指定对称带宽，单位 Mbps
   --download-mbps N       指定下载带宽，单位 Mbps
   --upload-mbps N         指定上传带宽，单位 Mbps
@@ -3264,6 +3264,7 @@ install/plan 选项：
 
   - 无参数交互询问公共 iperf3 测速，默认 Y；选择 N 后手填完整上下行带宽
   - 非交互必须使用 --auto，或提供对称带宽/完整上下行带宽
+  - 手动带宽 plan 只计算并显示；自动 plan 需要 root，可能更新测速缓存
   - install --auto 可通过系统配置的 APT 软件源非交互安装缺失测速依赖
   - 自动测速仅使用 IPv4 公共 iperf3；最多 2 个节点，每方向 P=4、t=5 秒
   - 每方向取有效较高结果；节点差异超过 30% 仅降低可信度并警告
@@ -3302,14 +3303,17 @@ main() {
 
     case "$COMMAND" in
         install)
-            require_root
+            require_root || return 1
             require_commands sysctl mv cp find modprobe ip flock getent install dirname getconf || exit 1
-            take_lock
+            take_lock || return 1
             install_optimization
             ;;
         plan)
+            if [[ "$TUNING_MODE" == "auto" ]]; then
+                require_root || return 1
+            fi
             require_commands flock getent getconf || exit 1
-            take_lock
+            take_lock || return 1
             resolve_tuning_values || return 1
             if ! validate_measurement_route; then
                 error "测速绑定的默认 IPv4 出口已变化，拒绝保存测量缓存"
@@ -3320,9 +3324,9 @@ main() {
             show_tuning_plan
             ;;
         restore)
-            require_root
+            require_root || return 1
             require_commands flock sysctl || exit 1
-            take_lock
+            take_lock || return 1
             restore_optimization "$RESTORE_SCOPE"
             ;;
         status)
