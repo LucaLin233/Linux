@@ -565,6 +565,62 @@ EOF
 )
 
 (
+    MEASUREMENT_TIME='2033-05-18T03:33:20Z'
+    DETECTED_DOWNLOAD_MBPS=1000
+    DETECTED_UPLOAD_MBPS=500
+    MEASUREMENT_NODES='东京/Leaseweb speedtest.example [192.0.2.10]:5201 (IPv4 RTT 42 ms);新加坡/OVH speedtest.example [192.0.2.20]:5201 (IPv4 RTT 58 ms)'
+    MEASUREMENT_CONFIDENCE=high
+    action=""
+    prompt_output="$TEMP_DIR/fresh-cache-prompt.out"
+
+    prompt_fresh_cache_action action > "$prompt_output" <<< ""
+    assert_eq reuse "$action" "fresh-cache Enter selects reuse"
+    for expected_line in \
+        '检测到 7 天内同路由测速缓存：' \
+        '  时间：2033-05-18T03:33:20Z' \
+        '  带宽：下载 1000 Mbps / 上传 500 Mbps' \
+        '    1. 东京 / Leaseweb / speedtest.example [192.0.2.10]:5201 / RTT 42 ms' \
+        '    2. 新加坡 / OVH / speedtest.example [192.0.2.20]:5201 / RTT 58 ms' \
+        '  可信度：高'; do
+        grep -Fqx "$expected_line" "$prompt_output" ||
+            fail "fresh-cache prompt omits metadata: $expected_line"
+    done
+    printf 'PASS: fresh-cache prompt displays complete cached metadata\n'
+
+    action=""
+    prompt_fresh_cache_action action >/dev/null <<< "yes"
+    assert_eq reuse "$action" "fresh-cache yes selects reuse"
+    action=""
+    prompt_fresh_cache_action action >/dev/null <<< "no"
+    assert_eq refresh "$action" "fresh-cache no selects refresh"
+
+    action=""
+    invalid_output="$TEMP_DIR/fresh-cache-invalid.out"
+    prompt_fresh_cache_action action > "$invalid_output" <<'EOF'
+invalid
+no
+EOF
+    assert_eq refresh "$action" "invalid cache input loops until no"
+    assert_eq 1 "$(grep -Fc '请输入 Y 或 N' "$invalid_output")" \
+        "invalid cache input reports one error before retry"
+
+    prompt_body=$(declare -f prompt_fresh_cache_action)
+    grep -Fq 'read -r -p "是否复用该缓存？[Y/n]: " answer' \
+        <<< "$prompt_body" || fail "fresh-cache prompt wording changed"
+    printf 'PASS: fresh-cache prompt uses required wording\n'
+
+    action=stale
+    eof_output="$TEMP_DIR/fresh-cache-eof.out"
+    if prompt_fresh_cache_action action </dev/null > "$eof_output" 2>&1; then
+        fail "fresh-cache EOF unexpectedly succeeded"
+    fi
+    assert_eq '' "$action" "fresh-cache EOF clears the result action"
+    grep -Fq '无法读取测速缓存选择' "$eof_output" ||
+        fail "fresh-cache EOF omitted its explicit error"
+    printf 'PASS: fresh-cache EOF returns nonzero with explicit error\n'
+)
+
+(
     : > "$NETWORK_DETAIL_LOG"
     MEASUREMENT_WARNINGS=""
     MEASUREMENT_CONFIDENCE=high

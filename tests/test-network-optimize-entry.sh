@@ -81,6 +81,7 @@ reset_selection() {
     RESTORE_SCOPE=previous
     TUNING_MODE=""
     TUNING_SELECTION_EXPLICIT=false
+    INTERACTIVE_TUNING_SELECTION=false
     AUTO_MODE_REQUESTED=false
     FORCE_REFRESH=false
     INITCWND_MODE=auto
@@ -121,6 +122,8 @@ reset_selection
 select_tuning_mode >/dev/null <<< ""
 assert_eq auto "$TUNING_MODE" "interactive Enter selects default public speed test"
 assert_eq true "$AUTO_MODE_REQUESTED" "default Enter records automatic mode"
+assert_eq true "$INTERACTIVE_TUNING_SELECTION" \
+    "interactive automatic selection records cache prompt eligibility"
 probe_guidance=$(show_active_probe_warning)
 expected_probe_guidance=$(printf '%s\n' \
     '测速配置：IPv4 iperf3，最多 2 个节点，每方向 4 并发，预热 2 秒 + 计量 5 秒' \
@@ -129,9 +132,9 @@ expected_probe_guidance=$(printf '%s\n' \
 assert_eq "$expected_probe_guidance" "$probe_guidance" \
     "interactive speed-test guidance uses three plain lines"
 select_tuning_body=$(declare -f select_tuning_mode)
-grep -Fq 'read -r -p "是否执行公共测速？[Y/n]: " answer' \
-    <<< "$select_tuning_body" || fail "interactive speed-test prompt is not concise"
-printf 'PASS: interactive speed-test prompt uses concise wording\n'
+grep -Fq 'read -r -p "是否使用自动带宽检测（可能复用同路由缓存）？[Y/n]: " answer' \
+    <<< "$select_tuning_body" || fail "interactive automatic-mode prompt omits cache reuse notice"
+printf 'PASS: interactive automatic-mode prompt mentions cache reuse\n'
 
 reset_selection
 select_tuning_mode >/dev/null <<'EOF'
@@ -143,6 +146,8 @@ assert_eq manual "$TUNING_MODE" "interactive N selects manual bandwidth"
 assert_eq 1000 "$MANUAL_DOWNLOAD_MBPS" "manual mode records download bandwidth"
 assert_eq 500 "$MANUAL_UPLOAD_MBPS" "manual mode records upload bandwidth"
 assert_eq 150 "$MANUAL_RTT_MS" "manual mode defaults RTT to 150 ms"
+assert_eq true "$INTERACTIVE_TUNING_SELECTION" \
+    "interactive manual selection records completed selection"
 
 is_interactive_terminal() { return 1; }
 reset_selection
@@ -152,6 +157,8 @@ select_tuning_mode
 unset -f read
 assert_eq auto "$TUNING_MODE" "--auto selects non-interactive automatic mode"
 assert_eq true "$TUNING_SELECTION_EXPLICIT" "--auto bypasses the prompt"
+assert_eq false "$INTERACTIVE_TUNING_SELECTION" \
+    "explicit --auto does not enable interactive cache choice"
 
 reset_selection
 parse_arguments plan --auto --rtt-ms 240
@@ -467,6 +474,9 @@ unset -f traffic_used_bytes
     detect_cgroup_memory_limit_mb() { printf '%s\n' 512; }
     current_epoch() { printf '%s\n' 2000000000; }
     format_measurement_epoch() { printf '%s\n' '2033-05-18T03:33:20Z'; }
+    load_measurement_cache() { fail "manual mode unexpectedly checked cache"; }
+    prompt_fresh_cache_action() { fail "manual mode unexpectedly prompted for cache"; }
+    probe_bandwidth() { fail "manual mode unexpectedly measured bandwidth"; }
     TUNING_MODE=manual
     MANUAL_DOWNLOAD_MBPS=1000
     MANUAL_UPLOAD_MBPS=500
@@ -776,9 +786,11 @@ printf 'PASS: generic health panel is absent\n'
     COMMAND=plan
     TUNING_MODE=auto
     AUTO_MODE_REQUESTED=true
+    INTERACTIVE_TUNING_SELECTION=true
     detect_memory_mb() { printf '%s\n' 8192; }
     detect_cgroup_memory_limit_mb() { return 1; }
     load_measurement_cache() { return 1; }
+    prompt_fresh_cache_action() { fail "missing fresh cache unexpectedly prompted"; }
     probe_bandwidth() {
         DETECTED_DOWNLOAD_MBPS=1000
         DETECTED_UPLOAD_MBPS=500
@@ -824,6 +836,146 @@ printf 'PASS: generic health panel is absent\n'
 )
 
 (
+    detect_memory_mb() { printf '%s\n' 8192; }
+    detect_cgroup_memory_limit_mb() { return 1; }
+    current_epoch() { printf '%s\n' 2000000000; }
+    route_identity_for_target() {
+        printf '%s\n' '2|eth0|192.0.2.1|192.0.2.2'
+    }
+    seed_fresh_cache() {
+        mkdir -p "$(dirname "$MEASUREMENT_CACHE")"
+        cat > "$MEASUREMENT_CACHE" <<'EOF'
+version=2
+saved_at=1999999940
+measured_at=2033-05-18T03:32:20Z
+download_mbps=900
+upload_mbps=450
+source=public iperf3 IPv4 (P=4, O=2s, t=5s)
+nodes=东京/Leaseweb cached.example [192.0.2.10]:5201 (IPv4 RTT 42 ms)
+confidence=high
+warnings=none
+route_target=1.1.1.1
+ifindex=2
+iface=eth0
+gateway=192.0.2.1
+source_address=192.0.2.2
+EOF
+    }
+    prepare_interactive_cache_case() {
+        reset_selection
+        COMMAND=plan
+        TUNING_MODE=auto
+        AUTO_MODE_REQUESTED=true
+        INTERACTIVE_TUNING_SELECTION=true
+        probe_calls=0
+        seed_fresh_cache
+        cache_before=$(sha256sum "$MEASUREMENT_CACHE" | awk '{print $1}')
+    }
+    probe_bandwidth() {
+        ((probe_calls += 1))
+        case "$probe_behavior" in
+            success)
+                DETECTED_DOWNLOAD_MBPS=1200
+                DETECTED_UPLOAD_MBPS=600
+                MEASUREMENT_SOURCE='mock refreshed public iperf3'
+                MEASUREMENT_EPOCH=2000000000
+                MEASUREMENT_TIME='2033-05-18T03:33:20Z'
+                MEASUREMENT_NODES='新加坡/OVH live.example [192.0.2.20]:5201 (IPv4 RTT 58 ms)'
+                MEASUREMENT_CONFIDENCE=high
+                MEASUREMENT_WARNINGS=''
+                MEASUREMENT_ROUTE_TARGET=1.1.1.1
+                MEASUREMENT_ROUTE_IDENTITY='2|eth0|192.0.2.1|192.0.2.2'
+                MEASUREMENT_CACHE_PENDING=true
+                return 0
+                ;;
+            failure)
+                DETECTED_DOWNLOAD_MBPS=1
+                DETECTED_UPLOAD_MBPS=1
+                MEASUREMENT_SOURCE='discarded partial measurement'
+                MEASUREMENT_CONFIDENCE=unknown
+                MEASUREMENT_CACHE_PENDING=false
+                return 1
+                ;;
+            *) fail "fresh-cache reuse unexpectedly called live measurement" ;;
+        esac
+    }
+    is_interactive_terminal() { return 1; }
+
+    prepare_interactive_cache_case
+    probe_behavior=unexpected
+    reuse_output="$TEMP_DIR/interactive-cache-reuse.out"
+    resolve_tuning_values > "$reuse_output" <<< ""
+    assert_eq 0 "$probe_calls" "fresh-cache Enter skips live measurement"
+    assert_eq 900 "$DETECTED_DOWNLOAD_MBPS" "fresh-cache Enter keeps cached download"
+    assert_eq 450 "$DETECTED_UPLOAD_MBPS" "fresh-cache Enter keeps cached upload"
+    grep -Fq '检测到 7 天内同路由测速缓存：' "$reuse_output" ||
+        fail "interactive fresh-cache reuse omitted cache details"
+
+    prepare_interactive_cache_case
+    probe_behavior=success
+    resolve_tuning_values >/dev/null <<< "n"
+    assert_eq 1 "$probe_calls" "fresh-cache n performs live measurement"
+    assert_eq 1200 "$DETECTED_DOWNLOAD_MBPS" "successful interactive refresh uses new download"
+    assert_eq 600 "$DETECTED_UPLOAD_MBPS" "successful interactive refresh uses new upload"
+    assert_eq true "$MEASUREMENT_CACHE_PENDING" \
+        "successful interactive refresh marks the new cache pending"
+    assert_eq false "$FORCE_REFRESH" \
+        "interactive refresh does not mutate the command-line refresh flag"
+    assert_eq "$cache_before" "$(sha256sum "$MEASUREMENT_CACHE" | awk '{print $1}')" \
+        "successful interactive refresh preserves old cache until commit"
+
+    prepare_interactive_cache_case
+    probe_behavior=failure
+    resolve_tuning_values >/dev/null <<< "n"
+    assert_eq 1 "$probe_calls" "failed interactive refresh attempts live measurement once"
+    assert_eq 900 "$DETECTED_DOWNLOAD_MBPS" \
+        "failed interactive refresh restores old fresh-cache download"
+    assert_eq 450 "$DETECTED_UPLOAD_MBPS" \
+        "failed interactive refresh restores old fresh-cache upload"
+    assert_eq low "$MEASUREMENT_CONFIDENCE" \
+        "failed interactive refresh lowers restored cache confidence"
+    assert_eq false "$MEASUREMENT_CACHE_PENDING" \
+        "failed interactive refresh leaves no cache write pending"
+    grep -Fq 'same-route fresh cache fallback' <<< "$MEASUREMENT_SOURCE" ||
+        fail "failed interactive refresh omitted fresh-cache fallback source"
+    grep -Fq 'live public iperf3 measurement failed' <<< "$MEASUREMENT_WARNINGS" ||
+        fail "failed interactive refresh omitted fallback warning"
+    assert_eq "$cache_before" "$(sha256sum "$MEASUREMENT_CACHE" | awk '{print $1}')" \
+        "failed interactive refresh preserves the old cache file"
+    warning_output=$(show_measurement_warnings)
+    grep -Fq '警告：现场公共 iperf3 测速失败，复用 30 天内同路由缓存' \
+        <<< "$warning_output" || fail "failed interactive refresh did not display fallback warning"
+)
+
+(
+    reset_selection
+    COMMAND=plan
+    parse_arguments plan --auto
+    detect_memory_mb() { printf '%s\n' 8192; }
+    detect_cgroup_memory_limit_mb() { return 1; }
+    load_measurement_cache() {
+        [[ "$1" == "fresh" ]] || fail "explicit --auto requested unexpected cache mode: $1"
+        DETECTED_DOWNLOAD_MBPS=900
+        DETECTED_UPLOAD_MBPS=450
+        MEASUREMENT_SOURCE='7-day route-bound cache (public iperf3)'
+        MEASUREMENT_EPOCH=1999999940
+        MEASUREMENT_TIME='2033-05-18T03:32:20Z'
+        MEASUREMENT_NODES='cached.example'
+        MEASUREMENT_CONFIDENCE=high
+        MEASUREMENT_WARNINGS=''
+        MEASUREMENT_CACHE_PENDING=false
+        return 0
+    }
+    prompt_fresh_cache_action() { fail "explicit --auto unexpectedly prompted for cache"; }
+    probe_bandwidth() { fail "explicit --auto unexpectedly measured with fresh cache"; }
+    resolve_tuning_values </dev/null >/dev/null
+    assert_eq 900 "$DETECTED_DOWNLOAD_MBPS" \
+        "explicit --auto reuses fresh cache without prompting"
+    assert_eq false "$INTERACTIVE_TUNING_SELECTION" \
+        "explicit --auto keeps interactive cache choice disabled"
+)
+
+(
     reset_selection
     COMMAND=plan
     TUNING_MODE=auto
@@ -836,6 +988,9 @@ printf 'PASS: generic health panel is absent\n'
     load_measurement_cache() {
         cache_modes="${cache_modes:+$cache_modes }$1"
         return 1
+    }
+    prompt_fresh_cache_action() {
+        fail "explicit --auto --refresh unexpectedly prompted for cache"
     }
     probe_bandwidth() {
         ((probe_calls += 1))

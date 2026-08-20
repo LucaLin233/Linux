@@ -92,6 +92,7 @@ COMMAND="install"
 RESTORE_SCOPE="previous"
 TUNING_MODE=""
 TUNING_SELECTION_EXPLICIT="false"
+INTERACTIVE_TUNING_SELECTION="false"
 AUTO_MODE_REQUESTED="false"
 FORCE_REFRESH="false"
 INITCWND_MODE="auto"
@@ -617,7 +618,7 @@ select_tuning_mode() {
     fi
 
     show_active_probe_warning
-    read -r -p "是否执行公共测速？[Y/n]: " answer || return 1
+    read -r -p "是否使用自动带宽检测（可能复用同路由缓存）？[Y/n]: " answer || return 1
     case "$answer" in
         ""|[Yy])
             TUNING_MODE="auto"
@@ -632,6 +633,7 @@ select_tuning_mode() {
             ;;
     esac
 
+    INTERACTIVE_TUNING_SELECTION="true"
     TUNING_SELECTION_EXPLICIT="true"
 }
 
@@ -2024,9 +2026,38 @@ set_manual_measurement_metadata() {
     MEASUREMENT_CACHE_PENDING="false"
 }
 
+prompt_fresh_cache_action() {
+    local result_name="$1" answer
+    local -n result="$result_name"
+
+    result=""
+    echo "检测到 7 天内同路由测速缓存："
+    printf '  时间：%s\n' "$(format_display_value "$MEASUREMENT_TIME")"
+    printf '  带宽：下载 %s Mbps / 上传 %s Mbps\n' \
+        "$DETECTED_DOWNLOAD_MBPS" "$DETECTED_UPLOAD_MBPS"
+    echo "  节点："
+    print_measurement_nodes "$MEASUREMENT_NODES" '    '
+    printf '  可信度：%s\n' "$(format_display_value "$MEASUREMENT_CONFIDENCE")"
+
+    while true; do
+        read -r -p "是否复用该缓存？[Y/n]: " answer || {
+            error "无法读取测速缓存选择"
+            return 1
+        }
+        case "$answer" in
+            ""|[Yy]|[Yy][Ee][Ss]) result="reuse"; return 0 ;;
+            [Nn]|[Nn][Oo]) result="refresh"; return 0 ;;
+            *) error "请输入 Y 或 N" ;;
+        esac
+    done
+}
+
 resolve_tuning_values() {
     local download_mbps="" upload_mbps="" rtt_ms="" live_ready="true"
     local cache_fallback_mode="stale"
+    local refresh_live="$FORCE_REFRESH"
+    local reuse_fresh_cache="false"
+    local fresh_cache_action=""
 
     PHYSICAL_RAM_MB=$(detect_memory_mb)
     is_positive_integer "$PHYSICAL_RAM_MB" 1 1073741824 || {
@@ -2056,9 +2087,19 @@ resolve_tuning_values() {
             error "缺少有效上下行带宽，拒绝生成或应用配置"
             return 1
         fi
-        [[ "$FORCE_REFRESH" != "true" ]] || cache_fallback_mode="fallback"
-        if [[ "$FORCE_REFRESH" != "true" ]] &&
-            load_measurement_cache fresh; then
+        [[ "$refresh_live" != "true" ]] || cache_fallback_mode="fallback"
+        if [[ "$refresh_live" != "true" ]] && load_measurement_cache fresh; then
+            reuse_fresh_cache="true"
+            if [[ "$INTERACTIVE_TUNING_SELECTION" == "true" ]]; then
+                prompt_fresh_cache_action fresh_cache_action || return 1
+                if [[ "$fresh_cache_action" == "refresh" ]]; then
+                    reuse_fresh_cache="false"
+                    refresh_live="true"
+                    cache_fallback_mode="fallback"
+                fi
+            fi
+        fi
+        if [[ "$reuse_fresh_cache" == "true" ]]; then
             download_mbps="$DETECTED_DOWNLOAD_MBPS"
             upload_mbps="$DETECTED_UPLOAD_MBPS"
         else
