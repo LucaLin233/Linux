@@ -212,6 +212,37 @@ assert_eq 150 "$MANUAL_RTT_MS" "manual command defaults RTT"
     printf 'PASS: retired parameters and command perform no writes\n'
 )
 
+[[ -z "$(trap -p ERR)" ]] || fail "network-optimize installed an ERR trap"
+printf 'PASS: network-optimize leaves ERR handling to explicit failures\n'
+
+(
+    reset_selection
+    known_failure_log="$TEMP_DIR/known-tuning-failure.log"
+    known_failure_rc=0
+    downstream_calls=0
+    require_commands() { return 0; }
+    take_lock() { return 0; }
+    error() { printf '%s\n' "$1" >&2; }
+    resolve_tuning_values() {
+        error "known tuning failure"
+        return 1
+    }
+    validate_measurement_route() { ((downstream_calls += 1)); return 0; }
+    persist_pending_measurement_cache() { ((downstream_calls += 1)); }
+    show_measurement_warnings() { ((downstream_calls += 1)); }
+    show_tuning_plan() { ((downstream_calls += 1)); }
+
+    main plan --download-mbps 1000 --upload-mbps 500 \
+        > "$known_failure_log" 2>&1 || known_failure_rc=$?
+    assert_eq 1 "$known_failure_rc" "known tuning failure returns nonzero"
+    assert_eq 0 "$downstream_calls" "known tuning failure stops plan output and cache work"
+    assert_eq 1 "$(grep -Fxc 'known tuning failure' "$known_failure_log")" \
+        "known tuning failure emits its specific error once"
+    if grep -Fq '网络优化脚本在第' "$known_failure_log"; then
+        fail "known tuning failure emitted the removed generic ERR fallback"
+    fi
+)
+
 if grep -Fq 'network-optimize' "$ROOT_DIR/linux_setup.sh"; then
     fail "linux_setup contains a network-optimize special case"
 fi

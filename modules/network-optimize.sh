@@ -3310,7 +3310,7 @@ main() {
         plan)
             require_commands flock getent getconf || exit 1
             take_lock
-            resolve_tuning_values
+            resolve_tuning_values || return 1
             if ! validate_measurement_route; then
                 error "测速绑定的默认 IPv4 出口已变化，拒绝保存测量缓存"
                 return 1
@@ -3341,8 +3341,6 @@ run_network_command() {
     trap 'exit 143' TERM
     main "$@"
 }
-
-trap 'error "网络优化脚本在第 $LINENO 行执行失败"' ERR
 
 if [[ "${BASH_SOURCE[0]:-$0}" == "$0" ]]; then
     run_network_command "$@"
