@@ -4,7 +4,8 @@
 # linux-setup:depends=
 # linux-setup:enabled=true
 # 网络优化模块
-# TCP 调优仅覆盖 IPv4。
+# 测速和 initcwnd 仅覆盖 IPv4；不增加 IPv6 initcwnd。
+# net.core.* 和共享 TCP sysctl 可能同时影响 IPv6 TCP。
 # 基础调优移植或参考 Kylin010/tcpfit v0.5.6（MIT，提交 67c0bdfb35dd98e86982600298237b6ecc08ebe4）。
 # 事务备份、交互与验证为本仓库下游扩展。
 # 功能：配置 BBR、fq 与 TCP 缓冲区；交互默认测速，也可手动提供完整带宽。
@@ -3271,7 +3272,7 @@ install/plan 选项：
   --download-mbps N       指定下载带宽，单位 Mbps
   --upload-mbps N         指定上传带宽，单位 Mbps
   --refresh               与 --auto 同用；绕过 7 天缓存，现场测速失败可回退到 30 天内缓存
-  --rtt-ms N              指定 RTT，单位 ms
+  --rtt-ms N              指定业务 RTT 用于 BDP；可与 --auto 同用
   --enable-initcwnd       强制把默认路由 initcwnd/initrwnd 设置为 32
   --disable-initcwnd      强制保留内核默认初始拥塞窗口
 
@@ -3295,9 +3296,13 @@ install/plan 选项：
   - 主动测速失败时回退到 30 天内同路由缓存；refresh 也可回退到 7 天内缓存
   - 测速和缓存固定绑定 1.1.1.1 的 ifindex、接口、网关与源地址
   - 只有完整上下行输入才生成配置；低可信度会警告并持久化，但不改变成功退出码
-  - 手填带宽缺少 RTT 时按 150 ms 计算；自动测速不采集 RTT
+  - 节点 RTT 仅用于节点排序和展示，不参与 BDP 计算
+  - 自动 BDP 默认固定按 150 ms 计算；已知业务 RTT 可用 --auto --rtt-ms N 覆盖
+  - 手填带宽缺少 RTT 时按 150 ms 计算
   - 主动测速失败且无缓存时，交互可转手填；非交互在系统写入前失败
-  - TCP 调优仅覆盖 IPv4，不管理 forwarding、IPv6 RA 或系统代理
+  - 测速和 initcwnd/initrwnd 仅使用 IPv4，不增加 IPv6 initcwnd
+  - net.core.* 和共享 TCP sysctl 可能同时影响 IPv6 TCP
+  - 不管理 forwarding、IPv6 RA 或系统代理
   - ECN 始终保留系统或管理员设置，不由本模块持久管理
   - initcwnd 默认 auto：上传 > 100 Mbps 设置 32，否则保留内核默认
   - initcwnd hook 在最终写路由前再次检查 ownership marker

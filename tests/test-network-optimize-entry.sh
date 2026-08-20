@@ -153,6 +153,11 @@ unset -f read
 assert_eq auto "$TUNING_MODE" "--auto selects non-interactive automatic mode"
 assert_eq true "$TUNING_SELECTION_EXPLICIT" "--auto bypasses the prompt"
 
+reset_selection
+parse_arguments plan --auto --rtt-ms 240
+assert_eq auto "$TUNING_MODE" "automatic mode accepts a business RTT override"
+assert_eq 240 "$MANUAL_RTT_MS" "automatic mode records the business RTT override"
+
 for refresh_args in '--auto --refresh' '--refresh --auto'; do
     reset_selection
     read -r -a parsed_refresh_args <<< "$refresh_args"
@@ -339,6 +344,18 @@ grep -Fq '手动带宽 plan 只计算并显示；自动 plan 需要 root，可�
     <<< "$help_output" || fail "plan help omits the automatic cache write warning"
 grep -Fq '自动测速仅使用 IPv4 公共 iperf3；最多 2 个节点，每方向 P=4、预热 2 秒 + 计量 5 秒' \
     <<< "$help_output" || fail "help omits iperf3 warm-up and sample durations"
+for expected_help_line in \
+    '--rtt-ms N              指定业务 RTT 用于 BDP；可与 --auto 同用' \
+    '节点 RTT 仅用于节点排序和展示，不参与 BDP 计算' \
+    '自动 BDP 默认固定按 150 ms 计算；已知业务 RTT 可用 --auto --rtt-ms N 覆盖' \
+    '测速和 initcwnd/initrwnd 仅使用 IPv4，不增加 IPv6 initcwnd' \
+    'net.core.* 和共享 TCP sysctl 可能同时影响 IPv6 TCP'; do
+    grep -Fq -- "$expected_help_line" <<< "$help_output" ||
+        fail "help omits network scope detail: $expected_help_line"
+done
+if grep -Eq 'ip -6 route .*initcwnd' "$ROOT_DIR/modules/network-optimize.sh"; then
+    fail "network-optimize added IPv6 initcwnd handling"
+fi
 printf 'PASS: plan help distinguishes manual calculation from root automatic cache use\n'
 
 if grep -Fq 'network-optimize' "$ROOT_DIR/linux_setup.sh"; then
@@ -768,7 +785,7 @@ printf 'PASS: generic health panel is absent\n'
         MEASUREMENT_SOURCE='mock public iperf3'
         MEASUREMENT_EPOCH=2000000000
         MEASUREMENT_TIME='2033-05-18T03:33:20Z'
-        MEASUREMENT_NODES='one.example'
+        MEASUREMENT_NODES='远端/Provider peer.example [192.0.2.10]:5201 (IPv4 RTT 600 ms)'
         MEASUREMENT_CONFIDENCE=low
         MEASUREMENT_WARNINGS='only one peer'
         return 0
@@ -777,6 +794,15 @@ printf 'PASS: generic health panel is absent\n'
     resolve_tuning_values >/dev/null
     assert_eq 1000 "$DETECTED_DOWNLOAD_MBPS" "low-confidence complete download succeeds"
     assert_eq 500 "$DETECTED_UPLOAD_MBPS" "low-confidence complete upload succeeds"
+    assert_eq 150 "$DETECTED_RTT_MS" "peer RTT does not replace automatic BDP default"
+    assert_eq 18750000 "$RX_BDP_BYTES" "automatic BDP uses fixed 150 ms"
+
+    MANUAL_RTT_MS=240
+    resolve_tuning_values >/dev/null
+    assert_eq 240 "$DETECTED_RTT_MS" "automatic mode honors explicit business RTT"
+    assert_eq 30000000 "$RX_BDP_BYTES" "business RTT override changes BDP"
+    assert_eq 'manual override' "$RTT_POLICY" "business RTT records manual policy"
+
     low_config="$TEMP_DIR/low-confidence.conf"
     create_network_config "$low_config" false
     grep -Fq '# 测量可信度: low' "$low_config" || fail "low confidence was not persisted"

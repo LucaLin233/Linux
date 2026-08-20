@@ -63,6 +63,7 @@ assert_eq "268435456" "$(calculate_memory_cap 16384)" \
     "large-memory cap keeps 256 MiB ceiling"
 assert_eq "2097152" "$TCP_BUFFER_DEFAULT_BYTES" \
     "TCP receive and send defaults stay fixed at 2 MiB"
+assert_eq 150 "$DEFAULT_RTT_MS" "automatic BDP keeps the fixed 150 ms default"
 (
     mock_page_size=4096
     getconf() {
