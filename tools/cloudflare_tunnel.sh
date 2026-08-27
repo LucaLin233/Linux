@@ -282,7 +282,7 @@ installed=$(dpkg-query -W -f='${Version}' cloudflared 2>/dev/null) || {
 }
 
 apt-get -o DPkg::Lock::Timeout=300 update -qq
-candidate=$(apt-cache policy cloudflared | awk '/Candidate:/ {print $2; exit}')
+candidate=$(LC_ALL=C apt-cache policy cloudflared | awk '/Candidate:/ {print $2; exit}')
 if [[ -z "$candidate" || "$candidate" == "(none)" ]]; then
     echo "无法取得 cloudflared 候选版本" >&2
     exit 1
