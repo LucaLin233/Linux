@@ -91,8 +91,9 @@ dpkg-query() {
 }
 ln -s "$APT_BIN" "$LEGACY_BIN"
 migrate_legacy_binary
-[[ ! -e "$LEGACY_BIN" && ! -L "$LEGACY_BIN" ]] || fail "APT compatibility symlink was not removed"
-pass "complete partially migrated APT symlink layout"
+[[ -L "$LEGACY_BIN" ]] || fail "APT compatibility symlink was not preserved"
+[[ "$(readlink -f "$LEGACY_BIN")" == "$APT_BIN" ]] || fail "APT compatibility symlink target changed"
+pass "preserve Cloudflare APT compatibility symlink layout"
 rm -f "$APT_BIN"
 
 write_auto_update_files
