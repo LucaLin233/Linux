@@ -100,6 +100,8 @@ write_auto_update_files
 bash -n "$AUTO_UPDATE_SCRIPT"
 grep -Fq 'apt-get -o DPkg::Lock::Timeout=300 update -qq' "$AUTO_UPDATE_SCRIPT" ||
     fail "auto updater does not refresh APT metadata"
+grep -Fq "candidate=\$(LC_ALL=C apt-cache policy cloudflared | awk '/Candidate:/ {print \$2; exit}')" "$AUTO_UPDATE_SCRIPT" ||
+    fail "auto updater candidate parsing depends on localized APT output"
 grep -Fq 'dpkg --compare-versions "$candidate" gt "$installed"' "$AUTO_UPDATE_SCRIPT" ||
     fail "auto updater does not compare installed and candidate versions"
 grep -Fq 'install -y --only-upgrade cloudflared' "$AUTO_UPDATE_SCRIPT" ||
