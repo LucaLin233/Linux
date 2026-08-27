@@ -181,8 +181,22 @@ legacy_auto_update_present() {
     return 1
 }
 
+legacy_binary_is_apt_compat_symlink() {
+    [[ -L "$LEGACY_BIN" ]] &&
+        [[ "$(readlink -f "$LEGACY_BIN")" == "$APT_BIN" ]] &&
+        dpkg-query -S "$APT_BIN" >/dev/null 2>&1
+}
+
 legacy_binary_is_safe_to_migrate() {
-    [[ -x "$LEGACY_BIN" && -f "$SERVICE_FILE" ]] || return 1
+    [[ -x "$LEGACY_BIN" ]] || return 1
+
+    # Cloudflare DEB postinst creates this unowned compatibility symlink.
+    # Keep it; dpkg-query cannot report /usr/local/bin/cloudflared as owned.
+    if legacy_binary_is_apt_compat_symlink; then
+        return 0
+    fi
+
+    [[ -f "$SERVICE_FILE" ]] || return 1
 
     if [[ -L "$LEGACY_BIN" ]] &&
         [[ "$(readlink -f "$LEGACY_BIN")" == "$APT_BIN" ]] &&
@@ -227,7 +241,8 @@ migrate_legacy_service_path() {
 
 migrate_legacy_binary() {
     [[ -e "$LEGACY_BIN" || -L "$LEGACY_BIN" ]] || return 0
-    if dpkg-query -S "$LEGACY_BIN" >/dev/null 2>&1; then
+    if dpkg-query -S "$LEGACY_BIN" >/dev/null 2>&1 ||
+        legacy_binary_is_apt_compat_symlink; then
         return 0
     fi
 
