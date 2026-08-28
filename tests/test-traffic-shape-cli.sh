@@ -75,6 +75,11 @@ source "$ROOT_DIR/tools/traffic-shape.sh"
 
 UPDATE_CALLS="$TEST_DIR/update-calls"
 : > "$UPDATE_CALLS"
+precheck_update_cli -y </dev/null || fail "-y was not accepted by shared update precheck"
+pass "shared update precheck accepts -y"
+rc=0
+precheck_update_cli --unknown > "$TEST_DIR/update-unknown.out" 2>&1 || rc=$?
+assert_eq 1 "$rc" "shared update precheck rejects unknown arguments"
 curl() { printf 'curl\n' >> "$UPDATE_CALLS"; return 1; }
 jq() { printf 'jq\n' >> "$UPDATE_CALLS"; return 1; }
 install() { printf 'install\n' >> "$UPDATE_CALLS"; return 1; }
@@ -105,6 +110,84 @@ if grep -Eq '^(install|mv)$' "$UPDATE_CALLS"; then
 fi
 pass "only explicit --yes permits unattended update"
 unset -f curl jq install mv
+
+cat > "$TEST_DIR/main-update-case.sh" <<'CASE'
+#!/usr/bin/env bash
+set -uo pipefail
+source "$TCSHAPE_SOURCE"
+record() { printf '%s\n' "$*" >> "$ENTRY_CALLS"; }
+require_root() { record require_root; return 0; }
+install_self() {
+    record "install_self:$*"
+    printf 'changed by install_self\n' > "$INSTALL_PATH"
+    return 0
+}
+ensure_dependencies() { record ensure_dependencies; return 0; }
+take_lock() { record take_lock; return 0; }
+cmd_update() { record "cmd_update:$*"; return 0; }
+curl() { record curl; return 1; }
+install() { record install; return 1; }
+mv() { record mv; return 1; }
+main "$@"
+CASE
+chmod 700 "$TEST_DIR/main-update-case.sh"
+
+for entry_command in update u; do
+    case_dir="$TEST_DIR/main-$entry_command-no-yes"
+    mkdir -p "$case_dir"
+    cp "$ROOT_DIR/tools/traffic-shape.sh" "$case_dir/installed"
+    before=$(sha256sum "$case_dir/installed" | awk '{print $1}')
+    : > "$case_dir/calls"
+    rc=0
+    env TCSHAPE_SOURCE="$ROOT_DIR/tools/traffic-shape.sh" \
+        TCSHAPE_TEST_MODE=1 \
+        TCSHAPE_INSTALL_PATH="$case_dir/installed" \
+        TCSHAPE_STATE_DIR="$case_dir/state" \
+        TCSHAPE_CONFIG_FILE="$case_dir/config" \
+        TCSHAPE_SERVICE_FILE="$case_dir/service" \
+        TCSHAPE_LOCK_FILE="$case_dir/lock" \
+        ENTRY_CALLS="$case_dir/calls" \
+        bash "$TEST_DIR/main-update-case.sh" "$entry_command" \
+        </dev/null > "$case_dir/output" 2>&1 || rc=$?
+    assert_eq 1 "$rc" "main $entry_command rejects unattended update"
+    grep -Fq '非交互更新必须显式使用 --yes' "$case_dir/output" ||
+        fail "main $entry_command omitted unattended update error"
+    [[ ! -s "$case_dir/calls" ]] ||
+        fail "main $entry_command performed setup before rejection: $(cat "$case_dir/calls")"
+    assert_eq "$before" "$(sha256sum "$case_dir/installed" | awk '{print $1}')" \
+        "main $entry_command preserves installed target"
+done
+pass "main rejects update aliases before root, install, dependencies, lock, or update"
+
+case_dir="$TEST_DIR/main-update-yes"
+mkdir -p "$case_dir"
+cp "$ROOT_DIR/tools/traffic-shape.sh" "$case_dir/installed"
+: > "$case_dir/calls"
+rc=0
+env TCSHAPE_SOURCE="$ROOT_DIR/tools/traffic-shape.sh" \
+    TCSHAPE_TEST_MODE=1 \
+    TCSHAPE_INSTALL_PATH="$case_dir/installed" \
+    TCSHAPE_STATE_DIR="$case_dir/state" \
+    TCSHAPE_CONFIG_FILE="$case_dir/config" \
+    TCSHAPE_SERVICE_FILE="$case_dir/service" \
+    TCSHAPE_LOCK_FILE="$case_dir/lock" \
+    ENTRY_CALLS="$case_dir/calls" \
+    bash "$TEST_DIR/main-update-case.sh" update --yes \
+    </dev/null > "$case_dir/output" 2>&1 || rc=$?
+assert_eq 0 "$rc" "main update --yes continues through setup"
+for expected_call in \
+    require_root \
+    'install_self:update --yes' \
+    ensure_dependencies \
+    take_lock \
+    'cmd_update:--yes'; do
+    grep -Fxq "$expected_call" "$case_dir/calls" ||
+        fail "main update --yes missed call: $expected_call"
+done
+if grep -Eq '^(curl|install|mv)$' "$case_dir/calls"; then
+    fail "main entry test unexpectedly bypassed cmd_update stub"
+fi
+pass "main update --yes reaches existing setup and cmd_update path"
 
 cat > "$TEST_DIR/signal-case.sh" <<'CASE'
 #!/usr/bin/env bash

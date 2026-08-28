@@ -267,6 +267,24 @@ update_input_is_tty() {
     [[ -t 0 ]]
 }
 
+precheck_update_cli() {
+    local assume_yes=false
+    local argument
+
+    for argument in "$@"; do
+        case "$argument" in
+            --yes|-y) assume_yes=true ;;
+            --from-menu) ;;
+            *) error "未知参数：$argument"; return 1 ;;
+        esac
+    done
+
+    if [[ "$assume_yes" != "true" ]] && ! update_input_is_tty; then
+        error "非交互更新必须显式使用 --yes"
+        return 1
+    fi
+}
+
 read_update_confirmation() {
     local answer
 
@@ -282,6 +300,8 @@ read_update_confirmation() {
 }
 
 cmd_update() {
+    precheck_update_cli "$@" || return 1
+
     local from_menu=false
     local assume_yes=false
     local metadata commit latest download_url temp_dir downloaded
@@ -294,11 +314,6 @@ cmd_update() {
             *) error "未知参数：$1"; return 1 ;;
         esac
     done
-
-    if [[ "$assume_yes" != "true" ]] && ! update_input_is_tty; then
-        error "非交互更新必须显式使用 --yes"
-        return 1
-    fi
 
     command -v curl >/dev/null 2>&1 || { error "需要 curl"; return 1; }
     command -v jq >/dev/null 2>&1 || { error "需要 jq"; return 1; }
@@ -2431,6 +2446,7 @@ main() {
     case "$command" in
         help|-h|--help) usage; return 0 ;;
         version|-v|--version) echo "tcshape $VERSION"; return 0 ;;
+        u|update) precheck_update_cli "$@" || return 1 ;;
     esac
 
     require_root
