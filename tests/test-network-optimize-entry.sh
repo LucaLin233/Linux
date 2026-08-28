@@ -369,8 +369,9 @@ if grep -Fq 'network-optimize' "$ROOT_DIR/linux_setup.sh"; then
     fail "linux_setup contains a network-optimize special case"
 fi
 execute_module_body=$(sed -n '/^execute_module() {/,/^}/p' "$ROOT_DIR/linux_setup.sh")
-grep -Fq 'if bash "$module_file"; then' <<< "$execute_module_body" ||
-    fail "linux_setup no longer invokes modules without arguments"
+grep -Fq 'if env RUN_COMMIT="$RUN_COMMIT" bash "$module_file"; then' \
+    <<< "$execute_module_body" ||
+    fail "linux_setup no longer pins generic module execution"
 if grep -Fq '执行模块：${MODULES[$module]}' <<< "$execute_module_body"; then
     fail "execute_module still repeats the user-visible module name"
 fi

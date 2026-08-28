@@ -9,23 +9,24 @@ set -uo pipefail
 
 # === 全局常量 ===
 readonly SCRIPT_VERSION="5.0.0"
-SCRIPT_COMMIT="${SCRIPT_COMMIT:-unknown}"
+readonly RUN_COMMIT="${RUN_COMMIT:-}"
 
 readonly MODULE_BASE_URL="https://raw.githubusercontent.com/LucaLin233/Linux"
 readonly GITHUB_API_URL="https://api.github.com/repos/LucaLin233/Linux/commits/main"
 readonly MODULES_API_URL="https://api.github.com/repos/LucaLin233/Linux/contents/modules"
 
-LOG_FILE="/var/log/linux-setup.log"
-readonly SUMMARY_FILE="/root/deployment_summary.txt"
-readonly CACHE_DIR="/var/cache/linux-setup"
+LOG_FILE="${LINUX_SETUP_LOG_FILE:-/var/log/linux-setup.log}"
+readonly SUMMARY_FILE="${LINUX_SETUP_SUMMARY_FILE:-/root/deployment_summary.txt}"
+readonly CACHE_DIR="${LINUX_SETUP_CACHE_DIR:-/var/cache/linux-setup}"
+readonly HOSTS_FILE="${LINUX_SETUP_HOSTS_FILE:-/etc/hosts}"
+readonly CLOUD_CONFIG_FILE="${LINUX_SETUP_CLOUD_CONFIG_FILE:-/etc/cloud/cloud.cfg}"
 readonly LINE="============================================================"
 
 TEMP_DIR=""
-LATEST_COMMIT=""
+PREPARED_SCRIPT=""
 TOTAL_START_TIME=0
 
 SELECTED_MODULES=()
-FILTERED_ARGS=()
 
 declare -A MODULE_STATUS
 declare -A MODULE_EXEC_TIME
@@ -88,14 +89,55 @@ command_exists() {
     command -v "$1" >/dev/null 2>&1
 }
 
-backup_initial_and_previous() {
+is_regular_file() {
     local file="$1"
-    local initial="${file}.initial-backup"
-    local previous="${file}.previous-backup"
+    [[ -f "$file" && ! -L "$file" ]]
+}
 
-    [[ -e "$file" ]] || return 0
-    [[ -e "$initial" ]] || cp -a "$file" "$initial" || return 1
-    cp -a "$file" "$previous"
+atomic_copy_file() {
+    local source="$1" destination="$2" destination_dir destination_base stage
+
+    is_regular_file "$source" || return 1
+    [[ ! -L "$destination" && ( ! -e "$destination" || -f "$destination" ) ]] || return 1
+    destination_dir=$(dirname -- "$destination")
+    destination_base=$(basename -- "$destination")
+    [[ -d "$destination_dir" && ! -L "$destination_dir" ]] || return 1
+
+    stage=$(mktemp "$destination_dir/.${destination_base}.linux-setup.XXXXXX") || return 1
+    rm -f -- "$stage"
+    if ! cp -a -- "$source" "$stage" || ! mv -fT -- "$stage" "$destination"; then
+        rm -f -- "$stage"
+        return 1
+    fi
+}
+
+atomic_replace_file() {
+    local source="$1" destination="$2" destination_dir destination_base stage
+
+    is_regular_file "$source" || return 1
+    is_regular_file "$destination" || return 1
+    destination_dir=$(dirname -- "$destination")
+    destination_base=$(basename -- "$destination")
+    [[ -d "$destination_dir" && ! -L "$destination_dir" ]] || return 1
+
+    stage=$(mktemp "$destination_dir/.${destination_base}.linux-setup.XXXXXX") || return 1
+    rm -f -- "$stage"
+    if ! cp -a -- "$destination" "$stage" ||
+        ! cat -- "$source" > "$stage" ||
+        ! mv -fT -- "$stage" "$destination"; then
+        rm -f -- "$stage"
+        return 1
+    fi
+}
+
+backup_initial_and_previous() {
+    local file="$1" initial="${1}.initial-backup" previous="${1}.previous-backup"
+
+    is_regular_file "$file" || return 1
+    [[ ! -L "$initial" && ( ! -e "$initial" || -f "$initial" ) ]] || return 1
+    [[ ! -L "$previous" && ( ! -e "$previous" || -f "$previous" ) ]] || return 1
+    [[ -e "$initial" ]] || atomic_copy_file "$file" "$initial" || return 1
+    atomic_copy_file "$file" "$previous"
 }
 
 cleanup() {
@@ -316,46 +358,127 @@ system_update() {
     fi
 }
 
+validate_hostname_value() {
+    local hostname_value="$1"
+
+    (( ${#hostname_value} >= 1 && ${#hostname_value} <= 253 )) || return 1
+    [[ "$hostname_value" != *..* ]] || return 1
+    [[ "$hostname_value" =~ ^[A-Za-z0-9]$ ||
+        "$hostname_value" =~ ^[A-Za-z0-9][A-Za-z0-9.-]*[A-Za-z0-9]$ ]]
+}
+
+render_cloud_config() {
+    local source="$1" output="$2"
+
+    awk '
+        /^manage_etc_hosts:[[:space:]]*/ {
+            if (!written) {
+                print "manage_etc_hosts: false"
+                written = 1
+            }
+            next
+        }
+        { print }
+        END { if (!written) print "manage_etc_hosts: false" }
+    ' "$source" > "$output"
+}
+
+hosts_contains_hostname() {
+    local hosts_file="$1" hostname_value="$2"
+
+    awk -v hostname="$hostname_value" '
+        $1 == "127.0.1.1" {
+            for (field = 2; field <= NF; field++) {
+                if ($field == hostname) found = 1
+            }
+        }
+        END { exit !found }
+    ' "$hosts_file"
+}
+
+render_hosts_file() {
+    local source="$1" output="$2" hostname_value="$3"
+
+    awk -v hostname="$hostname_value" '
+        $1 == "127.0.1.1" && !updated {
+            present = 0
+            for (field = 2; field <= NF; field++) {
+                if ($field == hostname) present = 1
+            }
+            if (present) print
+            else print $0 " " hostname
+            updated = 1
+            next
+        }
+        { print }
+        END { if (!updated) print "127.0.1.1 " hostname }
+    ' "$source" > "$output"
+}
+
 fix_hosts_file() {
-    local hostname_value
-    local cloud_config="/etc/cloud/cloud.cfg"
-    local changed=false
+    local hostname_value cloud_temp="" hosts_temp=""
+    local cloud_changed=false hosts_changed=false cloud_applied=false
 
-    hostname_value=$(hostname)
-
-    if [[ -f "$cloud_config" ]]; then
-        backup_initial_and_previous "$cloud_config" || return 1
-
-        if grep -qE '^[[:space:]]*manage_etc_hosts:' "$cloud_config"; then
-            if ! grep -qE '^[[:space:]]*manage_etc_hosts:[[:space:]]*false[[:space:]]*$' "$cloud_config"; then
-                sed -i \
-                    's/^[[:space:]]*manage_etc_hosts:.*/manage_etc_hosts: false/' \
-                    "$cloud_config"
-                changed=true
-            fi
-        else
-            echo "manage_etc_hosts: false" >> "$cloud_config"
-            changed=true
-        fi
+    if ! hostname_value=$(hostname 2>/dev/null) ||
+        ! validate_hostname_value "$hostname_value"; then
+        log "主机名为空或格式不安全，拒绝修改 hosts 配置" "error"
+        return 1
     fi
 
-    if ! grep -qE "^127\\.0\\.1\\.1[[:space:]].*\\b${hostname_value}\\b" \
-        /etc/hosts 2>/dev/null; then
-        backup_initial_and_previous /etc/hosts || return 1
-
-        if grep -qE '^127\.0\.1\.1[[:space:]]' /etc/hosts 2>/dev/null; then
-            sed -i \
-                "s/^127\\.0\\.1\\.1[[:space:]]\\+.*/127.0.1.1 ${hostname_value}/" \
-                /etc/hosts
-        else
-            echo "127.0.1.1 ${hostname_value}" >> /etc/hosts
+    if [[ -e "$CLOUD_CONFIG_FILE" || -L "$CLOUD_CONFIG_FILE" ]]; then
+        if ! is_regular_file "$CLOUD_CONFIG_FILE"; then
+            log "cloud-init 配置不是安全的普通文件：$CLOUD_CONFIG_FILE" "error"
+            return 1
         fi
-
-        changed=true
+        cloud_temp=$(mktemp "$TEMP_DIR/cloud.cfg.XXXXXX") || return 1
+        render_cloud_config "$CLOUD_CONFIG_FILE" "$cloud_temp" || return 1
+        cmp -s -- "$CLOUD_CONFIG_FILE" "$cloud_temp" || cloud_changed=true
     fi
 
-    [[ "$changed" == "true" ]] &&
-        log "已修复 hostname 与 /etc/hosts 映射" "success"
+    if ! is_regular_file "$HOSTS_FILE"; then
+        log "hosts 配置不是安全的普通文件：$HOSTS_FILE" "error"
+        return 1
+    fi
+    if ! hosts_contains_hostname "$HOSTS_FILE" "$hostname_value"; then
+        hosts_temp=$(mktemp "$TEMP_DIR/hosts.XXXXXX") || return 1
+        render_hosts_file "$HOSTS_FILE" "$hosts_temp" "$hostname_value" || return 1
+        hosts_changed=true
+    fi
+
+    if [[ "$cloud_changed" == "true" ]]; then
+        backup_initial_and_previous "$CLOUD_CONFIG_FILE" || {
+            log "无法安全备份 cloud-init 配置" "error"
+            return 1
+        }
+    fi
+    if [[ "$hosts_changed" == "true" ]]; then
+        backup_initial_and_previous "$HOSTS_FILE" || {
+            log "无法安全备份 hosts 配置" "error"
+            return 1
+        }
+    fi
+
+    if [[ "$cloud_changed" == "true" ]]; then
+        if ! atomic_replace_file "$cloud_temp" "$CLOUD_CONFIG_FILE"; then
+            log "无法安全写入 cloud-init 配置" "error"
+            return 1
+        fi
+        cloud_applied=true
+    fi
+    if [[ "$hosts_changed" == "true" ]] &&
+        ! atomic_replace_file "$hosts_temp" "$HOSTS_FILE"; then
+        log "无法安全写入 hosts 配置" "error"
+        if [[ "$cloud_applied" == "true" ]] &&
+            ! atomic_replace_file "${CLOUD_CONFIG_FILE}.previous-backup" "$CLOUD_CONFIG_FILE"; then
+            log "cloud-init 配置回滚失败，请从 previous-backup 手动恢复" "error"
+        fi
+        return 1
+    fi
+
+    if [[ "$cloud_changed" == "true" || "$hosts_changed" == "true" ]]; then
+        log "已修复 hostname 与 hosts 配置" "success"
+    fi
+    return 0
 }
 
 # =============================================================================
@@ -554,6 +677,11 @@ resolve_dependencies() {
 # GitHub Commit 与模块下载
 # =============================================================================
 
+is_valid_commit() {
+    local commit="$1"
+    [[ "$commit" =~ ^[0-9a-f]{40}$ ]]
+}
+
 get_latest_commit() {
     local commit_hash
 
@@ -575,30 +703,34 @@ get_latest_commit() {
     return 1
 }
 
+validate_bash_script() {
+    local file="$1" first_line
+
+    is_regular_file "$file" || return 1
+    [[ -s "$file" ]] || return 1
+    IFS= read -r first_line < "$file" || return 1
+    case "$first_line" in
+        '#!/usr/bin/env bash'|'#!/bin/bash') ;;
+        *) return 1 ;;
+    esac
+    bash -n "$file" >/dev/null 2>&1
+}
+
 download_with_retry() {
-    local url="$1"
-    local output="$2"
-    local max_attempts=3
-    local attempt
+    local url="$1" output="$2" validator="${3:-validate_bash_script}"
+    local max_attempts=3 attempt
 
     for ((attempt = 1; attempt <= max_attempts; attempt++)); do
-        if curl -fsSL \
-            --connect-timeout 10 \
-            --max-time 60 \
-            "$url" \
-            -o "$output" &&
-            [[ -s "$output" ]] &&
-            head -n 1 "$output" |
-                grep -qE '^#!/(usr/bin/env bash|bin/bash|bin/sh)$'; then
+        if curl -fsSL --connect-timeout 10 --max-time 60 "$url" -o "$output" &&
+            "$validator" "$output"; then
             return 0
         fi
-
+        rm -f -- "$output"
         if (( attempt < max_attempts )); then
-            log "下载失败，2 秒后重试（$attempt/$max_attempts）..." "warn"
+            log "下载或脚本验证失败，2 秒后重试（$attempt/$max_attempts）..." "warn"
             sleep 2
         fi
     done
-
     return 1
 }
 
@@ -717,7 +849,7 @@ download_module() {
     local module_file="$TEMP_DIR/${module}.sh"
     local module_url
 
-    module_url="$MODULE_BASE_URL/$LATEST_COMMIT/modules/${module}.sh"
+    module_url="$MODULE_BASE_URL/$RUN_COMMIT/modules/${module}.sh"
 
     if ! download_with_retry "$module_url" "$module_file"; then
         return 1
@@ -734,12 +866,12 @@ discover_and_prepare_modules() {
     local register_result
     local -a module_files=()
 
-    log "从固定 Commit 发现部署模块：${LATEST_COMMIT:0:7}"
+    log "从固定 Commit 发现部署模块：${RUN_COMMIT:0:7}"
 
     if ! curl -fsSL \
         --connect-timeout 10 \
         --max-time 30 \
-        "${MODULES_API_URL}?ref=${LATEST_COMMIT}" \
+        "${MODULES_API_URL}?ref=${RUN_COMMIT}" \
         -o "$index_file"; then
         log "无法获取 modules 目录列表" "error"
         return 1
@@ -800,115 +932,206 @@ discover_and_prepare_modules() {
 # 脚本自更新
 # =============================================================================
 
-try_cached_script() {
+cache_digest_path() {
+    printf '%s.sha256\n' "$1"
+}
+
+file_owner_and_mode_are_safe() {
+    local file="$1" owner mode
+
+    owner=$(stat -c '%u' -- "$file" 2>/dev/null) || return 1
+    mode=$(stat -c '%a' -- "$file" 2>/dev/null) || return 1
+    [[ "$owner" == "$EUID" && "$mode" =~ ^[0-7]{3,4}$ ]] || return 1
+    (( (8#$mode & 0022) == 0 ))
+}
+
+prepare_cache_dir() {
+    local owner mode
+
+    if [[ -L "$CACHE_DIR" || ( -e "$CACHE_DIR" && ! -d "$CACHE_DIR" ) ]]; then
+        log "主脚本缓存路径不安全，拒绝使用：$CACHE_DIR" "warn"
+        return 1
+    fi
+    [[ -d "$CACHE_DIR" ]] || install -d -m 0700 "$CACHE_DIR" || return 1
+    owner=$(stat -c '%u' -- "$CACHE_DIR" 2>/dev/null) || return 1
+    mode=$(stat -c '%a' -- "$CACHE_DIR" 2>/dev/null) || return 1
+    if [[ "$owner" != "$EUID" || ! "$mode" =~ ^[0-7]{3,4}$ ]] ||
+        (( (8#$mode & 0022) != 0 )); then
+        log "主脚本缓存目录所有者或权限不安全：$CACHE_DIR" "warn"
+        return 1
+    fi
+    chmod 0700 "$CACHE_DIR" 2>/dev/null || return 1
+}
+
+script_sha256() {
+    sha256sum -- "$1" 2>/dev/null | awk '{print $1}'
+}
+
+validate_cached_script() {
+    local cached_script="$1" commit="$2" digest_file expected_digest actual_digest
+    local -a digest_lines=()
+
+    is_valid_commit "$commit" || return 1
+    [[ "$cached_script" == "$CACHE_DIR/linux_setup_${commit}.sh" ]] || return 1
+    digest_file=$(cache_digest_path "$cached_script")
+    is_regular_file "$cached_script" && is_regular_file "$digest_file" || return 1
+    file_owner_and_mode_are_safe "$cached_script" || return 1
+    file_owner_and_mode_are_safe "$digest_file" || return 1
+    validate_bash_script "$cached_script" || return 1
+    mapfile -t digest_lines < "$digest_file" || return 1
+    (( ${#digest_lines[@]} == 1 )) || return 1
+    expected_digest="${digest_lines[0]}"
+    [[ "$expected_digest" =~ ^[0-9a-f]{64}$ ]] || return 1
+    actual_digest=$(script_sha256 "$cached_script") || return 1
+    [[ "$actual_digest" == "$expected_digest" ]]
+}
+
+remove_cached_script() {
+    rm -f -- "$1" "$(cache_digest_path "$1")"
+}
+
+load_cached_script() {
+    local commit="$1" cached_script="$CACHE_DIR/linux_setup_${1}.sh"
+
+    PREPARED_SCRIPT=""
+    prepare_cache_dir || return 1
+    if [[ ! -e "$cached_script" && ! -L "$cached_script" ]]; then
+        return 1
+    fi
+    if ! validate_cached_script "$cached_script" "$commit"; then
+        log "缓存脚本完整性验证失败，已删除：$cached_script" "warn"
+        remove_cached_script "$cached_script"
+        return 1
+    fi
+    PREPARED_SCRIPT="$cached_script"
+    log "使用已验证的缓存脚本（commit: ${commit:0:7}）"
+}
+
+write_cached_script_atomically() {
+    local source_script="$1" commit="$2"
+    local cached_script="$CACHE_DIR/linux_setup_${2}.sh"
+    local digest_file script_stage="" digest_stage="" digest
+
+    is_valid_commit "$commit" && validate_bash_script "$source_script" || return 1
+    prepare_cache_dir || return 1
+    digest_file=$(cache_digest_path "$cached_script")
+    if validate_cached_script "$cached_script" "$commit"; then
+        PREPARED_SCRIPT="$cached_script"
+        return 0
+    fi
+    remove_cached_script "$cached_script"
+    script_stage=$(mktemp "$CACHE_DIR/.linux_setup_${commit}.XXXXXX.sh") || return 1
+    digest_stage=$(mktemp "$CACHE_DIR/.linux_setup_${commit}.XXXXXX.sha256") || {
+        rm -f -- "$script_stage"; return 1;
+    }
+    if ! install -m 0700 "$source_script" "$script_stage" ||
+        ! validate_bash_script "$script_stage"; then
+        rm -f -- "$script_stage" "$digest_stage"; return 1
+    fi
+    digest=$(script_sha256 "$script_stage") || {
+        rm -f -- "$script_stage" "$digest_stage"; return 1;
+    }
+    if ! printf '%s\n' "$digest" > "$digest_stage" ||
+        ! chmod 0600 "$digest_stage" ||
+        ! mv -fT -- "$script_stage" "$cached_script"; then
+        rm -f -- "$script_stage" "$digest_stage"; return 1
+    fi
+    if ! mv -fT -- "$digest_stage" "$digest_file"; then
+        rm -f -- "$digest_stage" "$cached_script"; return 1
+    fi
+    if ! validate_cached_script "$cached_script" "$commit"; then
+        remove_cached_script "$cached_script"; return 1
+    fi
+    PREPARED_SCRIPT="$cached_script"
+}
+
+prune_script_cache() {
+    local -a entries=()
+    local index entry cached_script
+
+    prepare_cache_dir || return 0
+    mapfile -d '' -t entries < <(
+        find "$CACHE_DIR" -maxdepth 1 -type f -name 'linux_setup_*.sh' \
+            -printf '%T@ %p\0' | sort -z -nr
+    )
+    for ((index = 3; index < ${#entries[@]}; index++)); do
+        entry="${entries[index]}"
+        cached_script="${entry#* }"
+        remove_cached_script "$cached_script"
+    done
+}
+
+prepare_main_script() {
+    local commit="$1" temp_script script_url
+
+    PREPARED_SCRIPT=""
+    is_valid_commit "$commit" || return 1
+    load_cached_script "$commit" && return 0
+    temp_script=$(mktemp "$TEMP_DIR/linux_setup_${commit}.XXXXXX.sh") || return 1
+    script_url="$MODULE_BASE_URL/$commit/linux_setup.sh"
+    if ! download_with_retry "$script_url" "$temp_script"; then
+        rm -f -- "$temp_script"; return 1
+    fi
+    chmod 0700 "$temp_script" || { rm -f -- "$temp_script"; return 1; }
+    if write_cached_script_atomically "$temp_script" "$commit"; then
+        rm -f -- "$temp_script"
+        prune_script_cache
+        return 0
+    fi
+    PREPARED_SCRIPT="$temp_script"
+    log "无法安全写入主脚本缓存，将使用已验证的临时文件" "warn"
+}
+
+exec_prepared_script() {
     local commit="$1"
-    local cached_script="$CACHE_DIR/linux_setup_${commit}.sh"
 
-    if [[ ! -s "$cached_script" ]]; then
-        return 1
-    fi
-
-    if ! head -n 1 "$cached_script" |
-        grep -qE '^#!/(usr/bin/env bash|bin/bash|bin/sh)$'; then
-        log "缓存脚本格式异常，已删除：$cached_script" "warn"
-        rm -f "$cached_script"
-        return 1
-    fi
-
-    log "使用已缓存的新版本脚本（commit: ${commit:0:7}）"
-
-    SCRIPT_COMMIT="$commit" exec bash "$cached_script" "${FILTERED_ARGS[@]}"
+    is_valid_commit "$commit" || return 1
+    validate_bash_script "$PREPARED_SCRIPT" || return 1
+    log "正在使用固定 Commit 重新启动主脚本：${commit:0:7}" "success"
+    exec env RUN_COMMIT="$commit" bash "$PREPARED_SCRIPT"
 }
 
 self_update() {
-    local latest_commit
-    local temp_script
-    local script_url
-    local remote_version
-    local choice
-    local cached_script=""
+    local latest_commit remote_version choice
 
     if ! latest_commit=$(get_latest_commit); then
-        log "无法检查主脚本更新，继续使用当前版本" "warn"
+        if is_valid_commit "$RUN_COMMIT"; then
+            log "无法检查主脚本更新，继续使用已固定版本：${RUN_COMMIT:0:7}" "warn"
+            return 0
+        fi
+        log "无法确定主脚本固定 Commit，拒绝继续执行" "error"
+        return 1
+    fi
+    if [[ "$latest_commit" == "$RUN_COMMIT" ]]; then
+        log "主脚本已固定在最新 Commit" "success"
         return 0
     fi
-
-    if [[ "$SCRIPT_COMMIT" != "unknown" &&
-        "$latest_commit" == "$SCRIPT_COMMIT" ]]; then
-        log "主脚本已是最新版本" "success"
-        return 0
+    if ! prepare_main_script "$latest_commit"; then
+        if is_valid_commit "$RUN_COMMIT"; then
+            log "无法准备最新主脚本，继续使用已固定版本：${RUN_COMMIT:0:7}" "warn"
+            return 0
+        fi
+        log "无法获取并验证固定 Commit 的主脚本，拒绝继续执行" "error"
+        return 1
     fi
-
-    if try_cached_script "$latest_commit"; then
-        return 0
-    fi
-
-    if ! temp_script=$(mktemp "$TEMP_DIR/linux_setup_latest.XXXXXX.sh"); then
-        log "无法创建主脚本更新临时文件，继续使用当前版本" "warn"
-        return 0
-    fi
-
-    script_url="$MODULE_BASE_URL/$latest_commit/linux_setup.sh"
-
-    if ! download_with_retry "$script_url" "$temp_script"; then
-        rm -f "$temp_script"
-        log "主脚本更新下载失败，继续使用当前版本" "warn"
-        return 0
-    fi
-
-    remote_version=$(
-        grep -m 1 '^readonly SCRIPT_VERSION=' "$temp_script" |
-            cut -d '"' -f 2
-    )
+    remote_version=$(grep -m 1 '^readonly SCRIPT_VERSION=' "$PREPARED_SCRIPT" | cut -d '"' -f 2)
     remote_version="${remote_version:-未知}"
+    if [[ -z "$RUN_COMMIT" ]]; then
+        log "当前主脚本无法证明版本一致性，必须切换到固定 Commit" "warn"
+        exec_prepared_script "$latest_commit"
+    fi
 
     echo
     log "发现主脚本新版本" "warn"
-    echo "  当前：v$SCRIPT_VERSION（commit: ${SCRIPT_COMMIT:0:7}）"
+    echo "  当前：v$SCRIPT_VERSION（commit: ${RUN_COMMIT:0:7}）"
     echo "  最新：v$remote_version（commit: ${latest_commit:0:7}）"
-
     read -r -p "是否更新并重新运行？[Y/n]: " choice
     choice="${choice:-Y}"
-
     if [[ ! "$choice" =~ ^[Yy]$ ]]; then
-        rm -f "$temp_script"
-        log "已跳过主脚本更新"
+        log "已保留当前固定版本：${RUN_COMMIT:0:7}"
         return 0
     fi
-
-    mkdir -p "$CACHE_DIR" 2>/dev/null || true
-
-    if [[ -d "$CACHE_DIR" ]]; then
-        cached_script="$CACHE_DIR/linux_setup_${latest_commit}.sh"
-
-        if cp "$temp_script" "$cached_script"; then
-            chmod 700 "$cached_script"
-
-            find "$CACHE_DIR" \
-                -maxdepth 1 \
-                -type f \
-                -name 'linux_setup_*.sh' \
-                -printf '%T@ %p\n' |
-                sort -nr |
-                awk 'NR > 3 {print $2}' |
-                xargs -r rm -f
-
-            log "主脚本已更新至 v$remote_version" "success"
-        else
-            cached_script=""
-            log "无法缓存新主脚本，将直接使用临时文件重新运行" "warn"
-        fi
-    fi
-
-    log "正在重新启动更新后的主脚本..." "success"
-
-    if [[ -n "$cached_script" && -f "$cached_script" ]]; then
-        SCRIPT_COMMIT="$latest_commit" exec bash \
-            "$cached_script" "${FILTERED_ARGS[@]}"
-    fi
-
-    SCRIPT_COMMIT="$latest_commit" exec bash \
-        "$temp_script" "${FILTERED_ARGS[@]}"
+    exec_prepared_script "$latest_commit"
 }
 
 # =============================================================================
@@ -931,7 +1154,7 @@ execute_module() {
 
     start_time=$(date +%s)
 
-    if bash "$module_file"; then
+    if env RUN_COMMIT="$RUN_COMMIT" bash "$module_file"; then
         result=0
     else
         result=$?
@@ -1116,7 +1339,7 @@ generate_summary() {
             echo "Linux 系统部署摘要"
             echo "$LINE"
             echo "脚本版本: $SCRIPT_VERSION"
-            echo "模块 Commit: ${LATEST_COMMIT:-未知}"
+            echo "运行 Commit: ${RUN_COMMIT:-未知}"
             echo "部署时间: $(date '+%Y-%m-%d %H:%M:%S %Z')"
             echo "总耗时: ${total_time} 秒"
             echo "主机名: $(hostname)"
@@ -1177,9 +1400,22 @@ generate_summary() {
     echo "详细摘要已保存至：$SUMMARY_FILE"
 }
 
+deployment_has_failures() {
+    local module
+
+    for module in "${!MODULE_STATUS[@]}"; do
+        [[ "${MODULE_STATUS[$module]}" == "failed" ]] && return 0
+    done
+    return 1
+}
+
 show_recommendations() {
     echo
-    log "部署流程完成" "success"
+    if deployment_has_failures; then
+        log "部署流程结束，存在失败模块" "error"
+    else
+        log "部署流程完成" "success"
+    fi
 
     if [[ "${MODULE_STATUS[ssh-security]:-}" == "success" ]]; then
         local ssh_ports
@@ -1202,6 +1438,12 @@ show_recommendations() {
     echo "  查看部署摘要: cat $SUMMARY_FILE"
     echo "  查看自动更新日志: tail -f /var/log/auto-update.log"
     echo "  重新运行脚本: bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/linux_setup.sh)"
+}
+
+finish_deployment() {
+    generate_summary
+    show_recommendations
+    ! deployment_has_failures
 }
 
 # =============================================================================
@@ -1232,47 +1474,40 @@ EOF
 }
 
 handle_arguments() {
-    FILTERED_ARGS=()
+    local action="deploy" argument
 
-    while (( $# > 0 )); do
-        case "$1" in
-            --internal-commit=*)
-                SCRIPT_COMMIT="${1#*=}"
-                shift
-                ;;
-            --clean-cache)
-                log "清理主脚本缓存..."
-                rm -rf "$CACHE_DIR"
-                log "主脚本缓存已清理" "success"
-                exit 0
-                ;;
-            --check-status)
-                if [[ -f "$SUMMARY_FILE" ]]; then
-                    cat "$SUMMARY_FILE"
-                else
-                    echo "❌ 未找到部署摘要文件"
-                fi
-                exit 0
-                ;;
-            --help|-h)
-                show_help
-                exit 0
-                ;;
-            --version|-v)
-                echo "Linux 系统部署脚本 v$SCRIPT_VERSION"
-
-                if [[ "$SCRIPT_COMMIT" != "unknown" ]]; then
-                    echo "Commit: $SCRIPT_COMMIT"
-                fi
-
-                exit 0
-                ;;
+    for argument in "$@"; do
+        case "$argument" in
+            --clean-cache) [[ "$action" == "deploy" ]] || return 2; action="clean-cache" ;;
+            --check-status) [[ "$action" == "deploy" ]] || return 2; action="check-status" ;;
+            --help|-h) [[ "$action" == "deploy" ]] || return 2; action="help" ;;
+            --version|-v) [[ "$action" == "deploy" ]] || return 2; action="version" ;;
             *)
-                FILTERED_ARGS+=("$1")
-                shift
+                printf '❌ 未知参数：%s\n' "$argument" >&2
+                return 2
                 ;;
         esac
     done
+
+    case "$action" in
+        deploy) return 0 ;;
+        clean-cache)
+            log "清理主脚本缓存..."
+            rm -rf -- "$CACHE_DIR" || { log "主脚本缓存清理失败" "error"; return 1; }
+            log "主脚本缓存已清理" "success"
+            exit 0
+            ;;
+        check-status)
+            if [[ -f "$SUMMARY_FILE" ]]; then cat "$SUMMARY_FILE"; else echo "❌ 未找到部署摘要文件"; fi
+            exit 0
+            ;;
+        help) show_help; exit 0 ;;
+        version)
+            echo "Linux 系统部署脚本 v$SCRIPT_VERSION"
+            is_valid_commit "$RUN_COMMIT" && echo "Commit: $RUN_COMMIT"
+            exit 0
+            ;;
+    esac
 }
 
 # =============================================================================
@@ -1280,7 +1515,12 @@ handle_arguments() {
 # =============================================================================
 
 main() {
-    handle_arguments "$@"
+    handle_arguments "$@" || return $?
+
+    if [[ -n "$RUN_COMMIT" ]] && ! is_valid_commit "$RUN_COMMIT"; then
+        printf '❌ RUN_COMMIT 必须是 40 位小写 Git Commit：%s\n' "$RUN_COMMIT" >&2
+        return 2
+    fi
 
     init_logging
     create_temp_dir
@@ -1296,23 +1536,27 @@ main() {
     echo "$LINE"
     echo "Linux 系统部署脚本 v$SCRIPT_VERSION"
 
-    if [[ "$SCRIPT_COMMIT" != "unknown" ]]; then
-        echo "Commit: ${SCRIPT_COMMIT:0:7}"
+    if is_valid_commit "$RUN_COMMIT"; then
+        echo "Commit: ${RUN_COMMIT:0:7}"
     fi
 
     echo "$LINE"
     echo
 
-    self_update
+    if ! self_update; then
+        exit 1
+    fi
+    if ! is_valid_commit "$RUN_COMMIT"; then
+        log "主脚本未固定到可验证 Commit，拒绝继续执行" "error"
+        exit 1
+    fi
 
     pre_check
     migrate_legacy_apt_source_backups
     install_dependencies
     system_update
-    fix_hosts_file
-
-    if ! LATEST_COMMIT=$(get_latest_commit); then
-        log "无法获取 GitHub Commit，为避免主脚本与模块版本不一致，停止执行" "error"
+    if ! fix_hosts_file; then
+        log "hosts 配置修复失败，停止执行" "error"
         exit 1
     fi
 
@@ -1367,8 +1611,11 @@ main() {
         fi
     done
 
-    generate_summary
-    show_recommendations
+    if ! finish_deployment; then
+        exit 1
+    fi
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi
