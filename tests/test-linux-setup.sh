@@ -17,7 +17,8 @@ assert_fail() { local name="$1"; shift; if "$@"; then fail "$name: unexpectedly 
 
 mkdir -p "$TEST_DIR/etc/cloud" "$TEST_DIR/tmp"
 export RUN_COMMIT="$TEST_COMMIT"
-export LINUX_SETUP_CACHE_DIR="$TEST_DIR/cache"
+export LINUX_SETUP_TEST_MODE=1
+export LINUX_SETUP_CACHE_DIR="$TEST_DIR/linux-setup"
 export LINUX_SETUP_LOG_FILE="$TEST_DIR/linux-setup.log"
 export LINUX_SETUP_SUMMARY_FILE="$TEST_DIR/deployment-summary.txt"
 printf '127.0.0.1 localhost\n' > "$TEST_DIR/etc/hosts"
@@ -27,6 +28,21 @@ export LINUX_SETUP_CLOUD_CONFIG_FILE="$TEST_DIR/etc/cloud/cloud.cfg"
 # shellcheck source=../linux_setup.sh
 source "$ROOT_DIR/linux_setup.sh"
 TEMP_DIR="$TEST_DIR/tmp"
+assert_eq 1 "$LINUX_SETUP_TEST_MODE" "explicit test mode is active"
+assert_eq "$TEST_DIR/linux-setup" "$CACHE_DIR" "test mode enables cache override"
+assert_eq "$TEST_DIR/linux-setup.log" "$LOG_FILE" "test mode enables log override"
+assert_eq "$TEST_DIR/deployment-summary.txt" "$SUMMARY_FILE" "test mode enables summary override"
+assert_eq "$TEST_DIR/etc/hosts" "$HOSTS_FILE" "test mode enables hosts override"
+assert_eq "$TEST_DIR/etc/cloud/cloud.cfg" "$CLOUD_CONFIG_FILE" "test mode enables cloud override"
+pass "path overrides require explicit test mode"
+production_system_paths=$(env ROOT_DIR="$ROOT_DIR" LINUX_SETUP_TEST_MODE=0 LINUX_SETUP_HOSTS_FILE="$TEST_DIR/ignored-hosts" LINUX_SETUP_CLOUD_CONFIG_FILE="$TEST_DIR/ignored-cloud" bash -c 'source "$ROOT_DIR/linux_setup.sh"; printf "%s|%s\n" "$HOSTS_FILE" "$CLOUD_CONFIG_FILE"')
+assert_eq '/etc/hosts|/etc/cloud/cloud.cfg' "$production_system_paths" "production mode ignores hosts and cloud overrides"
+production_paths=$(env ROOT_DIR="$ROOT_DIR" LINUX_SETUP_TEST_MODE=0 \
+    LINUX_SETUP_LOG_FILE="$TEST_DIR/ignored-log" \
+    LINUX_SETUP_SUMMARY_FILE="$TEST_DIR/ignored-summary" \
+    LINUX_SETUP_CACHE_DIR="$TEST_DIR/ignored-cache" \
+    bash -c 'source "$ROOT_DIR/linux_setup.sh"; printf "%s|%s|%s\n" "$LOG_FILE" "$SUMMARY_FILE" "$CACHE_DIR"')
+assert_eq '/var/log/linux-setup.log|/root/deployment_summary.txt|/var/cache/linux-setup' "$production_paths" "production mode ignores log, summary, and cache overrides"
 
 ! grep -Eq 'SCRIPT_COMMIT|LATEST_COMMIT' "$ROOT_DIR/linux_setup.sh" || fail "legacy commit variables remain"
 grep -Fq 'module_url="$MODULE_BASE_URL/$RUN_COMMIT/modules/${module}.sh"' "$ROOT_DIR/linux_setup.sh" || fail "module download not pinned"
@@ -44,21 +60,69 @@ eval "$original_get_latest"
 mkdir -p "$TEST_DIR/unknown/cache"
 printf 'keep\n' > "$TEST_DIR/unknown/cache/sentinel"
 rc=0
-env -u RUN_COMMIT LINUX_SETUP_CACHE_DIR="$TEST_DIR/unknown/cache" LINUX_SETUP_LOG_FILE="$TEST_DIR/unknown/log" \
+env -u RUN_COMMIT LINUX_SETUP_TEST_MODE=1 LINUX_SETUP_CACHE_DIR="$TEST_DIR/unknown/cache" LINUX_SETUP_LOG_FILE="$TEST_DIR/unknown/log" \
     bash "$ROOT_DIR/linux_setup.sh" --clean-cache --not-supported > "$TEST_DIR/unknown/output" 2>&1 || rc=$?
 assert_eq 2 "$rc" "unknown argument returns usage error"
 [[ -f "$TEST_DIR/unknown/cache/sentinel" ]] || fail "unknown argument performed cleanup"
 grep -Fq '未知参数：--not-supported' "$TEST_DIR/unknown/output" || fail "unknown error missing"
 pass "reject unknown argument before side effects"
 
+
+mkdir -p "$TEST_DIR/clean/safe"
+env ROOT_DIR="$ROOT_DIR" LINUX_SETUP_TEST_MODE=1 \
+    LINUX_SETUP_CACHE_DIR="$TEST_DIR/clean/safe/linux-setup" \
+    LINUX_SETUP_LOG_FILE="$TEST_DIR/clean/safe.log" \
+    bash -c 'source "$ROOT_DIR/linux_setup.sh"; prepare_cache_dir'
+[[ -f "$TEST_DIR/clean/safe/linux-setup/.linux-setup-managed-cache-v1" ]] || fail "managed cache marker missing"
+printf 'keep\n' > "$TEST_DIR/clean/safe/linux-setup/sentinel"
+env -u RUN_COMMIT LINUX_SETUP_TEST_MODE=1 \
+    LINUX_SETUP_CACHE_DIR="$TEST_DIR/clean/safe/linux-setup" \
+    LINUX_SETUP_LOG_FILE="$TEST_DIR/clean/safe.log" \
+    bash "$ROOT_DIR/linux_setup.sh" --clean-cache >/dev/null
+[[ ! -e "$TEST_DIR/clean/safe/linux-setup" ]] || fail "managed cache was not removed"
+pass "clean-cache accepts safe managed directory"
+
+
+mkdir -p "$TEST_DIR/clean/unmarked/linux-setup"
+printf 'keep\n' > "$TEST_DIR/clean/unmarked/linux-setup/sentinel"
 rc=0
-env RUN_COMMIT=invalid LINUX_SETUP_CACHE_DIR="$TEST_DIR/invalid-cache" LINUX_SETUP_LOG_FILE="$TEST_DIR/invalid-log" \
+env -u RUN_COMMIT LINUX_SETUP_TEST_MODE=1 \
+    LINUX_SETUP_CACHE_DIR="$TEST_DIR/clean/unmarked/linux-setup" \
+    LINUX_SETUP_LOG_FILE="$TEST_DIR/clean/unmarked.log" \
+    bash "$ROOT_DIR/linux_setup.sh" --clean-cache >/dev/null 2>&1 || rc=$?
+assert_eq 1 "$rc" "clean-cache rejects unmarked directory"
+[[ -f "$TEST_DIR/clean/unmarked/linux-setup/sentinel" ]] || fail "unmarked cache target was modified"
+
+mkdir -p "$TEST_DIR/clean/unsafe/cache"
+printf 'keep\n' > "$TEST_DIR/clean/unsafe/cache/sentinel"
+rc=0
+env -u RUN_COMMIT LINUX_SETUP_TEST_MODE=1 \
+    LINUX_SETUP_CACHE_DIR="$TEST_DIR/clean/unsafe/cache" \
+    LINUX_SETUP_LOG_FILE="$TEST_DIR/clean/unsafe.log" \
+    bash "$ROOT_DIR/linux_setup.sh" --clean-cache >/dev/null 2>&1 || rc=$?
+assert_eq 1 "$rc" "clean-cache rejects unmanaged directory name"
+[[ -f "$TEST_DIR/clean/unsafe/cache/sentinel" ]] || fail "unsafe cache target was modified"
+
+mkdir -p "$TEST_DIR/clean/link-target" "$TEST_DIR/clean/link-parent"
+printf 'keep\n' > "$TEST_DIR/clean/link-target/sentinel"
+ln -s "$TEST_DIR/clean/link-target" "$TEST_DIR/clean/link-parent/linux-setup"
+rc=0
+env -u RUN_COMMIT LINUX_SETUP_TEST_MODE=1 \
+    LINUX_SETUP_CACHE_DIR="$TEST_DIR/clean/link-parent/linux-setup" \
+    LINUX_SETUP_LOG_FILE="$TEST_DIR/clean/link.log" \
+    bash "$ROOT_DIR/linux_setup.sh" --clean-cache >/dev/null 2>&1 || rc=$?
+assert_eq 1 "$rc" "clean-cache rejects symlink target"
+[[ -f "$TEST_DIR/clean/link-target/sentinel" ]] || fail "symlink cache target was modified"
+pass "clean-cache validates managed target"
+
+rc=0
+env RUN_COMMIT=invalid LINUX_SETUP_TEST_MODE=1 LINUX_SETUP_CACHE_DIR="$TEST_DIR/invalid-cache" LINUX_SETUP_LOG_FILE="$TEST_DIR/invalid-log" \
     bash "$ROOT_DIR/linux_setup.sh" > "$TEST_DIR/invalid-output" 2>&1 || rc=$?
 assert_eq 2 "$rc" "invalid RUN_COMMIT is rejected"
 [[ ! -e "$TEST_DIR/invalid-cache" ]] || fail "invalid commit reached cache setup"
 
 rc=0
-env -u RUN_COMMIT LINUX_SETUP_CACHE_DIR="$TEST_DIR/unproven-cache" LINUX_SETUP_LOG_FILE=/dev/null ROOT_DIR="$ROOT_DIR" \
+env -u RUN_COMMIT LINUX_SETUP_TEST_MODE=1 LINUX_SETUP_CACHE_DIR="$TEST_DIR/unproven-cache" LINUX_SETUP_LOG_FILE=/dev/null ROOT_DIR="$ROOT_DIR" \
     bash -c 'source "$ROOT_DIR/linux_setup.sh"; get_latest_commit() { return 1; }; self_update' >/dev/null 2>&1 || rc=$?
 assert_eq 1 "$rc" "unproven script version is rejected"
 
@@ -88,12 +152,32 @@ assert_fail "deployment returns nonzero after module failure" finish_deployment
 MODULE_STATUS=([ok]=success [partial]=degraded)
 assert_ok "degraded module remains nonfatal" finish_deployment
 
+cat > "$TEST_DIR/cloud-indented.in" <<'YAML'
+cloud_init:
+  preserve: true
+  manage_etc_hosts: true
+  manage_etc_hosts: false
+next: value
+YAML
+cat > "$TEST_DIR/cloud-indented.expected" <<'YAML'
+cloud_init:
+  preserve: true
+  manage_etc_hosts: false
+next: value
+YAML
+render_cloud_config "$TEST_DIR/cloud-indented.in" "$TEST_DIR/cloud-indented.out"
+cmp -s "$TEST_DIR/cloud-indented.expected" "$TEST_DIR/cloud-indented.out" ||
+    fail "indented cloud config was not preserved as valid YAML"
+pass "preserve indentation and deduplicate cloud YAML key"
+
 hostname() { printf '%s\n' 'safe-host.example'; }
 printf 'preserve: value\nmanage_etc_hosts: true\nmanage_etc_hosts: true\n' > "$CLOUD_CONFIG_FILE"
-printf '127.0.0.1 localhost\n127.0.1.1 old-alias\n' > "$HOSTS_FILE"
+printf '127.0.0.1 localhost\n127.0.1.1 old-alias   # safe-host.example comment-only\n' > "$HOSTS_FILE"
 assert_ok "hardened hosts repair" fix_hosts_file >/dev/null
 assert_eq 1 "$(grep -Fxc 'manage_etc_hosts: false' "$CLOUD_CONFIG_FILE")" "deduplicate cloud setting"
-grep -Fxq '127.0.1.1 old-alias safe-host.example' "$HOSTS_FILE" || fail "host alias lost"
+grep -Fxq '127.0.1.1 old-alias safe-host.example   # safe-host.example comment-only' "$HOSTS_FILE" || fail "inline hosts comment was not preserved"
+assert_ok "hostname is found before inline comment" hosts_contains_hostname "$HOSTS_FILE" safe-host.example
+pass "insert hostname before inline comment"
 [[ -f "${HOSTS_FILE}.initial-backup" && -f "${HOSTS_FILE}.previous-backup" ]] || fail "hosts backups missing"
 pass "preserve host aliases and backups"
 

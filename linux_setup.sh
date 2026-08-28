@@ -15,11 +15,24 @@ readonly MODULE_BASE_URL="https://raw.githubusercontent.com/LucaLin233/Linux"
 readonly GITHUB_API_URL="https://api.github.com/repos/LucaLin233/Linux/commits/main"
 readonly MODULES_API_URL="https://api.github.com/repos/LucaLin233/Linux/contents/modules"
 
-LOG_FILE="${LINUX_SETUP_LOG_FILE:-/var/log/linux-setup.log}"
-readonly SUMMARY_FILE="${LINUX_SETUP_SUMMARY_FILE:-/root/deployment_summary.txt}"
-readonly CACHE_DIR="${LINUX_SETUP_CACHE_DIR:-/var/cache/linux-setup}"
-readonly HOSTS_FILE="${LINUX_SETUP_HOSTS_FILE:-/etc/hosts}"
-readonly CLOUD_CONFIG_FILE="${LINUX_SETUP_CLOUD_CONFIG_FILE:-/etc/cloud/cloud.cfg}"
+readonly LINUX_SETUP_TEST_MODE="${LINUX_SETUP_TEST_MODE:-0}"
+
+if [[ "$LINUX_SETUP_TEST_MODE" == "1" ]]; then
+    LOG_FILE="${LINUX_SETUP_LOG_FILE:-/var/log/linux-setup.log}"
+    SUMMARY_FILE="${LINUX_SETUP_SUMMARY_FILE:-/root/deployment_summary.txt}"
+    CACHE_DIR="${LINUX_SETUP_CACHE_DIR:-/var/cache/linux-setup}"
+    HOSTS_FILE="${LINUX_SETUP_HOSTS_FILE:-/etc/hosts}"
+    CLOUD_CONFIG_FILE="${LINUX_SETUP_CLOUD_CONFIG_FILE:-/etc/cloud/cloud.cfg}"
+else
+    LOG_FILE="/var/log/linux-setup.log"
+    SUMMARY_FILE="/root/deployment_summary.txt"
+    CACHE_DIR="/var/cache/linux-setup"
+    HOSTS_FILE="/etc/hosts"
+    CLOUD_CONFIG_FILE="/etc/cloud/cloud.cfg"
+fi
+
+readonly SUMMARY_FILE CACHE_DIR HOSTS_FILE CLOUD_CONFIG_FILE
+readonly CACHE_MARKER_NAME=".linux-setup-managed-cache-v1"
 readonly LINE="============================================================"
 
 TEMP_DIR=""
@@ -371,9 +384,15 @@ render_cloud_config() {
     local source="$1" output="$2"
 
     awk '
-        /^manage_etc_hosts:[[:space:]]*/ {
+        {
+            content = $0
+            sub(/^ */, "", content)
+        }
+        content ~ /^manage_etc_hosts *:/ {
             if (!written) {
-                print "manage_etc_hosts: false"
+                indentation = $0
+                sub(/[^ ].*$/, "", indentation)
+                print indentation "manage_etc_hosts: false"
                 written = 1
             }
             next
@@ -388,8 +407,11 @@ hosts_contains_hostname() {
 
     awk -v hostname="$hostname_value" '
         $1 == "127.0.1.1" {
-            for (field = 2; field <= NF; field++) {
-                if ($field == hostname) found = 1
+            data = $0
+            sub(/#.*/, "", data)
+            count = split(data, fields, /[[:space:]]+/)
+            for (field = 1; field <= count; field++) {
+                if (fields[field] == hostname) found = 1
             }
         }
         END { exit !found }
@@ -401,12 +423,30 @@ render_hosts_file() {
 
     awk -v hostname="$hostname_value" '
         $1 == "127.0.1.1" && !updated {
-            present = 0
-            for (field = 2; field <= NF; field++) {
-                if ($field == hostname) present = 1
+            data = $0
+            comment_position = index(data, "#")
+            if (comment_position) {
+                comment = substr(data, comment_position)
+                data = substr(data, 1, comment_position - 1)
+            } else {
+                comment = ""
             }
-            if (present) print
-            else print $0 " " hostname
+            count = split(data, fields, /[[:space:]]+/)
+            present = 0
+            for (field = 1; field <= count; field++) {
+                if (fields[field] == hostname) present = 1
+            }
+            if (present) {
+                print
+            } else if (comment_position) {
+                spacing = data
+                sub(/^.*[^[:space:]]/, "", spacing)
+                sub(/[[:space:]]+$/, "", data)
+                if (spacing == "") spacing = " "
+                print data " " hostname spacing comment
+            } else {
+                print $0 " " hostname
+            }
             updated = 1
             next
         }
@@ -946,7 +986,7 @@ file_owner_and_mode_are_safe() {
 }
 
 prepare_cache_dir() {
-    local owner mode
+    local owner mode marker
 
     if [[ -L "$CACHE_DIR" || ( -e "$CACHE_DIR" && ! -d "$CACHE_DIR" ) ]]; then
         log "主脚本缓存路径不安全，拒绝使用：$CACHE_DIR" "warn"
@@ -961,6 +1001,12 @@ prepare_cache_dir() {
         return 1
     fi
     chmod 0700 "$CACHE_DIR" 2>/dev/null || return 1
+
+    marker="$CACHE_DIR/$CACHE_MARKER_NAME"
+    [[ ! -L "$marker" && ( ! -e "$marker" || -f "$marker" ) ]] || return 1
+    [[ -e "$marker" ]] || install -m 0600 /dev/null "$marker" || return 1
+    is_regular_file "$marker" || return 1
+    file_owner_and_mode_are_safe "$marker"
 }
 
 script_sha256() {
@@ -1473,6 +1519,36 @@ Linux 系统部署脚本 v$SCRIPT_VERSION
 EOF
 }
 
+validate_cache_cleanup_target() {
+    local normalized parent marker
+
+    [[ "$CACHE_DIR" == /* ]] || return 1
+    [[ "$(basename -- "$CACHE_DIR")" == "linux-setup" ]] || return 1
+    if [[ "$LINUX_SETUP_TEST_MODE" != "1" &&
+        "$CACHE_DIR" != "/var/cache/linux-setup" ]]; then
+        return 1
+    fi
+    [[ ! -L "$CACHE_DIR" && ( ! -e "$CACHE_DIR" || -d "$CACHE_DIR" ) ]] || return 1
+
+    normalized=$(realpath -m -- "$CACHE_DIR" 2>/dev/null) || return 1
+    [[ "$normalized" == "$CACHE_DIR" ]] || return 1
+
+    parent=$(dirname -- "$CACHE_DIR")
+    [[ -d "$parent" && ! -L "$parent" ]] || return 1
+    file_owner_and_mode_are_safe "$parent" || return 1
+
+    if [[ -d "$CACHE_DIR" ]]; then
+        file_owner_and_mode_are_safe "$CACHE_DIR" || return 1
+        marker="$CACHE_DIR/$CACHE_MARKER_NAME"
+        if [[ -e "$marker" || -L "$marker" ]]; then
+            is_regular_file "$marker" || return 1
+            file_owner_and_mode_are_safe "$marker" || return 1
+        elif [[ "$LINUX_SETUP_TEST_MODE" == "1" ]]; then
+            return 1
+        fi
+    fi
+}
+
 handle_arguments() {
     local action="deploy" argument
 
@@ -1492,8 +1568,15 @@ handle_arguments() {
     case "$action" in
         deploy) return 0 ;;
         clean-cache)
+            if ! validate_cache_cleanup_target; then
+                log "主脚本缓存目录不安全或不受管，拒绝清理：$CACHE_DIR" "error"
+                return 1
+            fi
             log "清理主脚本缓存..."
-            rm -rf -- "$CACHE_DIR" || { log "主脚本缓存清理失败" "error"; return 1; }
+            rm -rf --one-file-system -- "$CACHE_DIR" || {
+                log "主脚本缓存清理失败" "error"
+                return 1
+            }
             log "主脚本缓存已清理" "success"
             exit 0
             ;;
