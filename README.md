@@ -390,20 +390,6 @@ cd Linux
 `DELETE`；非交互执行还须显式设置 `ALLOW_DELETE_EXTRA="true"`。将 `known_hosts` 指向
 `/dev/null` 同样需要显式设置 `ALLOW_INSECURE_HOST_KEY_STORAGE="true"`，不推荐这样做。
 
-### sing-box 安装
-
-```bash
-sudo bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/tools/sbinstall.sh) install
-bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/tools/sbinstall.sh) status
-sudo bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/tools/sbinstall.sh) uninstall
-```
-
-安装前需准备有效的 `/root/proxy/config.json`；证书由该配置引用时还需准备 `cert.crt` 和
-`private.key`。脚本从 SagerNet GitHub Release API 获取目标文件及 SHA-256 digest，在 staging
-目录完成摘要、版本和 `sing-box check` 校验后才替换运行版本。已有二进制和 unit 会保存到
-`/root/proxy/backup`；替换或服务重启失败时自动回滚。卸载仅移除本脚本可确认管理的服务和
-程序文件，保留配置、证书与回滚快照。
-
 ### 独立动态 MOTD
 
 ```bash
