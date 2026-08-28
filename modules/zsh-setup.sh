@@ -9,6 +9,7 @@
 set -euo pipefail
 
 # === 常量定义 ===
+readonly RUN_COMMIT="${RUN_COMMIT:-}"
 readonly ZSH_DIR="$HOME/.oh-my-zsh"
 readonly CUSTOM_DIR="${ZSH_CUSTOM:-$ZSH_DIR/custom}"
 readonly THEME_DIR="$CUSTOM_DIR/themes/powerlevel10k"
@@ -40,6 +41,10 @@ debug_log() {
     if [[ "${DEBUG:-}" == "1" ]]; then
         log "DEBUG: $1" "debug" >&2
     fi
+}
+
+validate_run_commit() {
+    [[ -z "$RUN_COMMIT" || "$RUN_COMMIT" =~ ^[0-9a-f]{40}$ ]]
 }
 
 # === 辅助函数 ===
@@ -459,6 +464,7 @@ setup_theme() {
 
     local choice
     local config_url=""
+    local repository_ref="${RUN_COMMIT:-main}"
 
     read -r -t 30 -p "请选择 [1-6]（默认 5）: " choice >&2 || choice="5"
     choice="${choice:-5}"
@@ -466,7 +472,7 @@ setup_theme() {
     case "$choice" in
         1)
             echo "主题: LucaLin"
-            config_url="https://raw.githubusercontent.com/LucaLin233/Linux/main/p10k-config.zsh"
+            config_url="https://raw.githubusercontent.com/LucaLin233/Linux/${repository_ref}/p10k-config.zsh"
             ;;
         2)
             echo "主题: Rainbow"
@@ -535,6 +541,11 @@ setup_default_shell() {
 
 # === 主流程 ===
 main() {
+    if ! validate_run_commit; then
+        log "RUN_COMMIT 必须为空或 40 位小写 Git Commit" "error"
+        exit 1
+    fi
+
     if (( EUID != 0 )); then
         log "需要 root 权限运行" "error"
         exit 1
