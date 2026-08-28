@@ -10,7 +10,7 @@
 set -uo pipefail
 umask 022
 
-readonly VERSION="1.0.13"
+readonly VERSION="1.0.14"
 readonly INSTALL_PATH="${TCSHAPE_INSTALL_PATH:-/usr/local/sbin/tcshape}"
 readonly UPDATE_REPO="LucaLin233/Linux"
 readonly UPDATE_BRANCH="main"
@@ -115,6 +115,16 @@ require_root() {
     if (( EUID != 0 )); then
         error "需要 root 权限"
         exit 1
+    fi
+}
+
+require_option_value() {
+    local option="$1"
+    local value="${2:-}"
+
+    if (( $# < 2 )) || [[ -z "$value" || "$value" == -* ]]; then
+        error "$option 缺少值"
+        return 1
     fi
 }
 
@@ -253,11 +263,49 @@ validate_update_file() {
     bash -n "$file" >/dev/null 2>&1
 }
 
+update_input_is_tty() {
+    [[ -t 0 ]]
+}
+
+precheck_update_cli() {
+    local assume_yes=false
+    local argument
+
+    for argument in "$@"; do
+        case "$argument" in
+            --yes|-y) assume_yes=true ;;
+            --from-menu) ;;
+            *) error "未知参数：$argument"; return 1 ;;
+        esac
+    done
+
+    if [[ "$assume_yes" != "true" ]] && ! update_input_is_tty; then
+        error "非交互更新必须显式使用 --yes"
+        return 1
+    fi
+}
+
+read_update_confirmation() {
+    local answer
+
+    if ! read -r -p "现在更新？[Y/n]: " answer; then
+        error "无法读取更新确认，已取消"
+        return 1
+    fi
+    if [[ -z "$answer" || "$answer" =~ ^[Yy]$ ]]; then
+        return 0
+    fi
+    info "已取消"
+    return 2
+}
+
 cmd_update() {
+    precheck_update_cli "$@" || return 1
+
     local from_menu=false
     local assume_yes=false
-    local metadata commit latest download_url temp_dir downloaded answer
-    local new_file backup_file newest
+    local metadata commit latest download_url temp_dir downloaded
+    local new_file backup_file newest confirmation_status
 
     while (( $# > 0 )); do
         case "$1" in
@@ -316,12 +364,14 @@ cmd_update() {
     echo "来源提交：$commit"
     echo "更新地址：https://github.com/$UPDATE_REPO/commit/$commit"
     if [[ "$assume_yes" != "true" ]]; then
-        read -r -p "现在更新？[Y/n]: " answer
-        [[ -z "$answer" || "$answer" =~ ^[Yy]$ ]] || {
+        if read_update_confirmation; then
+            :
+        else
+            confirmation_status=$?
             rm -rf "$temp_dir"
-            info "已取消"
-            return 0
-        }
+            (( confirmation_status == 2 )) && return 0
+            return 1
+        fi
     fi
 
     [[ -f "$INSTALL_PATH" ]] && grep -Fq '# tcshape-managed' "$INSTALL_PATH" || {
@@ -1855,16 +1905,16 @@ cmd_scan() {
 
     while (( $# > 0 )); do
         case "$1" in
-            --peer) peer="${2:-}"; shift 2 ;;
-            --port) PEER_PORT="${2:-}"; shift 2 ;;
-            --nominal) nominal="${2:-}"; shift 2 ;;
-            --from) lo="${2:-}"; shift 2 ;;
-            --to) hi="${2:-}"; shift 2 ;;
-            --step) step="${2:-}"; shift 2 ;;
-            --dur) duration="${2:-}"; shift 2 ;;
-            --margin) margin="${2:-}"; shift 2 ;;
-            --cap) scan_cap="${2:-}"; shift 2 ;;
-            --loss-threshold) loss_threshold="${2:-}"; shift 2 ;;
+            --peer) require_option_value "$@" || return 1; peer="$2"; shift 2 ;;
+            --port) require_option_value "$@" || return 1; PEER_PORT="$2"; shift 2 ;;
+            --nominal) require_option_value "$@" || return 1; nominal="$2"; shift 2 ;;
+            --from) require_option_value "$@" || return 1; lo="$2"; shift 2 ;;
+            --to) require_option_value "$@" || return 1; hi="$2"; shift 2 ;;
+            --step) require_option_value "$@" || return 1; step="$2"; shift 2 ;;
+            --dur) require_option_value "$@" || return 1; duration="$2"; shift 2 ;;
+            --margin) require_option_value "$@" || return 1; margin="$2"; shift 2 ;;
+            --cap) require_option_value "$@" || return 1; scan_cap="$2"; shift 2 ;;
+            --loss-threshold) require_option_value "$@" || return 1; loss_threshold="$2"; shift 2 ;;
             --yes|-y) assume_yes=true; shift ;;
             -4|-6) IP_FAMILY="$1"; shift ;;
             --*) error "未知参数：$1"; return 1 ;;
@@ -1944,7 +1994,9 @@ cmd_scan() {
     qdisc_save "$iface" || return 1
     SWEEP_ACTIVE=true
     trap cleanup_sweep EXIT
-    trap 'exit 130' INT TERM HUP
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
 
     if [[ "$user_range" == "false" ]]; then
         info "不限速探测（${duration}s，单流）..."
@@ -2394,6 +2446,7 @@ main() {
     case "$command" in
         help|-h|--help) usage; return 0 ;;
         version|-v|--version) echo "tcshape $VERSION"; return 0 ;;
+        u|update) precheck_update_cli "$@" || return 1 ;;
     esac
 
     require_root

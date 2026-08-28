@@ -215,12 +215,12 @@ grep -Fq 'tcshape 使用自身独立的流量上限' "$ROOT_DIR/docs/traffic-sha
 printf 'PASS: traffic-shape keeps independent code, state, lock, and budget
 '
 
-assert_eq "1.0.13" "$(script_version "$ROOT_DIR/tools/traffic-shape.sh")" \
+assert_eq "1.0.14" "$(script_version "$ROOT_DIR/tools/traffic-shape.sh")" \
     "extract update version"
 assert_ok "validate install source" validate_install_file \
     "$ROOT_DIR/tools/traffic-shape.sh"
 assert_ok "validate managed update file" validate_update_file \
-    "$ROOT_DIR/tools/traffic-shape.sh" "1.0.13"
+    "$ROOT_DIR/tools/traffic-shape.sh" "1.0.14"
 grep -Fq '# Upstream version: v0.5.6' "$ROOT_DIR/tools/traffic-shape.sh" ||
     fail "traffic-shape upstream version is not pinned to v0.5.6"
 grep -Fq '`v0.5.6`' "$ROOT_DIR/docs/traffic-shape.md" ||
@@ -232,7 +232,7 @@ trap 'rm -rf "$temp_dir"' EXIT
 invalid_update="$temp_dir/invalid-update.sh"
 sed 's#readonly UPDATE_REPO="LucaLin233/Linux"#readonly UPDATE_REPO="other/repo"#' \
     "$ROOT_DIR/tools/traffic-shape.sh" > "$invalid_update"
-assert_fail "reject update from another repository" validate_update_file "$invalid_update" "1.0.13"
+assert_fail "reject update from another repository" validate_update_file "$invalid_update" "1.0.14"
 
 empty_install="$temp_dir/empty-tcshape"
 unknown_install="$temp_dir/unknown-tcshape"
