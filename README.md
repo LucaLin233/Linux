@@ -190,10 +190,14 @@ sudo bash <(curl -fsSL "$RAW_BASE/system-customize.sh") help
 
 `restore` 会统一恢复 MOTD、Locale 和 XanMod 软件源文件；默认恢复上一次运行前状态，
 `restore initial` 恢复首次运行前的可信状态。XanMod 的密钥、传统 list 与 Deb822 source
-按一个整体预检和恢复；任一状态缺失或未知时不会进行部分恢复。已安装的 XanMod 内核包不会被卸载。
+按一个整体预检和恢复；任一状态缺失、冲突或未知时不会进行部分恢复。模块更新 `initial`/`previous`
+前会先快照完整旧 backup 组，把三个目标的全部状态写入 stage，全部成功后才提交；capture、旧备份迁移
+或 commit 中途失败都会恢复同一世代的完整旧组。生产备份目录必须是 `root:root`、`0700` 的真实目录，
+状态项也会校验类型、owner 和写权限。已安装的 XanMod 内核包不会被卸载。
 
-直接执行 `xanmod` 时默认使用 `[y/N]` 确认；无 TTY 必须显式传入 `--yes`。`all` 或无参数模式
-在无 TTY 时仍会完成 MOTD 与 Locale 步骤，但会安全跳过 XanMod，避免管道、自动化或 EOF 意外安装内核。
+直接执行 `xanmod` 会先完成只读规划；不支持的发行版、非 amd64、x86-64-v1，或目标包与正式仓库
+文件已经严格安全有效时，无需确认。只有计划确实包含修改时才使用 `[y/N]`，无 TTY 必须显式传入
+`--yes`。`all` 或无参数模式在无 TTY 时仍会完成 MOTD 与 Locale，但只跳过确需修改的 XanMod 步骤。
 
 `network-optimize.sh` 支持自动测速、手动指定参数、查看状态和恢复配置：
 
@@ -420,13 +424,22 @@ sudo bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/t
 sudo bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/tools/xanmod-install.sh) help
 ```
 
-脚本检测 x86-64 psABI 级别并选择适合的 XanMod 包。直接安装默认使用 `[y/N]`，无 TTY 时必须
-显式传入 `--yes`。密钥、传统 list 和 Deb822 source 使用同目录随机临时文件原子替换，并通过
-完整运行时快照在失败时全量回滚；候选源和正式路径都会使用隔离 APT lists 验证。
+脚本先执行只读规划，再检测 x86-64 psABI 并选择适合的 XanMod 包。独立工具保留动态 codename
+探测；系统定制模块仍使用其原有发行版策略。不支持、非 amd64、x86-64-v1，或目标包和正式仓库文件
+已经安全有效时，不要求 `--yes`。只有确需修改时才使用 `[y/N]`；无 TTY 必须显式传入 `--yes`。
+
+生产环境中的正式 keyring、传统 list、Deb822 source 必须是 `root:root`、`0644` 的普通文件；测试模式
+要求当前测试 UID/GID 和同样的 `0644`。内容正确但类型、owner 或 mode 不安全仍会判定无效，只能在
+授权事务内通过随机 stage 重新生成。候选源和正式路径分别使用隔离 APT lists 验证，正式文件通过
+同目录原子替换提交，失败则从三文件运行时快照全量回滚。
+
+事务期间会处理 `HUP`、`INT`、`TERM`，分别以 129、130、143 退出并恢复正式配置；进入包安装阶段后
+还会提示 APT 可能部分安装，但不会自动卸载任何内核包。`SIGKILL` 无法被 Shell 捕获，因此不能保证
+自动回滚；执行内核操作前仍须保留控制台和可启动的旧内核。删除临时 stage、snapshot 或 APT lists
+失败会返回非零并报告具体残留路径。
 
 内核安装完成后通常需要重启才能生效；Debian/Ubuntu 原内核和已安装的其他 XanMod 分支均会保留。
-APT 安装失败时可能已经部分解包软件，脚本会恢复三项 APT 配置，但不会自动卸载任何内核包；请检查
-`dpkg --audit` 和 APT 状态，并保留可用旧内核和控制台访问方式。
+APT 安装失败时请检查 `dpkg --audit` 和 APT 状态。
 
 ## 配置文件
 
