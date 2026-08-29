@@ -152,6 +152,8 @@ reset_tool_files() {
     XANMOD_TRANSACTION_ACTIVE=false; XANMOD_CONFIG_MODIFIED=false
     XANMOD_STAGED_KEY=""; XANMOD_STAGED_SOURCE=""; XANMOD_CANDIDATE_SOURCE=""
     XANMOD_ARMORED_KEY_TEMP=""; XANMOD_ACTIVE_APT_LISTS_DIR=""; XANMOD_ACTIVE_APT_LISTS_BUILDING=false
+    XANMOD_ALLOCATION_CANDIDATE=""; XANMOD_ALLOCATION_KIND=""; XANMOD_ALLOCATION_OWNER_TOKEN=""
+    XANMOD_ALLOCATION_EXPECTED_MODE=""; XANMOD_ALLOCATION_STATE=""
     XANMOD_RESTORE_STAGE=""
     XANMOD_GUARD_ACTIVE=false; XANMOD_LOCK_HELD=false
     reset_xanmod_plan
@@ -585,7 +587,7 @@ run_install_scenario postcheck-fail 1
     reset_tool_files
     candidate="$TEST_DIR/tool/candidate.sources"; printf 'Types: deb\n' > "$candidate"
     apt-get() { return 0; }
-    rm() { local last=${!#}; [[ "$last" == *xanmod-apt-lists.* ]] && return 1; command rm "$@"; }
+    rm() { local last=${!#}; [[ -d "$last" && "$(basename "$last")" == xanmod-apt-lists.* ]] && return 1; command rm "$@"; }
     rc=0; xanmod_source_is_usable "$candidate" > "$TEST_DIR/lists-cleanup.log" 2>&1 || rc=$?
     assert_eq 125 "$rc" "APT lists deletion failure returns cleanup status"
     grep -Fq '临时 APT lists 残留:' "$TEST_DIR/lists-cleanup.log" || fail "APT lists cleanup omitted residue path"
@@ -787,20 +789,20 @@ block_for_signal() {
     touch "$root/ready"
     while :; do sleep 1; done
 }
+xanmod_after_allocation_attempt_hook() {
+    local attempted_kind="$1"
+    local create_status="$3"
+
+    if [[ "$attempted_kind" == "$kind" && "$create_status" == 0 ]]; then
+        block_for_signal
+    fi
+}
 install_xanmod_transaction_guards
 take_xanmod_lock
 if [[ "$kind" == directory ]]; then
-    xanmod_create_temp_directory_at_path() {
-        command mkdir -m "$2" -- "$1"
-        block_for_signal
-    }
     xanmod_allocate_temp_directory XANMOD_RUNTIME_SNAPSHOT_DIR \
         XANMOD_RUNTIME_SNAPSHOT_BUILDING "$root/tmp" allocation-directory 0700
 else
-    xanmod_create_temp_file_at_path() {
-        (umask 077; set -o noclobber; : > "$1") 2>/dev/null
-        block_for_signal
-    }
     xanmod_allocate_temp_file XANMOD_STAGED_KEY "$root/tmp" allocation-file .tmp 0600
 fi
 ALLOCATION_WINDOW_CHILD
@@ -837,6 +839,128 @@ for allocation_signal in HUP INT TERM; do
     run_allocation_window_signal_case "$allocation_signal" "$allocation_status" directory
     run_allocation_window_signal_case "$allocation_signal" "$allocation_status" file
  done
+
+cat > "$TEST_DIR/allocation-collision-signal-child.sh" <<'ALLOCATION_COLLISION_SIGNAL_CHILD'
+#!/usr/bin/env bash
+set -euo pipefail
+root="$1"
+kind="$2"
+tool="$3"
+mkdir -p "$root/tmp"
+printf key-before > "$root/key.gpg"
+printf list-before > "$root/release.list"
+printf source-before > "$root/release.sources"
+export XANMOD_TEST_MODE=1
+export XANMOD_KEYRING_PATH="$root/key.gpg"
+export XANMOD_SOURCE_LIST_PATH="$root/release.list"
+export XANMOD_SOURCE_DEB822_PATH="$root/release.sources"
+export XANMOD_LOCK_PATH="$root/xanmod.lock"
+export XANMOD_OS_RELEASE_PATH="$root/os-release"
+export XANMOD_CPUINFO_PATH="$root/cpuinfo"
+export TMPDIR="$root/tmp"
+source "$tool"
+case "$kind" in
+    directory)
+        collision_path="$root/tmp/allocation-directory.collision"
+        mkdir -m 0700 "$collision_path"
+        printf owner-data > "$collision_path/owner-data"
+        ;;
+    file)
+        collision_path="$root/tmp/allocation-file.collision.tmp"
+        printf keep > "$collision_path"
+        ;;
+    file-symlink)
+        collision_path="$root/tmp/allocation-file.collision.tmp"
+        printf link-target > "$root/link-target"
+        ln -s "$root/link-target" "$collision_path"
+        ;;
+    *) exit 2 ;;
+esac
+token_call=0
+xanmod_random_token() {
+    ((token_call += 1))
+    case "$token_call" in
+        1) printf 'collision\n' ;;
+        2) printf 'allocation-owner\n' ;;
+        *) printf 'unexpected-%s\n' "$token_call" ;;
+    esac
+}
+block_for_signal() {
+    touch "$root/ready"
+    while :; do sleep 1; done
+}
+xanmod_after_allocation_attempt_hook() {
+    local attempted_path="$2"
+    local create_status="$3"
+
+    if [[ "$attempted_path" == "$collision_path" && "$create_status" != 0 ]]; then
+        block_for_signal
+    fi
+}
+install_xanmod_transaction_guards
+take_xanmod_lock
+if [[ "$kind" == directory ]]; then
+    xanmod_allocate_temp_directory XANMOD_RUNTIME_SNAPSHOT_DIR \
+        XANMOD_RUNTIME_SNAPSHOT_BUILDING "$root/tmp" allocation-directory 0700
+else
+    xanmod_allocate_temp_file XANMOD_STAGED_KEY "$root/tmp" allocation-file .tmp 0600
+fi
+ALLOCATION_COLLISION_SIGNAL_CHILD
+chmod 0755 "$TEST_DIR/allocation-collision-signal-child.sh"
+
+run_allocation_collision_signal_case() {
+    local signal_name="$1" expected_status="$2" kind="$3"
+    local root="$TEST_DIR/allocation-collision-$kind-$signal_name"
+    local collision=""
+    local pid rc=0
+
+    mkdir -p "$root"
+    setsid env --default-signal=HUP,INT,TERM \
+        bash "$TEST_DIR/allocation-collision-signal-child.sh" \
+        "$root" "$kind" "$TOOL" > "$root/output.log" 2>&1 &
+    pid=$!
+    for _ in $(seq 1 200); do
+        [[ -e "$root/ready" ]] && break
+        sleep 0.05
+    done
+    [[ -e "$root/ready" ]] || { cat "$root/output.log"; kill "$pid" 2>/dev/null || true; fail "$signal_name/$kind collision did not block"; }
+    kill "-$signal_name" -- "-$pid"
+    wait "$pid" || rc=$?
+    assert_eq "$expected_status" "$rc" "$signal_name during $kind collision returns conventional status"
+    case "$kind" in
+        directory)
+            collision="$root/tmp/allocation-directory.collision"
+            [[ -d "$collision" && ! -L "$collision" ]] || fail "$signal_name directory collision was deleted"
+            assert_file_eq owner-data "$collision/owner-data" "$signal_name directory collision preserves owner data"
+            ;;
+        file)
+            collision="$root/tmp/allocation-file.collision.tmp"
+            assert_file_eq keep "$collision" "$signal_name file collision preserves content"
+            ;;
+        file-symlink)
+            collision="$root/tmp/allocation-file.collision.tmp"
+            [[ -L "$collision" ]] || fail "$signal_name file symlink collision was deleted"
+            assert_eq "$root/link-target" "$(readlink "$collision")" "$signal_name file symlink collision preserves target"
+            assert_file_eq link-target "$root/link-target" "$signal_name file symlink collision preserves target content"
+            ;;
+    esac
+    [[ -z "$(find "$root/tmp" -mindepth 1 -maxdepth 1 \
+        \( -name 'allocation-directory.*' -o -name 'allocation-file.*' \) \
+        ! -path "$collision" -print -quit)" ]] || fail "$signal_name/$kind collision left owned allocation residue"
+    pass "$signal_name during $kind collision creates no owned allocation residue"
+    assert_file_eq key-before "$root/key.gpg" "$signal_name/$kind collision leaves key unchanged"
+    assert_file_eq list-before "$root/release.list" "$signal_name/$kind collision leaves list unchanged"
+    assert_file_eq source-before "$root/release.sources" "$signal_name/$kind collision leaves source unchanged"
+    flock -n "$root/xanmod.lock" -c true || fail "$signal_name/$kind collision did not release lock"
+    pass "$signal_name during $kind collision releases lock"
+}
+
+for allocation_signal in HUP INT TERM; do
+    case "$allocation_signal" in HUP) allocation_status=129;; INT) allocation_status=130;; TERM) allocation_status=143;; esac
+    run_allocation_collision_signal_case "$allocation_signal" "$allocation_status" directory
+    run_allocation_collision_signal_case "$allocation_signal" "$allocation_status" file
+    run_allocation_collision_signal_case "$allocation_signal" "$allocation_status" file-symlink
+done
 
 cat > "$TEST_DIR/exit-zero-child.sh" <<'EXIT_ZERO_CHILD'
 #!/usr/bin/env bash
@@ -982,9 +1106,13 @@ block_for_signal() {
     touch "$root/ready"
     while :; do sleep 1; done
 }
-xanmod_create_backup_state_dir() {
-    command mkdir -m 0700 -- "$XANMOD_BACKUP_STATE_DIR"
-    block_for_signal
+xanmod_after_allocation_attempt_hook() {
+    local attempted_kind="$1"
+    local create_status="$3"
+
+    if [[ "$attempted_kind" == backup-state && "$create_status" == 0 ]]; then
+        block_for_signal
+    fi
 }
 install_xanmod_transaction_guards
 take_xanmod_lock
@@ -1024,6 +1152,180 @@ run_backup_dir_window_signal_case() {
 run_backup_dir_window_signal_case HUP 129
 run_backup_dir_window_signal_case INT 130
 run_backup_dir_window_signal_case TERM 143
+
+cat > "$TEST_DIR/backup-dir-race-signal-child.sh" <<'BACKUP_DIR_RACE_SIGNAL_CHILD'
+#!/usr/bin/env bash
+set -euo pipefail
+root="$1"
+module="$2"
+mkdir -p "$root/tmp"
+printf key-before > "$root/key.gpg"
+printf list-before > "$root/release.list"
+printf source-before > "$root/release.sources"
+export XANMOD_TEST_MODE=1
+export XANMOD_KEYRING_PATH="$root/key.gpg"
+export XANMOD_SOURCE_LIST_PATH="$root/release.list"
+export XANMOD_SOURCE_DEB822_PATH="$root/release.sources"
+export XANMOD_LOCK_PATH="$root/xanmod.lock"
+export XANMOD_OS_RELEASE_PATH="$root/os-release"
+export XANMOD_CPUINFO_PATH="$root/cpuinfo"
+export XANMOD_BACKUP_STATE_DIR="$root/backups"
+export TMPDIR="$root/tmp"
+source "$module"
+block_for_signal() {
+    touch "$root/ready"
+    while :; do sleep 1; done
+}
+xanmod_create_backup_state_dir() {
+    command mkdir -m 0700 -- "$XANMOD_BACKUP_STATE_DIR"
+    printf owner-data > "$XANMOD_BACKUP_STATE_DIR/owner-data"
+    return 1
+}
+xanmod_after_allocation_attempt_hook() {
+    local attempted_kind="$1"
+    local create_status="$3"
+
+    if [[ "$attempted_kind" == backup-state && "$create_status" != 0 ]]; then
+        block_for_signal
+    fi
+}
+install_xanmod_transaction_guards
+take_xanmod_lock
+ensure_xanmod_backup_state_dir
+BACKUP_DIR_RACE_SIGNAL_CHILD
+chmod 0755 "$TEST_DIR/backup-dir-race-signal-child.sh"
+
+run_backup_dir_race_signal_case() {
+    local signal_name="$1" expected_status="$2"
+    local root="$TEST_DIR/backup-dir-race-$signal_name"
+    local pid rc=0
+
+    mkdir -p "$root"
+    setsid env --default-signal=HUP,INT,TERM \
+        bash "$TEST_DIR/backup-dir-race-signal-child.sh" \
+        "$root" "$MODULE" > "$root/output.log" 2>&1 &
+    pid=$!
+    for _ in $(seq 1 200); do
+        [[ -e "$root/ready" ]] && break
+        sleep 0.05
+    done
+    [[ -e "$root/ready" ]] || { cat "$root/output.log"; kill "$pid" 2>/dev/null || true; fail "$signal_name backup directory race did not block"; }
+    kill "-$signal_name" -- "-$pid"
+    wait "$pid" || rc=$?
+    assert_eq "$expected_status" "$rc" "$signal_name during backup directory race returns conventional status"
+    [[ -d "$root/backups" && ! -L "$root/backups" ]] || fail "$signal_name backup directory race deleted competing directory"
+    assert_eq 700 "$(stat -c %a "$root/backups")" "$signal_name backup directory race preserves 0700 mode"
+    assert_file_eq owner-data "$root/backups/owner-data" "$signal_name backup directory race preserves owner data"
+    [[ ! -e "$root/backups/.xanmod-allocation-owner" ]] || fail "$signal_name backup directory race wrote ownership proof into competing directory"
+    pass "$signal_name backup directory race does not claim competing directory"
+    assert_file_eq key-before "$root/key.gpg" "$signal_name backup directory race leaves key unchanged"
+    assert_file_eq list-before "$root/release.list" "$signal_name backup directory race leaves list unchanged"
+    assert_file_eq source-before "$root/release.sources" "$signal_name backup directory race leaves source unchanged"
+    flock -n "$root/xanmod.lock" -c true || fail "$signal_name backup directory race did not release lock"
+    pass "$signal_name backup directory race releases lock"
+}
+
+run_backup_dir_race_signal_case HUP 129
+run_backup_dir_race_signal_case INT 130
+run_backup_dir_race_signal_case TERM 143
+
+cat > "$TEST_DIR/backup-parent-child.sh" <<'BACKUP_PARENT_CHILD'
+#!/usr/bin/env bash
+set -euo pipefail
+root="$1"
+case_name="$2"
+module="$3"
+state_dir="$root/missing-parent/missing-child/apt-source-backups"
+parent_dir=$(dirname "$state_dir")
+mkdir -p "$root/tmp"
+printf key-before > "$root/key.gpg"
+printf list-before > "$root/release.list"
+printf source-before > "$root/release.sources"
+case "$case_name" in
+    success) ;;
+    symlink)
+        mkdir -p "$root/real-parent"
+        ln -s "$root/real-parent" "$root/missing-parent"
+        state_dir="$root/missing-parent/apt-source-backups"
+        parent_dir=$(dirname "$state_dir")
+        ;;
+    writable)
+        mkdir -p "$parent_dir"
+        chmod 0777 "$parent_dir"
+        ;;
+    wrong-owner|wrong-gid)
+        mkdir -p "$parent_dir"
+        chmod 0755 "$parent_dir"
+        ;;
+    *) exit 2 ;;
+esac
+export XANMOD_TEST_MODE=1
+export XANMOD_KEYRING_PATH="$root/key.gpg"
+export XANMOD_SOURCE_LIST_PATH="$root/release.list"
+export XANMOD_SOURCE_DEB822_PATH="$root/release.sources"
+export XANMOD_LOCK_PATH="$root/xanmod.lock"
+export XANMOD_OS_RELEASE_PATH="$root/os-release"
+export XANMOD_CPUINFO_PATH="$root/cpuinfo"
+export XANMOD_BACKUP_STATE_DIR="$state_dir"
+export TMPDIR="$root/tmp"
+source "$module"
+fail() { printf 'FAIL: backup parent %s: %s
+' "$case_name" "$*" >&2; exit 1; }
+pass() { printf 'PASS: backup parent %s %s
+' "$case_name" "$*"; }
+assert_file() {
+    local expected="$1" file="$2" label="$3"
+    [[ -f "$file" && ! -L "$file" && "$(<"$file")" == "$expected" ]] || fail "$label"
+    pass "$label"
+}
+if [[ "$case_name" == wrong-owner || "$case_name" == wrong-gid ]]; then
+    other_uid=65534; [[ "$other_uid" == "$XANMOD_TRUSTED_UID" ]] && other_uid=0
+    other_gid=65534; [[ "$other_gid" == "$XANMOD_TRUSTED_GID" ]] && other_gid=0
+    stat() {
+        local last=${!#}
+        if [[ "$last" == "$parent_dir" && "$*" == *'%u:%g:%a'* ]]; then
+            if [[ "$case_name" == wrong-owner ]]; then
+                printf '%s:%s:755
+' "$other_uid" "$XANMOD_TRUSTED_GID"
+            else
+                printf '%s:%s:755
+' "$XANMOD_TRUSTED_UID" "$other_gid"
+            fi
+        else
+            command stat "$@"
+        fi
+    }
+fi
+rc=0; ensure_xanmod_backup_state_dir > "$root/ensure.log" 2>&1 || rc=$?
+if [[ "$case_name" == success ]]; then
+    [[ "$rc" == 0 ]] || { cat "$root/ensure.log"; fail "multi-level missing parent ensure failed"; }
+    [[ -d "$root/missing-parent" && ! -L "$root/missing-parent" ]] || fail "first missing parent is not a regular directory"
+    [[ -d "$parent_dir" && ! -L "$parent_dir" ]] || fail "immediate missing parent is not a regular directory"
+    [[ -d "$state_dir" && ! -L "$state_dir" ]] || fail "leaf is not a regular directory"
+    [[ "$(stat -c %a "$state_dir")" == 700 ]] || fail "leaf mode is not 0700"
+    pass "creates trusted multi-level parent and 0700 leaf"
+    cleanup_new_empty_xanmod_backup_state_dir || fail "could not remove owned empty leaf"
+    [[ -d "$parent_dir" && ! -L "$parent_dir" ]] || fail "cleanup deleted trusted parent"
+    ensure_xanmod_backup_state_dir || fail "second ensure could not recreate leaf"
+    [[ "$(stat -c %a "$state_dir")" == 700 ]] || fail "recreated leaf mode is not 0700"
+    pass "keeps trusted parent and recreates trusted leaf"
+else
+    [[ "$rc" == 1 ]] || fail "untrusted parent was not rejected"
+    [[ ! -e "$state_dir" && ! -L "$state_dir" ]] || fail "rejected parent still created leaf"
+    pass "rejects parent before leaf creation"
+fi
+assert_file key-before "$root/key.gpg" "leaves key unchanged"
+assert_file list-before "$root/release.list" "leaves list unchanged"
+assert_file source-before "$root/release.sources" "leaves source unchanged"
+BACKUP_PARENT_CHILD
+chmod 0755 "$TEST_DIR/backup-parent-child.sh"
+
+for backup_parent_case in success symlink writable wrong-owner wrong-gid; do
+    backup_parent_root="$TEST_DIR/backup-parent-$backup_parent_case"
+    mkdir -p "$backup_parent_root"
+    bash "$TEST_DIR/backup-parent-child.sh" \
+        "$backup_parent_root" "$backup_parent_case" "$MODULE"
+done
 
 module_root="$TEST_DIR/module"
 make_layout "$module_root"
@@ -1106,9 +1408,11 @@ reset_state() {
     XANMOD_GUARD_ACTIVE=false; XANMOD_GUARD_HANDLING=false; XANMOD_LOCK_HELD=false
     XANMOD_STAGED_KEY=""; XANMOD_STAGED_SOURCE=""; XANMOD_CANDIDATE_SOURCE=""
     XANMOD_ARMORED_KEY_TEMP=""; XANMOD_ACTIVE_APT_LISTS_DIR=""; XANMOD_ACTIVE_APT_LISTS_BUILDING=false
+    XANMOD_ALLOCATION_CANDIDATE=""; XANMOD_ALLOCATION_KIND=""; XANMOD_ALLOCATION_OWNER_TOKEN=""
+    XANMOD_ALLOCATION_EXPECTED_MODE=""; XANMOD_ALLOCATION_STATE=""
     XANMOD_RESTORE_STAGE=""
     XANMOD_BACKUP_STATE_DIR_CREATING=false; XANMOD_BACKUP_STATE_DIR_CREATED=false; XANMOD_BACKUP_STATE_DIR_PREEXISTED=false
-    XANMOD_BACKUP_TRANSACTION_ACTIVE=false; XANMOD_BACKUP_SNAPSHOT_BUILDING=false
+    XANMOD_BACKUP_TRANSACTION_ACTIVE=false; XANMOD_BACKUP_SNAPSHOT_BUILDING=false; XANMOD_BACKUP_SNAPSHOT_REMOVED=false
     XANMOD_BACKUP_GROUP_SNAPSHOT_DIR=""; XANMOD_BACKUP_STAGE_DIR=""; XANMOD_BACKUP_STAGE_BUILDING=false
     XANMOD_BACKUP_SNAPSHOT_PATHS=(); XANMOD_BACKUP_LEGACY_PATHS=(); XANMOD_BACKUP_NEW_ARCHIVES=()
     APT_RESULT=0; : > "$ROOT/apt.log"
@@ -1265,6 +1569,77 @@ rc=0; prepare_persistent_xanmod_backups || rc=$?
 assert_eq 1 "$rc" "backup commit middle failure returns nonzero"
 restore_function original_commit_xanmod_persistent_state commit_xanmod_persistent_state
 restore_previous_generation A "backup commit failure preserves A generation"
+
+# Snapshot deletion failure must retain a newly created 0700 state directory until retry.
+reset_state
+write_generation A
+ensure_xanmod_backup_state_dir
+assert_eq true "$XANMOD_BACKUP_STATE_DIR_CREATED" "new backup state directory records owned creation"
+create_xanmod_backup_group_snapshot
+backup_snapshot="$XANMOD_BACKUP_GROUP_SNAPSHOT_DIR"
+backup_path_count=${#XANMOD_BACKUP_SNAPSHOT_PATHS[@]}
+backup_archive="$XANMOD_BACKUP_STATE_DIR/retry-archive"
+printf archive > "$backup_archive"
+XANMOD_BACKUP_NEW_ARCHIVES=("$backup_archive")
+xanmod_allocate_temp_directory XANMOD_BACKUP_STAGE_DIR \
+    XANMOD_BACKUP_STAGE_BUILDING "$XANMOD_BACKUP_STATE_DIR" .retry-stage 0700
+XANMOD_BACKUP_STAGE_BUILDING=false
+backup_stage="$XANMOD_BACKUP_STAGE_DIR"
+printf stage > "$XANMOD_BACKUP_STAGE_DIR/staged"
+rm() { local last=${!#}; [[ "$last" == "$backup_snapshot" ]] && return 1; command rm "$@"; }
+rc=0; restore_xanmod_backup_group_snapshot > "$ROOT/backup-new-state-snapshot-delete.log" 2>&1 || rc=$?
+assert_eq 1 "$rc" "new-state snapshot deletion failure returns nonzero"
+[[ -d "$XANMOD_BACKUP_STATE_DIR" && ! -L "$XANMOD_BACKUP_STATE_DIR" ]] || fail "snapshot deletion failure removed new backup state directory"
+assert_eq 700 "$(stat -c %a "$XANMOD_BACKUP_STATE_DIR")" "snapshot deletion failure keeps new state directory at 0700"
+assert_eq false "$XANMOD_BACKUP_STATE_DIR_CREATING" "snapshot deletion failure preserves completed creating state"
+assert_eq true "$XANMOD_BACKUP_STATE_DIR_CREATED" "snapshot deletion failure preserves created ownership state"
+assert_eq false "$XANMOD_BACKUP_STATE_DIR_PREEXISTED" "snapshot deletion failure preserves non-preexisting state"
+assert_eq true "$XANMOD_BACKUP_TRANSACTION_ACTIVE" "snapshot deletion failure preserves backup transaction"
+assert_eq false "$XANMOD_BACKUP_SNAPSHOT_REMOVED" "snapshot deletion failure records snapshot as retained"
+assert_eq "$backup_snapshot" "$XANMOD_BACKUP_GROUP_SNAPSHOT_DIR" "snapshot deletion failure preserves snapshot path"
+assert_eq "$backup_path_count" "${#XANMOD_BACKUP_SNAPSHOT_PATHS[@]}" "snapshot deletion failure preserves restore array"
+[[ -d "$backup_snapshot" ]] || fail "snapshot deletion failure lost snapshot directory"
+[[ ! -e "$backup_archive" && ! -e "$backup_stage" ]] || fail "snapshot deletion failure left archive or stage"
+pass "snapshot deletion failure cleans archive and stage before retaining snapshot"
+unset -f rm
+restore_xanmod_backup_group_snapshot
+[[ ! -e "$backup_snapshot" ]] || fail "new-state restore retry left snapshot"
+[[ ! -e "$XANMOD_BACKUP_STATE_DIR" && ! -L "$XANMOD_BACKUP_STATE_DIR" ]] || fail "new-state restore retry left empty state directory"
+pass "new-state restore retry deletes snapshot before owned empty state directory"
+assert_eq false "$XANMOD_BACKUP_TRANSACTION_ACTIVE" "new-state restore retry clears active state"
+assert_eq 0 "${#XANMOD_BACKUP_SNAPSHOT_PATHS[@]}" "new-state restore retry clears restore array"
+assert_eq false "$XANMOD_BACKUP_STATE_DIR_CREATED" "new-state restore retry clears created state"
+ensure_xanmod_backup_state_dir
+assert_eq 700 "$(stat -c %a "$XANMOD_BACKUP_STATE_DIR")" "post-retry ensure creates trusted 0700 state directory"
+cleanup_new_empty_xanmod_backup_state_dir
+
+# Snapshot deletion retry must never remove a preexisting trusted state directory.
+reset_state
+write_generation A
+mkdir -m 0700 "$XANMOD_BACKUP_STATE_DIR"
+printf keep > "$XANMOD_BACKUP_STATE_DIR/owner-data"
+ensure_xanmod_backup_state_dir
+assert_eq true "$XANMOD_BACKUP_STATE_DIR_PREEXISTED" "preexisting backup state directory is recorded"
+create_xanmod_backup_group_snapshot
+backup_snapshot="$XANMOD_BACKUP_GROUP_SNAPSHOT_DIR"
+backup_path_count=${#XANMOD_BACKUP_SNAPSHOT_PATHS[@]}
+rm() { local last=${!#}; [[ "$last" == "$backup_snapshot" ]] && return 1; command rm "$@"; }
+rc=0; restore_xanmod_backup_group_snapshot > "$ROOT/backup-preexisting-snapshot-delete.log" 2>&1 || rc=$?
+assert_eq 1 "$rc" "preexisting-state snapshot deletion failure returns nonzero"
+assert_eq true "$XANMOD_BACKUP_STATE_DIR_PREEXISTED" "preexisting-state failure preserves preexisting state"
+assert_eq false "$XANMOD_BACKUP_STATE_DIR_CREATED" "preexisting-state failure does not claim directory ownership"
+assert_eq true "$XANMOD_BACKUP_TRANSACTION_ACTIVE" "preexisting-state failure preserves active transaction"
+assert_eq "$backup_path_count" "${#XANMOD_BACKUP_SNAPSHOT_PATHS[@]}" "preexisting-state failure preserves restore array"
+assert_eq 700 "$(stat -c %a "$XANMOD_BACKUP_STATE_DIR")" "preexisting-state failure preserves 0700 mode"
+assert_eq keep "$(<"$XANMOD_BACKUP_STATE_DIR/owner-data")" "preexisting-state failure preserves owner data"
+unset -f rm
+restore_xanmod_backup_group_snapshot
+[[ ! -e "$backup_snapshot" ]] || fail "preexisting-state retry left snapshot"
+[[ -d "$XANMOD_BACKUP_STATE_DIR" && ! -L "$XANMOD_BACKUP_STATE_DIR" ]] || fail "preexisting-state retry removed directory"
+assert_eq 700 "$(stat -c %a "$XANMOD_BACKUP_STATE_DIR")" "preexisting-state retry keeps 0700 mode"
+assert_eq keep "$(<"$XANMOD_BACKUP_STATE_DIR/owner-data")" "preexisting-state retry keeps owner data"
+assert_eq false "$XANMOD_BACKUP_TRANSACTION_ACTIVE" "preexisting-state retry clears active transaction"
+assert_eq 0 "${#XANMOD_BACKUP_SNAPSHOT_PATHS[@]}" "preexisting-state retry clears restore array"
 
 # A failed backup-group restore preserves the only snapshot and supports retry.
 reset_state
@@ -1434,7 +1809,11 @@ common_functions=(
     xanmod_formal_keyring_valid xanmod_list_source_configured xanmod_deb822_source_configured
     get_xanmod_source_file xanmod_source_matches_codename write_xanmod_deb822_source
     remove_xanmod_temp_directory remove_xanmod_temp_file xanmod_random_token
-    xanmod_create_temp_directory_at_path xanmod_create_temp_file_at_path
+    xanmod_allocation_proof_path xanmod_create_temp_directory_at_path xanmod_create_temp_file_at_path
+    xanmod_begin_pending_allocation xanmod_clear_pending_allocation xanmod_after_allocation_attempt_hook
+    xanmod_run_pending_allocation_create xanmod_pending_allocation_proof_trusted
+    xanmod_pending_allocation_owned xanmod_release_pending_allocation_proof
+    cleanup_xanmod_pending_allocation xanmod_finish_pending_allocation
     xanmod_allocate_temp_directory xanmod_allocate_temp_file cleanup_xanmod_active_apt_lists xanmod_source_is_usable
     capture_xanmod_snapshot_item cleanup_incomplete_xanmod_runtime_snapshot create_xanmod_runtime_snapshot restore_xanmod_snapshot_item
     restore_xanmod_runtime_snapshot discard_xanmod_runtime_snapshot restore_xanmod_saved_trap
