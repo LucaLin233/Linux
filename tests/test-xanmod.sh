@@ -148,7 +148,8 @@ reset_tool_files() {
     mkdir -p "$TEST_DIR/tool/etc/keyrings" "$TEST_DIR/tool/etc/sources" "$TEST_DIR/tool/original" "$TEST_DIR/tool/run" "$TEST_DIR/tool/tmp"
     printf 'VERSION_CODENAME=trixie\n' > "$XANMOD_OS_RELEASE"
     cp "$TEST_DIR/v3.cpu" "$XANMOD_CPUINFO"
-    XANMOD_RUNTIME_SNAPSHOT_DIR=""; XANMOD_TRANSACTION_ACTIVE=false; XANMOD_CONFIG_MODIFIED=false
+    XANMOD_RUNTIME_SNAPSHOT_DIR=""; XANMOD_RUNTIME_SNAPSHOT_BUILDING=false
+    XANMOD_TRANSACTION_ACTIVE=false; XANMOD_CONFIG_MODIFIED=false
     XANMOD_STAGED_KEY=""; XANMOD_STAGED_SOURCE=""; XANMOD_CANDIDATE_SOURCE=""
     XANMOD_ARMORED_KEY_TEMP=""; XANMOD_ACTIVE_APT_LISTS_DIR=""; XANMOD_RESTORE_STAGE=""
     XANMOD_GUARD_ACTIVE=false; XANMOD_LOCK_HELD=false
@@ -510,6 +511,23 @@ run_install_scenario postcheck-fail 1
 
 (
     reset_tool_files
+    snapshot="$TMPDIR/xanmod-runtime-snapshot.incomplete"
+    mkdir -m 0700 "$snapshot"
+    XANMOD_RUNTIME_SNAPSHOT_DIR="$snapshot"
+    XANMOD_RUNTIME_SNAPSHOT_BUILDING=true
+    XANMOD_TRANSACTION_ACTIVE=false
+    rm() { local last=${!#}; [[ "$last" == "$snapshot" ]] && return 1; command rm "$@"; }
+    rc=0; cleanup_incomplete_xanmod_runtime_snapshot > "$TEST_DIR/incomplete-runtime-cleanup.log" 2>&1 || rc=$?
+    assert_eq 1 "$rc" "incomplete runtime snapshot deletion failure returns nonzero"
+    assert_eq "$snapshot" "$XANMOD_RUNTIME_SNAPSHOT_DIR" "incomplete runtime deletion failure preserves path"
+    assert_eq true "$XANMOD_RUNTIME_SNAPSHOT_BUILDING" "incomplete runtime deletion failure preserves building state"
+    grep -Fq "$snapshot" "$TEST_DIR/incomplete-runtime-cleanup.log" || fail "incomplete runtime cleanup omitted residue path"
+    pass "incomplete runtime snapshot deletion failure reports exact path"
+    unset -f rm; command rm -rf "$snapshot"; XANMOD_RUNTIME_SNAPSHOT_DIR=""; XANMOD_RUNTIME_SNAPSHOT_BUILDING=false
+)
+
+(
+    reset_tool_files
     candidate="$TEST_DIR/tool/candidate.sources"; printf 'Types: deb\n' > "$candidate"
     apt-get() { return 0; }
     rm() { local last=${!#}; [[ "$last" == *xanmod-apt-lists.* ]] && return 1; command rm "$@"; }
@@ -519,6 +537,30 @@ run_install_scenario postcheck-fail 1
     pass "APT lists deletion failure reports exact residue path"
     unset -f rm; command find "$TMPDIR" -maxdepth 1 -type d -name 'xanmod-apt-lists.*' -exec rm -rf {} +
     XANMOD_ACTIVE_APT_LISTS_DIR=""
+)
+
+(
+    reset_tool_files
+    dangling="$TEST_DIR/tool/dangling-lists"
+    ln -s "$TEST_DIR/tool/missing-lists-target" "$dangling"
+    XANMOD_ACTIVE_APT_LISTS_DIR="$dangling"
+    cleanup_xanmod_active_apt_lists
+    [[ ! -e "$dangling" && ! -L "$dangling" ]] || fail "dangling APT lists symlink remained"
+    assert_eq '' "$XANMOD_ACTIVE_APT_LISTS_DIR" "dangling APT lists cleanup clears variable only after deletion"
+)
+
+(
+    reset_tool_files
+    dangling="$TEST_DIR/tool/dangling-lists-fail"
+    ln -s "$TEST_DIR/tool/missing-lists-target" "$dangling"
+    XANMOD_ACTIVE_APT_LISTS_DIR="$dangling"
+    rm() { local last=${!#}; [[ "$last" == "$dangling" ]] && return 1; command rm "$@"; }
+    rc=0; cleanup_xanmod_active_apt_lists > "$TEST_DIR/dangling-lists-fail.log" 2>&1 || rc=$?
+    assert_eq 1 "$rc" "dangling APT lists rm failure returns nonzero"
+    assert_eq "$dangling" "$XANMOD_ACTIVE_APT_LISTS_DIR" "dangling APT lists rm failure preserves variable"
+    grep -Fq "$dangling" "$TEST_DIR/dangling-lists-fail.log" || fail "dangling APT lists failure omitted residue path"
+    pass "dangling APT lists rm failure reports exact path"
+    unset -f rm; command rm -f "$dangling"; XANMOD_ACTIVE_APT_LISTS_DIR=""
 )
 
 cat > "$TEST_DIR/signal-child.sh" <<'SIGNAL_CHILD'
@@ -580,6 +622,15 @@ apt-get() {
     return 0
 }
 if [[ "$stage" == commit ]]; then xanmod_after_formal_commit_hook() { block_for_signal; }; fi
+if [[ "$stage" == runtime-build ]]; then
+    eval "$(declare -f capture_xanmod_snapshot_item | sed '1s/capture_xanmod_snapshot_item/original_capture_xanmod_snapshot_item/')"
+    capture_calls=0
+    capture_xanmod_snapshot_item() {
+        ((capture_calls += 1))
+        if (( capture_calls == 1 )); then block_for_signal; fi
+        original_capture_xanmod_snapshot_item "$@"
+    }
+fi
 resolve_xanmod_plan
 take_xanmod_lock
 install_xanmod
@@ -626,6 +677,127 @@ run_signal_case INT 130 commit
 run_signal_case TERM 143 commit
 run_signal_case TERM 143 install
 run_signal_case TERM 143 probe
+run_signal_case HUP 129 runtime-build
+run_signal_case INT 130 runtime-build
+run_signal_case TERM 143 runtime-build
+
+cat > "$TEST_DIR/exit-zero-child.sh" <<'EXIT_ZERO_CHILD'
+#!/usr/bin/env bash
+set -euo pipefail
+root="$1"
+tool="$2"
+mkdir -p "$root/etc/keyrings" "$root/etc/sources" "$root/tmp"
+printf key-before > "$root/etc/keyrings/xanmod.gpg"
+printf list-before > "$root/etc/sources/xanmod.list"
+printf source-before > "$root/etc/sources/xanmod.sources"
+export XANMOD_TEST_MODE=1
+export XANMOD_KEYRING_PATH="$root/etc/keyrings/xanmod.gpg"
+export XANMOD_SOURCE_LIST_PATH="$root/etc/sources/xanmod.list"
+export XANMOD_SOURCE_DEB822_PATH="$root/etc/sources/xanmod.sources"
+export XANMOD_LOCK_PATH="$root/xanmod.lock"
+export XANMOD_OS_RELEASE_PATH="$root/os-release"
+export XANMOD_CPUINFO_PATH="$root/cpuinfo"
+export TMPDIR="$root/tmp"
+source "$tool"
+install_xanmod_transaction_guards
+create_xanmod_runtime_snapshot
+exit 0
+EXIT_ZERO_CHILD
+chmod 0755 "$TEST_DIR/exit-zero-child.sh"
+(
+    root="$TEST_DIR/exit-zero"
+    mkdir -p "$root"
+    rc=0
+    bash "$TEST_DIR/exit-zero-child.sh" "$root" "$TOOL" > "$root/output.log" 2>&1 || rc=$?
+    assert_eq 1 "$rc" "active transaction exit 0 becomes failure"
+    assert_file_eq key-before "$root/etc/keyrings/xanmod.gpg" "exit 0 leaves key unchanged"
+    assert_file_eq list-before "$root/etc/sources/xanmod.list" "exit 0 leaves list unchanged"
+    assert_file_eq source-before "$root/etc/sources/xanmod.sources" "exit 0 leaves source unchanged"
+    [[ -z "$(find "$root" -name 'xanmod-runtime-snapshot.*' -print -quit)" ]] || fail "exit 0 left runtime snapshot"
+    pass "exit 0 cleans runtime snapshot"
+    grep -Fq 'XanMod 事务异常退出' "$root/output.log" || fail "exit 0 omitted abnormal transaction message"
+    pass "exit 0 reports abnormal active transaction"
+)
+
+cat > "$TEST_DIR/backup-build-signal-child.sh" <<'BACKUP_BUILD_CHILD'
+#!/usr/bin/env bash
+set -euo pipefail
+root="$1"
+module="$2"
+mkdir -p "$root/tmp"
+printf key-before > "$root/key.gpg"
+printf list-before > "$root/release.list"
+printf source-before > "$root/release.sources"
+printf backup-key > "$root/key.gpg.previous-backup"; chmod 0600 "$root/key.gpg.previous-backup"
+printf backup-list > "$root/release.list.previous-backup"; chmod 0600 "$root/release.list.previous-backup"
+printf backup-source > "$root/release.sources.previous-backup"; chmod 0600 "$root/release.sources.previous-backup"
+printf 'VERSION_CODENAME=trixie\n' > "$root/os-release"
+printf '%s\n' 'flags : lm cmov cx8 fpu fxsr mmx syscall sse2 cx16 lahf_lm popcnt sse4_1 sse4_2 ssse3' > "$root/cpuinfo"
+export XANMOD_TEST_MODE=1
+export XANMOD_KEYRING_PATH="$root/key.gpg"
+export XANMOD_SOURCE_LIST_PATH="$root/release.list"
+export XANMOD_SOURCE_DEB822_PATH="$root/release.sources"
+export XANMOD_LOCK_PATH="$root/xanmod.lock"
+export XANMOD_OS_RELEASE_PATH="$root/os-release"
+export XANMOD_CPUINFO_PATH="$root/cpuinfo"
+export XANMOD_BACKUP_STATE_DIR="$root/backups"
+export TMPDIR="$root/tmp"
+source "$module"
+dpkg() { echo amd64; }
+uname() { [[ ${1:-} == -m ]] && echo x86_64 || echo 6.1.0-amd64; }
+get_installed_xanmod_packages() { :; }
+package_is_installed() { return 1; }
+block_for_signal() {
+    touch "$root/ready"
+    while :; do sleep 1; done
+}
+eval "$(declare -f capture_xanmod_snapshot_item | sed '1s/capture_xanmod_snapshot_item/original_capture_xanmod_snapshot_item/')"
+capture_calls=0
+capture_xanmod_snapshot_item() {
+    ((capture_calls += 1))
+    if (( capture_calls == 1 )); then block_for_signal; fi
+    original_capture_xanmod_snapshot_item "$@"
+}
+resolve_xanmod_plan
+take_xanmod_lock
+install_xanmod
+BACKUP_BUILD_CHILD
+chmod 0755 "$TEST_DIR/backup-build-signal-child.sh"
+
+run_backup_build_signal_case() {
+    local signal_name="$1" expected_status="$2"
+    local root="$TEST_DIR/backup-build-$signal_name"
+    local pid rc=0
+
+    mkdir -p "$root"
+    env --default-signal=HUP,INT,TERM \
+        bash "$TEST_DIR/backup-build-signal-child.sh" "$root" "$MODULE" > "$root/output.log" 2>&1 &
+    pid=$!
+    for _ in $(seq 1 200); do
+        [[ -e "$root/ready" ]] && break
+        sleep 0.05
+    done
+    [[ -e "$root/ready" ]] || { cat "$root/output.log"; kill "$pid" 2>/dev/null || true; fail "$signal_name backup build did not block"; }
+    kill "-$signal_name" "$pid"
+    wait "$pid" || rc=$?
+    assert_eq "$expected_status" "$rc" "$signal_name during backup snapshot build returns conventional status"
+    assert_file_eq key-before "$root/key.gpg" "$signal_name backup build leaves key unchanged"
+    assert_file_eq list-before "$root/release.list" "$signal_name backup build leaves list unchanged"
+    assert_file_eq source-before "$root/release.sources" "$signal_name backup build leaves source unchanged"
+    assert_file_eq backup-key "$root/key.gpg.previous-backup" "$signal_name backup build preserves key backup"
+    assert_file_eq backup-list "$root/release.list.previous-backup" "$signal_name backup build preserves list backup"
+    assert_file_eq backup-source "$root/release.sources.previous-backup" "$signal_name backup build preserves source backup"
+    [[ ! -e "$root/backups" && ! -L "$root/backups" ]] || fail "$signal_name backup build left new backup directory"
+    pass "$signal_name backup build removes newly created empty backup directory"
+    [[ -z "$(find "$root" \( -name 'xanmod-backup-group.*' -o -name '.xanmod-backup-stage.*' \) -print -quit)" ]] || fail "$signal_name backup build left snapshot or stage"
+    pass "$signal_name backup build leaves no backup snapshot or stage"
+    flock -n "$root/xanmod.lock" -c true || fail "$signal_name backup build did not release lock"
+    pass "$signal_name backup build releases lock"
+}
+
+run_backup_build_signal_case HUP 129
+run_backup_build_signal_case INT 130
+run_backup_build_signal_case TERM 143
 
 module_root="$TEST_DIR/module"
 make_layout "$module_root"
@@ -703,11 +875,13 @@ reset_state() {
         "$XANMOD_BACKUP_STATE_DIR" "$XANMOD_LOCK" "$ROOT/tmp"
     mkdir -p "$ROOT/tmp"
     printf 'VERSION_CODENAME=trixie\n' > "$XANMOD_OS_RELEASE"
-    XANMOD_RUNTIME_SNAPSHOT_DIR=""; XANMOD_TRANSACTION_ACTIVE=false; XANMOD_CONFIG_MODIFIED=false
+    XANMOD_RUNTIME_SNAPSHOT_DIR=""; XANMOD_RUNTIME_SNAPSHOT_BUILDING=false
+    XANMOD_TRANSACTION_ACTIVE=false; XANMOD_CONFIG_MODIFIED=false
     XANMOD_GUARD_ACTIVE=false; XANMOD_GUARD_HANDLING=false; XANMOD_LOCK_HELD=false
     XANMOD_STAGED_KEY=""; XANMOD_STAGED_SOURCE=""; XANMOD_CANDIDATE_SOURCE=""
     XANMOD_ARMORED_KEY_TEMP=""; XANMOD_ACTIVE_APT_LISTS_DIR=""; XANMOD_RESTORE_STAGE=""
-    XANMOD_BACKUP_TRANSACTION_ACTIVE=false; XANMOD_BACKUP_GROUP_SNAPSHOT_DIR=""; XANMOD_BACKUP_STAGE_DIR=""
+    XANMOD_BACKUP_TRANSACTION_ACTIVE=false; XANMOD_BACKUP_SNAPSHOT_BUILDING=false
+    XANMOD_BACKUP_GROUP_SNAPSHOT_DIR=""; XANMOD_BACKUP_STAGE_DIR=""
     XANMOD_BACKUP_SNAPSHOT_PATHS=(); XANMOD_BACKUP_LEGACY_PATHS=(); XANMOD_BACKUP_NEW_ARCHIVES=()
     APT_RESULT=0; : > "$ROOT/apt.log"
 }
@@ -737,6 +911,22 @@ restore_function() {
     local saved_name="$1" function_name="$2"
     eval "$(declare -f "$saved_name" | sed "1s/$saved_name/$function_name/")"
 }
+
+reset_state
+ensure_xanmod_backup_state_dir
+snapshot="$ROOT/tmp/xanmod-backup-group.incomplete"
+mkdir -m 0700 "$snapshot"
+XANMOD_BACKUP_GROUP_SNAPSHOT_DIR="$snapshot"
+XANMOD_BACKUP_SNAPSHOT_BUILDING=true
+XANMOD_BACKUP_TRANSACTION_ACTIVE=false
+rm() { local last=${!#}; [[ "$last" == "$snapshot" ]] && return 1; command rm "$@"; }
+rc=0; abort_pending_xanmod_backup_transaction > "$ROOT/incomplete-backup-cleanup.log" 2>&1 || rc=$?
+assert_eq 1 "$rc" "incomplete backup snapshot deletion failure returns nonzero"
+assert_eq "$snapshot" "$XANMOD_BACKUP_GROUP_SNAPSHOT_DIR" "incomplete backup deletion failure preserves path"
+assert_eq true "$XANMOD_BACKUP_SNAPSHOT_BUILDING" "incomplete backup deletion failure preserves building state"
+grep -Fq "$snapshot" "$ROOT/incomplete-backup-cleanup.log" || fail "incomplete backup cleanup omitted residue path"
+pass "incomplete backup snapshot deletion failure reports exact path"
+unset -f rm; command rm -rf "$snapshot"; XANMOD_BACKUP_GROUP_SNAPSHOT_DIR=""; XANMOD_BACKUP_SNAPSHOT_BUILDING=false; XANMOD_BACKUP_STATE_DIR_CREATED=false
 
 reset_state
 write_generation A; prepare_persistent_xanmod_backups
@@ -949,7 +1139,7 @@ common_functions=(
     xanmod_formal_keyring_valid xanmod_list_source_configured xanmod_deb822_source_configured
     get_xanmod_source_file xanmod_source_matches_codename write_xanmod_deb822_source
     remove_xanmod_temp_directory remove_xanmod_temp_file cleanup_xanmod_active_apt_lists xanmod_source_is_usable
-    capture_xanmod_snapshot_item create_xanmod_runtime_snapshot restore_xanmod_snapshot_item
+    capture_xanmod_snapshot_item cleanup_incomplete_xanmod_runtime_snapshot create_xanmod_runtime_snapshot restore_xanmod_snapshot_item
     restore_xanmod_runtime_snapshot discard_xanmod_runtime_snapshot restore_xanmod_saved_trap
     install_xanmod_transaction_guards clear_xanmod_transaction_guards warn_xanmod_partial_install
     cleanup_xanmod_transaction_state xanmod_transaction_signal_handler xanmod_transaction_exit_handler
@@ -988,6 +1178,32 @@ assert_eq rejected "$module_policy" "module keeps original restricted codename p
     write_xanmod_deb822_source "$XANMOD_SOURCE_DEB822" https://deb.xanmod.org forky "$XANMOD_KEYRING"
     chmod 0644 "$XANMOD_SOURCE_DEB822"
     assert_ok "shared source parser accepts a syntactically safe dynamic codename" xanmod_deb822_source_configured
+)
+
+(
+    reset_tool_files
+    deb822="$TEST_DIR/tool/codename.sources"
+    list="$TEST_DIR/tool/codename.list"
+    write_xanmod_deb822_source "$deb822" https://deb.xanmod.org foo.bar "$XANMOD_KEYRING"
+    assert_ok "Deb822 codename matches foo.bar exactly" xanmod_source_matches_codename "$deb822" foo.bar
+    cat > "$deb822" <<EOF
+Types: deb
+URIs: https://deb.xanmod.org
+Suites: fooXbar
+Components: main
+Signed-By: $XANMOD_KEYRING
+EOF
+    assert_fail "Deb822 expected foo.bar rejects fooXbar suite" xanmod_source_matches_codename "$deb822" foo.bar
+    write_xanmod_deb822_source "$deb822" https://deb.xanmod.org foo+bar "$XANMOD_KEYRING"
+    assert_ok "Deb822 codename matches foo+bar literally" xanmod_source_matches_codename "$deb822" foo+bar
+    write_xanmod_deb822_source "$deb822" https://deb.xanmod.org fooooobar "$XANMOD_KEYRING"
+    assert_fail "Deb822 foo+bar is not a regex quantifier" xanmod_source_matches_codename "$deb822" foo+bar
+
+    printf 'deb [signed-by=%s] https://deb.xanmod.org foo.bar main\n' "$XANMOD_KEYRING" > "$list"
+    assert_ok "legacy list codename matches foo.bar exactly" xanmod_source_matches_codename "$list" foo.bar
+    assert_fail "legacy list foo.bar does not match fooXbar" xanmod_source_matches_codename "$list" fooXbar
+    printf 'deb [signed-by=%s] https://deb.xanmod.org fooooobar main\n' "$XANMOD_KEYRING" > "$list"
+    assert_fail "legacy list foo+bar is not a regex quantifier" xanmod_source_matches_codename "$list" foo+bar
 )
 
 grep -Fq '只读规划' "$ROOT_DIR/README.md" || fail "README omits read-only XanMod planning"

@@ -64,6 +64,7 @@ readonly -a XANMOD_MANAGED_PATHS=(
 
 XANMOD_ASSUME_YES=false
 XANMOD_RUNTIME_SNAPSHOT_DIR=""
+XANMOD_RUNTIME_SNAPSHOT_BUILDING=false
 XANMOD_TRANSACTION_ACTIVE=false
 XANMOD_CONFIG_MODIFIED=false
 XANMOD_APT_MAY_BE_PARTIAL=false
@@ -94,6 +95,7 @@ XANMOD_PLAN_NEEDS_PACKAGE_INSTALL=false
 XANMOD_RESTORED_COUNT=0
 XANMOD_BACKUP_STATE_DIR_CREATED=false
 XANMOD_BACKUP_TRANSACTION_ACTIVE=false
+XANMOD_BACKUP_SNAPSHOT_BUILDING=false
 XANMOD_BACKUP_GROUP_SNAPSHOT_DIR=""
 XANMOD_BACKUP_STAGE_DIR=""
 XANMOD_BACKUP_TRANSACTION_ID=""
@@ -775,10 +777,36 @@ xanmod_source_matches_codename() {
     xanmod_codename_safe "$codename" || return 1
     case "$source_file" in
         *.sources)
-            grep -Eq "^[[:space:]]*Suites:[[:space:]]*${codename}[[:space:]]*$" "$source_file"
+            awk -F: -v expected="$codename" '
+                function trim(value) {
+                    sub(/^[[:space:]]+/, "", value)
+                    sub(/[[:space:]]+$/, "", value)
+                    return value
+                }
+                /^[[:space:]]*($|#)/ { next }
+                {
+                    name=trim($1)
+                    value=trim(substr($0, index($0, ":") + 1))
+                    if (name == "Suites") {
+                        suite_count++
+                        suite=value
+                    }
+                }
+                END { exit !(suite_count == 1 && suite == expected) }
+            ' "$source_file"
             ;;
         *)
-            grep -Eq "^[[:space:]]*deb[[:space:]].*[[:space:]]${codename}[[:space:]]+main([[:space:]]|$)" "$source_file"
+            awk -v expected="$codename" '
+                /^[[:space:]]*($|#)/ { next }
+                {
+                    line_count++
+                    if (NF == 5 && $1 == "deb" && $4 == expected && $5 == "main")
+                        valid_count++
+                    else
+                        invalid=1
+                }
+                END { exit !(line_count == 1 && valid_count == 1 && !invalid) }
+            ' "$source_file"
             ;;
     esac
 }
@@ -827,7 +855,7 @@ cleanup_xanmod_active_apt_lists() {
     if [[ -z "$XANMOD_ACTIVE_APT_LISTS_DIR" ]]; then
         return 0
     fi
-    if [[ ! -e "$XANMOD_ACTIVE_APT_LISTS_DIR" ]] ||
+    if [[ ! -e "$XANMOD_ACTIVE_APT_LISTS_DIR" && ! -L "$XANMOD_ACTIVE_APT_LISTS_DIR" ]] ||
         remove_xanmod_temp_directory "$XANMOD_ACTIVE_APT_LISTS_DIR" "临时 APT lists"; then
         XANMOD_ACTIVE_APT_LISTS_DIR=""
         return 0
@@ -880,31 +908,49 @@ capture_xanmod_snapshot_item() {
     fi
 }
 
+cleanup_incomplete_xanmod_runtime_snapshot() {
+    if [[ "$XANMOD_TRANSACTION_ACTIVE" == "true" ]]; then
+        error "拒绝把完整活动快照当作不完整快照删除"
+        return 1
+    fi
+    if [[ -z "$XANMOD_RUNTIME_SNAPSHOT_DIR" ]]; then
+        XANMOD_RUNTIME_SNAPSHOT_BUILDING=false
+        return 0
+    fi
+    if ! remove_xanmod_temp_directory "$XANMOD_RUNTIME_SNAPSHOT_DIR" "XanMod 不完整运行时快照"; then
+        return 1
+    fi
+    XANMOD_RUNTIME_SNAPSHOT_DIR=""
+    XANMOD_RUNTIME_SNAPSHOT_BUILDING=false
+}
+
 create_xanmod_runtime_snapshot() {
     local index
 
-    if [[ "$XANMOD_TRANSACTION_ACTIVE" == "true" ]]; then
-        error "XanMod 配置事务已经开始"
+    if [[ "$XANMOD_TRANSACTION_ACTIVE" == "true" ||
+        "$XANMOD_RUNTIME_SNAPSHOT_BUILDING" == "true" ||
+        -n "$XANMOD_RUNTIME_SNAPSHOT_DIR" ]]; then
+        error "XanMod 配置快照生命周期尚未结束"
         return 1
     fi
 
     XANMOD_RUNTIME_SNAPSHOT_DIR=$(mktemp -d "${TMPDIR:-/tmp}/xanmod-runtime-snapshot.XXXXXX") || return 1
-    chmod 0700 "$XANMOD_RUNTIME_SNAPSHOT_DIR" || {
-        remove_xanmod_temp_directory "$XANMOD_RUNTIME_SNAPSHOT_DIR" "XanMod 运行时快照" || true
-        XANMOD_RUNTIME_SNAPSHOT_DIR=""
+    XANMOD_RUNTIME_SNAPSHOT_BUILDING=true
+    if ! chmod 0700 "$XANMOD_RUNTIME_SNAPSHOT_DIR"; then
+        cleanup_incomplete_xanmod_runtime_snapshot || true
         return 1
-    }
+    fi
 
     for index in "${!XANMOD_MANAGED_PATHS[@]}"; do
         if ! capture_xanmod_snapshot_item \
             "${XANMOD_MANAGED_PATHS[$index]}" \
             "$XANMOD_RUNTIME_SNAPSHOT_DIR/item-$index"; then
-            remove_xanmod_temp_directory "$XANMOD_RUNTIME_SNAPSHOT_DIR" "XanMod 运行时快照" || true
-            XANMOD_RUNTIME_SNAPSHOT_DIR=""
+            cleanup_incomplete_xanmod_runtime_snapshot || true
             return 1
         fi
     done
 
+    XANMOD_RUNTIME_SNAPSHOT_BUILDING=false
     XANMOD_TRANSACTION_ACTIVE=true
     XANMOD_CONFIG_MODIFIED=false
 }
@@ -971,6 +1017,7 @@ restore_xanmod_runtime_snapshot() {
 
     if remove_xanmod_temp_directory "$XANMOD_RUNTIME_SNAPSHOT_DIR" "XanMod 运行时快照"; then
         XANMOD_RUNTIME_SNAPSHOT_DIR=""
+        XANMOD_RUNTIME_SNAPSHOT_BUILDING=false
         XANMOD_TRANSACTION_ACTIVE=false
     else
         cleanup_failed=true
@@ -981,6 +1028,7 @@ restore_xanmod_runtime_snapshot() {
 
 discard_xanmod_runtime_snapshot() {
     if [[ -z "$XANMOD_RUNTIME_SNAPSHOT_DIR" ]]; then
+        XANMOD_RUNTIME_SNAPSHOT_BUILDING=false
         XANMOD_TRANSACTION_ACTIVE=false
         return 0
     fi
@@ -988,6 +1036,7 @@ discard_xanmod_runtime_snapshot() {
         return 1
     fi
     XANMOD_RUNTIME_SNAPSHOT_DIR=""
+    XANMOD_RUNTIME_SNAPSHOT_BUILDING=false
     XANMOD_TRANSACTION_ACTIVE=false
 }
 
@@ -1272,25 +1321,82 @@ build_xanmod_backup_snapshot_paths() {
     done
 }
 
+xanmod_backup_state_dir_empty() {
+    [[ -d "$XANMOD_BACKUP_STATE_DIR" && ! -L "$XANMOD_BACKUP_STATE_DIR" ]] || return 1
+    [[ -z "$(find "$XANMOD_BACKUP_STATE_DIR" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]]
+}
+
+cleanup_new_empty_xanmod_backup_state_dir() {
+    if [[ "$XANMOD_BACKUP_STATE_DIR_CREATED" != "true" ]]; then
+        return 0
+    fi
+    if [[ ! -e "$XANMOD_BACKUP_STATE_DIR" && ! -L "$XANMOD_BACKUP_STATE_DIR" ]]; then
+        XANMOD_BACKUP_STATE_DIR_CREATED=false
+        return 0
+    fi
+    if ! xanmod_backup_state_dir_empty; then
+        return 0
+    fi
+    if ! rmdir "$XANMOD_BACKUP_STATE_DIR"; then
+        error "本次新建的空 XanMod backup 目录残留: $XANMOD_BACKUP_STATE_DIR"
+        return 1
+    fi
+    XANMOD_BACKUP_STATE_DIR_CREATED=false
+}
+
+cleanup_incomplete_xanmod_backup_snapshot() {
+    local cleanup_failed=false
+
+    if [[ "$XANMOD_BACKUP_TRANSACTION_ACTIVE" == "true" ]]; then
+        error "拒绝把完整 backup 组快照当作不完整快照删除"
+        return 1
+    fi
+    cleanup_xanmod_backup_stage || cleanup_failed=true
+    if [[ -n "$XANMOD_BACKUP_GROUP_SNAPSHOT_DIR" ]]; then
+        if [[ ! -e "$XANMOD_BACKUP_GROUP_SNAPSHOT_DIR" && ! -L "$XANMOD_BACKUP_GROUP_SNAPSHOT_DIR" ]] ||
+            remove_xanmod_temp_directory "$XANMOD_BACKUP_GROUP_SNAPSHOT_DIR" "XanMod 不完整 backup 组快照"; then
+            :
+        else
+            cleanup_failed=true
+        fi
+    fi
+    cleanup_new_empty_xanmod_backup_state_dir || cleanup_failed=true
+
+    if [[ "$cleanup_failed" == "false" ]]; then
+        XANMOD_BACKUP_GROUP_SNAPSHOT_DIR=""
+        XANMOD_BACKUP_SNAPSHOT_BUILDING=false
+        XANMOD_BACKUP_SNAPSHOT_PATHS=()
+        XANMOD_BACKUP_NEW_ARCHIVES=()
+        return 0
+    fi
+    return 1
+}
+
 create_xanmod_backup_group_snapshot() {
     local index
 
+    if [[ "$XANMOD_BACKUP_TRANSACTION_ACTIVE" == "true" ||
+        "$XANMOD_BACKUP_SNAPSHOT_BUILDING" == "true" ||
+        -n "$XANMOD_BACKUP_GROUP_SNAPSHOT_DIR" ]]; then
+        error "XanMod backup 快照生命周期尚未结束"
+        return 1
+    fi
     build_xanmod_backup_snapshot_paths || return 1
     XANMOD_BACKUP_GROUP_SNAPSHOT_DIR=$(mktemp -d "${TMPDIR:-/tmp}/xanmod-backup-group.XXXXXX") || return 1
+    XANMOD_BACKUP_SNAPSHOT_BUILDING=true
     if ! chmod 0700 "$XANMOD_BACKUP_GROUP_SNAPSHOT_DIR"; then
-        remove_xanmod_temp_directory "$XANMOD_BACKUP_GROUP_SNAPSHOT_DIR" "XanMod backup 组快照" || true
-        XANMOD_BACKUP_GROUP_SNAPSHOT_DIR=""
+        cleanup_incomplete_xanmod_backup_snapshot || true
         return 1
     fi
     for index in "${!XANMOD_BACKUP_SNAPSHOT_PATHS[@]}"; do
         if ! capture_xanmod_snapshot_item \
             "${XANMOD_BACKUP_SNAPSHOT_PATHS[$index]}" \
             "$XANMOD_BACKUP_GROUP_SNAPSHOT_DIR/item-$index"; then
-            remove_xanmod_temp_directory "$XANMOD_BACKUP_GROUP_SNAPSHOT_DIR" "XanMod backup 组快照" || true
-            XANMOD_BACKUP_GROUP_SNAPSHOT_DIR=""
+            cleanup_incomplete_xanmod_backup_snapshot || true
             return 1
         fi
     done
+    XANMOD_BACKUP_SNAPSHOT_BUILDING=false
     XANMOD_BACKUP_TRANSACTION_ACTIVE=true
 }
 
@@ -1437,12 +1543,11 @@ restore_xanmod_backup_group_snapshot() {
     cleanup_xanmod_backup_stage || cleanup_failed=true
     if remove_xanmod_temp_directory "$XANMOD_BACKUP_GROUP_SNAPSHOT_DIR" "XanMod backup 组快照"; then
         XANMOD_BACKUP_GROUP_SNAPSHOT_DIR=""
+        XANMOD_BACKUP_SNAPSHOT_BUILDING=false
     else
         cleanup_failed=true
     fi
-    if [[ "$XANMOD_BACKUP_STATE_DIR_CREATED" == "true" ]]; then
-        rmdir "$XANMOD_BACKUP_STATE_DIR" 2>/dev/null || true
-    fi
+    cleanup_new_empty_xanmod_backup_state_dir || cleanup_failed=true
     XANMOD_BACKUP_TRANSACTION_ACTIVE=false
     XANMOD_BACKUP_SNAPSHOT_PATHS=()
     XANMOD_BACKUP_NEW_ARCHIVES=()
@@ -1450,20 +1555,18 @@ restore_xanmod_backup_group_snapshot() {
 }
 
 discard_xanmod_backup_group_snapshot() {
-    local cleanup_failed=false
-
-    cleanup_xanmod_backup_stage || cleanup_failed=true
+    cleanup_xanmod_backup_stage || return 1
     if [[ -n "$XANMOD_BACKUP_GROUP_SNAPSHOT_DIR" ]]; then
-        if remove_xanmod_temp_directory "$XANMOD_BACKUP_GROUP_SNAPSHOT_DIR" "XanMod backup 组快照"; then
-            XANMOD_BACKUP_GROUP_SNAPSHOT_DIR=""
-        else
-            cleanup_failed=true
+        if ! remove_xanmod_temp_directory "$XANMOD_BACKUP_GROUP_SNAPSHOT_DIR" "XanMod backup 组快照"; then
+            return 1
         fi
     fi
+    XANMOD_BACKUP_GROUP_SNAPSHOT_DIR=""
+    XANMOD_BACKUP_SNAPSHOT_BUILDING=false
     XANMOD_BACKUP_TRANSACTION_ACTIVE=false
+    XANMOD_BACKUP_STATE_DIR_CREATED=false
     XANMOD_BACKUP_SNAPSHOT_PATHS=()
     XANMOD_BACKUP_NEW_ARCHIVES=()
-    [[ "$cleanup_failed" == "false" ]]
 }
 
 prepare_persistent_xanmod_backups() {
@@ -1515,6 +1618,12 @@ prepare_xanmod_transaction() {
 abort_pending_xanmod_backup_transaction() {
     if [[ "$XANMOD_BACKUP_TRANSACTION_ACTIVE" == "true" ]]; then
         restore_xanmod_backup_group_snapshot
+    elif [[ "$XANMOD_BACKUP_SNAPSHOT_BUILDING" == "true" ||
+        -n "$XANMOD_BACKUP_GROUP_SNAPSHOT_DIR" ||
+        -n "$XANMOD_BACKUP_STAGE_DIR" ]]; then
+        cleanup_incomplete_xanmod_backup_snapshot
+    elif [[ "$XANMOD_BACKUP_STATE_DIR_CREATED" == "true" ]]; then
+        cleanup_new_empty_xanmod_backup_state_dir
     fi
 }
 
@@ -1742,6 +1851,10 @@ cleanup_xanmod_transaction_state() {
     cleanup_xanmod_stages || cleanup_failed=true
     cleanup_xanmod_active_apt_lists || cleanup_failed=true
     abort_pending_xanmod_backup_transaction || cleanup_failed=true
+    if [[ "$XANMOD_RUNTIME_SNAPSHOT_BUILDING" == "true" ||
+        ( -n "$XANMOD_RUNTIME_SNAPSHOT_DIR" && "$XANMOD_TRANSACTION_ACTIVE" != "true" ) ]]; then
+        cleanup_incomplete_xanmod_runtime_snapshot || cleanup_failed=true
+    fi
     if [[ "$XANMOD_TRANSACTION_ACTIVE" == "true" ]]; then
         if [[ "$XANMOD_CONFIG_MODIFIED" == "true" ]]; then
             restore_xanmod_runtime_snapshot || cleanup_failed=true
@@ -1777,7 +1890,6 @@ xanmod_transaction_signal_handler() {
 
 xanmod_transaction_exit_handler() {
     local exit_status="$1"
-    local cleanup_status=0
     local saved_exit="$XANMOD_SAVED_TRAP_EXIT"
 
     if [[ "$XANMOD_GUARD_ACTIVE" != "true" || "$XANMOD_GUARD_HANDLING" == "true" ]]; then
@@ -1787,9 +1899,9 @@ xanmod_transaction_exit_handler() {
     trap - EXIT
     trap '' HUP INT TERM
     error "XanMod 事务异常退出，正在恢复运行前状态"
-    cleanup_xanmod_transaction_state || cleanup_status=$?
+    cleanup_xanmod_transaction_state || true
     XANMOD_GUARD_ACTIVE=false
-    if (( exit_status == 0 && cleanup_status != 0 )); then
+    if (( exit_status == 0 )); then
         exit_status=1
     fi
     restore_xanmod_saved_trap EXIT "$saved_exit"
@@ -1806,7 +1918,7 @@ begin_xanmod_install_transaction() {
         return 1
     fi
     if ! create_xanmod_runtime_snapshot; then
-        abort_pending_xanmod_backup_transaction || true
+        cleanup_xanmod_transaction_state || true
         clear_xanmod_transaction_guards
         return 1
     fi
@@ -2538,7 +2650,7 @@ require_xanmod_plan_commands() {
 
 require_xanmod_mutation_commands() {
     require_xanmod_commands apt-cache apt-get awk basename cat chgrp chmod chown cp curl dirname \
-        dpkg dpkg-query flock grep id install ln mktemp mv readlink rm rmdir sort stat tr uname
+        dpkg dpkg-query find flock grep id install ln mktemp mv readlink rm rmdir sort stat tr uname
 }
 
 run_authorized_xanmod_install() {
