@@ -21,10 +21,8 @@ set -euo pipefail
 # === 常量定义 ===
 readonly MOTD_SCRIPT="/etc/update-motd.d/00-custom-welcome"
 
-readonly XANMOD_KEYRING="/etc/apt/keyrings/xanmod-archive-keyring.gpg"
-readonly XANMOD_SOURCE_LIST="/etc/apt/sources.list.d/xanmod-release.list"
-readonly XANMOD_SOURCE_DEB822="/etc/apt/sources.list.d/xanmod-release.sources"
 readonly XANMOD_KEY_FINGERPRINT="D38D7D1DA1349567ADED882D86F7D09EE734E623"
+readonly XANMOD_KEY_UID="XanMod Kernel <kernel@xanmod.org>"
 readonly XANMOD_KEY_URL="https://dl.xanmod.org/archive.key"
 readonly XANMOD_KEY_FALLBACK_UBUNTU="https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x${XANMOD_KEY_FINGERPRINT}"
 readonly XANMOD_REPOSITORIES=(
@@ -33,6 +31,39 @@ readonly XANMOD_REPOSITORIES=(
     "https://mirrors.bfsu.edu.cn/xanmod"
     "https://mirrors.tuna.tsinghua.edu.cn/xanmod"
 )
+
+if [[ "${XANMOD_TEST_MODE:-0}" == "1" ]]; then
+    XANMOD_KEYRING="${XANMOD_KEYRING_PATH:-/etc/apt/keyrings/xanmod-archive-keyring.gpg}"
+    XANMOD_SOURCE_LIST="${XANMOD_SOURCE_LIST_PATH:-/etc/apt/sources.list.d/xanmod-release.list}"
+    XANMOD_SOURCE_DEB822="${XANMOD_SOURCE_DEB822_PATH:-/etc/apt/sources.list.d/xanmod-release.sources}"
+    XANMOD_LOCK="${XANMOD_LOCK_PATH:-/run/lock/xanmod-install.lock}"
+    XANMOD_OS_RELEASE="${XANMOD_OS_RELEASE_PATH:-/etc/os-release}"
+    XANMOD_CPUINFO="${XANMOD_CPUINFO_PATH:-/proc/cpuinfo}"
+    XANMOD_BACKUP_STATE_DIR="${XANMOD_BACKUP_STATE_DIR:-/var/lib/linux-setup/apt-source-backups}"
+else
+    XANMOD_KEYRING="/etc/apt/keyrings/xanmod-archive-keyring.gpg"
+    XANMOD_SOURCE_LIST="/etc/apt/sources.list.d/xanmod-release.list"
+    XANMOD_SOURCE_DEB822="/etc/apt/sources.list.d/xanmod-release.sources"
+    XANMOD_LOCK="/run/lock/xanmod-install.lock"
+    XANMOD_OS_RELEASE="/etc/os-release"
+    XANMOD_CPUINFO="/proc/cpuinfo"
+    XANMOD_BACKUP_STATE_DIR="/var/lib/linux-setup/apt-source-backups"
+fi
+readonly XANMOD_KEYRING XANMOD_SOURCE_LIST XANMOD_SOURCE_DEB822 XANMOD_LOCK
+readonly XANMOD_OS_RELEASE XANMOD_CPUINFO XANMOD_BACKUP_STATE_DIR
+readonly -a XANMOD_MANAGED_PATHS=(
+    "$XANMOD_KEYRING"
+    "$XANMOD_SOURCE_LIST"
+    "$XANMOD_SOURCE_DEB822"
+)
+
+XANMOD_ASSUME_YES=false
+XANMOD_RUNTIME_SNAPSHOT_DIR=""
+XANMOD_TRANSACTION_ACTIVE=false
+XANMOD_STAGED_KEY=""
+XANMOD_STAGED_SOURCE=""
+XANMOD_SELECTED_REPOSITORY=""
+XANMOD_RESTORED_COUNT=0
 
 # === 日志函数 ===
 log() {
@@ -448,10 +479,49 @@ configure_chinese_locale() {
 }
 
 # === XanMod 内核 ===
-get_os_codename() {
-    if [[ -r /etc/os-release ]]; then
-        . /etc/os-release
+require_xanmod_commands() {
+    local command_name
 
+    for command_name in "$@"; do
+        if ! command -v "$command_name" >/dev/null 2>&1; then
+            error "缺少必要命令: $command_name"
+            return 1
+        fi
+    done
+}
+
+is_interactive_terminal() {
+    [[ -t 0 && -t 1 ]]
+}
+
+confirm_xanmod_install() {
+    local choice=""
+
+    if ! read -r -p "是否安装 XanMod 内核？[y/N]: " choice; then
+        return 1
+    fi
+    [[ "$choice" =~ ^[Yy]$ ]]
+}
+
+authorize_xanmod_install() {
+    if [[ "$XANMOD_ASSUME_YES" == "true" ]]; then
+        return 0
+    fi
+    if ! is_interactive_terminal; then
+        error "非交互安装必须显式传入 --yes"
+        return 1
+    fi
+    if confirm_xanmod_install; then
+        return 0
+    fi
+    echo "XanMod 内核: 已跳过"
+    return 2
+}
+
+get_os_codename() {
+    if [[ -r "$XANMOD_OS_RELEASE" ]]; then
+        # shellcheck disable=SC1090
+        . "$XANMOD_OS_RELEASE"
         if [[ -n "${VERSION_CODENAME:-}" ]]; then
             echo "$VERSION_CODENAME"
             return 0
@@ -466,227 +536,164 @@ get_os_codename() {
     return 1
 }
 
+xanmod_codename_supported() {
+    case "$1" in
+        bookworm|trixie|noble) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 is_amd64() {
     [[ "$(dpkg --print-architecture)" == "amd64" ]] &&
         [[ "$(uname -m)" == "x86_64" || "$(uname -m)" == "amd64" ]]
 }
 
 package_is_installed() {
-    local package="$1"
-
-    dpkg-query -W -f='${db:Status-Status}' "$package" 2>/dev/null |
+    dpkg-query -W -f='${db:Status-Status}' "$1" 2>/dev/null |
         grep -qx "installed"
 }
 
 get_running_xanmod_package() {
-    local kernel
-    kernel=$(uname -r)
-
-    case "$kernel" in
-        *-x64v3-xanmod*)
-            echo "linux-xanmod-x64v3"
-            ;;
-        *-x64v2-xanmod*)
-            echo "linux-xanmod-x64v2"
-            ;;
-        *)
-            return 1
-            ;;
+    case "$(uname -r)" in
+        *-x64v3-xanmod*) echo "linux-xanmod-x64v3" ;;
+        *-x64v2-xanmod*) echo "linux-xanmod-x64v2" ;;
+        *) return 1 ;;
     esac
 }
 
 # 可选文件参数供离线 CPU 特征测试使用。
 # shellcheck disable=SC2120
 detect_x86_64_psabi_level() {
-    local cpuinfo_file="${1:-/proc/cpuinfo}"
+    local cpuinfo_file="${1:-$XANMOD_CPUINFO}"
 
     [[ -r "$cpuinfo_file" ]] || return 3
-
     awk '
-        function has(name) {
-            return index(flags, " " name " ") > 0
-        }
-
+        function has(name) { return index(flags, " " name " ") > 0 }
         BEGIN { found = 0 }
-
         /^flags[[:space:]]*:/ {
             found = 1
             flags = " " $0 " "
             level = 0
-
             if (has("lm") && has("cmov") && has("cx8") && has("fpu") &&
-                has("fxsr") && has("mmx") && has("syscall") && has("sse2")) {
-                level = 1
-            }
-
-            if (level == 1 && has("cx16") && has("lahf_lm") &&
-                has("popcnt") && has("sse4_1") && has("sse4_2") &&
-                has("ssse3")) {
-                level = 2
-            }
-
+                has("fxsr") && has("mmx") && has("syscall") && has("sse2")) level = 1
+            if (level == 1 && has("cx16") && has("lahf_lm") && has("popcnt") &&
+                has("sse4_1") && has("sse4_2") && has("ssse3")) level = 2
             if (level == 2 && has("avx") && has("avx2") && has("bmi1") &&
                 has("bmi2") && has("f16c") && has("fma") &&
-                (has("abm") || has("lzcnt")) && has("movbe") && has("xsave")) {
-                level = 3
-            }
-
+                (has("abm") || has("lzcnt")) && has("movbe") && has("xsave")) level = 3
             if (level == 3 && has("avx512f") && has("avx512bw") &&
-                has("avx512cd") && has("avx512dq") && has("avx512vl")) {
-                level = 4
-            }
-
-            if (level > 0) {
-                print "v" level
-                exit 0
-            }
+                has("avx512cd") && has("avx512dq") && has("avx512vl")) level = 4
+            if (level > 0) { print "v" level; exit 0 }
             exit 2
         }
-
-        END {
-            if (!found) exit 3
-        }
+        END { if (!found) exit 3 }
     ' "$cpuinfo_file"
 }
 
 get_xanmod_package_for_psabi_level() {
-    local psabi_level="$1"
-
-    case "$psabi_level" in
-        v4|v3)
-            # XanMod 不提供 MAIN v4 包，且官方说明 v4 对内核无收益。
-            echo "linux-xanmod-x64v3"
-            ;;
-        v2)
-            echo "linux-xanmod-x64v2"
-            ;;
-        *)
-            return 1
-            ;;
+    case "$1" in
+        v4|v3) echo "linux-xanmod-x64v3" ;;
+        v2) echo "linux-xanmod-x64v2" ;;
+        *) return 1 ;;
     esac
 }
 
 detect_xanmod_package() {
     local psabi_level
 
-    if ! is_amd64; then
-        return 1
-    fi
-
+    is_amd64 || return 1
     if psabi_level=$(detect_x86_64_psabi_level); then
+        if [[ "$psabi_level" == "v1" ]]; then
+            return 2
+        fi
         get_xanmod_package_for_psabi_level "$psabi_level"
     else
         return $?
     fi
 }
 
-get_primary_key_fingerprint() {
-    local key_file="$1"
+xanmod_keyring_valid() {
+    local key_file="${1:-$XANMOD_KEYRING}"
 
+    [[ -s "$key_file" ]] || return 1
+    command -v gpg >/dev/null 2>&1 || return 1
     gpg --batch --show-keys --with-colons "$key_file" 2>/dev/null |
-        awk -F: '
-            $1 == "pub" && !seen_pub {
-                seen_pub = 1
+        awk -F: -v expected_fingerprint="$XANMOD_KEY_FINGERPRINT" \
+            -v expected_uid="$XANMOD_KEY_UID" '
+            $1 == "pub" {
+                pub_count++
+                waiting_for_primary_fingerprint = 1
                 next
             }
-            seen_pub && $1 == "fpr" {
-                print $10
-                exit
+            $1 == "sub" {
+                waiting_for_primary_fingerprint = 0
+                next
+            }
+            $1 == "fpr" && waiting_for_primary_fingerprint {
+                primary_fingerprint_count++
+                if ($10 == expected_fingerprint) fingerprint_matches = 1
+                waiting_for_primary_fingerprint = 0
+                next
+            }
+            $1 == "uid" && $10 == expected_uid { uid_matches = 1 }
+            END {
+                exit !(pub_count == 1 && primary_fingerprint_count == 1 &&
+                    fingerprint_matches && uid_matches)
             }
         '
 }
 
-xanmod_keyring_valid() {
-    local key_file="${1:-$XANMOD_KEYRING}"
-    local fingerprint
-
-    [[ -s "$key_file" ]] || return 1
-    fingerprint=$(get_primary_key_fingerprint "$key_file") || return 1
-    [[ "$fingerprint" == "$XANMOD_KEY_FINGERPRINT" ]] || return 1
-    gpg --batch --show-keys --with-colons "$key_file" 2>/dev/null |
-        awk -F: '$1 == "uid" { found = 1 } END { exit !found }'
-}
-
-install_xanmod_key() {
-    local key_temp
-    local key_new="${XANMOD_KEYRING}.new"
-    local key_url
-
-    if xanmod_keyring_valid; then
-        return 0
-    fi
-
-    if [[ -e "$XANMOD_KEYRING" ]]; then
-        warn "现有 XanMod 密钥指纹无效，将重新获取"
-    fi
-
-    key_temp=$(mktemp) || return 1
-    trap 'rm -f "$key_temp" "$key_new"' RETURN
-    rm -f "$key_new"
-
-    for key_url in \
-        "$XANMOD_KEY_URL" \
-        "$XANMOD_KEY_FALLBACK_UBUNTU"; do
-        info "下载 XanMod 软件源签名密钥: $key_url"
-
-        if ! curl -fsSL --connect-timeout 10 --max-time 30 \
-            "$key_url" -o "$key_temp"; then
-            warn "该密钥来源下载失败，尝试下一个来源"
-            continue
-        fi
-
-        if ! xanmod_keyring_valid "$key_temp"; then
-            warn "该密钥来源的第一主密钥指纹不匹配，尝试下一个来源"
-            continue
-        fi
-
-        rm -f "$key_new"
-        if ! gpg --batch --yes --dearmor --output "$key_new" "$key_temp"; then
-            warn "XanMod 签名密钥转换失败，尝试下一个来源"
-            continue
-        fi
-
-        if ! xanmod_keyring_valid "$key_new"; then
-            warn "转换后的 XanMod 密钥指纹不匹配，尝试下一个来源"
-            continue
-        fi
-
-        chmod 644 "$key_new"
-        mv -f "$key_new" "$XANMOD_KEYRING"
-        rm -f "$key_temp"
-        trap - RETURN
-        success "XanMod 签名密钥已验证并安装"
-        return 0
-    done
-
-    rm -f "$key_temp" "$key_new"
-    trap - RETURN
-    error "无法获得指纹为 $XANMOD_KEY_FINGERPRINT 的 XanMod 签名密钥"
-    return 1
-}
-
 xanmod_source_has_supported_uri() {
-    local source_file="$1"
-
     grep -Eiq \
         '^[[:space:]]*URIs:[[:space:]]*https://(deb\.xanmod\.org|mirror\.nju\.edu\.cn/xanmod|mirrors\.bfsu\.edu\.cn/xanmod|mirrors\.tuna\.tsinghua\.edu\.cn/xanmod)/?[[:space:]]*$' \
-        "$source_file"
+        "$1"
 }
 
 xanmod_list_source_configured() {
-    [[ -s "$XANMOD_KEYRING" ]] &&
+    [[ -f "$XANMOD_KEYRING" && ! -L "$XANMOD_KEYRING" ]] &&
         xanmod_keyring_valid &&
-        [[ -f "$XANMOD_SOURCE_LIST" ]] &&
-        grep -Eiq 'https://(deb\.xanmod\.org|mirror\.nju\.edu\.cn/xanmod|mirrors\.bfsu\.edu\.cn/xanmod|mirrors\.tuna\.tsinghua\.edu\.cn/xanmod)/?' "$XANMOD_SOURCE_LIST" &&
-        grep -Fiq "signed-by=$XANMOD_KEYRING" "$XANMOD_SOURCE_LIST"
+        [[ -f "$XANMOD_SOURCE_LIST" && ! -L "$XANMOD_SOURCE_LIST" ]] &&
+        awk -v expected_key="$XANMOD_KEYRING" '
+            /^[[:space:]]*($|#)/ { next }
+            {
+                line_count++
+                if (NF == 5 && $1 == "deb" &&
+                    $2 == "[signed-by=" expected_key "]" &&
+                    $3 ~ /^https:\/\/(deb\.xanmod\.org|mirror\.nju\.edu\.cn\/xanmod|mirrors\.bfsu\.edu\.cn\/xanmod|mirrors\.tuna\.tsinghua\.edu\.cn\/xanmod)\/?$/ &&
+                    $4 ~ /^(bookworm|trixie|noble)$/ && $5 == "main") valid_count++
+                else invalid = 1
+            }
+            END { exit !(line_count == 1 && valid_count == 1 && !invalid) }
+        ' "$XANMOD_SOURCE_LIST"
 }
 
 xanmod_deb822_source_configured() {
-    [[ -s "$XANMOD_KEYRING" ]] &&
+    [[ -f "$XANMOD_KEYRING" && ! -L "$XANMOD_KEYRING" ]] &&
         xanmod_keyring_valid &&
-        [[ -f "$XANMOD_SOURCE_DEB822" ]] &&
-        xanmod_source_has_supported_uri "$XANMOD_SOURCE_DEB822" &&
-        grep -Fiq "Signed-By: $XANMOD_KEYRING" "$XANMOD_SOURCE_DEB822"
+        [[ -f "$XANMOD_SOURCE_DEB822" && ! -L "$XANMOD_SOURCE_DEB822" ]] &&
+        awk -F: -v expected_key="$XANMOD_KEYRING" '
+            function trim(value) {
+                sub(/^[[:space:]]+/, "", value)
+                sub(/[[:space:]]+$/, "", value)
+                return value
+            }
+            /^[[:space:]]*($|#)/ { next }
+            {
+                name=trim($1)
+                value=trim(substr($0, index($0, ":") + 1))
+                if (name == "Types" && value == "deb") types++
+                else if (name == "URIs" &&
+                    value ~ /^https:\/\/(deb\.xanmod\.org|mirror\.nju\.edu\.cn\/xanmod|mirrors\.bfsu\.edu\.cn\/xanmod|mirrors\.tuna\.tsinghua\.edu\.cn\/xanmod)\/?$/) uris++
+                else if (name == "Suites" && value ~ /^(bookworm|trixie|noble)$/) suites++
+                else if (name == "Components" && value == "main") components++
+                else if (name == "Signed-By" && value == expected_key) signed_by++
+                else invalid = 1
+            }
+            END {
+                exit !(types == 1 && uris == 1 && suites == 1 && components == 1 &&
+                    signed_by == 1 && !invalid)
+            }
+        ' "$XANMOD_SOURCE_DEB822"
 }
 
 get_xanmod_source_file() {
@@ -697,10 +704,6 @@ get_xanmod_source_file() {
     else
         return 1
     fi
-}
-
-xanmod_source_configured() {
-    get_xanmod_source_file >/dev/null
 }
 
 xanmod_source_matches_codename() {
@@ -717,35 +720,31 @@ xanmod_source_matches_codename() {
     esac
 }
 
-xanmod_codename_supported() {
-    case "$1" in
-        bookworm|trixie|noble) return 0 ;;
-        *) return 1 ;;
-    esac
-}
-
 write_xanmod_deb822_source() {
     local source_file="$1"
     local repository="$2"
     local codename="$3"
+    local keyring_path="${4:-$XANMOD_KEYRING}"
 
     cat > "$source_file" <<EOF
 Types: deb
 URIs: $repository
 Suites: $codename
 Components: main
-Signed-By: $XANMOD_KEYRING
+Signed-By: $keyring_path
 EOF
 }
 
 xanmod_source_is_usable() {
     local source_file="$1"
-    local lists_temp
-    local apt_status
+    local lists_temp=""
+    local apt_status=0
 
-    lists_temp=$(mktemp -d) || return 1
-    chmod 0755 "$lists_temp"
-    install -d -m 0755 "$lists_temp/partial"
+    lists_temp=$(mktemp -d "${TMPDIR:-/tmp}/xanmod-apt-lists.XXXXXX") || return 1
+    if ! chmod 0755 "$lists_temp" || ! install -d -m 0755 "$lists_temp/partial"; then
+        rm -rf -- "$lists_temp"
+        return 1
+    fi
 
     if apt-get update -qq \
         -o "Dir::Etc::sourcelist=$source_file" \
@@ -761,133 +760,588 @@ xanmod_source_is_usable() {
     return "$apt_status"
 }
 
-configure_xanmod_repository() {
-    local codename
-    local source_file
-    local source_temp
-    local source_new="${XANMOD_SOURCE_DEB822}.new"
-    local repository
-    local selected_repository=""
-    local managed_file
-    local state_prefix
+capture_xanmod_snapshot_item() {
+    local target="$1"
+    local snapshot_prefix="$2"
 
-    ensure_package "gpg" "gpg" || return 1
-    codename=$(get_os_codename) || {
-        error "无法识别系统发行版代号"
+    if [[ -L "$target" ]]; then
+        printf '%s\n' symlink > "${snapshot_prefix}.state" || return 1
+        cp -a -- "$target" "${snapshot_prefix}.data" || return 1
+    elif [[ -f "$target" ]]; then
+        printf '%s\n' file > "${snapshot_prefix}.state" || return 1
+        cp -a -- "$target" "${snapshot_prefix}.data" || return 1
+    elif [[ ! -e "$target" ]]; then
+        printf '%s\n' absent > "${snapshot_prefix}.state" || return 1
+    else
+        error "拒绝处理非常规 XanMod 配置路径: $target"
+        return 1
+    fi
+}
+
+create_xanmod_runtime_snapshot() {
+    local index
+
+    if [[ "$XANMOD_TRANSACTION_ACTIVE" == "true" ]]; then
+        error "XanMod 配置事务已经开始"
+        return 1
+    fi
+
+    XANMOD_RUNTIME_SNAPSHOT_DIR=$(mktemp -d "${TMPDIR:-/tmp}/xanmod-runtime-snapshot.XXXXXX") || return 1
+    chmod 0700 "$XANMOD_RUNTIME_SNAPSHOT_DIR" || {
+        rm -rf -- "$XANMOD_RUNTIME_SNAPSHOT_DIR"
+        XANMOD_RUNTIME_SNAPSHOT_DIR=""
         return 1
     }
 
-    if ! xanmod_codename_supported "$codename"; then
-        warn "XanMod 官方 APT 仓库不支持当前发行版代号：$codename"
+    for index in "${!XANMOD_MANAGED_PATHS[@]}"; do
+        if ! capture_xanmod_snapshot_item \
+            "${XANMOD_MANAGED_PATHS[$index]}" \
+            "$XANMOD_RUNTIME_SNAPSHOT_DIR/item-$index"; then
+            rm -rf -- "$XANMOD_RUNTIME_SNAPSHOT_DIR"
+            XANMOD_RUNTIME_SNAPSHOT_DIR=""
+            return 1
+        fi
+    done
+
+    XANMOD_TRANSACTION_ACTIVE=true
+}
+
+restore_xanmod_snapshot_item() {
+    local target="$1"
+    local snapshot_prefix="$2"
+    local state=""
+
+    [[ -r "${snapshot_prefix}.state" ]] || return 1
+    state=$(<"${snapshot_prefix}.state")
+
+    if [[ -d "$target" && ! -L "$target" ]]; then
+        error "拒绝用文件状态覆盖目录: $target"
         return 1
     fi
 
-    install -d -m 0755 /etc/apt/keyrings
-    if { [[ -f "$XANMOD_SOURCE_DEB822" ]] && grep -Fq "Signed-By: $XANMOD_KEYRING" "$XANMOD_SOURCE_DEB822"; } ||
-        { [[ -f "$XANMOD_SOURCE_LIST" ]] && grep -Fq 'xanmod' "$XANMOD_SOURCE_LIST"; }; then
-        for managed_file in "$XANMOD_KEYRING" "$XANMOD_SOURCE_LIST" "$XANMOD_SOURCE_DEB822"; do
-            if [[ "$managed_file" == /etc/apt/sources.list.d/* ]]; then
-                state_prefix="/var/lib/linux-setup/apt-source-backups/$(basename "$managed_file")"
-                if [[ ! -e "${state_prefix}.initial-backup" && ! -e "${state_prefix}.initial-absent" &&
-                    ! -e "${state_prefix}.initial-unknown" &&
-                    ! -e "${managed_file}.initial-backup" && ! -e "${managed_file}.initial-absent" &&
-                    ! -e "${managed_file}.initial-unknown" ]]; then
-                    install -D -m 0600 /dev/null "${state_prefix}.initial-unknown"
-                fi
-            elif [[ ! -e "${managed_file}.initial-backup" && ! -e "${managed_file}.initial-absent" &&
-                ! -e "${managed_file}.initial-unknown" ]]; then
-                install -D -m 0600 /dev/null "${managed_file}.initial-unknown"
-            fi
-        done
-    fi
-    backup_managed_file "$XANMOD_KEYRING" || return 1
-    backup_managed_file "$XANMOD_SOURCE_LIST" || return 1
-    backup_managed_file "$XANMOD_SOURCE_DEB822" || return 1
-    install_xanmod_key || return 1
+    case "$state" in
+        file)
+            [[ -f "${snapshot_prefix}.data" && ! -L "${snapshot_prefix}.data" ]] || return 1
+            install -d -m 0755 "$(dirname "$target")" || return 1
+            rm -f -- "$target" || return 1
+            cp -a -- "${snapshot_prefix}.data" "$target" || return 1
+            ;;
+        symlink)
+            [[ -L "${snapshot_prefix}.data" ]] || return 1
+            install -d -m 0755 "$(dirname "$target")" || return 1
+            rm -f -- "$target" || return 1
+            cp -a -- "${snapshot_prefix}.data" "$target" || return 1
+            ;;
+        absent)
+            rm -f -- "$target" || return 1
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
 
-    if source_file=$(get_xanmod_source_file); then
-        if xanmod_source_matches_codename "$source_file" "$codename" &&
-            xanmod_source_is_usable "$source_file"; then
-            echo "XanMod 软件源: 已配置并可用（$source_file）"
+restore_xanmod_runtime_snapshot() {
+    local index
+    local restore_failed=false
+
+    [[ "$XANMOD_TRANSACTION_ACTIVE" == "true" ]] || return 0
+
+    for index in "${!XANMOD_MANAGED_PATHS[@]}"; do
+        if ! restore_xanmod_snapshot_item \
+            "${XANMOD_MANAGED_PATHS[$index]}" \
+            "$XANMOD_RUNTIME_SNAPSHOT_DIR/item-$index"; then
+            error "恢复 XanMod 配置失败: ${XANMOD_MANAGED_PATHS[$index]}"
+            restore_failed=true
+        fi
+    done
+
+    rm -rf -- "$XANMOD_RUNTIME_SNAPSHOT_DIR"
+    XANMOD_RUNTIME_SNAPSHOT_DIR=""
+    XANMOD_TRANSACTION_ACTIVE=false
+
+    [[ "$restore_failed" == "false" ]]
+}
+
+discard_xanmod_runtime_snapshot() {
+    if [[ -n "$XANMOD_RUNTIME_SNAPSHOT_DIR" ]]; then
+        rm -rf -- "$XANMOD_RUNTIME_SNAPSHOT_DIR"
+    fi
+    XANMOD_RUNTIME_SNAPSHOT_DIR=""
+    XANMOD_TRANSACTION_ACTIVE=false
+}
+
+ensure_xanmod_backup_state_dir() {
+    local mode=""
+
+    if [[ -L "$XANMOD_BACKUP_STATE_DIR" ||
+        ( -e "$XANMOD_BACKUP_STATE_DIR" && ! -d "$XANMOD_BACKUP_STATE_DIR" ) ]]; then
+        error "XanMod 备份状态路径不是可信目录: $XANMOD_BACKUP_STATE_DIR"
+        return 1
+    fi
+
+    install -d -m 0700 "$XANMOD_BACKUP_STATE_DIR" || return 1
+    chmod 0700 "$XANMOD_BACKUP_STATE_DIR" || return 1
+    mode=$(stat -c '%a' "$XANMOD_BACKUP_STATE_DIR") || return 1
+    if [[ "$mode" != "700" ]]; then
+        error "XanMod 备份状态目录权限必须是 0700"
+        return 1
+    fi
+}
+
+get_xanmod_backup_prefix() {
+    printf '%s/%s\n' "$XANMOD_BACKUP_STATE_DIR" "$(basename "$1")"
+}
+
+xanmod_persistent_state_count() {
+    local prefix="$1"
+    local scope="$2"
+    local count=0
+    local suffix
+
+    for suffix in backup absent unknown; do
+        if [[ -e "${prefix}.${scope}-${suffix}" || -L "${prefix}.${scope}-${suffix}" ]]; then
+            ((count += 1))
+        fi
+    done
+    printf '%s\n' "$count"
+}
+
+capture_xanmod_persistent_state() {
+    local target="$1"
+    local prefix="$2"
+    local scope="$3"
+    local backup="${prefix}.${scope}-backup"
+    local absent="${prefix}.${scope}-absent"
+    local unknown="${prefix}.${scope}-unknown"
+
+    rm -f -- "$backup" "$absent" "$unknown" || return 1
+    if [[ -L "$target" || -f "$target" ]]; then
+        cp -a -- "$target" "$backup" || return 1
+    elif [[ ! -e "$target" ]]; then
+        install -m 0600 /dev/null "$absent" || return 1
+    else
+        error "拒绝备份非常规 XanMod 配置路径: $target"
+        return 1
+    fi
+}
+
+xanmod_configuration_looks_previously_managed() {
+    if [[ -f "$XANMOD_SOURCE_DEB822" ]] &&
+        grep -Fq "Signed-By: $XANMOD_KEYRING" "$XANMOD_SOURCE_DEB822"; then
+        return 0
+    fi
+    if [[ -f "$XANMOD_SOURCE_LIST" ]] && grep -Fq 'xanmod' "$XANMOD_SOURCE_LIST"; then
+        return 0
+    fi
+    return 1
+}
+
+migrate_legacy_xanmod_backup_states() {
+    local target
+    local prefix
+    local suffix
+    local legacy
+    local destination
+
+    for target in "${XANMOD_MANAGED_PATHS[@]}"; do
+        prefix=$(get_xanmod_backup_prefix "$target") || return 1
+        for suffix in initial-backup initial-absent initial-unknown previous-backup previous-absent; do
+            legacy="${target}.${suffix}"
+            destination="${prefix}.${suffix}"
+            [[ -e "$legacy" || -L "$legacy" ]] || continue
+            if [[ -e "$destination" || -L "$destination" ]]; then
+                destination=$(mktemp "$XANMOD_BACKUP_STATE_DIR/$(basename "$legacy").legacy.XXXXXX") || return 1
+                rm -f -- "$destination" || return 1
+            fi
+            mv -T -- "$legacy" "$destination" || return 1
+        done
+    done
+}
+
+prepare_persistent_xanmod_backups() {
+    local target
+    local prefix
+    local initial_count
+    local previously_managed=false
+
+    ensure_xanmod_backup_state_dir || return 1
+    migrate_legacy_xanmod_backup_states || return 1
+    if xanmod_configuration_looks_previously_managed; then
+        previously_managed=true
+    fi
+
+    for target in "${XANMOD_MANAGED_PATHS[@]}"; do
+        prefix=$(get_xanmod_backup_prefix "$target") || return 1
+        initial_count=$(xanmod_persistent_state_count "$prefix" initial) || return 1
+        if (( initial_count > 1 )); then
+            error "XanMod initial 备份状态冲突: $target"
+            return 1
+        fi
+        if (( initial_count == 0 )); then
+            if [[ "$previously_managed" == "true" ]]; then
+                install -m 0600 /dev/null "${prefix}.initial-unknown" || return 1
+            else
+                capture_xanmod_persistent_state "$target" "$prefix" initial || return 1
+            fi
+        fi
+
+        capture_xanmod_persistent_state "$target" "$prefix" previous || return 1
+    done
+}
+
+prepare_xanmod_transaction() {
+    prepare_persistent_xanmod_backups
+}
+
+classify_xanmod_persistent_state() {
+    local target="$1"
+    local scope="$2"
+    local prefix
+    local count
+    local backup
+    local absent
+    local unknown
+
+    prefix=$(get_xanmod_backup_prefix "$target") || return 1
+    count=$(xanmod_persistent_state_count "$prefix" "$scope") || return 1
+    backup="${prefix}.${scope}-backup"
+    absent="${prefix}.${scope}-absent"
+    unknown="${prefix}.${scope}-unknown"
+
+    if (( count == 0 )); then
+        return 2
+    fi
+    if (( count != 1 )); then
+        return 1
+    fi
+    if [[ -e "$unknown" || -L "$unknown" ]]; then
+        return 2
+    fi
+    if [[ -L "$backup" || -f "$backup" ]]; then
+        printf 'backup\n'
+        return 0
+    fi
+    if [[ -f "$absent" && ! -L "$absent" ]]; then
+        printf 'absent\n'
+        return 0
+    fi
+    return 1
+}
+
+restore_xanmod_persistent_item() {
+    local target="$1"
+    local scope="$2"
+    local state_type="$3"
+    local prefix
+    local backup
+    local staged=""
+
+    prefix=$(get_xanmod_backup_prefix "$target") || return 1
+    backup="${prefix}.${scope}-backup"
+
+    if [[ -d "$target" && ! -L "$target" ]]; then
+        error "拒绝用备份文件覆盖目录: $target"
+        return 1
+    fi
+
+    case "$state_type" in
+        absent)
+            rm -f -- "$target"
+            ;;
+        backup)
+            staged=$(make_xanmod_stage_file "$target" .restore) || return 1
+            rm -f -- "$staged" || return 1
+            if ! cp -a -- "$backup" "$staged"; then
+                rm -f -- "$staged"
+                return 1
+            fi
+            if ! mv -fT -- "$staged" "$target"; then
+                rm -f -- "$staged"
+                return 1
+            fi
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+restore_xanmod_group() {
+    local scope="$1"
+    local target
+    local state_type
+    local state_status=0
+    local index
+    local apply_failed=false
+    local -a state_types=()
+
+    XANMOD_RESTORED_COUNT=0
+    ensure_xanmod_backup_state_dir || return 1
+
+    for target in "${XANMOD_MANAGED_PATHS[@]}"; do
+        state_status=0
+        state_type=$(classify_xanmod_persistent_state "$target" "$scope") || state_status=$?
+        case "$state_status" in
+            0) state_types+=("$state_type") ;;
+            2)
+                warn "XanMod $scope 组状态缺失或未知，不进行部分恢复"
+                return 2
+                ;;
+            *)
+                error "XanMod $scope 组备份状态不可信，不进行部分恢复"
+                return 1
+                ;;
+        esac
+    done
+
+    create_xanmod_runtime_snapshot || return 1
+    for index in "${!XANMOD_MANAGED_PATHS[@]}"; do
+        if ! restore_xanmod_persistent_item \
+            "${XANMOD_MANAGED_PATHS[$index]}" "$scope" "${state_types[$index]}"; then
+            error "恢复 XanMod 配置失败: ${XANMOD_MANAGED_PATHS[$index]}"
+            apply_failed=true
+            break
+        fi
+    done
+
+    if [[ "$apply_failed" == "true" ]]; then
+        if ! restore_xanmod_runtime_snapshot; then
+            error "XanMod 组恢复失败，且运行前配置回滚不完整"
+        fi
+        return 1
+    fi
+
+    discard_xanmod_runtime_snapshot
+    XANMOD_RESTORED_COUNT=${#XANMOD_MANAGED_PATHS[@]}
+    if ! apt-get update -qq; then
+        warn "XanMod 软件源配置已恢复，但 APT 索引更新失败；已保留请求恢复的配置"
+        return 1
+    fi
+}
+
+
+begin_xanmod_install_transaction() {
+    prepare_xanmod_transaction || return 1
+    create_xanmod_runtime_snapshot
+}
+
+make_xanmod_stage_file() {
+    local target="$1"
+    local suffix="$2"
+    local target_dir
+
+    target_dir=$(dirname "$target") || return 1
+    install -d -m 0755 "$target_dir" || return 1
+    mktemp --suffix="$suffix" "$target_dir/.xanmod-stage.$(basename "$target").XXXXXX"
+}
+
+cleanup_xanmod_stages() {
+    [[ -z "$XANMOD_STAGED_KEY" ]] || rm -f -- "$XANMOD_STAGED_KEY"
+    [[ -z "$XANMOD_STAGED_SOURCE" ]] || rm -f -- "$XANMOD_STAGED_SOURCE"
+    XANMOD_STAGED_KEY=""
+    XANMOD_STAGED_SOURCE=""
+}
+
+stage_xanmod_key() {
+    local armored_temp=""
+    local key_url
+
+    XANMOD_STAGED_KEY=$(make_xanmod_stage_file "$XANMOD_KEYRING" .gpg) || return 1
+
+    if xanmod_keyring_valid; then
+        if install -m 0644 "$XANMOD_KEYRING" "$XANMOD_STAGED_KEY" &&
+            xanmod_keyring_valid "$XANMOD_STAGED_KEY"; then
             return 0
         fi
-        warn "现有 XanMod 软件源与当前发行版不匹配或不可用，将重新选择镜像"
+        cleanup_xanmod_stages
+        return 1
     fi
 
-    source_temp=$(mktemp --suffix=.sources) || return 1
-    trap 'rm -f "$source_temp" "$source_new"' RETURN
-    rm -f "$source_new"
+    if [[ -e "$XANMOD_KEYRING" || -L "$XANMOD_KEYRING" ]]; then
+        warn "现有 XanMod 密钥不满足严格指纹与 UID 校验，将重新获取"
+    fi
+
+    armored_temp=$(mktemp "${TMPDIR:-/tmp}/xanmod-key.XXXXXX") || {
+        cleanup_xanmod_stages
+        return 1
+    }
+
+    for key_url in "$XANMOD_KEY_URL" "$XANMOD_KEY_FALLBACK_UBUNTU"; do
+        info "下载 XanMod 软件源签名密钥: $key_url"
+        : > "$armored_temp"
+        if ! curl -fsSL --connect-timeout 10 --max-time 30 "$key_url" -o "$armored_temp"; then
+            warn "该密钥来源下载失败，尝试下一个来源"
+            continue
+        fi
+        if ! xanmod_keyring_valid "$armored_temp"; then
+            warn "该密钥来源未通过严格主密钥指纹与 UID 校验，尝试下一个来源"
+            continue
+        fi
+
+        rm -f -- "$XANMOD_STAGED_KEY"
+        if ! gpg --batch --yes --dearmor --output "$XANMOD_STAGED_KEY" "$armored_temp"; then
+            warn "XanMod 签名密钥转换失败，尝试下一个来源"
+            rm -f -- "$XANMOD_STAGED_KEY"
+            XANMOD_STAGED_KEY=$(make_xanmod_stage_file "$XANMOD_KEYRING" .gpg) || break
+            continue
+        fi
+        chmod 0644 "$XANMOD_STAGED_KEY" || break
+        if xanmod_keyring_valid "$XANMOD_STAGED_KEY"; then
+            rm -f -- "$armored_temp"
+            return 0
+        fi
+
+        warn "转换后的 XanMod 密钥未通过严格校验，尝试下一个来源"
+        rm -f -- "$XANMOD_STAGED_KEY"
+        XANMOD_STAGED_KEY=$(make_xanmod_stage_file "$XANMOD_KEYRING" .gpg) || break
+    done
+
+    rm -f -- "$armored_temp"
+    cleanup_xanmod_stages
+    error "无法获得指纹为 $XANMOD_KEY_FINGERPRINT 且 UID 匹配的 XanMod 签名密钥"
+    return 1
+}
+
+stage_xanmod_source() {
+    local codename="$1"
+    local candidate_source=""
+    local repository
+
+    candidate_source=$(make_xanmod_stage_file "$XANMOD_SOURCE_DEB822" .sources) || return 1
+    XANMOD_SELECTED_REPOSITORY=""
 
     for repository in "${XANMOD_REPOSITORIES[@]}"; do
         info "探测 XanMod 软件源: $repository"
-        write_xanmod_deb822_source "$source_temp" "$repository" "$codename"
+        write_xanmod_deb822_source \
+            "$candidate_source" "$repository" "$codename" "$XANMOD_STAGED_KEY"
+        chmod 0644 "$candidate_source" || {
+            rm -f -- "$candidate_source"
+            return 1
+        }
 
-        if xanmod_source_is_usable "$source_temp"; then
-            selected_repository="$repository"
+        if xanmod_source_is_usable "$candidate_source"; then
+            XANMOD_SELECTED_REPOSITORY="$repository"
             break
         fi
-
         warn "XanMod 软件源不可用: $repository"
     done
 
-    if [[ -z "$selected_repository" ]]; then
-        rm -f "$source_temp" "$source_new"
-        trap - RETURN
+    rm -f -- "$candidate_source"
+    if [[ -z "$XANMOD_SELECTED_REPOSITORY" ]]; then
         error "所有 XanMod 软件源均不可用，未修改正式 APT 配置"
         return 1
     fi
 
-    install -m 644 "$source_temp" "$source_new"
-    mv -f "$source_new" "$XANMOD_SOURCE_DEB822"
-    rm -f "$XANMOD_SOURCE_LIST"
-    rm -f "$source_temp"
-    trap - RETURN
+    XANMOD_STAGED_SOURCE=$(make_xanmod_stage_file "$XANMOD_SOURCE_DEB822" .sources) || return 1
+    write_xanmod_deb822_source \
+        "$XANMOD_STAGED_SOURCE" "$XANMOD_SELECTED_REPOSITORY" "$codename" "$XANMOD_KEYRING"
+    chmod 0644 "$XANMOD_STAGED_SOURCE"
+}
 
-    echo "XanMod 软件源: 已配置（Deb822 / $codename / $selected_repository）"
+xanmod_repository_ready() {
+    local codename="$1"
+
+    xanmod_deb822_source_configured &&
+        [[ ! -e "$XANMOD_SOURCE_LIST" && ! -L "$XANMOD_SOURCE_LIST" ]] &&
+        xanmod_source_matches_codename "$XANMOD_SOURCE_DEB822" "$codename" &&
+        xanmod_source_is_usable "$XANMOD_SOURCE_DEB822"
+}
+
+configure_xanmod_repository() {
+    local codename="$1"
+
+    [[ "$XANMOD_TRANSACTION_ACTIVE" == "true" ]] || {
+        error "拒绝在事务外修改 XanMod 配置"
+        return 1
+    }
+
+    ensure_package "gpg" "gpg" || return 1
+    install -d -m 0755 "$(dirname "$XANMOD_KEYRING")" || return 1
+    install -d -m 0755 "$(dirname "$XANMOD_SOURCE_DEB822")" || return 1
+
+    if xanmod_repository_ready "$codename"; then
+        echo "XanMod 软件源: 已配置并可用（$XANMOD_SOURCE_DEB822）"
+        return 0
+    fi
+
+    warn "现有 XanMod 软件源缺失、不匹配或不可用，将事务式重新配置"
+    stage_xanmod_key || return 1
+    if ! stage_xanmod_source "$codename"; then
+        cleanup_xanmod_stages
+        return 1
+    fi
+
+    if ! mv -fT -- "$XANMOD_STAGED_KEY" "$XANMOD_KEYRING"; then
+        cleanup_xanmod_stages
+        return 1
+    fi
+    XANMOD_STAGED_KEY=""
+
+    if ! mv -fT -- "$XANMOD_STAGED_SOURCE" "$XANMOD_SOURCE_DEB822"; then
+        cleanup_xanmod_stages
+        return 1
+    fi
+    XANMOD_STAGED_SOURCE=""
+
+    if ! rm -f -- "$XANMOD_SOURCE_LIST"; then
+        return 1
+    fi
+
+    if ! xanmod_keyring_valid ||
+        ! xanmod_deb822_source_configured ||
+        ! xanmod_source_matches_codename "$XANMOD_SOURCE_DEB822" "$codename" ||
+        ! xanmod_source_is_usable "$XANMOD_SOURCE_DEB822"; then
+        error "正式 XanMod 软件源未通过隔离 APT 验证"
+        return 1
+    fi
+
+    echo "XanMod 软件源: 已配置（Deb822 / $codename / $XANMOD_SELECTED_REPOSITORY）"
+}
+
+abort_xanmod_install_transaction() {
+    local apt_may_be_partial="${1:-false}"
+
+    cleanup_xanmod_stages
+    if ! restore_xanmod_runtime_snapshot; then
+        error "XanMod APT 配置回滚不完整，请立即人工检查三个受管文件"
+    else
+        warn "XanMod APT 配置已恢复到本次运行前状态"
+    fi
+
+    if [[ "$apt_may_be_partial" == "true" ]]; then
+        warn "APT 可能已部分安装内核包；为避免误删可启动内核，脚本不会自动卸载任何包"
+        warn "请检查: dpkg --audit；必要时执行 apt-get -f install，并确认引导菜单中的可用内核"
+    fi
+
+    return 1
 }
 
 get_installed_xanmod_packages() {
-    dpkg-query -W \
-        -f='${binary:Package} ${db:Status-Status}\n' \
+    dpkg-query -W -f='${binary:Package} ${db:Status-Status}\n' \
         "linux-xanmod-*" 2>/dev/null |
-        awk '
-            $2 == "installed" {
-                sub(/:amd64$/, "", $1)
-                print $1
-            }
-        ' |
+        awk '$2 == "installed" { sub(/:amd64$/, "", $1); print $1 }' |
         sort -u
 }
 
-is_xanmod_kernel_running() {
-    [[ "$(uname -r)" == *"-xanmod"* ]]
-}
-
 install_xanmod() {
-    local target_package
-    local installed_packages
-    local install_choice
-    local codename
-    local candidate_version
+    local target_package=""
+    local installed_packages=""
+    local codename=""
+    local policy_output=""
+    local candidate_version=""
 
     codename=$(get_os_codename || true)
     if [[ -z "$codename" ]]; then
         warn "无法识别系统发行版代号，已跳过 XanMod 安装"
         return 0
     fi
-
     if ! xanmod_codename_supported "$codename"; then
         warn "XanMod 官方 APT 仓库不支持 $codename，已跳过内核安装"
         return 0
     fi
 
     echo "XanMod 将在兼容时自动安装；系统原内核会保留，重启后才生效。"
-
-    if ! ask_yes_no "是否安装 XanMod 内核？[Y/n]: " "Y"; then
-        echo "XanMod 内核: 已跳过"
-        return 0
-    fi
-
     if ! is_amd64; then
         warn "当前架构为 $(dpkg --print-architecture) / $(uname -m)"
         warn "XanMod 官方 APT 仓库目前仅提供 amd64 内核包，已跳过安装"
@@ -913,78 +1367,74 @@ install_xanmod() {
                 warn "无法确认适用的 XanMod 内核包"
                 ;;
         esac
-
-        if [[ -z "${target_package:-}" ]]; then
+        if [[ -z "$target_package" ]]; then
             warn "为避免安装不兼容内核，已保留系统原内核"
             return 0
         fi
     fi
 
     echo "检测到适合当前环境的 XanMod 包: $target_package"
-
     installed_packages=$(get_installed_xanmod_packages || true)
+    if [[ -n "$installed_packages" ]] && ! package_is_installed "$target_package"; then
+        warn "已安装的 XanMod 包与 CPU 检测结果不匹配: $(tr '\n' ' ' <<< "$installed_packages")"
+        warn "将安装检测到的正确版本: $target_package"
+        echo "说明: 旧 XanMod 包将保留，确认新内核可正常启动后再手动清理。"
+    fi
+
+    if ! begin_xanmod_install_transaction; then
+        error "无法建立 XanMod 配置运行时快照"
+        return 1
+    fi
+
+    if ! configure_xanmod_repository "$codename"; then
+        error "XanMod 软件源配置失败"
+        abort_xanmod_install_transaction false || true
+        return 1
+    fi
 
     if package_is_installed "$target_package"; then
+        discard_xanmod_runtime_snapshot
         echo "XanMod 目标包: 已安装（$target_package）"
-
-        # 4.x 版本可能使用旧密钥路径或旧软件源格式。即使内核包已经安装，
-        # 仍需校验并按当前格式修复软件源，确保后续内核可以正常更新。
-        if ! configure_xanmod_repository; then
-            warn "XanMod 已安装，但软件源校验或修复失败；当前内核不受影响"
-        fi
-
         if [[ "$(get_running_xanmod_package || true)" == "$target_package" ]]; then
             echo "当前内核: $(uname -r)（匹配 CPU 检测结果）"
         else
             echo "当前内核: $(uname -r)（目标内核将在下次重启后生效）"
         fi
-
         return 0
     fi
 
-    if [[ -n "$installed_packages" ]]; then
-        warn "已安装的 XanMod 包与 CPU 检测结果不匹配: $(tr '\n' ' ' <<< "$installed_packages")"
-        warn "建议安装: $target_package"
-
-        read -r -p "是否安装检测到的正确版本 $target_package？[Y/n]: " install_choice
-        install_choice="${install_choice:-Y}"
-
-        if [[ ! "$install_choice" =~ ^[Yy]$ ]]; then
-            echo "XanMod 内核: 保留现有安装"
-            return 0
-        fi
-
-        echo "说明: 旧 XanMod 包将保留，确认新内核可正常启动后再手动清理。"
-    fi
-
-    configure_xanmod_repository || return 1
-
     info "更新软件包索引..."
-
     if ! apt-get update; then
         error "XanMod 软件源索引更新失败"
+        abort_xanmod_install_transaction false || true
         return 1
     fi
 
-    candidate_version=$(apt-cache policy "$target_package" |
-        awk '/Candidate:/ {print $2; exit}')
+    if ! policy_output=$(apt-cache policy "$target_package"); then
+        error "无法查询 XanMod 候选版本"
+        abort_xanmod_install_transaction false || true
+        return 1
+    fi
+    candidate_version=$(awk '/Candidate:/ {print $2; exit}' <<< "$policy_output")
     if [[ -z "$candidate_version" || "$candidate_version" == "(none)" ]]; then
         error "XanMod 软件源没有可安装的 $target_package 候选版本"
+        abort_xanmod_install_transaction false || true
         return 1
     fi
 
     info "安装 XanMod 内核包: $target_package（$candidate_version）"
-
-    if ! apt-get install -y "$target_package"; then
+    if ! DEBIAN_FRONTEND=noninteractive apt-get install -y "$target_package"; then
         error "XanMod 内核安装失败"
+        abort_xanmod_install_transaction true || true
         return 1
     fi
-
     if ! package_is_installed "$target_package"; then
         error "XanMod 内核安装后验证失败"
+        abort_xanmod_install_transaction true || true
         return 1
     fi
 
+    discard_xanmod_runtime_snapshot
     success "XanMod 内核已安装: $target_package"
     echo "当前运行内核: $(uname -r)"
     echo "说明: 系统原内核未被移除；XanMod 将在下次系统重启后生效。"
@@ -995,8 +1445,8 @@ show_xanmod_status() {
     local recommended_package=""
     local running_package=""
     local source_file=""
-    local installed_packages
-    local codename
+    local installed_packages=""
+    local codename=""
     local repository_supported=true
 
     codename=$(get_os_codename || true)
@@ -1057,6 +1507,27 @@ show_xanmod_status() {
     fi
 }
 
+take_xanmod_lock() {
+    install -d -m 0755 "$(dirname "$XANMOD_LOCK")" || return 1
+    if [[ -L "$XANMOD_LOCK" || ( -e "$XANMOD_LOCK" && ! -f "$XANMOD_LOCK" ) ]]; then
+        error "XanMod 锁路径不是普通文件: $XANMOD_LOCK"
+        return 1
+    fi
+
+    exec 9>> "$XANMOD_LOCK"
+    if [[ -L "$XANMOD_LOCK" || ! -f "$XANMOD_LOCK" ]]; then
+        exec 9>&-
+        error "XanMod 锁路径在打开时发生变化"
+        return 1
+    fi
+    if ! flock -n 9; then
+        exec 9>&-
+        error "另一个 XanMod 安装或恢复任务正在运行"
+        return 1
+    fi
+}
+
+
 restore_system_customization() {
     local scope="${1:-previous}"
     local target
@@ -1064,7 +1535,6 @@ restore_system_customization() {
     local restored_count=0
     local restore_failed=false
     local locale_restored=false
-    local apt_restored=false
     local -a targets=(
         /etc/motd
         /etc/issue
@@ -1075,9 +1545,6 @@ restore_system_customization() {
         /etc/locale.gen
         /etc/locale.conf
         /etc/default/locale
-        "$XANMOD_KEYRING"
-        "$XANMOD_SOURCE_LIST"
-        "$XANMOD_SOURCE_DEB822"
     )
 
     case "$scope" in
@@ -1097,15 +1564,19 @@ restore_system_customization() {
                 /etc/locale.gen|/etc/locale.conf|/etc/default/locale)
                     locale_restored=true
                     ;;
-                "$XANMOD_KEYRING"|"$XANMOD_SOURCE_LIST"|"$XANMOD_SOURCE_DEB822")
-                    apt_restored=true
-                    ;;
             esac
         else
             result=$?
             (( result == 1 )) && restore_failed=true
         fi
     done
+
+    local xanmod_result=0
+    restore_xanmod_group "$scope" || xanmod_result=$?
+    restored_count=$((restored_count + XANMOD_RESTORED_COUNT))
+    if (( xanmod_result == 1 )); then
+        restore_failed=true
+    fi
 
     if (( restored_count == 0 )); then
         error "没有可恢复的可信配置"
@@ -1124,13 +1595,6 @@ restore_system_customization() {
         fi
     fi
 
-    if [[ "$apt_restored" == "true" ]]; then
-        if ! apt-get update -qq; then
-            warn "XanMod 软件源配置已恢复，但 APT 索引更新失败"
-            restore_failed=true
-        fi
-    fi
-
     echo "说明: 已安装的 XanMod 内核包不会被卸载。"
 
     if [[ "$restore_failed" == "true" ]]; then
@@ -1145,21 +1609,72 @@ restore_system_customization() {
 show_help() {
     cat <<'EOF'
 用法：
-  system-customize.sh            交互执行全部功能
-  system-customize.sh all        交互执行全部功能
-  system-customize.sh motd       仅配置动态欢迎信息
-  system-customize.sh locale     仅配置中文环境
-  system-customize.sh xanmod     仅检查并可选安装 XanMod 内核
-  system-customize.sh status     查看 XanMod 状态
-  system-customize.sh restore    恢复上一次运行前的配置
-  system-customize.sh restore initial
-                                 恢复首次运行前的可信配置
-  system-customize.sh help       显示本帮助
+  system-customize.sh                 交互执行全部功能
+  system-customize.sh all             交互执行全部功能
+  system-customize.sh motd            仅配置动态欢迎信息
+  system-customize.sh locale          仅配置中文环境
+  system-customize.sh xanmod [--yes|-y]
+                                      检查并安装 XanMod 内核
+  system-customize.sh status          查看 XanMod 状态
+  system-customize.sh restore         恢复上一次运行前的配置
+  system-customize.sh restore initial 恢复首次运行前的可信配置
+  system-customize.sh help            显示本帮助
+
+XanMod 默认使用 [y/N] 确认。直接非交互安装必须传入 --yes；all 模式无 TTY 时会安全跳过 XanMod。
 EOF
+}
+
+run_authorized_xanmod_install() {
+    require_xanmod_commands apt-cache apt-get awk basename cat chmod cp curl dirname dpkg \
+        dpkg-query flock grep install mktemp mv rm sort stat tr uname || return 1
+    take_xanmod_lock || return 1
+    install_xanmod
 }
 
 main() {
     local action="${1:-all}"
+    local authorization_status=0
+
+    XANMOD_ASSUME_YES=false
+    case "$action" in
+        help|--help|-h)
+            (( $# == 1 )) || { error "help 不接受额外参数"; return 1; }
+            show_help
+            return 0
+            ;;
+        xanmod)
+            case $# in
+                1) ;;
+                2)
+                    case "$2" in
+                        --yes|-y) XANMOD_ASSUME_YES=true ;;
+                        *) error "未知 XanMod 参数: $2"; show_help; return 1 ;;
+                    esac
+                    ;;
+                *) error "xanmod 参数过多"; show_help; return 1 ;;
+            esac
+            authorize_xanmod_install || authorization_status=$?
+            case "$authorization_status" in
+                0) ;;
+                2) return 0 ;;
+                *) return 1 ;;
+            esac
+            ;;
+        all)
+            (( $# <= 1 )) || { error "all 不接受额外参数"; show_help; return 1; }
+            ;;
+        motd|locale|status)
+            (( $# == 1 )) || { error "$action 不接受额外参数"; show_help; return 1; }
+            ;;
+        restore)
+            (( $# <= 2 )) || { error "restore 参数过多"; show_help; return 1; }
+            ;;
+        *)
+            error "未知参数: $action"
+            show_help
+            return 1
+            ;;
+    esac
 
     require_root
 
@@ -1168,53 +1683,48 @@ main() {
         hostname install mktemp mv rm sed sleep sort tr uname uptime; do
         if ! command -v "$required_command" >/dev/null 2>&1; then
             error "缺少必要命令: $required_command"
-            exit 1
+            return 1
         fi
     done
 
     case "$action" in
         all)
             info "🎨 配置系统定制功能..."
-
             echo
             configure_motd
-
             echo
             configure_chinese_locale
-
             echo
-            install_xanmod
-
+            if ! is_interactive_terminal; then
+                echo "XanMod 内核: 无交互终端，all 模式已安全跳过；如需安装请运行 xanmod --yes"
+            else
+                authorization_status=0
+                authorize_xanmod_install || authorization_status=$?
+                case "$authorization_status" in
+                    0) run_authorized_xanmod_install ;;
+                    2) ;;
+                    *) return 1 ;;
+                esac
+            fi
             show_xanmod_status
             success "系统定制配置完成"
             ;;
-        motd)
-            configure_motd
-            ;;
-        locale)
-            configure_chinese_locale
-            ;;
+        motd) configure_motd ;;
+        locale) configure_chinese_locale ;;
         xanmod)
-            install_xanmod
+            run_authorized_xanmod_install
             show_xanmod_status
             ;;
-        status)
-            show_xanmod_status
-            ;;
+        status) show_xanmod_status ;;
         restore)
+            require_xanmod_commands flock stat || return 1
+            take_xanmod_lock || return 1
             restore_system_customization "${2:-previous}"
-            ;;
-        help|--help|-h)
-            show_help
-            ;;
-        *)
-            error "未知参数: $action"
-            show_help
-            exit 1
             ;;
     esac
 }
 
-trap 'error "系统定制脚本在第 $LINENO 行执行失败"' ERR
-
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    trap 'error "系统定制脚本在第 $LINENO 行执行失败"' ERR
+    main "$@"
+fi

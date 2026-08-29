@@ -181,6 +181,7 @@ RAW_BASE="https://raw.githubusercontent.com/LucaLin233/Linux/main/modules"
 sudo bash <(curl -fsSL "$RAW_BASE/system-customize.sh") motd
 sudo bash <(curl -fsSL "$RAW_BASE/system-customize.sh") locale
 sudo bash <(curl -fsSL "$RAW_BASE/system-customize.sh") xanmod
+sudo bash <(curl -fsSL "$RAW_BASE/system-customize.sh") xanmod --yes
 sudo bash <(curl -fsSL "$RAW_BASE/system-customize.sh") status
 sudo bash <(curl -fsSL "$RAW_BASE/system-customize.sh") restore
 sudo bash <(curl -fsSL "$RAW_BASE/system-customize.sh") restore initial
@@ -188,7 +189,11 @@ sudo bash <(curl -fsSL "$RAW_BASE/system-customize.sh") help
 ```
 
 `restore` 会统一恢复 MOTD、Locale 和 XanMod 软件源文件；默认恢复上一次运行前状态，
-`restore initial` 恢复首次运行前的可信状态。已安装的 XanMod 内核包不会被卸载。
+`restore initial` 恢复首次运行前的可信状态。XanMod 的密钥、传统 list 与 Deb822 source
+按一个整体预检和恢复；任一状态缺失或未知时不会进行部分恢复。已安装的 XanMod 内核包不会被卸载。
+
+直接执行 `xanmod` 时默认使用 `[y/N]` 确认；无 TTY 必须显式传入 `--yes`。`all` 或无参数模式
+在无 TTY 时仍会完成 MOTD 与 Locale 步骤，但会安全跳过 XanMod，避免管道、自动化或 EOF 意外安装内核。
 
 `network-optimize.sh` 支持自动测速、手动指定参数、查看状态和恢复配置：
 
@@ -409,12 +414,19 @@ sudo bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/t
 
 ```bash
 sudo bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/tools/xanmod-install.sh)
+sudo bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/tools/xanmod-install.sh) --yes
+sudo bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/tools/xanmod-install.sh) install --yes
 sudo bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/tools/xanmod-install.sh) status
 sudo bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/tools/xanmod-install.sh) help
 ```
 
-脚本检测 x86-64 psABI 级别并选择适合的 XanMod 包。内核安装完成后通常需要重启才能生效；
-请保留可用旧内核和控制台访问方式。
+脚本检测 x86-64 psABI 级别并选择适合的 XanMod 包。直接安装默认使用 `[y/N]`，无 TTY 时必须
+显式传入 `--yes`。密钥、传统 list 和 Deb822 source 使用同目录随机临时文件原子替换，并通过
+完整运行时快照在失败时全量回滚；候选源和正式路径都会使用隔离 APT lists 验证。
+
+内核安装完成后通常需要重启才能生效；Debian/Ubuntu 原内核和已安装的其他 XanMod 分支均会保留。
+APT 安装失败时可能已经部分解包软件，脚本会恢复三项 APT 配置，但不会自动卸载任何内核包；请检查
+`dpkg --audit` 和 APT 状态，并保留可用旧内核和控制台访问方式。
 
 ## 配置文件
 
