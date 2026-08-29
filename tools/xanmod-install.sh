@@ -61,6 +61,7 @@ XANMOD_STAGED_SOURCE=""
 XANMOD_CANDIDATE_SOURCE=""
 XANMOD_ARMORED_KEY_TEMP=""
 XANMOD_ACTIVE_APT_LISTS_DIR=""
+XANMOD_ACTIVE_APT_LISTS_BUILDING=false
 XANMOD_RESTORE_STAGE=""
 XANMOD_SELECTED_REPOSITORY=""
 XANMOD_GUARD_ACTIVE=false
@@ -459,13 +460,97 @@ remove_xanmod_temp_file() {
     return 1
 }
 
+xanmod_random_token() {
+    local token=""
+
+    token=$(od -An -N16 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n') || return 1
+    [[ "$token" =~ ^[0-9a-f]{32}$ ]] || return 1
+    printf '%s\n' "$token"
+}
+
+xanmod_create_temp_directory_at_path() {
+    local path="$1"
+    local mode="$2"
+
+    mkdir -m "$mode" -- "$path"
+}
+
+xanmod_create_temp_file_at_path() {
+    local path="$1"
+    local mode="$2"
+
+    [[ "$mode" == "0600" || "$mode" == "600" ]] || return 1
+    (umask 077; set -o noclobber; : > "$path") 2>/dev/null
+}
+
+xanmod_allocate_temp_directory() {
+    local path_variable="$1"
+    local building_variable="$2"
+    local parent="$3"
+    local prefix="$4"
+    local mode="$5"
+    local token=""
+    local candidate=""
+    local attempt
+
+    [[ -d "$parent" && ! -L "$parent" ]] || return 1
+    for attempt in {1..64}; do
+        token=$(xanmod_random_token) || return 1
+        candidate="$parent/$prefix.$token"
+        printf -v "$path_variable" '%s' "$candidate"
+        printf -v "$building_variable" '%s' true
+        if xanmod_create_temp_directory_at_path "$candidate" "$mode" 2>/dev/null; then
+            return 0
+        fi
+        if [[ -e "$candidate" || -L "$candidate" ]]; then
+            printf -v "$path_variable" '%s' ""
+            printf -v "$building_variable" '%s' false
+            continue
+        fi
+        printf -v "$path_variable" '%s' ""
+        printf -v "$building_variable" '%s' false
+        return 1
+    done
+    return 1
+}
+
+xanmod_allocate_temp_file() {
+    local path_variable="$1"
+    local parent="$2"
+    local prefix="$3"
+    local suffix="$4"
+    local mode="$5"
+    local token=""
+    local candidate=""
+    local attempt
+
+    [[ -d "$parent" && ! -L "$parent" ]] || return 1
+    for attempt in {1..64}; do
+        token=$(xanmod_random_token) || return 1
+        candidate="$parent/$prefix.$token$suffix"
+        printf -v "$path_variable" '%s' "$candidate"
+        if xanmod_create_temp_file_at_path "$candidate" "$mode"; then
+            return 0
+        fi
+        if [[ -e "$candidate" || -L "$candidate" ]]; then
+            printf -v "$path_variable" '%s' ""
+            continue
+        fi
+        printf -v "$path_variable" '%s' ""
+        return 1
+    done
+    return 1
+}
+
 cleanup_xanmod_active_apt_lists() {
     if [[ -z "$XANMOD_ACTIVE_APT_LISTS_DIR" ]]; then
+        XANMOD_ACTIVE_APT_LISTS_BUILDING=false
         return 0
     fi
     if [[ ! -e "$XANMOD_ACTIVE_APT_LISTS_DIR" && ! -L "$XANMOD_ACTIVE_APT_LISTS_DIR" ]] ||
         remove_xanmod_temp_directory "$XANMOD_ACTIVE_APT_LISTS_DIR" "临时 APT lists"; then
         XANMOD_ACTIVE_APT_LISTS_DIR=""
+        XANMOD_ACTIVE_APT_LISTS_BUILDING=false
         return 0
     fi
     return 1
@@ -474,10 +559,12 @@ cleanup_xanmod_active_apt_lists() {
 xanmod_source_is_usable() {
     local source_file="$1"
     local apt_status=0
+    local temp_parent="${TMPDIR:-/tmp}"
 
-    XANMOD_ACTIVE_APT_LISTS_DIR=$(mktemp -d "${TMPDIR:-/tmp}/xanmod-apt-lists.XXXXXX") || return 1
-    if ! chmod 0755 "$XANMOD_ACTIVE_APT_LISTS_DIR" ||
-        ! install -d -m 0755 "$XANMOD_ACTIVE_APT_LISTS_DIR/partial"; then
+    xanmod_allocate_temp_directory XANMOD_ACTIVE_APT_LISTS_DIR \
+        XANMOD_ACTIVE_APT_LISTS_BUILDING "$temp_parent" xanmod-apt-lists 0755 || return 1
+    XANMOD_ACTIVE_APT_LISTS_BUILDING=false
+    if ! install -d -m 0755 "$XANMOD_ACTIVE_APT_LISTS_DIR/partial"; then
         cleanup_xanmod_active_apt_lists || true
         return 1
     fi
@@ -534,6 +621,7 @@ cleanup_incomplete_xanmod_runtime_snapshot() {
 
 create_xanmod_runtime_snapshot() {
     local index
+    local temp_parent="${TMPDIR:-/tmp}"
 
     if [[ "$XANMOD_TRANSACTION_ACTIVE" == "true" ||
         "$XANMOD_RUNTIME_SNAPSHOT_BUILDING" == "true" ||
@@ -542,9 +630,8 @@ create_xanmod_runtime_snapshot() {
         return 1
     fi
 
-    XANMOD_RUNTIME_SNAPSHOT_DIR=$(mktemp -d "${TMPDIR:-/tmp}/xanmod-runtime-snapshot.XXXXXX") || return 1
-    XANMOD_RUNTIME_SNAPSHOT_BUILDING=true
-    if ! chmod 0700 "$XANMOD_RUNTIME_SNAPSHOT_DIR"; then
+    if ! xanmod_allocate_temp_directory XANMOD_RUNTIME_SNAPSHOT_DIR \
+        XANMOD_RUNTIME_SNAPSHOT_BUILDING "$temp_parent" xanmod-runtime-snapshot 0700; then
         cleanup_incomplete_xanmod_runtime_snapshot || true
         return 1
     fi
@@ -607,7 +694,6 @@ restore_xanmod_snapshot_item() {
 restore_xanmod_runtime_snapshot() {
     local index
     local restore_failed=false
-    local cleanup_failed=false
 
     [[ "$XANMOD_TRANSACTION_ACTIVE" == "true" ]] || return 0
 
@@ -619,19 +705,20 @@ restore_xanmod_runtime_snapshot() {
             restore_failed=true
         fi
     done
-    if [[ "$restore_failed" == "false" ]]; then
-        XANMOD_CONFIG_MODIFIED=false
+    if [[ "$restore_failed" == "true" ]]; then
+        XANMOD_CONFIG_MODIFIED=true
+        error "XanMod 运行时快照已保留，可在故障解除后重试: $XANMOD_RUNTIME_SNAPSHOT_DIR"
+        return 1
     fi
 
-    if remove_xanmod_temp_directory "$XANMOD_RUNTIME_SNAPSHOT_DIR" "XanMod 运行时快照"; then
-        XANMOD_RUNTIME_SNAPSHOT_DIR=""
-        XANMOD_RUNTIME_SNAPSHOT_BUILDING=false
-        XANMOD_TRANSACTION_ACTIVE=false
-    else
-        cleanup_failed=true
+    if ! remove_xanmod_temp_directory "$XANMOD_RUNTIME_SNAPSHOT_DIR" "XanMod 运行时快照"; then
+        XANMOD_CONFIG_MODIFIED=true
+        return 1
     fi
-
-    [[ "$restore_failed" == "false" && "$cleanup_failed" == "false" ]]
+    XANMOD_RUNTIME_SNAPSHOT_DIR=""
+    XANMOD_RUNTIME_SNAPSHOT_BUILDING=false
+    XANMOD_TRANSACTION_ACTIVE=false
+    XANMOD_CONFIG_MODIFIED=false
 }
 
 discard_xanmod_runtime_snapshot() {
@@ -789,13 +876,16 @@ begin_xanmod_install_transaction() {
 }
 
 make_xanmod_stage_file() {
-    local target="$1"
-    local suffix="$2"
+    local path_variable="$1"
+    local target="$2"
+    local suffix="$3"
     local target_dir
+    local prefix
 
     target_dir=$(dirname "$target") || return 1
     install -d -m 0755 "$target_dir" || return 1
-    mktemp --suffix="$suffix" "$target_dir/.xanmod-stage.$(basename "$target").XXXXXX"
+    prefix=".xanmod-stage.$(basename "$target")"
+    xanmod_allocate_temp_file "$path_variable" "$target_dir" "$prefix" "$suffix" 0600
 }
 
 cleanup_xanmod_stages() {
@@ -848,7 +938,7 @@ cleanup_xanmod_stages() {
 stage_xanmod_key() {
     local key_url
 
-    XANMOD_STAGED_KEY=$(make_xanmod_stage_file "$XANMOD_KEYRING" .gpg) || return 1
+    make_xanmod_stage_file XANMOD_STAGED_KEY "$XANMOD_KEYRING" .gpg || return 1
 
     if xanmod_keyring_valid "$XANMOD_KEYRING"; then
         if install -m 0600 "$XANMOD_KEYRING" "$XANMOD_STAGED_KEY" &&
@@ -864,10 +954,11 @@ stage_xanmod_key() {
         warn "现有 XanMod 密钥不满足严格内容校验，将重新获取"
     fi
 
-    XANMOD_ARMORED_KEY_TEMP=$(mktemp "${TMPDIR:-/tmp}/xanmod-key.XXXXXX") || {
+    if ! xanmod_allocate_temp_file XANMOD_ARMORED_KEY_TEMP \
+        "${TMPDIR:-/tmp}" xanmod-key .asc 0600; then
         cleanup_xanmod_stages || true
         return 1
-    }
+    fi
 
     for key_url in "$XANMOD_KEY_URL" "$XANMOD_KEY_FALLBACK_UBUNTU"; do
         info "下载 XanMod 软件源签名密钥: $key_url"
@@ -886,7 +977,7 @@ stage_xanmod_key() {
         if ! gpg --batch --yes --dearmor --output "$XANMOD_STAGED_KEY" "$XANMOD_ARMORED_KEY_TEMP"; then
             warn "XanMod 签名密钥转换失败，尝试下一个来源"
             remove_xanmod_temp_file "$XANMOD_STAGED_KEY" "XanMod staged key" || break
-            XANMOD_STAGED_KEY=$(make_xanmod_stage_file "$XANMOD_KEYRING" .gpg) || break
+            make_xanmod_stage_file XANMOD_STAGED_KEY "$XANMOD_KEYRING" .gpg || break
             continue
         fi
         if ! set_xanmod_staged_file_metadata "$XANMOD_STAGED_KEY"; then
@@ -903,7 +994,7 @@ stage_xanmod_key() {
 
         warn "转换后的 XanMod 密钥未通过严格校验，尝试下一个来源"
         remove_xanmod_temp_file "$XANMOD_STAGED_KEY" "XanMod staged key" || break
-        XANMOD_STAGED_KEY=$(make_xanmod_stage_file "$XANMOD_KEYRING" .gpg) || break
+        make_xanmod_stage_file XANMOD_STAGED_KEY "$XANMOD_KEYRING" .gpg || break
     done
 
     cleanup_xanmod_stages || true
@@ -916,7 +1007,7 @@ stage_xanmod_source() {
     local repository
     local source_status=0
 
-    XANMOD_CANDIDATE_SOURCE=$(make_xanmod_stage_file "$XANMOD_SOURCE_DEB822" .sources) || return 1
+    make_xanmod_stage_file XANMOD_CANDIDATE_SOURCE "$XANMOD_SOURCE_DEB822" .sources || return 1
     XANMOD_SELECTED_REPOSITORY=""
 
     for repository in "${XANMOD_REPOSITORIES[@]}"; do
@@ -950,7 +1041,7 @@ stage_xanmod_source() {
         return 1
     fi
 
-    XANMOD_STAGED_SOURCE=$(make_xanmod_stage_file "$XANMOD_SOURCE_DEB822" .sources) || return 1
+    make_xanmod_stage_file XANMOD_STAGED_SOURCE "$XANMOD_SOURCE_DEB822" .sources || return 1
     write_xanmod_deb822_source \
         "$XANMOD_STAGED_SOURCE" "$XANMOD_SELECTED_REPOSITORY" "$codename" "$XANMOD_KEYRING" || return 1
     set_xanmod_staged_file_metadata "$XANMOD_STAGED_SOURCE"
@@ -1491,7 +1582,7 @@ main() {
 
     require_root || return 1
     require_commands apt-cache apt-get awk basename cat chgrp chmod chown cp curl dirname dpkg \
-        dpkg-query flock grep id install mktemp mv readlink rm sort stat tr uname || return 1
+        dpkg-query flock grep id install mkdir mv od readlink rm sort stat tr uname || return 1
     run_locked_xanmod_plan || execution_status=$?
     if (( execution_status == 0 )); then
         show_xanmod_status

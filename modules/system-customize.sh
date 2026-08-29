@@ -73,6 +73,7 @@ XANMOD_STAGED_SOURCE=""
 XANMOD_CANDIDATE_SOURCE=""
 XANMOD_ARMORED_KEY_TEMP=""
 XANMOD_ACTIVE_APT_LISTS_DIR=""
+XANMOD_ACTIVE_APT_LISTS_BUILDING=false
 XANMOD_RESTORE_STAGE=""
 XANMOD_SELECTED_REPOSITORY=""
 XANMOD_GUARD_ACTIVE=false
@@ -93,11 +94,14 @@ XANMOD_PLAN_REPOSITORY_READY=false
 XANMOD_PLAN_NEEDS_REPOSITORY_CHANGE=false
 XANMOD_PLAN_NEEDS_PACKAGE_INSTALL=false
 XANMOD_RESTORED_COUNT=0
+XANMOD_BACKUP_STATE_DIR_CREATING=false
 XANMOD_BACKUP_STATE_DIR_CREATED=false
+XANMOD_BACKUP_STATE_DIR_PREEXISTED=false
 XANMOD_BACKUP_TRANSACTION_ACTIVE=false
 XANMOD_BACKUP_SNAPSHOT_BUILDING=false
 XANMOD_BACKUP_GROUP_SNAPSHOT_DIR=""
 XANMOD_BACKUP_STAGE_DIR=""
+XANMOD_BACKUP_STAGE_BUILDING=false
 XANMOD_BACKUP_TRANSACTION_ID=""
 XANMOD_CONFIGURATION_PREVIOUSLY_MANAGED=false
 XANMOD_BACKUP_SNAPSHOT_PATHS=()
@@ -851,13 +855,97 @@ remove_xanmod_temp_file() {
     return 1
 }
 
+xanmod_random_token() {
+    local token=""
+
+    token=$(od -An -N16 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n') || return 1
+    [[ "$token" =~ ^[0-9a-f]{32}$ ]] || return 1
+    printf '%s\n' "$token"
+}
+
+xanmod_create_temp_directory_at_path() {
+    local path="$1"
+    local mode="$2"
+
+    mkdir -m "$mode" -- "$path"
+}
+
+xanmod_create_temp_file_at_path() {
+    local path="$1"
+    local mode="$2"
+
+    [[ "$mode" == "0600" || "$mode" == "600" ]] || return 1
+    (umask 077; set -o noclobber; : > "$path") 2>/dev/null
+}
+
+xanmod_allocate_temp_directory() {
+    local path_variable="$1"
+    local building_variable="$2"
+    local parent="$3"
+    local prefix="$4"
+    local mode="$5"
+    local token=""
+    local candidate=""
+    local attempt
+
+    [[ -d "$parent" && ! -L "$parent" ]] || return 1
+    for attempt in {1..64}; do
+        token=$(xanmod_random_token) || return 1
+        candidate="$parent/$prefix.$token"
+        printf -v "$path_variable" '%s' "$candidate"
+        printf -v "$building_variable" '%s' true
+        if xanmod_create_temp_directory_at_path "$candidate" "$mode" 2>/dev/null; then
+            return 0
+        fi
+        if [[ -e "$candidate" || -L "$candidate" ]]; then
+            printf -v "$path_variable" '%s' ""
+            printf -v "$building_variable" '%s' false
+            continue
+        fi
+        printf -v "$path_variable" '%s' ""
+        printf -v "$building_variable" '%s' false
+        return 1
+    done
+    return 1
+}
+
+xanmod_allocate_temp_file() {
+    local path_variable="$1"
+    local parent="$2"
+    local prefix="$3"
+    local suffix="$4"
+    local mode="$5"
+    local token=""
+    local candidate=""
+    local attempt
+
+    [[ -d "$parent" && ! -L "$parent" ]] || return 1
+    for attempt in {1..64}; do
+        token=$(xanmod_random_token) || return 1
+        candidate="$parent/$prefix.$token$suffix"
+        printf -v "$path_variable" '%s' "$candidate"
+        if xanmod_create_temp_file_at_path "$candidate" "$mode"; then
+            return 0
+        fi
+        if [[ -e "$candidate" || -L "$candidate" ]]; then
+            printf -v "$path_variable" '%s' ""
+            continue
+        fi
+        printf -v "$path_variable" '%s' ""
+        return 1
+    done
+    return 1
+}
+
 cleanup_xanmod_active_apt_lists() {
     if [[ -z "$XANMOD_ACTIVE_APT_LISTS_DIR" ]]; then
+        XANMOD_ACTIVE_APT_LISTS_BUILDING=false
         return 0
     fi
     if [[ ! -e "$XANMOD_ACTIVE_APT_LISTS_DIR" && ! -L "$XANMOD_ACTIVE_APT_LISTS_DIR" ]] ||
         remove_xanmod_temp_directory "$XANMOD_ACTIVE_APT_LISTS_DIR" "临时 APT lists"; then
         XANMOD_ACTIVE_APT_LISTS_DIR=""
+        XANMOD_ACTIVE_APT_LISTS_BUILDING=false
         return 0
     fi
     return 1
@@ -866,10 +954,12 @@ cleanup_xanmod_active_apt_lists() {
 xanmod_source_is_usable() {
     local source_file="$1"
     local apt_status=0
+    local temp_parent="${TMPDIR:-/tmp}"
 
-    XANMOD_ACTIVE_APT_LISTS_DIR=$(mktemp -d "${TMPDIR:-/tmp}/xanmod-apt-lists.XXXXXX") || return 1
-    if ! chmod 0755 "$XANMOD_ACTIVE_APT_LISTS_DIR" ||
-        ! install -d -m 0755 "$XANMOD_ACTIVE_APT_LISTS_DIR/partial"; then
+    xanmod_allocate_temp_directory XANMOD_ACTIVE_APT_LISTS_DIR \
+        XANMOD_ACTIVE_APT_LISTS_BUILDING "$temp_parent" xanmod-apt-lists 0755 || return 1
+    XANMOD_ACTIVE_APT_LISTS_BUILDING=false
+    if ! install -d -m 0755 "$XANMOD_ACTIVE_APT_LISTS_DIR/partial"; then
         cleanup_xanmod_active_apt_lists || true
         return 1
     fi
@@ -926,6 +1016,7 @@ cleanup_incomplete_xanmod_runtime_snapshot() {
 
 create_xanmod_runtime_snapshot() {
     local index
+    local temp_parent="${TMPDIR:-/tmp}"
 
     if [[ "$XANMOD_TRANSACTION_ACTIVE" == "true" ||
         "$XANMOD_RUNTIME_SNAPSHOT_BUILDING" == "true" ||
@@ -934,9 +1025,8 @@ create_xanmod_runtime_snapshot() {
         return 1
     fi
 
-    XANMOD_RUNTIME_SNAPSHOT_DIR=$(mktemp -d "${TMPDIR:-/tmp}/xanmod-runtime-snapshot.XXXXXX") || return 1
-    XANMOD_RUNTIME_SNAPSHOT_BUILDING=true
-    if ! chmod 0700 "$XANMOD_RUNTIME_SNAPSHOT_DIR"; then
+    if ! xanmod_allocate_temp_directory XANMOD_RUNTIME_SNAPSHOT_DIR \
+        XANMOD_RUNTIME_SNAPSHOT_BUILDING "$temp_parent" xanmod-runtime-snapshot 0700; then
         cleanup_incomplete_xanmod_runtime_snapshot || true
         return 1
     fi
@@ -999,7 +1089,6 @@ restore_xanmod_snapshot_item() {
 restore_xanmod_runtime_snapshot() {
     local index
     local restore_failed=false
-    local cleanup_failed=false
 
     [[ "$XANMOD_TRANSACTION_ACTIVE" == "true" ]] || return 0
 
@@ -1011,19 +1100,20 @@ restore_xanmod_runtime_snapshot() {
             restore_failed=true
         fi
     done
-    if [[ "$restore_failed" == "false" ]]; then
-        XANMOD_CONFIG_MODIFIED=false
+    if [[ "$restore_failed" == "true" ]]; then
+        XANMOD_CONFIG_MODIFIED=true
+        error "XanMod 运行时快照已保留，可在故障解除后重试: $XANMOD_RUNTIME_SNAPSHOT_DIR"
+        return 1
     fi
 
-    if remove_xanmod_temp_directory "$XANMOD_RUNTIME_SNAPSHOT_DIR" "XanMod 运行时快照"; then
-        XANMOD_RUNTIME_SNAPSHOT_DIR=""
-        XANMOD_RUNTIME_SNAPSHOT_BUILDING=false
-        XANMOD_TRANSACTION_ACTIVE=false
-    else
-        cleanup_failed=true
+    if ! remove_xanmod_temp_directory "$XANMOD_RUNTIME_SNAPSHOT_DIR" "XanMod 运行时快照"; then
+        XANMOD_CONFIG_MODIFIED=true
+        return 1
     fi
-
-    [[ "$restore_failed" == "false" && "$cleanup_failed" == "false" ]]
+    XANMOD_RUNTIME_SNAPSHOT_DIR=""
+    XANMOD_RUNTIME_SNAPSHOT_BUILDING=false
+    XANMOD_TRANSACTION_ACTIVE=false
+    XANMOD_CONFIG_MODIFIED=false
 }
 
 discard_xanmod_runtime_snapshot() {
@@ -1123,9 +1213,16 @@ xanmod_new_backup_state_trusted() {
         xanmod_backup_metadata_values "$metadata_file" >/dev/null
 }
 
+xanmod_create_backup_state_dir() {
+    mkdir -m 0700 -- "$XANMOD_BACKUP_STATE_DIR"
+}
+
 ensure_xanmod_backup_state_dir() {
+    XANMOD_BACKUP_STATE_DIR_CREATING=false
     XANMOD_BACKUP_STATE_DIR_CREATED=false
+    XANMOD_BACKUP_STATE_DIR_PREEXISTED=false
     if [[ -e "$XANMOD_BACKUP_STATE_DIR" || -L "$XANMOD_BACKUP_STATE_DIR" ]]; then
+        XANMOD_BACKUP_STATE_DIR_PREEXISTED=true
         if ! xanmod_directory_trusted "$XANMOD_BACKUP_STATE_DIR" 700; then
             error "XanMod 备份目录类型、owner 或 mode 不可信: $XANMOD_BACKUP_STATE_DIR"
             return 1
@@ -1133,13 +1230,22 @@ ensure_xanmod_backup_state_dir() {
         return 0
     fi
 
-    install -d -m 0700 "$XANMOD_BACKUP_STATE_DIR" || return 1
-    if ! xanmod_directory_trusted "$XANMOD_BACKUP_STATE_DIR" 700; then
-        error "新建 XanMod 备份目录未通过 owner/mode 校验"
-        rmdir "$XANMOD_BACKUP_STATE_DIR" 2>/dev/null || true
+    XANMOD_BACKUP_STATE_DIR_CREATING=true
+    if ! xanmod_create_backup_state_dir; then
+        if [[ -e "$XANMOD_BACKUP_STATE_DIR" || -L "$XANMOD_BACKUP_STATE_DIR" ]]; then
+            XANMOD_BACKUP_STATE_DIR_PREEXISTED=true
+        fi
+        XANMOD_BACKUP_STATE_DIR_CREATING=false
+        error "无法排他创建 XanMod 备份目录: $XANMOD_BACKUP_STATE_DIR"
         return 1
     fi
     XANMOD_BACKUP_STATE_DIR_CREATED=true
+    XANMOD_BACKUP_STATE_DIR_CREATING=false
+    if ! xanmod_directory_trusted "$XANMOD_BACKUP_STATE_DIR" 700; then
+        error "新建 XanMod 备份目录未通过 owner/mode 校验"
+        cleanup_new_empty_xanmod_backup_state_dir || true
+        return 1
+    fi
 }
 
 get_xanmod_backup_prefix() {
@@ -1327,21 +1433,33 @@ xanmod_backup_state_dir_empty() {
 }
 
 cleanup_new_empty_xanmod_backup_state_dir() {
-    if [[ "$XANMOD_BACKUP_STATE_DIR_CREATED" != "true" ]]; then
+    if [[ "$XANMOD_BACKUP_STATE_DIR_PREEXISTED" == "true" ]]; then
+        return 0
+    fi
+    if [[ "$XANMOD_BACKUP_STATE_DIR_CREATING" != "true" &&
+        "$XANMOD_BACKUP_STATE_DIR_CREATED" != "true" ]]; then
         return 0
     fi
     if [[ ! -e "$XANMOD_BACKUP_STATE_DIR" && ! -L "$XANMOD_BACKUP_STATE_DIR" ]]; then
+        XANMOD_BACKUP_STATE_DIR_CREATING=false
         XANMOD_BACKUP_STATE_DIR_CREATED=false
         return 0
     fi
+    if ! xanmod_directory_trusted "$XANMOD_BACKUP_STATE_DIR" 700; then
+        error "拒绝删除类型、owner 或 mode 不可信的 backup 路径: $XANMOD_BACKUP_STATE_DIR"
+        return 1
+    fi
     if ! xanmod_backup_state_dir_empty; then
-        return 0
+        error "本次新建的 XanMod backup 目录非空，保留路径: $XANMOD_BACKUP_STATE_DIR"
+        return 1
     fi
     if ! rmdir "$XANMOD_BACKUP_STATE_DIR"; then
         error "本次新建的空 XanMod backup 目录残留: $XANMOD_BACKUP_STATE_DIR"
         return 1
     fi
+    XANMOD_BACKUP_STATE_DIR_CREATING=false
     XANMOD_BACKUP_STATE_DIR_CREATED=false
+    XANMOD_BACKUP_STATE_DIR_PREEXISTED=false
 }
 
 cleanup_incomplete_xanmod_backup_snapshot() {
@@ -1374,6 +1492,7 @@ cleanup_incomplete_xanmod_backup_snapshot() {
 
 create_xanmod_backup_group_snapshot() {
     local index
+    local temp_parent="${TMPDIR:-/tmp}"
 
     if [[ "$XANMOD_BACKUP_TRANSACTION_ACTIVE" == "true" ||
         "$XANMOD_BACKUP_SNAPSHOT_BUILDING" == "true" ||
@@ -1382,9 +1501,8 @@ create_xanmod_backup_group_snapshot() {
         return 1
     fi
     build_xanmod_backup_snapshot_paths || return 1
-    XANMOD_BACKUP_GROUP_SNAPSHOT_DIR=$(mktemp -d "${TMPDIR:-/tmp}/xanmod-backup-group.XXXXXX") || return 1
-    XANMOD_BACKUP_SNAPSHOT_BUILDING=true
-    if ! chmod 0700 "$XANMOD_BACKUP_GROUP_SNAPSHOT_DIR"; then
+    if ! xanmod_allocate_temp_directory XANMOD_BACKUP_GROUP_SNAPSHOT_DIR \
+        XANMOD_BACKUP_SNAPSHOT_BUILDING "$temp_parent" xanmod-backup-group 0700; then
         cleanup_incomplete_xanmod_backup_snapshot || true
         return 1
     fi
@@ -1514,12 +1632,14 @@ commit_xanmod_backup_group() {
 
 cleanup_xanmod_backup_stage() {
     if [[ -z "$XANMOD_BACKUP_STAGE_DIR" ]]; then
+        XANMOD_BACKUP_STAGE_BUILDING=false
         return 0
     fi
     if ! remove_xanmod_temp_directory "$XANMOD_BACKUP_STAGE_DIR" "XanMod backup stage"; then
         return 1
     fi
     XANMOD_BACKUP_STAGE_DIR=""
+    XANMOD_BACKUP_STAGE_BUILDING=false
 }
 
 restore_xanmod_backup_group_snapshot() {
@@ -1537,21 +1657,32 @@ restore_xanmod_backup_group_snapshot() {
             restore_failed=true
         fi
     done
+    if [[ "$restore_failed" == "true" ]]; then
+        error "XanMod backup 组快照已保留，可在故障解除后重试: $XANMOD_BACKUP_GROUP_SNAPSHOT_DIR"
+        return 1
+    fi
+
     for archive in "${XANMOD_BACKUP_NEW_ARCHIVES[@]}"; do
-        rm -f -- "$archive" || { error "XanMod legacy archive 残留: $archive"; cleanup_failed=true; }
+        if ! rm -f -- "$archive"; then
+            error "XanMod legacy archive 残留: $archive"
+            cleanup_failed=true
+        fi
     done
     cleanup_xanmod_backup_stage || cleanup_failed=true
-    if remove_xanmod_temp_directory "$XANMOD_BACKUP_GROUP_SNAPSHOT_DIR" "XanMod backup 组快照"; then
-        XANMOD_BACKUP_GROUP_SNAPSHOT_DIR=""
-        XANMOD_BACKUP_SNAPSHOT_BUILDING=false
-    else
-        cleanup_failed=true
-    fi
     cleanup_new_empty_xanmod_backup_state_dir || cleanup_failed=true
+    if [[ "$cleanup_failed" == "true" ]]; then
+        error "XanMod backup 组快照已保留，可在清理故障解除后重试: $XANMOD_BACKUP_GROUP_SNAPSHOT_DIR"
+        return 1
+    fi
+
+    if ! remove_xanmod_temp_directory "$XANMOD_BACKUP_GROUP_SNAPSHOT_DIR" "XanMod backup 组快照"; then
+        return 1
+    fi
+    XANMOD_BACKUP_GROUP_SNAPSHOT_DIR=""
+    XANMOD_BACKUP_SNAPSHOT_BUILDING=false
     XANMOD_BACKUP_TRANSACTION_ACTIVE=false
     XANMOD_BACKUP_SNAPSHOT_PATHS=()
     XANMOD_BACKUP_NEW_ARCHIVES=()
-    [[ "$restore_failed" == "false" && "$cleanup_failed" == "false" ]]
 }
 
 discard_xanmod_backup_group_snapshot() {
@@ -1564,7 +1695,9 @@ discard_xanmod_backup_group_snapshot() {
     XANMOD_BACKUP_GROUP_SNAPSHOT_DIR=""
     XANMOD_BACKUP_SNAPSHOT_BUILDING=false
     XANMOD_BACKUP_TRANSACTION_ACTIVE=false
+    XANMOD_BACKUP_STATE_DIR_CREATING=false
     XANMOD_BACKUP_STATE_DIR_CREATED=false
+    XANMOD_BACKUP_STATE_DIR_PREEXISTED=false
     XANMOD_BACKUP_SNAPSHOT_PATHS=()
     XANMOD_BACKUP_NEW_ARCHIVES=()
 }
@@ -1577,14 +1710,12 @@ prepare_persistent_xanmod_backups() {
     validate_xanmod_backup_group_items || return 1
     create_xanmod_backup_group_snapshot || return 1
     XANMOD_BACKUP_TRANSACTION_ID=$(basename "$XANMOD_BACKUP_GROUP_SNAPSHOT_DIR")
-    XANMOD_BACKUP_STAGE_DIR=$(mktemp -d "$XANMOD_BACKUP_STATE_DIR/.xanmod-backup-stage.XXXXXX") || {
+    if ! xanmod_allocate_temp_directory XANMOD_BACKUP_STAGE_DIR \
+        XANMOD_BACKUP_STAGE_BUILDING "$XANMOD_BACKUP_STATE_DIR" .xanmod-backup-stage 0700; then
         restore_xanmod_backup_group_snapshot || true
         return 1
-    }
-    chmod 0700 "$XANMOD_BACKUP_STAGE_DIR" || {
-        restore_xanmod_backup_group_snapshot || true
-        return 1
-    }
+    fi
+    XANMOD_BACKUP_STAGE_BUILDING=false
 
     if xanmod_configuration_looks_previously_managed; then
         XANMOD_CONFIGURATION_PREVIOUSLY_MANAGED=true
@@ -1622,7 +1753,8 @@ abort_pending_xanmod_backup_transaction() {
         -n "$XANMOD_BACKUP_GROUP_SNAPSHOT_DIR" ||
         -n "$XANMOD_BACKUP_STAGE_DIR" ]]; then
         cleanup_incomplete_xanmod_backup_snapshot
-    elif [[ "$XANMOD_BACKUP_STATE_DIR_CREATED" == "true" ]]; then
+    elif [[ "$XANMOD_BACKUP_STATE_DIR_CREATING" == "true" ||
+        "$XANMOD_BACKUP_STATE_DIR_CREATED" == "true" ]]; then
         cleanup_new_empty_xanmod_backup_state_dir
     fi
 }
@@ -1671,8 +1803,8 @@ restore_xanmod_persistent_item() {
             rm -f -- "$target"
             ;;
         backup)
-            staged=$(make_xanmod_stage_file "$target" .restore) || return 1
-            XANMOD_RESTORE_STAGE="$staged"
+            make_xanmod_stage_file XANMOD_RESTORE_STAGE "$target" .restore || return 1
+            staged="$XANMOD_RESTORE_STAGE"
             if ! remove_xanmod_temp_file "$staged" "XanMod restore stage"; then
                 return 1
             fi
@@ -1925,13 +2057,16 @@ begin_xanmod_install_transaction() {
 }
 
 make_xanmod_stage_file() {
-    local target="$1"
-    local suffix="$2"
+    local path_variable="$1"
+    local target="$2"
+    local suffix="$3"
     local target_dir
+    local prefix
 
     target_dir=$(dirname "$target") || return 1
     install -d -m 0755 "$target_dir" || return 1
-    mktemp --suffix="$suffix" "$target_dir/.xanmod-stage.$(basename "$target").XXXXXX"
+    prefix=".xanmod-stage.$(basename "$target")"
+    xanmod_allocate_temp_file "$path_variable" "$target_dir" "$prefix" "$suffix" 0600
 }
 
 cleanup_xanmod_stages() {
@@ -1984,7 +2119,7 @@ cleanup_xanmod_stages() {
 stage_xanmod_key() {
     local key_url
 
-    XANMOD_STAGED_KEY=$(make_xanmod_stage_file "$XANMOD_KEYRING" .gpg) || return 1
+    make_xanmod_stage_file XANMOD_STAGED_KEY "$XANMOD_KEYRING" .gpg || return 1
 
     if xanmod_keyring_valid "$XANMOD_KEYRING"; then
         if install -m 0600 "$XANMOD_KEYRING" "$XANMOD_STAGED_KEY" &&
@@ -2000,10 +2135,11 @@ stage_xanmod_key() {
         warn "现有 XanMod 密钥不满足严格内容校验，将重新获取"
     fi
 
-    XANMOD_ARMORED_KEY_TEMP=$(mktemp "${TMPDIR:-/tmp}/xanmod-key.XXXXXX") || {
+    if ! xanmod_allocate_temp_file XANMOD_ARMORED_KEY_TEMP \
+        "${TMPDIR:-/tmp}" xanmod-key .asc 0600; then
         cleanup_xanmod_stages || true
         return 1
-    }
+    fi
 
     for key_url in "$XANMOD_KEY_URL" "$XANMOD_KEY_FALLBACK_UBUNTU"; do
         info "下载 XanMod 软件源签名密钥: $key_url"
@@ -2022,7 +2158,7 @@ stage_xanmod_key() {
         if ! gpg --batch --yes --dearmor --output "$XANMOD_STAGED_KEY" "$XANMOD_ARMORED_KEY_TEMP"; then
             warn "XanMod 签名密钥转换失败，尝试下一个来源"
             remove_xanmod_temp_file "$XANMOD_STAGED_KEY" "XanMod staged key" || break
-            XANMOD_STAGED_KEY=$(make_xanmod_stage_file "$XANMOD_KEYRING" .gpg) || break
+            make_xanmod_stage_file XANMOD_STAGED_KEY "$XANMOD_KEYRING" .gpg || break
             continue
         fi
         if ! set_xanmod_staged_file_metadata "$XANMOD_STAGED_KEY"; then
@@ -2039,7 +2175,7 @@ stage_xanmod_key() {
 
         warn "转换后的 XanMod 密钥未通过严格校验，尝试下一个来源"
         remove_xanmod_temp_file "$XANMOD_STAGED_KEY" "XanMod staged key" || break
-        XANMOD_STAGED_KEY=$(make_xanmod_stage_file "$XANMOD_KEYRING" .gpg) || break
+        make_xanmod_stage_file XANMOD_STAGED_KEY "$XANMOD_KEYRING" .gpg || break
     done
 
     cleanup_xanmod_stages || true
@@ -2052,7 +2188,7 @@ stage_xanmod_source() {
     local repository
     local source_status=0
 
-    XANMOD_CANDIDATE_SOURCE=$(make_xanmod_stage_file "$XANMOD_SOURCE_DEB822" .sources) || return 1
+    make_xanmod_stage_file XANMOD_CANDIDATE_SOURCE "$XANMOD_SOURCE_DEB822" .sources || return 1
     XANMOD_SELECTED_REPOSITORY=""
 
     for repository in "${XANMOD_REPOSITORIES[@]}"; do
@@ -2086,7 +2222,7 @@ stage_xanmod_source() {
         return 1
     fi
 
-    XANMOD_STAGED_SOURCE=$(make_xanmod_stage_file "$XANMOD_SOURCE_DEB822" .sources) || return 1
+    make_xanmod_stage_file XANMOD_STAGED_SOURCE "$XANMOD_SOURCE_DEB822" .sources || return 1
     write_xanmod_deb822_source \
         "$XANMOD_STAGED_SOURCE" "$XANMOD_SELECTED_REPOSITORY" "$codename" "$XANMOD_KEYRING" || return 1
     set_xanmod_staged_file_metadata "$XANMOD_STAGED_SOURCE"
@@ -2650,7 +2786,7 @@ require_xanmod_plan_commands() {
 
 require_xanmod_mutation_commands() {
     require_xanmod_commands apt-cache apt-get awk basename cat chgrp chmod chown cp curl dirname \
-        dpkg dpkg-query find flock grep id install ln mktemp mv readlink rm rmdir sort stat tr uname
+        dpkg dpkg-query find flock grep id install ln mkdir mv od readlink rm rmdir sort stat tr uname
 }
 
 run_authorized_xanmod_install() {

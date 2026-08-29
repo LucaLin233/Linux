@@ -151,7 +151,8 @@ reset_tool_files() {
     XANMOD_RUNTIME_SNAPSHOT_DIR=""; XANMOD_RUNTIME_SNAPSHOT_BUILDING=false
     XANMOD_TRANSACTION_ACTIVE=false; XANMOD_CONFIG_MODIFIED=false
     XANMOD_STAGED_KEY=""; XANMOD_STAGED_SOURCE=""; XANMOD_CANDIDATE_SOURCE=""
-    XANMOD_ARMORED_KEY_TEMP=""; XANMOD_ACTIVE_APT_LISTS_DIR=""; XANMOD_RESTORE_STAGE=""
+    XANMOD_ARMORED_KEY_TEMP=""; XANMOD_ACTIVE_APT_LISTS_DIR=""; XANMOD_ACTIVE_APT_LISTS_BUILDING=false
+    XANMOD_RESTORE_STAGE=""
     XANMOD_GUARD_ACTIVE=false; XANMOD_LOCK_HELD=false
     reset_xanmod_plan
 }
@@ -504,9 +505,63 @@ run_install_scenario postcheck-fail 1
     rm() { local last=${!#}; [[ "$last" == "$snapshot" ]] && return 1; command rm "$@"; }
     rc=0; discard_xanmod_runtime_snapshot > "$TEST_DIR/snapshot-cleanup.log" 2>&1 || rc=$?
     assert_eq 1 "$rc" "snapshot deletion failure returns nonzero"
+    assert_eq "$snapshot" "$XANMOD_RUNTIME_SNAPSHOT_DIR" "snapshot deletion failure preserves path"
+    assert_eq true "$XANMOD_TRANSACTION_ACTIVE" "snapshot deletion failure preserves active state"
     grep -Fq "$snapshot" "$TEST_DIR/snapshot-cleanup.log" || fail "snapshot cleanup did not report residue path"
     pass "snapshot deletion failure reports exact residue path"
-    unset -f rm; command rm -rf "$snapshot"; XANMOD_RUNTIME_SNAPSHOT_DIR=""; XANMOD_TRANSACTION_ACTIVE=false
+    unset -f rm
+    discard_xanmod_runtime_snapshot
+    [[ ! -e "$snapshot" ]] || fail "snapshot deletion retry left directory"
+    assert_eq false "$XANMOD_TRANSACTION_ACTIVE" "snapshot deletion retry clears active state"
+)
+
+(
+    reset_tool_files
+    printf original-key > "$XANMOD_KEYRING"; printf original-list > "$XANMOD_SOURCE_LIST"; printf original-source > "$XANMOD_SOURCE_DEB822"
+    create_xanmod_runtime_snapshot
+    snapshot="$XANMOD_RUNTIME_SNAPSHOT_DIR"
+    XANMOD_CONFIG_MODIFIED=true
+    printf changed-key > "$XANMOD_KEYRING"; printf changed-list > "$XANMOD_SOURCE_LIST"; printf changed-source > "$XANMOD_SOURCE_DEB822"
+    cp() { local source=${@: -2:1}; [[ "$source" == "$snapshot/item-1.data" ]] && return 1; command cp "$@"; }
+    rc=0; restore_xanmod_runtime_snapshot > "$TEST_DIR/runtime-cp-restore.log" 2>&1 || rc=$?
+    assert_eq 1 "$rc" "runtime restore cp failure returns nonzero"
+    [[ -d "$snapshot" ]] || fail "runtime restore cp failure deleted snapshot"
+    pass "runtime restore cp failure preserves snapshot directory"
+    assert_eq true "$XANMOD_TRANSACTION_ACTIVE" "runtime restore cp failure preserves active state"
+    assert_eq true "$XANMOD_CONFIG_MODIFIED" "runtime restore cp failure preserves modified state"
+    grep -Fq "$snapshot" "$TEST_DIR/runtime-cp-restore.log" || fail "runtime restore cp failure omitted snapshot path"
+    pass "runtime restore cp failure reports retained snapshot path"
+    unset -f cp
+    restore_xanmod_runtime_snapshot
+    assert_file_eq original-key "$XANMOD_KEYRING" "runtime cp retry restores key"
+    assert_file_eq original-list "$XANMOD_SOURCE_LIST" "runtime cp retry restores list"
+    assert_file_eq original-source "$XANMOD_SOURCE_DEB822" "runtime cp retry restores source"
+    [[ ! -e "$snapshot" ]] || fail "runtime cp retry left snapshot"
+    assert_eq false "$XANMOD_TRANSACTION_ACTIVE" "runtime cp retry clears active state"
+    assert_eq false "$XANMOD_CONFIG_MODIFIED" "runtime cp retry clears modified state"
+)
+
+(
+    reset_tool_files
+    printf original-key > "$XANMOD_KEYRING"; printf original-list > "$XANMOD_SOURCE_LIST"; printf original-source > "$XANMOD_SOURCE_DEB822"
+    create_xanmod_runtime_snapshot
+    snapshot="$XANMOD_RUNTIME_SNAPSHOT_DIR"
+    XANMOD_CONFIG_MODIFIED=true
+    printf changed-key > "$XANMOD_KEYRING"; printf changed-list > "$XANMOD_SOURCE_LIST"; printf changed-source > "$XANMOD_SOURCE_DEB822"
+    rm() { local last=${!#}; [[ "$last" == "$XANMOD_SOURCE_LIST" ]] && return 1; command rm "$@"; }
+    rc=0; restore_xanmod_runtime_snapshot > "$TEST_DIR/runtime-rm-restore.log" 2>&1 || rc=$?
+    assert_eq 1 "$rc" "runtime restore rm failure returns nonzero"
+    [[ -d "$snapshot" ]] || fail "runtime restore rm failure deleted snapshot"
+    pass "runtime restore rm failure preserves snapshot directory"
+    assert_eq true "$XANMOD_TRANSACTION_ACTIVE" "runtime restore rm failure preserves active state"
+    assert_eq true "$XANMOD_CONFIG_MODIFIED" "runtime restore rm failure preserves modified state"
+    grep -Fq "$snapshot" "$TEST_DIR/runtime-rm-restore.log" || fail "runtime restore rm failure omitted snapshot path"
+    pass "runtime restore rm failure reports retained snapshot path"
+    unset -f rm
+    restore_xanmod_runtime_snapshot
+    assert_file_eq original-list "$XANMOD_SOURCE_LIST" "runtime rm retry restores list"
+    [[ ! -e "$snapshot" ]] || fail "runtime rm retry left snapshot"
+    assert_eq false "$XANMOD_TRANSACTION_ACTIVE" "runtime rm retry clears active state"
 )
 
 (
@@ -561,6 +616,34 @@ run_install_scenario postcheck-fail 1
     grep -Fq "$dangling" "$TEST_DIR/dangling-lists-fail.log" || fail "dangling APT lists failure omitted residue path"
     pass "dangling APT lists rm failure reports exact path"
     unset -f rm; command rm -f "$dangling"; XANMOD_ACTIVE_APT_LISTS_DIR=""
+)
+
+(
+    reset_tool_files
+    parent="$TEST_DIR/tool/tmp"
+    collision="$parent/alloc-dir.collision"
+    mkdir -m 0700 "$collision"; printf keep > "$collision/owner-data"
+    token_counter="$TEST_DIR/tool/dir-token-counter"; printf 0 > "$token_counter"
+    xanmod_random_token() { local count; count=$(<"$token_counter"); ((count += 1)); printf '%s' "$count" > "$token_counter"; (( count == 1 )) && echo collision || echo unique; }
+    ALLOCATED_DIR=""; ALLOCATED_DIR_BUILDING=false
+    xanmod_allocate_temp_directory ALLOCATED_DIR ALLOCATED_DIR_BUILDING "$parent" alloc-dir 0700
+    assert_eq "$parent/alloc-dir.unique" "$ALLOCATED_DIR" "directory allocator retries collision with new token"
+    assert_file_eq keep "$collision/owner-data" "directory allocator does not delete collision path"
+    command rm -rf "$ALLOCATED_DIR" "$collision"; ALLOCATED_DIR=""; ALLOCATED_DIR_BUILDING=false
+)
+
+(
+    reset_tool_files
+    parent="$TEST_DIR/tool/tmp"
+    collision="$parent/alloc-file.collision.tmp"
+    printf keep > "$collision"
+    token_counter="$TEST_DIR/tool/file-token-counter"; printf 0 > "$token_counter"
+    xanmod_random_token() { local count; count=$(<"$token_counter"); ((count += 1)); printf '%s' "$count" > "$token_counter"; (( count == 1 )) && echo collision || echo unique; }
+    ALLOCATED_FILE=""
+    xanmod_allocate_temp_file ALLOCATED_FILE "$parent" alloc-file .tmp 0600
+    assert_eq "$parent/alloc-file.unique.tmp" "$ALLOCATED_FILE" "file allocator retries collision with new token"
+    assert_file_eq keep "$collision" "file allocator does not delete collision path"
+    command rm -f "$ALLOCATED_FILE" "$collision"; ALLOCATED_FILE=""
 )
 
 cat > "$TEST_DIR/signal-child.sh" <<'SIGNAL_CHILD'
@@ -681,6 +764,80 @@ run_signal_case HUP 129 runtime-build
 run_signal_case INT 130 runtime-build
 run_signal_case TERM 143 runtime-build
 
+cat > "$TEST_DIR/allocation-window-child.sh" <<'ALLOCATION_WINDOW_CHILD'
+#!/usr/bin/env bash
+set -euo pipefail
+root="$1"
+kind="$2"
+tool="$3"
+mkdir -p "$root/tmp"
+printf key-before > "$root/key.gpg"
+printf list-before > "$root/release.list"
+printf source-before > "$root/release.sources"
+export XANMOD_TEST_MODE=1
+export XANMOD_KEYRING_PATH="$root/key.gpg"
+export XANMOD_SOURCE_LIST_PATH="$root/release.list"
+export XANMOD_SOURCE_DEB822_PATH="$root/release.sources"
+export XANMOD_LOCK_PATH="$root/xanmod.lock"
+export XANMOD_OS_RELEASE_PATH="$root/os-release"
+export XANMOD_CPUINFO_PATH="$root/cpuinfo"
+export TMPDIR="$root/tmp"
+source "$tool"
+block_for_signal() {
+    touch "$root/ready"
+    while :; do sleep 1; done
+}
+install_xanmod_transaction_guards
+take_xanmod_lock
+if [[ "$kind" == directory ]]; then
+    xanmod_create_temp_directory_at_path() {
+        command mkdir -m "$2" -- "$1"
+        block_for_signal
+    }
+    xanmod_allocate_temp_directory XANMOD_RUNTIME_SNAPSHOT_DIR \
+        XANMOD_RUNTIME_SNAPSHOT_BUILDING "$root/tmp" allocation-directory 0700
+else
+    xanmod_create_temp_file_at_path() {
+        (umask 077; set -o noclobber; : > "$1") 2>/dev/null
+        block_for_signal
+    }
+    xanmod_allocate_temp_file XANMOD_STAGED_KEY "$root/tmp" allocation-file .tmp 0600
+fi
+ALLOCATION_WINDOW_CHILD
+chmod 0755 "$TEST_DIR/allocation-window-child.sh"
+
+run_allocation_window_signal_case() {
+    local signal_name="$1" expected_status="$2" kind="$3"
+    local root="$TEST_DIR/allocation-$kind-$signal_name"
+    local pid rc=0
+
+    mkdir -p "$root"
+    setsid env --default-signal=HUP,INT,TERM \
+        bash "$TEST_DIR/allocation-window-child.sh" "$root" "$kind" "$TOOL" > "$root/output.log" 2>&1 &
+    pid=$!
+    for _ in $(seq 1 200); do
+        [[ -e "$root/ready" ]] && break
+        sleep 0.05
+    done
+    [[ -e "$root/ready" ]] || { cat "$root/output.log"; kill "$pid" 2>/dev/null || true; fail "$signal_name/$kind allocation did not block"; }
+    kill "-$signal_name" -- "-$pid"
+    wait "$pid" || rc=$?
+    assert_eq "$expected_status" "$rc" "$signal_name during $kind allocation returns conventional status"
+    assert_file_eq key-before "$root/key.gpg" "$signal_name/$kind allocation leaves key unchanged"
+    assert_file_eq list-before "$root/release.list" "$signal_name/$kind allocation leaves list unchanged"
+    assert_file_eq source-before "$root/release.sources" "$signal_name/$kind allocation leaves source unchanged"
+    [[ -z "$(find "$root" \( -name 'allocation-directory.*' -o -name 'allocation-file.*' \) -print -quit)" ]] || fail "$signal_name/$kind allocation left resource"
+    pass "$signal_name during $kind allocation leaves no resource"
+    flock -n "$root/xanmod.lock" -c true || fail "$signal_name/$kind allocation did not release lock"
+    pass "$signal_name during $kind allocation releases lock"
+}
+
+for allocation_signal in HUP INT TERM; do
+    case "$allocation_signal" in HUP) allocation_status=129;; INT) allocation_status=130;; TERM) allocation_status=143;; esac
+    run_allocation_window_signal_case "$allocation_signal" "$allocation_status" directory
+    run_allocation_window_signal_case "$allocation_signal" "$allocation_status" file
+ done
+
 cat > "$TEST_DIR/exit-zero-child.sh" <<'EXIT_ZERO_CHILD'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -799,6 +956,75 @@ run_backup_build_signal_case HUP 129
 run_backup_build_signal_case INT 130
 run_backup_build_signal_case TERM 143
 
+cat > "$TEST_DIR/backup-dir-window-child.sh" <<'BACKUP_DIR_WINDOW_CHILD'
+#!/usr/bin/env bash
+set -euo pipefail
+root="$1"
+module="$2"
+mkdir -p "$root/tmp"
+printf key-before > "$root/key.gpg"
+printf list-before > "$root/release.list"
+printf source-before > "$root/release.sources"
+printf backup-key > "$root/key.gpg.previous-backup"; chmod 0600 "$root/key.gpg.previous-backup"
+printf backup-list > "$root/release.list.previous-backup"; chmod 0600 "$root/release.list.previous-backup"
+printf backup-source > "$root/release.sources.previous-backup"; chmod 0600 "$root/release.sources.previous-backup"
+export XANMOD_TEST_MODE=1
+export XANMOD_KEYRING_PATH="$root/key.gpg"
+export XANMOD_SOURCE_LIST_PATH="$root/release.list"
+export XANMOD_SOURCE_DEB822_PATH="$root/release.sources"
+export XANMOD_LOCK_PATH="$root/xanmod.lock"
+export XANMOD_OS_RELEASE_PATH="$root/os-release"
+export XANMOD_CPUINFO_PATH="$root/cpuinfo"
+export XANMOD_BACKUP_STATE_DIR="$root/backups"
+export TMPDIR="$root/tmp"
+source "$module"
+block_for_signal() {
+    touch "$root/ready"
+    while :; do sleep 1; done
+}
+xanmod_create_backup_state_dir() {
+    command mkdir -m 0700 -- "$XANMOD_BACKUP_STATE_DIR"
+    block_for_signal
+}
+install_xanmod_transaction_guards
+take_xanmod_lock
+ensure_xanmod_backup_state_dir
+BACKUP_DIR_WINDOW_CHILD
+chmod 0755 "$TEST_DIR/backup-dir-window-child.sh"
+
+run_backup_dir_window_signal_case() {
+    local signal_name="$1" expected_status="$2"
+    local root="$TEST_DIR/backup-dir-window-$signal_name"
+    local pid rc=0
+
+    mkdir -p "$root"
+    setsid env --default-signal=HUP,INT,TERM \
+        bash "$TEST_DIR/backup-dir-window-child.sh" "$root" "$MODULE" > "$root/output.log" 2>&1 &
+    pid=$!
+    for _ in $(seq 1 200); do
+        [[ -e "$root/ready" ]] && break
+        sleep 0.05
+    done
+    [[ -e "$root/ready" ]] || { cat "$root/output.log"; kill "$pid" 2>/dev/null || true; fail "$signal_name backup dir allocation did not block"; }
+    kill "-$signal_name" -- "-$pid"
+    wait "$pid" || rc=$?
+    assert_eq "$expected_status" "$rc" "$signal_name during backup directory creation returns conventional status"
+    [[ ! -e "$root/backups" && ! -L "$root/backups" ]] || fail "$signal_name backup directory creation left empty directory"
+    pass "$signal_name backup directory creation removes owned empty directory"
+    assert_file_eq key-before "$root/key.gpg" "$signal_name backup directory creation leaves key unchanged"
+    assert_file_eq list-before "$root/release.list" "$signal_name backup directory creation leaves list unchanged"
+    assert_file_eq source-before "$root/release.sources" "$signal_name backup directory creation leaves source unchanged"
+    assert_file_eq backup-key "$root/key.gpg.previous-backup" "$signal_name backup directory creation preserves key backup"
+    assert_file_eq backup-list "$root/release.list.previous-backup" "$signal_name backup directory creation preserves list backup"
+    assert_file_eq backup-source "$root/release.sources.previous-backup" "$signal_name backup directory creation preserves source backup"
+    flock -n "$root/xanmod.lock" -c true || fail "$signal_name backup directory creation did not release lock"
+    pass "$signal_name backup directory creation releases lock"
+}
+
+run_backup_dir_window_signal_case HUP 129
+run_backup_dir_window_signal_case INT 130
+run_backup_dir_window_signal_case TERM 143
+
 module_root="$TEST_DIR/module"
 make_layout "$module_root"
 env XANMOD_TEST_MODE=1 \
@@ -879,9 +1105,11 @@ reset_state() {
     XANMOD_TRANSACTION_ACTIVE=false; XANMOD_CONFIG_MODIFIED=false
     XANMOD_GUARD_ACTIVE=false; XANMOD_GUARD_HANDLING=false; XANMOD_LOCK_HELD=false
     XANMOD_STAGED_KEY=""; XANMOD_STAGED_SOURCE=""; XANMOD_CANDIDATE_SOURCE=""
-    XANMOD_ARMORED_KEY_TEMP=""; XANMOD_ACTIVE_APT_LISTS_DIR=""; XANMOD_RESTORE_STAGE=""
+    XANMOD_ARMORED_KEY_TEMP=""; XANMOD_ACTIVE_APT_LISTS_DIR=""; XANMOD_ACTIVE_APT_LISTS_BUILDING=false
+    XANMOD_RESTORE_STAGE=""
+    XANMOD_BACKUP_STATE_DIR_CREATING=false; XANMOD_BACKUP_STATE_DIR_CREATED=false; XANMOD_BACKUP_STATE_DIR_PREEXISTED=false
     XANMOD_BACKUP_TRANSACTION_ACTIVE=false; XANMOD_BACKUP_SNAPSHOT_BUILDING=false
-    XANMOD_BACKUP_GROUP_SNAPSHOT_DIR=""; XANMOD_BACKUP_STAGE_DIR=""
+    XANMOD_BACKUP_GROUP_SNAPSHOT_DIR=""; XANMOD_BACKUP_STAGE_DIR=""; XANMOD_BACKUP_STAGE_BUILDING=false
     XANMOD_BACKUP_SNAPSHOT_PATHS=(); XANMOD_BACKUP_LEGACY_PATHS=(); XANMOD_BACKUP_NEW_ARCHIVES=()
     APT_RESULT=0; : > "$ROOT/apt.log"
 }
@@ -927,6 +1155,20 @@ assert_eq true "$XANMOD_BACKUP_SNAPSHOT_BUILDING" "incomplete backup deletion fa
 grep -Fq "$snapshot" "$ROOT/incomplete-backup-cleanup.log" || fail "incomplete backup cleanup omitted residue path"
 pass "incomplete backup snapshot deletion failure reports exact path"
 unset -f rm; command rm -rf "$snapshot"; XANMOD_BACKUP_GROUP_SNAPSHOT_DIR=""; XANMOD_BACKUP_SNAPSHOT_BUILDING=false; XANMOD_BACKUP_STATE_DIR_CREATED=false
+
+reset_state
+ensure_xanmod_backup_state_dir
+rmdir() { [[ "$1" == "$XANMOD_BACKUP_STATE_DIR" ]] && return 1; command rmdir "$@"; }
+rc=0; cleanup_new_empty_xanmod_backup_state_dir > "$ROOT/backup-rmdir-fail.log" 2>&1 || rc=$?
+assert_eq 1 "$rc" "new empty backup directory rmdir failure returns nonzero"
+assert_eq true "$XANMOD_BACKUP_STATE_DIR_CREATED" "backup directory rmdir failure preserves ownership state"
+[[ -d "$XANMOD_BACKUP_STATE_DIR" ]] || fail "backup directory rmdir failure lost directory"
+grep -Fq "$XANMOD_BACKUP_STATE_DIR" "$ROOT/backup-rmdir-fail.log" || fail "backup directory rmdir failure omitted path"
+pass "backup directory rmdir failure reports exact path"
+unset -f rmdir
+cleanup_new_empty_xanmod_backup_state_dir
+[[ ! -e "$XANMOD_BACKUP_STATE_DIR" ]] || fail "backup directory rmdir retry left directory"
+pass "backup directory rmdir retry completes cleanup"
 
 reset_state
 write_generation A; prepare_persistent_xanmod_backups
@@ -1023,6 +1265,59 @@ rc=0; prepare_persistent_xanmod_backups || rc=$?
 assert_eq 1 "$rc" "backup commit middle failure returns nonzero"
 restore_function original_commit_xanmod_persistent_state commit_xanmod_persistent_state
 restore_previous_generation A "backup commit failure preserves A generation"
+
+# A failed backup-group restore preserves the only snapshot and supports retry.
+reset_state
+write_generation A; prepare_persistent_xanmod_backups
+create_xanmod_backup_group_snapshot
+backup_snapshot="$XANMOD_BACKUP_GROUP_SNAPSHOT_DIR"
+backup_path_count=${#XANMOD_BACKUP_SNAPSHOT_PATHS[@]}
+key_previous="$(get_xanmod_backup_prefix "$XANMOD_KEYRING").previous-backup"
+list_previous="$(get_xanmod_backup_prefix "$XANMOD_SOURCE_LIST").previous-backup"
+source_previous="$(get_xanmod_backup_prefix "$XANMOD_SOURCE_DEB822").previous-backup"
+printf unexpected-key > "$key_previous"; printf unexpected-list > "$list_previous"; printf unexpected-source > "$source_previous"
+save_function restore_xanmod_snapshot_item original_restore_xanmod_snapshot_item
+restore_xanmod_snapshot_item() {
+    if [[ "$1" == "$list_previous" ]]; then return 1; fi
+    original_restore_xanmod_snapshot_item "$@"
+}
+rc=0; restore_xanmod_backup_group_snapshot > "$ROOT/backup-restore-fail.log" 2>&1 || rc=$?
+assert_eq 1 "$rc" "backup group restore failure returns nonzero"
+[[ -d "$backup_snapshot" ]] || fail "backup group restore failure deleted snapshot"
+pass "backup group restore failure preserves snapshot directory"
+assert_eq true "$XANMOD_BACKUP_TRANSACTION_ACTIVE" "backup group restore failure preserves active state"
+assert_eq "$backup_path_count" "${#XANMOD_BACKUP_SNAPSHOT_PATHS[@]}" "backup group restore failure preserves path array"
+assert_eq unexpected-list "$(<"$list_previous")" "failed backup target remains available for retry"
+grep -Fq "$backup_snapshot" "$ROOT/backup-restore-fail.log" || fail "backup group restore failure omitted snapshot path"
+pass "backup group restore failure reports retained snapshot path"
+restore_function original_restore_xanmod_snapshot_item restore_xanmod_snapshot_item
+restore_xanmod_backup_group_snapshot
+assert_eq A-key "$(<"$key_previous")" "backup group retry restores key generation"
+assert_eq A-list "$(<"$list_previous")" "backup group retry restores list generation"
+assert_eq A-source "$(<"$source_previous")" "backup group retry restores source generation"
+[[ ! -e "$backup_snapshot" ]] || fail "backup group retry left snapshot"
+assert_eq false "$XANMOD_BACKUP_TRANSACTION_ACTIVE" "backup group retry clears active state"
+assert_eq 0 "${#XANMOD_BACKUP_SNAPSHOT_PATHS[@]}" "backup group retry clears path array"
+
+# A complete backup snapshot deletion failure keeps recovery state until retry.
+reset_state
+write_generation A; prepare_persistent_xanmod_backups
+create_xanmod_backup_group_snapshot
+backup_snapshot="$XANMOD_BACKUP_GROUP_SNAPSHOT_DIR"
+backup_path_count=${#XANMOD_BACKUP_SNAPSHOT_PATHS[@]}
+rm() { local last=${!#}; [[ "$last" == "$backup_snapshot" ]] && return 1; command rm "$@"; }
+rc=0; discard_xanmod_backup_group_snapshot > "$ROOT/backup-discard-fail.log" 2>&1 || rc=$?
+assert_eq 1 "$rc" "complete backup snapshot deletion failure returns nonzero"
+assert_eq "$backup_snapshot" "$XANMOD_BACKUP_GROUP_SNAPSHOT_DIR" "backup deletion failure preserves path"
+assert_eq true "$XANMOD_BACKUP_TRANSACTION_ACTIVE" "backup deletion failure preserves active state"
+assert_eq "$backup_path_count" "${#XANMOD_BACKUP_SNAPSHOT_PATHS[@]}" "backup deletion failure preserves recovery array"
+grep -Fq "$backup_snapshot" "$ROOT/backup-discard-fail.log" || fail "backup deletion failure omitted snapshot path"
+pass "backup snapshot deletion failure reports exact path"
+unset -f rm
+discard_xanmod_backup_group_snapshot
+[[ ! -e "$backup_snapshot" ]] || fail "backup snapshot deletion retry left snapshot"
+assert_eq false "$XANMOD_BACKUP_TRANSACTION_ACTIVE" "backup deletion retry clears active state"
+assert_eq 0 "${#XANMOD_BACKUP_SNAPSHOT_PATHS[@]}" "backup deletion retry clears recovery array"
 
 # Previously managed files without history become one initial-unknown group.
 reset_state
@@ -1138,7 +1433,9 @@ common_functions=(
     xanmod_regular_file_trusted set_xanmod_staged_file_metadata xanmod_keyring_valid
     xanmod_formal_keyring_valid xanmod_list_source_configured xanmod_deb822_source_configured
     get_xanmod_source_file xanmod_source_matches_codename write_xanmod_deb822_source
-    remove_xanmod_temp_directory remove_xanmod_temp_file cleanup_xanmod_active_apt_lists xanmod_source_is_usable
+    remove_xanmod_temp_directory remove_xanmod_temp_file xanmod_random_token
+    xanmod_create_temp_directory_at_path xanmod_create_temp_file_at_path
+    xanmod_allocate_temp_directory xanmod_allocate_temp_file cleanup_xanmod_active_apt_lists xanmod_source_is_usable
     capture_xanmod_snapshot_item cleanup_incomplete_xanmod_runtime_snapshot create_xanmod_runtime_snapshot restore_xanmod_snapshot_item
     restore_xanmod_runtime_snapshot discard_xanmod_runtime_snapshot restore_xanmod_saved_trap
     install_xanmod_transaction_guards clear_xanmod_transaction_guards warn_xanmod_partial_install
