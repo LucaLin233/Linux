@@ -414,6 +414,7 @@ fail() { printf 'FAIL: module CLI: %s\n' "$*" >&2; exit 1; }
 pass() { printf 'PASS: module %s\n' "$*"; }
 assert_eq() { [[ "$1" == "$2" ]] || fail "$3: expected '$1', got '$2'"; pass "$3"; }
 source "$MODULE"
+curl() { fail "module CLI test attempted a real curl call"; }
 [[ -z "$(trap -p ERR)" ]] || fail "source installed ERR trap"
 pass "source leaves ERR trap unchanged"
 assert_eq "$ROOT/key.gpg" "$XANMOD_KEYRING" "test mode overrides keyring"
