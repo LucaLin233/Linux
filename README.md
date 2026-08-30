@@ -390,14 +390,23 @@ cd Linux
 ./tools/push.sh /local/path/ /remote/path/
 ```
 
-默认生成当前目录的 `config.conf`，权限为 `600`，且仓库已通过 `.gitignore` 忽略根目录和
-`tools/` 下的该文件。该文件会作为受信任的 Bash 配置加载，因此拒绝符号链接、非当前用户/root
-所有以及组或其他用户可写的配置。默认使用密钥认证、持久化 `known_hosts`，并支持
-`user@[IPv6]:port` 格式。
+默认生成当前目录的 `config.conf`，采用排他创建且权限为 `600`；已有文件、目录或符号链接均不会被覆盖。
+`tools/push.sh` 已带可执行位，可直接使用上述 `./tools/push.sh` 命令。配置作为受信任 Bash 文件从已验证的
+文件描述符加载，只接受当前运行用户所有、当前 GID、可读且禁止组或其他用户写入的普通文件。
+
+`--test-auth` 会连接全部配置服务器，并仅执行无副作用的 SSH `true`；不会运行 rsync，也不会写入或删除
+远端文件。密钥文件必须为当前用户和 GID 所有、权限 `0400` 或 `0600`；脚本会将已验证内容复制到
+`0700` runtime 目录中的 `0600` 临时副本。密码文件必须为当前用户和 GID 所有且权限严格为 `0600`。
+临时密钥和 `SSHPASS` 会在正常退出、失败以及 HUP/INT/TERM 后清理。
+
+默认持久化 `known_hosts`。其父目录必须由当前用户和 GID 所有且禁止组或其他用户写入；文件必须是
+当前用户和 GID 所有、owner 可读写且禁止组或其他用户写入的普通文件，安全的 `0600`/`0644` 均可。
+将其指向 `/dev/null` 仍须显式设置 `ALLOW_INSECURE_HOST_KEY_STORAGE="true"`，并会输出 MITM 警告。
 
 示例配置默认 `DELETE_EXTRA="false"`，不会删除目标端多余文件。启用删除时，交互执行必须输入
-`DELETE`；非交互执行还须显式设置 `ALLOW_DELETE_EXTRA="true"`。将 `known_hosts` 指向
-`/dev/null` 同样需要显式设置 `ALLOW_INSECURE_HOST_KEY_STORAGE="true"`，不推荐这样做。
+`DELETE`；非交互执行还须显式设置 `ALLOW_DELETE_EXTRA="true"`。rsync 使用参数数组、
+`--protect-args` 和 `--` 边界处理包含空格或 shell 元字符的路径。仓库测试全部使用 fake SSH/rsync，
+不会连接真实服务器或执行真实远端写入。
 
 ### 独立动态 MOTD
 
