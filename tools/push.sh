@@ -341,7 +341,7 @@ check_and_generate_config() {
 
 check_dependencies() {
     local operation="$1" cmd
-    local -a required=(ssh timeout stat dirname basename mkdir chmod mktemp ln rm cat id ps setsid awk tr wc sleep date)
+    local -a required=(ssh timeout stat dirname basename mkdir chmod mktemp ln rm cat id setsid awk tr wc sleep date)
     [[ "$operation" == transfer ]] && required+=(rsync flock)
     [[ "${AUTH_METHOD:-}" == password ]] && required+=(sshpass)
     local -a missing=()
@@ -525,6 +525,12 @@ get_process_start_time() {
     local pid="$1"
     [[ "$pid" =~ ^[0-9]+$ && -r "/proc/$pid/stat" ]] || return 1
     awk '{print $22}' "/proc/$pid/stat" 2>/dev/null
+}
+
+get_process_group_id() {
+    local pid="$1"
+    [[ "$pid" =~ ^[0-9]+$ && -r "/proc/$pid/stat" ]] || return 1
+    awk '{print $5}' "/proc/$pid/stat" 2>/dev/null
 }
 
 process_identity_matches() {
@@ -827,7 +833,7 @@ worker_transfer_identity_matches() {
     [[ -n "$WORKER_TRANSFER_PID" && -n "$WORKER_TRANSFER_START" ]] || return 1
     process_identity_matches "$WORKER_TRANSFER_PID" "$WORKER_TRANSFER_START" || return 1
     local pgid=""
-    pgid=$(ps -o pgid= -p "$WORKER_TRANSFER_PID" 2>/dev/null | tr -d ' ') || return 1
+    pgid=$(get_process_group_id "$WORKER_TRANSFER_PID") || return 1
     [[ "$pgid" == "$WORKER_TRANSFER_PGID" && "$pgid" == "$WORKER_TRANSFER_PID" ]]
 }
 
@@ -880,7 +886,7 @@ run_transfer_command() {
     WORKER_TRANSFER_PGID="$WORKER_TRANSFER_PID"
     for _ in {1..50}; do
         WORKER_TRANSFER_START=$(get_process_start_time "$WORKER_TRANSFER_PID" 2>/dev/null || true)
-        pgid=$(ps -o pgid= -p "$WORKER_TRANSFER_PID" 2>/dev/null | tr -d ' ' || true)
+        pgid=$(get_process_group_id "$WORKER_TRANSFER_PID" 2>/dev/null || true)
         [[ -n "$WORKER_TRANSFER_START" && "$pgid" == "$WORKER_TRANSFER_PID" ]] && break
         kill -0 "$WORKER_TRANSFER_PID" 2>/dev/null || break
         sleep 0.01
