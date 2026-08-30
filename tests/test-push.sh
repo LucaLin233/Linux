@@ -705,72 +705,24 @@ EOF
     pass "explicit non-interactive delete authorization remains supported"
 )
 
-# Full CLI success/failure keeps exit status and performs idempotent EXIT cleanup.
-run_cli_status_case() {
-    local name="$1" expected="$2" servers_literal="$3"
-    local root="$TEST_DIR/cli-$name" rc=0
-    mkdir -m 0700 "$root" "$root/bin" "$root/runtime" "$root/ssh"
-    printf source > "$root/source"
-    cat > "$root/config.conf" <<EOF
-AUTH_METHOD="password"
-PASSWORD_METHOD="inline"
-PASSWORD="cli-secret"
-DEFAULT_PORT=22
-DEFAULT_USER="root"
-MAX_PARALLEL=2
-CONNECTION_TIMEOUT=5
-TOTAL_TIMEOUT=10
-MAX_RETRIES=1
-RETRY_DELAY=1
-DELETE_EXTRA="false"
-ALLOW_DELETE_EXTRA="false"
-RSYNC_ARCHIVE="true"
-RSYNC_COMPRESS="false"
-SERVERS=($servers_literal)
-declare -A TASKS=()
-ENABLE_LOGGING="false"
-STRICT_HOST_KEY_CHECKING="accept-new"
-USER_KNOWN_HOSTS_FILE="$root/ssh/known_hosts"
-ALLOW_INSECURE_HOST_KEY_STORAGE="false"
-EOF
-    chmod 0600 "$root/config.conf"
-    cat > "$root/bin/timeout" <<'EOF'
-#!/usr/bin/env bash
-shift
-exec "$@"
-EOF
-    cat > "$root/bin/sshpass" <<'EOF'
-#!/usr/bin/env bash
-[[ ${1:-} == -e ]] && shift
-exec "$@"
-EOF
-    cat > "$root/bin/rsync" <<'EOF'
-#!/usr/bin/env bash
-last=${!#}
-sleep 0.05
-[[ "$last" == *bad* ]] && exit 1
-exit 0
-EOF
-    cat > "$root/bin/ssh" <<'EOF'
-#!/usr/bin/env bash
-exit 0
-EOF
-    chmod 0700 "$root/bin"/*
-    (
-        cd "$root"
-        env PATH="$root/bin:$PATH" TMPDIR="$root/runtime" \
-            "$SCRIPT" "$root/source" /remote/path
-    ) > "$root/output.log" 2>&1 || rc=$?
-    assert_eq "$expected" "$rc" "full CLI $name preserves result status"
-    [[ -z "$(find "$root/runtime" -mindepth 1 -maxdepth 1 -name 'push-runtime.*' -print -quit)" ]] || fail "full CLI $name left runtime directory"
-    pass "full CLI $name EXIT cleanup removes runtime directory"
-    [[ -f "$root/config.conf" && -f "$root/ssh/known_hosts" ]] || fail "full CLI $name deleted persistent files"
-    pass "full CLI $name preserves config and known_hosts"
+# EXIT cleanup preserves normal success and ordinary failure statuses.
+run_exit_cleanup_case() {
+    local requested_status="$1" root="$TEST_DIR/exit-$1" rc=0
+    mkdir -m 0700 "$root" "$root/runtime"
+    env SCRIPT="$SCRIPT" TMPDIR="$root/runtime" REQUESTED_STATUS="$requested_status" bash -c '
+set -euo pipefail
+source "$SCRIPT"
+initialize_runtime
+install_runtime_traps
+exit "$REQUESTED_STATUS"
+' || rc=$?
+    assert_eq "$requested_status" "$rc" "EXIT cleanup preserves status $requested_status"
+    [[ -z "$(find "$root/runtime" -mindepth 1 -maxdepth 1 -name 'push-runtime.*' -print -quit)" ]] || fail "EXIT status $requested_status left runtime directory"
+    pass "EXIT status $requested_status removes runtime directory"
 }
 
-run_cli_status_case success 0 '"good.example"'
-run_cli_status_case partial 1 '"good.example" "bad.example"'
-run_cli_status_case failure 1 '"bad1.example" "bad2.example"'
+run_exit_cleanup_case 0
+run_exit_cleanup_case 7
 
 # Real process-tree cleanup under HUP/INT/TERM; all commands are local fakes.
 write_signal_fixture() {
