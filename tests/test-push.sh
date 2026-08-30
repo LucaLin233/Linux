@@ -46,7 +46,7 @@ assert_eq source-safe "$source_result" "source has no filesystem, trap, config, 
 
 [[ -x "$SCRIPT" ]] || fail "tools/push.sh is not executable"
 pass "tools/push.sh is executable"
-push_mode=$(git -C "$ROOT_DIR" ls-files -s tools/push.sh | awk '{print $1}')
+push_mode=$(git -c safe.directory="$ROOT_DIR" -C "$ROOT_DIR" ls-files -s tools/push.sh | awk '{print $1}')
 assert_eq 100755 "$push_mode" "tools/push.sh Git mode is 100755"
 
 # shellcheck source=../tools/push.sh
