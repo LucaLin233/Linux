@@ -49,6 +49,11 @@ readonly -a XANMOD_MANAGED_PATHS=(
     "$XANMOD_SOURCE_DEB822"
 )
 
+readonly XANMOD_ALLOCATION_NOT_CREATED=17
+readonly XANMOD_ALLOCATION_FAILED_CLEAN=18
+readonly XANMOD_ALLOCATION_RESIDUE_WITH_PROOF=19
+readonly XANMOD_ALLOCATION_RESIDUE_WITHOUT_PROOF=20
+
 XANMOD_ACTION="install"
 XANMOD_ASSUME_YES=false
 XANMOD_RUNTIME_SNAPSHOT_DIR=""
@@ -66,7 +71,11 @@ XANMOD_ALLOCATION_CANDIDATE=""
 XANMOD_ALLOCATION_KIND=""
 XANMOD_ALLOCATION_OWNER_TOKEN=""
 XANMOD_ALLOCATION_EXPECTED_MODE=""
+XANMOD_ALLOCATION_PROOF_OWNED=false
 XANMOD_ALLOCATION_STATE=""
+XANMOD_ALLOCATION_CRITICAL=false
+XANMOD_ALLOCATION_PENDING_SIGNAL=""
+XANMOD_ALLOCATION_PENDING_SIGNAL_STATUS=0
 XANMOD_RESTORE_STAGE=""
 XANMOD_SELECTED_REPOSITORY=""
 XANMOD_GUARD_ACTIVE=false
@@ -485,20 +494,105 @@ xanmod_allocation_proof_path() {
     esac
 }
 
+xanmod_create_allocation_proof_file() {
+    local proof_path="$1"
+
+    (umask 077; set -o noclobber; : > "$proof_path") 2>/dev/null
+}
+
+xanmod_write_allocation_proof() {
+    local proof_path="$1"
+    local owner_token="$2"
+    local identity="$3"
+
+    printf '%s\n%s\n' "$owner_token" "$identity" > "$proof_path"
+}
+
+xanmod_cleanup_created_allocation() {
+    local kind="$1"
+    local path="$2"
+    local proof_path="$3"
+    local proof_owned="$4"
+    local cleanup_failed=false
+
+    case "$kind" in
+        directory)
+            if [[ -e "$path" || -L "$path" ]]; then
+                if [[ ! -d "$path" || -L "$path" ]]; then
+                    error "XanMod 自有临时目录类型已变化，保留路径: $path"
+                    cleanup_failed=true
+                else
+                    if [[ "$proof_owned" == true && ( -e "$proof_path" || -L "$proof_path" ) ]]; then
+                        if [[ ! -f "$proof_path" || -L "$proof_path" ]]; then
+                            error "XanMod 自有分配 proof 类型已变化，保留路径: $proof_path"
+                            cleanup_failed=true
+                        elif ! remove_xanmod_temp_file "$proof_path" "XanMod 自有分配 proof"; then
+                            cleanup_failed=true
+                        fi
+                    fi
+                    if ! rmdir -- "$path"; then
+                        error "XanMod 自有临时目录残留: $path"
+                        cleanup_failed=true
+                    fi
+                fi
+            fi
+            ;;
+        file)
+            if [[ "$proof_owned" == true && ( -e "$proof_path" || -L "$proof_path" ) ]]; then
+                if [[ ! -f "$proof_path" || -L "$proof_path" ]]; then
+                    error "XanMod 自有分配 proof 类型已变化，保留路径: $proof_path"
+                    cleanup_failed=true
+                elif ! remove_xanmod_temp_file "$proof_path" "XanMod 自有分配 proof"; then
+                    cleanup_failed=true
+                fi
+            fi
+            if [[ -e "$path" || -L "$path" ]]; then
+                if [[ ! -f "$path" || -L "$path" ]]; then
+                    error "XanMod 自有临时文件类型已变化，保留路径: $path"
+                    cleanup_failed=true
+                elif ! remove_xanmod_temp_file "$path" "XanMod 自有临时文件"; then
+                    cleanup_failed=true
+                fi
+            fi
+            ;;
+        *) return 1 ;;
+    esac
+
+    [[ "$cleanup_failed" == false ]]
+}
+
 xanmod_create_temp_directory_at_path() {
     local path="$1"
     local mode="$2"
     local proof_path=""
     local identity=""
+    local proof_owned=false
 
     proof_path=$(xanmod_allocation_proof_path directory "$path" "$XANMOD_ALLOCATION_OWNER_TOKEN") || return 1
-    mkdir -m "$mode" -- "$path" || return 1
-    if ! identity=$(stat -c '%d:%i' -- "$path") ||
-        ! (umask 077; set -o noclobber; printf '%s\n%s\n' \
-            "$XANMOD_ALLOCATION_OWNER_TOKEN" "$identity" > "$proof_path") 2>/dev/null; then
-        rmdir "$path" 2>/dev/null || true
-        return 1
+    if ! mkdir -m "$mode" -- "$path" 2>/dev/null; then
+        return "$XANMOD_ALLOCATION_NOT_CREATED"
     fi
+    if ! identity=$(stat -c '%d:%i' -- "$path"); then
+        error "无法读取新建 XanMod 临时目录 identity: $path"
+    elif ! xanmod_create_allocation_proof_file "$proof_path"; then
+        error "无法排他创建 XanMod 分配 proof: $proof_path"
+    else
+        proof_owned=true
+        if xanmod_write_allocation_proof \
+            "$proof_path" "$XANMOD_ALLOCATION_OWNER_TOKEN" "$identity"; then
+            return 0
+        fi
+        error "写入 XanMod 分配 proof 失败: $proof_path"
+    fi
+
+    if xanmod_cleanup_created_allocation directory \
+        "$path" "$proof_path" "$proof_owned"; then
+        return "$XANMOD_ALLOCATION_FAILED_CLEAN"
+    fi
+    if [[ "$proof_owned" == true ]]; then
+        return "$XANMOD_ALLOCATION_RESIDUE_WITH_PROOF"
+    fi
+    return "$XANMOD_ALLOCATION_RESIDUE_WITHOUT_PROOF"
 }
 
 xanmod_create_temp_file_at_path() {
@@ -506,18 +600,34 @@ xanmod_create_temp_file_at_path() {
     local mode="$2"
     local proof_path=""
     local identity=""
+    local proof_owned=false
 
     [[ "$mode" == "0600" || "$mode" == "600" ]] || return 1
     proof_path=$(xanmod_allocation_proof_path file "$path" "$XANMOD_ALLOCATION_OWNER_TOKEN") || return 1
     if ! (umask 077; set -o noclobber; : > "$path") 2>/dev/null; then
-        return 1
+        return "$XANMOD_ALLOCATION_NOT_CREATED"
     fi
-    if ! identity=$(stat -c '%d:%i' -- "$path") ||
-        ! (umask 077; set -o noclobber; printf '%s\n%s\n' \
-            "$XANMOD_ALLOCATION_OWNER_TOKEN" "$identity" > "$proof_path") 2>/dev/null; then
-        rm -f -- "$path" 2>/dev/null || true
-        return 1
+    if ! identity=$(stat -c '%d:%i' -- "$path"); then
+        error "无法读取新建 XanMod 临时文件 identity: $path"
+    elif ! xanmod_create_allocation_proof_file "$proof_path"; then
+        error "无法排他创建 XanMod 分配 proof: $proof_path"
+    else
+        proof_owned=true
+        if xanmod_write_allocation_proof \
+            "$proof_path" "$XANMOD_ALLOCATION_OWNER_TOKEN" "$identity"; then
+            return 0
+        fi
+        error "写入 XanMod 分配 proof 失败: $proof_path"
     fi
+
+    if xanmod_cleanup_created_allocation file \
+        "$path" "$proof_path" "$proof_owned"; then
+        return "$XANMOD_ALLOCATION_FAILED_CLEAN"
+    fi
+    if [[ "$proof_owned" == true ]]; then
+        return "$XANMOD_ALLOCATION_RESIDUE_WITH_PROOF"
+    fi
+    return "$XANMOD_ALLOCATION_RESIDUE_WITHOUT_PROOF"
 }
 
 xanmod_begin_pending_allocation() {
@@ -536,6 +646,7 @@ xanmod_begin_pending_allocation() {
     XANMOD_ALLOCATION_KIND="$kind"
     XANMOD_ALLOCATION_OWNER_TOKEN="$owner_token"
     XANMOD_ALLOCATION_EXPECTED_MODE="${mode#0}"
+    XANMOD_ALLOCATION_PROOF_OWNED=false
     XANMOD_ALLOCATION_STATE=candidate
 }
 
@@ -544,7 +655,32 @@ xanmod_clear_pending_allocation() {
     XANMOD_ALLOCATION_KIND=""
     XANMOD_ALLOCATION_OWNER_TOKEN=""
     XANMOD_ALLOCATION_EXPECTED_MODE=""
+    XANMOD_ALLOCATION_PROOF_OWNED=false
     XANMOD_ALLOCATION_STATE=""
+}
+
+xanmod_begin_allocation_critical_section() {
+    if [[ "$XANMOD_ALLOCATION_CRITICAL" == true ]]; then
+        error "XanMod 分配结果提交临界区已经启用"
+        return 1
+    fi
+    XANMOD_ALLOCATION_PENDING_SIGNAL=""
+    XANMOD_ALLOCATION_PENDING_SIGNAL_STATUS=0
+    XANMOD_ALLOCATION_CRITICAL=true
+}
+
+xanmod_end_allocation_critical_section() {
+    local signal_name=""
+    local signal_status=0
+
+    XANMOD_ALLOCATION_CRITICAL=false
+    signal_name="$XANMOD_ALLOCATION_PENDING_SIGNAL"
+    signal_status="$XANMOD_ALLOCATION_PENDING_SIGNAL_STATUS"
+    XANMOD_ALLOCATION_PENDING_SIGNAL=""
+    XANMOD_ALLOCATION_PENDING_SIGNAL_STATUS=0
+    if [[ -n "$signal_name" ]]; then
+        xanmod_transaction_signal_handler "$signal_name" "$signal_status"
+    fi
 }
 
 xanmod_after_allocation_attempt_hook() {
@@ -629,10 +765,47 @@ xanmod_pending_allocation_owned() {
         "$identity" == "$proof_identity" ]]
 }
 
+xanmod_mark_pending_allocation_residue() {
+    local create_status="$1"
+    local proof_path=""
+    local residue_reported=false
+
+    case "$create_status" in
+        "$XANMOD_ALLOCATION_RESIDUE_WITH_PROOF")
+            XANMOD_ALLOCATION_PROOF_OWNED=true
+            ;;
+        "$XANMOD_ALLOCATION_RESIDUE_WITHOUT_PROOF")
+            XANMOD_ALLOCATION_PROOF_OWNED=false
+            ;;
+        *) return 1 ;;
+    esac
+    XANMOD_ALLOCATION_STATE=residue
+    if [[ -e "$XANMOD_ALLOCATION_CANDIDATE" || -L "$XANMOD_ALLOCATION_CANDIDATE" ]]; then
+        error "XanMod 自有临时资源残留: $XANMOD_ALLOCATION_CANDIDATE"
+        residue_reported=true
+    fi
+    if [[ "$XANMOD_ALLOCATION_PROOF_OWNED" == true ]]; then
+        proof_path=$(xanmod_allocation_proof_path \
+            "$XANMOD_ALLOCATION_KIND" "$XANMOD_ALLOCATION_CANDIDATE" \
+            "$XANMOD_ALLOCATION_OWNER_TOKEN") || return 1
+        if [[ -e "$proof_path" || -L "$proof_path" ]]; then
+            error "XanMod 自有分配 proof 残留: $proof_path"
+            residue_reported=true
+        fi
+    fi
+    if [[ "$residue_reported" == false ]]; then
+        error "XanMod 自有临时资源清理状态不完整: $XANMOD_ALLOCATION_CANDIDATE"
+    fi
+    return 0
+}
+
 xanmod_release_pending_allocation_proof() {
     local proof_path=""
 
-    xanmod_pending_allocation_owned || return 1
+    if ! xanmod_pending_allocation_owned; then
+        error "XanMod 分配所有权证明不可信: $XANMOD_ALLOCATION_CANDIDATE"
+        return 1
+    fi
     proof_path=$(xanmod_allocation_proof_path \
         "$XANMOD_ALLOCATION_KIND" "$XANMOD_ALLOCATION_CANDIDATE" \
         "$XANMOD_ALLOCATION_OWNER_TOKEN") || return 1
@@ -653,27 +826,34 @@ cleanup_xanmod_pending_allocation() {
         "$XANMOD_ALLOCATION_KIND" "$XANMOD_ALLOCATION_CANDIDATE" \
         "$XANMOD_ALLOCATION_OWNER_TOKEN") || return 1
 
-    if xanmod_pending_allocation_owned; then
-        case "$XANMOD_ALLOCATION_KIND" in
-            directory)
-                remove_xanmod_temp_directory \
-                    "$XANMOD_ALLOCATION_CANDIDATE" "XanMod 自有临时目录" || return 1
-                ;;
-            file)
-                remove_xanmod_temp_file \
-                    "$XANMOD_ALLOCATION_CANDIDATE" "XanMod 自有临时文件" || return 1
-                remove_xanmod_temp_file \
-                    "$proof_path" "XanMod 分配所有权标记" || return 1
-                ;;
-        esac
+    if [[ "$XANMOD_ALLOCATION_STATE" == residue ||
+        "$XANMOD_ALLOCATION_PROOF_OWNED" == true ]]; then
+        if ! xanmod_cleanup_created_allocation \
+            "$XANMOD_ALLOCATION_KIND" "$XANMOD_ALLOCATION_CANDIDATE" \
+            "$proof_path" "$XANMOD_ALLOCATION_PROOF_OWNED"; then
+            return 1
+        fi
+    elif xanmod_pending_allocation_owned; then
+        XANMOD_ALLOCATION_STATE=residue
+        XANMOD_ALLOCATION_PROOF_OWNED=true
+        if ! xanmod_cleanup_created_allocation \
+            "$XANMOD_ALLOCATION_KIND" "$XANMOD_ALLOCATION_CANDIDATE" \
+            "$proof_path" true; then
+            return 1
+        fi
     elif [[ "$XANMOD_ALLOCATION_KIND" == file &&
         ! -e "$XANMOD_ALLOCATION_CANDIDATE" &&
         ! -L "$XANMOD_ALLOCATION_CANDIDATE" ]] &&
         xanmod_pending_allocation_proof_trusted; then
-        remove_xanmod_temp_file \
-            "$proof_path" "XanMod 分配所有权标记" || return 1
+        XANMOD_ALLOCATION_STATE=residue
+        XANMOD_ALLOCATION_PROOF_OWNED=true
+        if ! xanmod_cleanup_created_allocation file \
+            "$XANMOD_ALLOCATION_CANDIDATE" "$proof_path" true; then
+            return 1
+        fi
     else
-        # 没有可信 proof 的 candidate 可能是冲突对象；只清状态，绝不删除路径。
+        # 没有可信 proof 或 owned-residue 状态的 candidate 可能是冲突对象。
+        # 只清内存状态，绝不删除该路径。
         xanmod_clear_pending_allocation
         return 0
     fi
@@ -685,8 +865,14 @@ xanmod_finish_pending_allocation() {
     local path_variable="$1"
     local building_variable="${2:-}"
 
-    xanmod_pending_allocation_owned || return 1
+    if ! xanmod_pending_allocation_owned; then
+        XANMOD_ALLOCATION_PROOF_OWNED=true
+        XANMOD_ALLOCATION_STATE=residue
+        error "XanMod 新建临时资源未通过所有权校验: $XANMOD_ALLOCATION_CANDIDATE"
+        return 1
+    fi
     XANMOD_ALLOCATION_STATE=owned
+    XANMOD_ALLOCATION_PROOF_OWNED=true
     printf -v "$path_variable" '%s' "$XANMOD_ALLOCATION_CANDIDATE"
     if [[ -n "$building_variable" ]]; then
         printf -v "$building_variable" '%s' true
@@ -718,24 +904,49 @@ xanmod_allocate_temp_directory() {
         owner_token=$(xanmod_random_token) || return 1
         candidate="$parent/$prefix.$token"
         xanmod_begin_pending_allocation directory "$candidate" "$mode" "$owner_token" || return 1
+        xanmod_begin_allocation_critical_section || return 1
         create_status=0
-        xanmod_run_pending_allocation_create 2>/dev/null || create_status=$?
+        xanmod_run_pending_allocation_create || create_status=$?
+        case "$create_status" in
+            0)
+                XANMOD_ALLOCATION_PROOF_OWNED=true
+                XANMOD_ALLOCATION_STATE=owned
+                ;;
+            "$XANMOD_ALLOCATION_NOT_CREATED")
+                candidate_conflict=false
+                [[ -e "$candidate" || -L "$candidate" ]] && candidate_conflict=true
+                xanmod_clear_pending_allocation
+                ;;
+            "$XANMOD_ALLOCATION_FAILED_CLEAN")
+                xanmod_clear_pending_allocation
+                ;;
+            "$XANMOD_ALLOCATION_RESIDUE_WITH_PROOF"|"$XANMOD_ALLOCATION_RESIDUE_WITHOUT_PROOF")
+                xanmod_mark_pending_allocation_residue "$create_status"
+                ;;
+            *)
+                if xanmod_pending_allocation_owned; then
+                    XANMOD_ALLOCATION_PROOF_OWNED=true
+                    XANMOD_ALLOCATION_STATE=residue
+                else
+                    xanmod_clear_pending_allocation
+                fi
+                ;;
+        esac
+        xanmod_end_allocation_critical_section
         xanmod_after_allocation_attempt_hook directory "$candidate" "$create_status" || true
-        if (( create_status == 0 )); then
-            xanmod_finish_pending_allocation "$path_variable" "$building_variable"
-            return
-        fi
-        if xanmod_pending_allocation_owned; then
-            cleanup_xanmod_pending_allocation || true
-            return 1
-        fi
-        candidate_conflict=false
-        [[ -e "$candidate" || -L "$candidate" ]] && candidate_conflict=true
-        xanmod_clear_pending_allocation
-        if [[ "$candidate_conflict" == true ]]; then
-            continue
-        fi
-        return 1
+        case "$create_status" in
+            0)
+                xanmod_finish_pending_allocation "$path_variable" "$building_variable"
+                return
+                ;;
+            "$XANMOD_ALLOCATION_NOT_CREATED")
+                if [[ "$candidate_conflict" == true ]]; then
+                    continue
+                fi
+                return 1
+                ;;
+            *) return 1 ;;
+        esac
     done
     return 1
 }
@@ -761,24 +972,49 @@ xanmod_allocate_temp_file() {
         owner_token=$(xanmod_random_token) || return 1
         candidate="$parent/$prefix.$token$suffix"
         xanmod_begin_pending_allocation file "$candidate" "$mode" "$owner_token" || return 1
+        xanmod_begin_allocation_critical_section || return 1
         create_status=0
         xanmod_run_pending_allocation_create || create_status=$?
+        case "$create_status" in
+            0)
+                XANMOD_ALLOCATION_PROOF_OWNED=true
+                XANMOD_ALLOCATION_STATE=owned
+                ;;
+            "$XANMOD_ALLOCATION_NOT_CREATED")
+                candidate_conflict=false
+                [[ -e "$candidate" || -L "$candidate" ]] && candidate_conflict=true
+                xanmod_clear_pending_allocation
+                ;;
+            "$XANMOD_ALLOCATION_FAILED_CLEAN")
+                xanmod_clear_pending_allocation
+                ;;
+            "$XANMOD_ALLOCATION_RESIDUE_WITH_PROOF"|"$XANMOD_ALLOCATION_RESIDUE_WITHOUT_PROOF")
+                xanmod_mark_pending_allocation_residue "$create_status"
+                ;;
+            *)
+                if xanmod_pending_allocation_owned; then
+                    XANMOD_ALLOCATION_PROOF_OWNED=true
+                    XANMOD_ALLOCATION_STATE=residue
+                else
+                    xanmod_clear_pending_allocation
+                fi
+                ;;
+        esac
+        xanmod_end_allocation_critical_section
         xanmod_after_allocation_attempt_hook file "$candidate" "$create_status" || true
-        if (( create_status == 0 )); then
-            xanmod_finish_pending_allocation "$path_variable"
-            return
-        fi
-        if xanmod_pending_allocation_owned; then
-            cleanup_xanmod_pending_allocation || true
-            return 1
-        fi
-        candidate_conflict=false
-        [[ -e "$candidate" || -L "$candidate" ]] && candidate_conflict=true
-        xanmod_clear_pending_allocation
-        if [[ "$candidate_conflict" == true ]]; then
-            continue
-        fi
-        return 1
+        case "$create_status" in
+            0)
+                xanmod_finish_pending_allocation "$path_variable"
+                return
+                ;;
+            "$XANMOD_ALLOCATION_NOT_CREATED")
+                if [[ "$candidate_conflict" == true ]]; then
+                    continue
+                fi
+                return 1
+                ;;
+            *) return 1 ;;
+        esac
     done
     return 1
 }
@@ -1007,6 +1243,9 @@ install_xanmod_transaction_guards() {
     XANMOD_SAVED_TRAP_TERM=$(trap -p TERM || true)
     XANMOD_GUARD_ACTIVE=true
     XANMOD_GUARD_HANDLING=false
+    XANMOD_ALLOCATION_CRITICAL=false
+    XANMOD_ALLOCATION_PENDING_SIGNAL=""
+    XANMOD_ALLOCATION_PENDING_SIGNAL_STATUS=0
     trap 'xanmod_transaction_exit_handler $?' EXIT
     trap 'xanmod_transaction_signal_handler HUP 129' HUP
     trap 'xanmod_transaction_signal_handler INT 130' INT
@@ -1022,6 +1261,9 @@ clear_xanmod_transaction_guards() {
     trap - EXIT HUP INT TERM
     XANMOD_GUARD_ACTIVE=false
     XANMOD_GUARD_HANDLING=false
+    XANMOD_ALLOCATION_CRITICAL=false
+    XANMOD_ALLOCATION_PENDING_SIGNAL=""
+    XANMOD_ALLOCATION_PENDING_SIGNAL_STATUS=0
     XANMOD_SAVED_TRAP_EXIT=""
     XANMOD_SAVED_TRAP_HUP=""
     XANMOD_SAVED_TRAP_INT=""
@@ -1068,13 +1310,20 @@ xanmod_transaction_signal_handler() {
     local exit_status="$2"
     local saved_exit="$XANMOD_SAVED_TRAP_EXIT"
 
+    if [[ "$XANMOD_ALLOCATION_CRITICAL" == true ]]; then
+        if [[ -z "$XANMOD_ALLOCATION_PENDING_SIGNAL" ]]; then
+            XANMOD_ALLOCATION_PENDING_SIGNAL_STATUS="$exit_status"
+            XANMOD_ALLOCATION_PENDING_SIGNAL="$signal_name"
+        fi
+        return 0
+    fi
     if [[ "$XANMOD_GUARD_HANDLING" == "true" ]]; then
         exit "$exit_status"
     fi
     XANMOD_GUARD_HANDLING=true
     trap - EXIT
     trap '' HUP INT TERM
-    error "收到 $signal_name，正在回滚 XanMod 事务"
+    error "收到 $signal_name，正在安全清理 XanMod 事务"
     cleanup_xanmod_transaction_state || true
     XANMOD_GUARD_ACTIVE=false
     restore_xanmod_saved_trap EXIT "$saved_exit"
@@ -1106,13 +1355,15 @@ begin_xanmod_install_transaction() {
     XANMOD_CONFIG_MODIFIED=false
     install_xanmod_transaction_guards || return 1
     if ! prepare_xanmod_transaction; then
-        abort_pending_xanmod_backup_transaction || true
-        clear_xanmod_transaction_guards
+        if cleanup_xanmod_transaction_state; then
+            clear_xanmod_transaction_guards
+        fi
         return 1
     fi
     if ! create_xanmod_runtime_snapshot; then
-        cleanup_xanmod_transaction_state || true
-        clear_xanmod_transaction_guards
+        if cleanup_xanmod_transaction_state; then
+            clear_xanmod_transaction_guards
+        fi
         return 1
     fi
 }
@@ -1500,11 +1751,9 @@ show_xanmod_plan_result() {
 abort_xanmod_install_transaction() {
     local config_was_modified="$XANMOD_CONFIG_MODIFIED"
 
-    XANMOD_GUARD_HANDLING=true
-    trap - EXIT
-    trap '' HUP INT TERM
-    cleanup_xanmod_transaction_state || true
-    clear_xanmod_transaction_guards
+    if cleanup_xanmod_transaction_state; then
+        clear_xanmod_transaction_guards
+    fi
     if [[ "$config_was_modified" == "true" && "$XANMOD_CONFIG_MODIFIED" == "false" ]]; then
         warn "XanMod APT 配置已恢复到本次运行前状态"
     elif [[ "$config_was_modified" == "true" ]]; then
@@ -1514,20 +1763,12 @@ abort_xanmod_install_transaction() {
 }
 
 complete_xanmod_install_transaction() {
-    local cleanup_failed=false
-
-    XANMOD_GUARD_HANDLING=true
-    trap - EXIT
-    trap '' HUP INT TERM
-    cleanup_xanmod_stages || cleanup_failed=true
-    cleanup_xanmod_active_apt_lists || cleanup_failed=true
-    abort_pending_xanmod_backup_transaction || cleanup_failed=true
     XANMOD_CONFIG_MODIFIED=false
     XANMOD_APT_MAY_BE_PARTIAL=false
+    if ! cleanup_xanmod_transaction_state; then
+        return 1
+    fi
     clear_xanmod_transaction_guards
-    discard_xanmod_runtime_snapshot || cleanup_failed=true
-
-    [[ "$cleanup_failed" == "false" ]]
 }
 
 install_xanmod() {

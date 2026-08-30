@@ -153,7 +153,8 @@ reset_tool_files() {
     XANMOD_STAGED_KEY=""; XANMOD_STAGED_SOURCE=""; XANMOD_CANDIDATE_SOURCE=""
     XANMOD_ARMORED_KEY_TEMP=""; XANMOD_ACTIVE_APT_LISTS_DIR=""; XANMOD_ACTIVE_APT_LISTS_BUILDING=false
     XANMOD_ALLOCATION_CANDIDATE=""; XANMOD_ALLOCATION_KIND=""; XANMOD_ALLOCATION_OWNER_TOKEN=""
-    XANMOD_ALLOCATION_EXPECTED_MODE=""; XANMOD_ALLOCATION_STATE=""
+    XANMOD_ALLOCATION_EXPECTED_MODE=""; XANMOD_ALLOCATION_PROOF_OWNED=false; XANMOD_ALLOCATION_STATE=""
+    XANMOD_ALLOCATION_CRITICAL=false; XANMOD_ALLOCATION_PENDING_SIGNAL=""; XANMOD_ALLOCATION_PENDING_SIGNAL_STATUS=0
     XANMOD_RESTORE_STAGE=""
     XANMOD_GUARD_ACTIVE=false; XANMOD_LOCK_HELD=false
     reset_xanmod_plan
@@ -648,6 +649,157 @@ run_install_scenario postcheck-fail 1
     command rm -f "$ALLOCATED_FILE" "$collision"; ALLOCATED_FILE=""
 )
 
+(
+    reset_tool_files
+    parent="$TEST_DIR/tool/tmp"
+    token_counter="$TEST_DIR/tool/dir-partial-counter"; printf 0 > "$token_counter"
+    xanmod_random_token() {
+        local count; count=$(<"$token_counter"); ((count += 1)); printf '%s' "$count" > "$token_counter"
+        case "$count" in 1) echo partial;; 2) echo owner;; *) echo unexpected;; esac
+    }
+    xanmod_write_allocation_proof() { printf '%s\n' "$2" > "$1"; return 1; }
+    ALLOCATED_DIR=""; ALLOCATED_DIR_BUILDING=false
+    rc=0; xanmod_allocate_temp_directory ALLOCATED_DIR ALLOCATED_DIR_BUILDING \
+        "$parent" alloc-dir 0700 > "$TEST_DIR/dir-partial-clean.log" 2>&1 || rc=$?
+    assert_eq 1 "$rc" "directory partial proof returns nonzero"
+    assert_eq '' "$ALLOCATED_DIR" "directory partial proof does not publish final path"
+    assert_eq 2 "$(<"$token_counter")" "directory partial proof does not retry with another token"
+    [[ -z "$(find "$parent" -maxdepth 1 -name 'alloc-dir.*' -print -quit)" ]] || fail "directory partial proof left candidate"
+    pass "directory partial proof cleans candidate and proof"
+    assert_eq '' "$XANMOD_ALLOCATION_CANDIDATE" "directory partial proof clears pending candidate after successful cleanup"
+)
+
+(
+    reset_tool_files
+    parent="$TEST_DIR/tool/tmp"
+    token_counter="$TEST_DIR/tool/dir-partial-residue-counter"; printf 0 > "$token_counter"
+    xanmod_random_token() {
+        local count; count=$(<"$token_counter"); ((count += 1)); printf '%s' "$count" > "$token_counter"
+        case "$count" in 1) echo partial-residue;; 2) echo owner;; *) echo unexpected;; esac
+    }
+    xanmod_write_allocation_proof() { printf '%s\n' "$2" > "$1"; return 1; }
+    rm() { local last=${!#}; [[ "$last" == */.xanmod-allocation-owner ]] && return 1; command rm "$@"; }
+    ALLOCATED_DIR=""; ALLOCATED_DIR_BUILDING=false
+    rc=0; xanmod_allocate_temp_directory ALLOCATED_DIR ALLOCATED_DIR_BUILDING \
+        "$parent" alloc-dir 0700 > "$TEST_DIR/dir-partial-residue.log" 2>&1 || rc=$?
+    assert_eq 1 "$rc" "directory partial proof cleanup failure returns nonzero"
+    candidate="$parent/alloc-dir.partial-residue"
+    proof="$candidate/.xanmod-allocation-owner"
+    [[ -d "$candidate" && -f "$proof" ]] || fail "directory partial proof cleanup failure lost residue"
+    pass "directory partial proof cleanup failure preserves owned residue"
+    assert_eq residue "$XANMOD_ALLOCATION_STATE" "directory cleanup failure records residue state"
+    assert_eq true "$XANMOD_ALLOCATION_PROOF_OWNED" "directory cleanup failure records proof ownership"
+    assert_eq 2 "$(<"$token_counter")" "directory cleanup failure stops allocation retries"
+    grep -Fq "$candidate" "$TEST_DIR/dir-partial-residue.log" || fail "directory cleanup failure omitted candidate path"
+    grep -Fq "$proof" "$TEST_DIR/dir-partial-residue.log" || fail "directory cleanup failure omitted proof path"
+    pass "directory cleanup failure reports candidate and proof paths"
+    unset -f rm
+    cleanup_xanmod_pending_allocation
+    [[ ! -e "$candidate" && ! -L "$candidate" ]] || fail "directory residue retry left candidate"
+    assert_eq '' "$XANMOD_ALLOCATION_CANDIDATE" "directory residue retry clears pending state"
+)
+
+(
+    reset_tool_files
+    parent="$TEST_DIR/tool/tmp"
+    token_counter="$TEST_DIR/tool/file-partial-counter"; printf 0 > "$token_counter"
+    xanmod_random_token() {
+        local count; count=$(<"$token_counter"); ((count += 1)); printf '%s' "$count" > "$token_counter"
+        case "$count" in 1) echo partial;; 2) echo owner;; *) echo unexpected;; esac
+    }
+    xanmod_write_allocation_proof() { printf '%s\n' "$2" > "$1"; return 1; }
+    ALLOCATED_FILE=""
+    rc=0; xanmod_allocate_temp_file ALLOCATED_FILE "$parent" alloc-file .tmp 0600 \
+        > "$TEST_DIR/file-partial-clean.log" 2>&1 || rc=$?
+    assert_eq 1 "$rc" "file partial proof returns nonzero"
+    assert_eq '' "$ALLOCATED_FILE" "file partial proof does not publish final path"
+    assert_eq 2 "$(<"$token_counter")" "file partial proof does not retry with another token"
+    [[ -z "$(find "$parent" -maxdepth 1 \
+        \( -name 'alloc-file.*' -o -name '*.xanmod-owner.*' \) -print -quit)" ]] || fail "file partial proof left candidate or proof"
+    pass "file partial proof cleans candidate and sidecar"
+)
+
+(
+    reset_tool_files
+    parent="$TEST_DIR/tool/tmp"
+    token_counter="$TEST_DIR/tool/file-partial-residue-counter"; printf 0 > "$token_counter"
+    xanmod_random_token() {
+        local count; count=$(<"$token_counter"); ((count += 1)); printf '%s' "$count" > "$token_counter"
+        case "$count" in 1) echo partial-residue;; 2) echo owner;; *) echo unexpected;; esac
+    }
+    xanmod_write_allocation_proof() { printf '%s\n' "$2" > "$1"; return 1; }
+    rm() { local last=${!#}; [[ "$last" == *.xanmod-owner.* ]] && return 1; command rm "$@"; }
+    ALLOCATED_FILE=""
+    rc=0; xanmod_allocate_temp_file ALLOCATED_FILE "$parent" alloc-file .tmp 0600 \
+        > "$TEST_DIR/file-partial-residue.log" 2>&1 || rc=$?
+    assert_eq 1 "$rc" "file partial proof cleanup failure returns nonzero"
+    candidate="$parent/alloc-file.partial-residue.tmp"
+    proof="$candidate.xanmod-owner.owner"
+    [[ ! -e "$candidate" && -f "$proof" ]] || fail "file partial proof cleanup failure did not preserve expected proof residue"
+    pass "file partial proof cleanup failure preserves owned sidecar residue"
+    assert_eq residue "$XANMOD_ALLOCATION_STATE" "file cleanup failure records residue state"
+    assert_eq true "$XANMOD_ALLOCATION_PROOF_OWNED" "file cleanup failure records proof ownership"
+    assert_eq 2 "$(<"$token_counter")" "file cleanup failure stops allocation retries"
+    grep -Fq "$proof" "$TEST_DIR/file-partial-residue.log" || fail "file cleanup failure omitted proof path"
+    pass "file cleanup failure reports exact proof path"
+    unset -f rm
+    cleanup_xanmod_pending_allocation
+    [[ ! -e "$proof" && ! -L "$proof" ]] || fail "file residue retry left proof"
+    assert_eq '' "$XANMOD_ALLOCATION_CANDIDATE" "file residue retry clears pending state"
+)
+
+(
+    reset_tool_files
+    parent="$TEST_DIR/tool/tmp"
+    token_counter="$TEST_DIR/tool/file-proof-collision-counter"; printf 0 > "$token_counter"
+    xanmod_random_token() {
+        local count; count=$(<"$token_counter"); ((count += 1)); printf '%s' "$count" > "$token_counter"
+        case "$count" in 1) echo fresh;; 2) echo proof-collision;; *) echo unexpected;; esac
+    }
+    candidate="$parent/alloc-file.fresh.tmp"
+    proof="$candidate.xanmod-owner.proof-collision"
+    printf keep > "$proof"
+    ALLOCATED_FILE=""
+    rc=0; xanmod_allocate_temp_file ALLOCATED_FILE "$parent" alloc-file .tmp 0600         > "$TEST_DIR/file-proof-collision.log" 2>&1 || rc=$?
+    assert_eq 1 "$rc" "preexisting proof sidecar collision returns nonzero"
+    [[ ! -e "$candidate" && ! -L "$candidate" ]] || fail "proof sidecar collision left owned candidate"
+    assert_file_eq keep "$proof" "preexisting proof sidecar collision preserves foreign proof"
+    assert_eq 2 "$(<"$token_counter")" "proof sidecar collision does not retry as candidate collision"
+    assert_eq '' "$XANMOD_ALLOCATION_CANDIDATE" "proof sidecar collision clears pending state after owned candidate cleanup"
+    command rm -f "$proof"
+)
+
+(
+    reset_tool_files
+    parent="$TEST_DIR/tool/tmp"
+    release_failed=true
+    rm() {
+        local last=${!#}
+        if [[ "$release_failed" == true && "$last" == *.xanmod-owner.* ]]; then
+            return 1
+        fi
+        command rm "$@"
+    }
+    rc=0; xanmod_allocate_temp_file XANMOD_STAGED_KEY "$parent" release-proof .tmp 0600 \
+        > "$TEST_DIR/proof-release-fail.log" 2>&1 || rc=$?
+    assert_eq 1 "$rc" "proof release failure returns nonzero"
+    [[ -f "$XANMOD_STAGED_KEY" ]] || fail "proof release failure lost final temp path"
+    proof=$(xanmod_allocation_proof_path file "$XANMOD_ALLOCATION_CANDIDATE" "$XANMOD_ALLOCATION_OWNER_TOKEN")
+    [[ -f "$proof" ]] || fail "proof release failure lost proof"
+    pass "proof release failure preserves final path and proof for retry"
+    assert_eq active "$XANMOD_ALLOCATION_STATE" "proof release failure preserves active allocation state"
+    assert_eq true "$XANMOD_ALLOCATION_PROOF_OWNED" "proof release failure preserves proof ownership"
+    grep -Fq "$proof" "$TEST_DIR/proof-release-fail.log" || fail "proof release failure omitted proof path"
+    pass "proof release failure reports exact proof path"
+    release_failed=false
+    cleanup_xanmod_transaction_state
+    assert_eq '' "$XANMOD_ALLOCATION_CANDIDATE" "proof release cleanup clears pending candidate"
+    assert_eq false "$XANMOD_ALLOCATION_PROOF_OWNED" "proof release cleanup clears proof ownership"
+    assert_eq '' "$XANMOD_STAGED_KEY" "proof release cleanup clears final temp path"
+    [[ ! -e "$proof" && ! -L "$proof" ]] || fail "proof release cleanup left proof"
+    pass "proof release cleanup removes final path and proof"
+)
+
 cat > "$TEST_DIR/signal-child.sh" <<'SIGNAL_CHILD'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -840,6 +992,68 @@ for allocation_signal in HUP INT TERM; do
     run_allocation_window_signal_case "$allocation_signal" "$allocation_status" file
  done
 
+cat > "$TEST_DIR/allocation-critical-signal-child.sh" <<'ALLOCATION_CRITICAL_SIGNAL_CHILD'
+#!/usr/bin/env bash
+set -euo pipefail
+root="$1"
+tool="$2"
+mkdir -p "$root/tmp"
+printf key-before > "$root/key.gpg"
+printf list-before > "$root/release.list"
+printf source-before > "$root/release.sources"
+export XANMOD_TEST_MODE=1
+export XANMOD_KEYRING_PATH="$root/key.gpg"
+export XANMOD_SOURCE_LIST_PATH="$root/release.list"
+export XANMOD_SOURCE_DEB822_PATH="$root/release.sources"
+export XANMOD_LOCK_PATH="$root/xanmod.lock"
+export XANMOD_OS_RELEASE_PATH="$root/os-release"
+export XANMOD_CPUINFO_PATH="$root/cpuinfo"
+export TMPDIR="$root/tmp"
+source "$tool"
+eval "$(declare -f xanmod_write_allocation_proof | sed '1s/xanmod_write_allocation_proof/original_xanmod_write_allocation_proof/')"
+xanmod_write_allocation_proof() {
+    original_xanmod_write_allocation_proof "$@"
+    touch "$root/ready"
+    sleep 1
+}
+install_xanmod_transaction_guards
+take_xanmod_lock
+xanmod_allocate_temp_directory XANMOD_RUNTIME_SNAPSHOT_DIR \
+    XANMOD_RUNTIME_SNAPSHOT_BUILDING "$root/tmp" allocation-critical 0700
+ALLOCATION_CRITICAL_SIGNAL_CHILD
+chmod 0755 "$TEST_DIR/allocation-critical-signal-child.sh"
+
+run_allocation_critical_signal_case() {
+    local signal_name="$1" expected_status="$2"
+    local root="$TEST_DIR/allocation-critical-$signal_name"
+    local pid rc=0
+
+    mkdir -p "$root"
+    setsid env --default-signal=HUP,INT,TERM \
+        bash "$TEST_DIR/allocation-critical-signal-child.sh" \
+        "$root" "$TOOL" > "$root/output.log" 2>&1 &
+    pid=$!
+    for _ in $(seq 1 200); do
+        [[ -e "$root/ready" ]] && break
+        sleep 0.05
+    done
+    [[ -e "$root/ready" ]] || { cat "$root/output.log"; kill "$pid" 2>/dev/null || true; fail "$signal_name allocation critical section did not block"; }
+    kill "-$signal_name" -- "-$pid"
+    wait "$pid" || rc=$?
+    assert_eq "$expected_status" "$rc" "$signal_name during allocation proof write returns conventional status"
+    assert_file_eq key-before "$root/key.gpg" "$signal_name allocation proof write leaves key unchanged"
+    assert_file_eq list-before "$root/release.list" "$signal_name allocation proof write leaves list unchanged"
+    assert_file_eq source-before "$root/release.sources" "$signal_name allocation proof write leaves source unchanged"
+    [[ -z "$(find "$root" \( -name 'allocation-critical.*' -o -name '.xanmod-allocation-owner' \) -print -quit)" ]] || fail "$signal_name allocation proof write left candidate or proof"
+    pass "$signal_name allocation proof write defers signal until owned resource can be cleaned"
+    flock -n "$root/xanmod.lock" -c true || fail "$signal_name allocation proof write did not release lock"
+    pass "$signal_name allocation proof write releases lock"
+}
+
+run_allocation_critical_signal_case HUP 129
+run_allocation_critical_signal_case INT 130
+run_allocation_critical_signal_case TERM 143
+
 cat > "$TEST_DIR/allocation-collision-signal-child.sh" <<'ALLOCATION_COLLISION_SIGNAL_CHILD'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -961,6 +1175,108 @@ for allocation_signal in HUP INT TERM; do
     run_allocation_collision_signal_case "$allocation_signal" "$allocation_status" file
     run_allocation_collision_signal_case "$allocation_signal" "$allocation_status" file-symlink
 done
+
+(
+    trap - EXIT
+    reset_tool_files
+    printf committed-key > "$XANMOD_KEYRING"
+    printf committed-list > "$XANMOD_SOURCE_LIST"
+    printf committed-source > "$XANMOD_SOURCE_DEB822"
+    install_xanmod_transaction_guards
+    create_xanmod_runtime_snapshot
+    snapshot="$XANMOD_RUNTIME_SNAPSHOT_DIR"
+    XANMOD_CONFIG_MODIFIED=false
+    rm() { local last=${!#}; [[ "$last" == "$snapshot" ]] && return 1; command rm "$@"; }
+    rc=0; complete_xanmod_install_transaction > "$TEST_DIR/complete-snapshot-delete-fail.log" 2>&1 || rc=$?
+    assert_eq 1 "$rc" "complete runtime snapshot deletion failure returns nonzero"
+    assert_eq true "$XANMOD_GUARD_ACTIVE" "complete deletion failure keeps transaction guards active"
+    assert_eq true "$XANMOD_TRANSACTION_ACTIVE" "complete deletion failure preserves runtime snapshot state"
+    assert_eq "$snapshot" "$XANMOD_RUNTIME_SNAPSHOT_DIR" "complete deletion failure preserves runtime snapshot path"
+    grep -Fq "$snapshot" "$TEST_DIR/complete-snapshot-delete-fail.log" || fail "complete deletion failure omitted snapshot path"
+    pass "complete deletion failure reports exact runtime snapshot path"
+    unset -f rm
+    complete_xanmod_install_transaction
+    assert_eq false "$XANMOD_GUARD_ACTIVE" "complete deletion retry clears transaction guards"
+    assert_eq false "$XANMOD_TRANSACTION_ACTIVE" "complete deletion retry clears runtime snapshot state"
+    [[ ! -e "$snapshot" ]] || fail "complete deletion retry left runtime snapshot"
+    pass "complete deletion retry removes runtime snapshot"
+)
+
+cat > "$TEST_DIR/complete-finalization-signal-child.sh" <<'COMPLETE_FINALIZATION_SIGNAL_CHILD'
+#!/usr/bin/env bash
+set -euo pipefail
+root="$1"
+tool="$2"
+mkdir -p "$root/tmp"
+printf old-key > "$root/key.gpg"
+printf old-list > "$root/release.list"
+printf old-source > "$root/release.sources"
+export XANMOD_TEST_MODE=1
+export XANMOD_KEYRING_PATH="$root/key.gpg"
+export XANMOD_SOURCE_LIST_PATH="$root/release.list"
+export XANMOD_SOURCE_DEB822_PATH="$root/release.sources"
+export XANMOD_LOCK_PATH="$root/xanmod.lock"
+export XANMOD_OS_RELEASE_PATH="$root/os-release"
+export XANMOD_CPUINFO_PATH="$root/cpuinfo"
+export TMPDIR="$root/tmp"
+source "$tool"
+take_xanmod_lock
+install_xanmod_transaction_guards
+create_xanmod_runtime_snapshot
+snapshot="$XANMOD_RUNTIME_SNAPSHOT_DIR"
+xanmod_allocate_temp_file XANMOD_STAGED_KEY "$root/tmp" final-stage .tmp 0600
+printf stage > "$XANMOD_STAGED_KEY"
+xanmod_allocate_temp_directory XANMOD_ACTIVE_APT_LISTS_DIR \
+    XANMOD_ACTIVE_APT_LISTS_BUILDING "$root/tmp" final-lists 0755
+XANMOD_ACTIVE_APT_LISTS_BUILDING=false
+printf new-key > "$XANMOD_KEYRING"
+printf new-list > "$XANMOD_SOURCE_LIST"
+printf new-source > "$XANMOD_SOURCE_DEB822"
+XANMOD_CONFIG_MODIFIED=true
+eval "$(declare -f remove_xanmod_temp_directory | sed '1s/remove_xanmod_temp_directory/original_remove_xanmod_temp_directory/')"
+remove_xanmod_temp_directory() {
+    if [[ "$1" == "$snapshot" && ! -e "$root/discard-started" ]]; then
+        touch "$root/discard-started" "$root/ready"
+        while :; do sleep 1; done
+    fi
+    original_remove_xanmod_temp_directory "$@"
+}
+complete_xanmod_install_transaction
+COMPLETE_FINALIZATION_SIGNAL_CHILD
+chmod 0755 "$TEST_DIR/complete-finalization-signal-child.sh"
+
+run_complete_finalization_signal_case() {
+    local signal_name="$1" expected_status="$2"
+    local root="$TEST_DIR/complete-finalization-$signal_name"
+    local pid rc=0
+
+    mkdir -p "$root"
+    setsid env --default-signal=HUP,INT,TERM \
+        bash "$TEST_DIR/complete-finalization-signal-child.sh" \
+        "$root" "$TOOL" > "$root/output.log" 2>&1 &
+    pid=$!
+    for _ in $(seq 1 200); do
+        [[ -e "$root/ready" ]] && break
+        sleep 0.05
+    done
+    [[ -e "$root/ready" ]] || { cat "$root/output.log"; kill "$pid" 2>/dev/null || true; fail "$signal_name complete finalization did not block"; }
+    kill "-$signal_name" -- "-$pid"
+    wait "$pid" || rc=$?
+    assert_eq "$expected_status" "$rc" "$signal_name during complete finalization returns conventional status"
+    assert_file_eq new-key "$root/key.gpg" "$signal_name complete finalization keeps committed key"
+    assert_file_eq new-list "$root/release.list" "$signal_name complete finalization keeps committed list"
+    assert_file_eq new-source "$root/release.sources" "$signal_name complete finalization keeps committed source"
+    [[ -z "$(find "$root" \( -name 'xanmod-runtime-snapshot.*' -o -name 'final-stage.*' \
+        -o -name 'final-lists.*' -o -name '.xanmod-allocation-owner' \
+        -o -name '*.xanmod-owner.*' \) -print -quit)" ]] || fail "$signal_name complete finalization left transaction residue"
+    pass "$signal_name complete finalization removes runtime snapshot, stage, APT lists, and proof"
+    flock -n "$root/xanmod.lock" -c true || fail "$signal_name complete finalization did not release lock"
+    pass "$signal_name complete finalization releases lock"
+}
+
+run_complete_finalization_signal_case HUP 129
+run_complete_finalization_signal_case INT 130
+run_complete_finalization_signal_case TERM 143
 
 cat > "$TEST_DIR/exit-zero-child.sh" <<'EXIT_ZERO_CHILD'
 #!/usr/bin/env bash
@@ -1327,6 +1643,125 @@ for backup_parent_case in success symlink writable wrong-owner wrong-gid; do
         "$backup_parent_root" "$backup_parent_case" "$MODULE"
 done
 
+cat > "$TEST_DIR/restore-no-backup-child.sh" <<'RESTORE_NO_BACKUP_CHILD'
+#!/usr/bin/env bash
+set -euo pipefail
+root="$1"
+module="$2"
+state_dir="$root/missing-parent/apt-source-backups"
+printf key-before > "$root/key.gpg"
+printf list-before > "$root/release.list"
+printf source-before > "$root/release.sources"
+mkdir -p "$root/tmp"
+export XANMOD_TEST_MODE=1
+export XANMOD_KEYRING_PATH="$root/key.gpg"
+export XANMOD_SOURCE_LIST_PATH="$root/release.list"
+export XANMOD_SOURCE_DEB822_PATH="$root/release.sources"
+export XANMOD_LOCK_PATH="$root/xanmod.lock"
+export XANMOD_OS_RELEASE_PATH="$root/os-release"
+export XANMOD_CPUINFO_PATH="$root/cpuinfo"
+export XANMOD_BACKUP_STATE_DIR="$state_dir"
+export TMPDIR="$root/tmp"
+source "$module"
+apt-get() { printf 'unexpected apt\n' >&2; return 1; }
+for scope in previous initial; do
+    rc=0; restore_xanmod_group "$scope" > "$root/$scope.log" 2>&1 || rc=$?
+    [[ "$rc" == 2 ]] || { cat "$root/$scope.log"; printf 'FAIL: restore without backup %s returned %s\n' "$scope" "$rc" >&2; exit 1; }
+    printf 'PASS: real restore without backup %s returns missing state\n' "$scope"
+done
+[[ ! -e "$root/missing-parent" && ! -L "$root/missing-parent" ]] || { printf 'FAIL: restore without backup created parent\n' >&2; exit 1; }
+[[ ! -e "$state_dir" && ! -L "$state_dir" ]] || { printf 'FAIL: restore without backup created state directory\n' >&2; exit 1; }
+[[ -z "$(find "$root" \( -name '.xanmod-allocation-owner' -o -name '*.xanmod-owner.*' \) -print -quit)" ]] || { printf 'FAIL: restore without backup left proof\n' >&2; exit 1; }
+[[ "$(<"$root/key.gpg")" == key-before && "$(<"$root/release.list")" == list-before && "$(<"$root/release.sources")" == source-before ]] || { printf 'FAIL: restore without backup changed formal files\n' >&2; exit 1; }
+printf 'PASS: real restore without backup creates no parent, state directory, or proof\n'
+printf 'PASS: real restore without backup leaves formal files unchanged\n'
+RESTORE_NO_BACKUP_CHILD
+chmod 0755 "$TEST_DIR/restore-no-backup-child.sh"
+restore_no_backup_root="$TEST_DIR/restore-no-backup"
+mkdir -p "$restore_no_backup_root"
+bash "$TEST_DIR/restore-no-backup-child.sh" "$restore_no_backup_root" "$MODULE"
+
+cat > "$TEST_DIR/restore-allocation-signal-child.sh" <<'RESTORE_ALLOCATION_SIGNAL_CHILD'
+#!/usr/bin/env bash
+set -euo pipefail
+root="$1"
+module="$2"
+mkdir -p "$root/tmp"
+export XANMOD_TEST_MODE=1
+export XANMOD_KEYRING_PATH="$root/key.gpg"
+export XANMOD_SOURCE_LIST_PATH="$root/release.list"
+export XANMOD_SOURCE_DEB822_PATH="$root/release.sources"
+export XANMOD_LOCK_PATH="$root/xanmod.lock"
+export XANMOD_OS_RELEASE_PATH="$root/os-release"
+export XANMOD_CPUINFO_PATH="$root/cpuinfo"
+export XANMOD_BACKUP_STATE_DIR="$root/state/apt-source-backups"
+export TMPDIR="$root/tmp"
+source "$module"
+apt-get() { :; }
+write_generation() {
+    local generation="$1"
+    printf '%s-key' "$generation" > "$XANMOD_KEYRING"
+    printf '%s-list' "$generation" > "$XANMOD_SOURCE_LIST"
+    printf '%s-source' "$generation" > "$XANMOD_SOURCE_DEB822"
+}
+write_generation A
+prepare_persistent_xanmod_backups
+write_generation B
+prepare_persistent_xanmod_backups
+write_generation C
+block_for_signal() {
+    touch "$root/ready"
+    while :; do sleep 1; done
+}
+xanmod_after_allocation_attempt_hook() {
+    local attempted_kind="$1"
+    local attempted_path="$2"
+    local create_status="$3"
+
+    if [[ "$attempted_kind" == directory &&
+        "$(basename "$attempted_path")" == xanmod-runtime-snapshot.* &&
+        "$create_status" == 0 ]]; then
+        block_for_signal
+    fi
+}
+take_xanmod_lock
+restore_xanmod_group previous
+RESTORE_ALLOCATION_SIGNAL_CHILD
+chmod 0755 "$TEST_DIR/restore-allocation-signal-child.sh"
+
+run_restore_allocation_signal_case() {
+    local signal_name="$1" expected_status="$2"
+    local root="$TEST_DIR/restore-allocation-$signal_name"
+    local pid rc=0
+
+    mkdir -p "$root"
+    setsid env --default-signal=HUP,INT,TERM \
+        bash "$TEST_DIR/restore-allocation-signal-child.sh" \
+        "$root" "$MODULE" > "$root/output.log" 2>&1 &
+    pid=$!
+    for _ in $(seq 1 200); do
+        [[ -e "$root/ready" ]] && break
+        sleep 0.05
+    done
+    [[ -e "$root/ready" ]] || { cat "$root/output.log"; kill "$pid" 2>/dev/null || true; fail "$signal_name real restore allocation did not block"; }
+    kill "-$signal_name" -- "-$pid"
+    wait "$pid" || rc=$?
+    assert_eq "$expected_status" "$rc" "$signal_name during real restore allocation returns conventional status"
+    assert_file_eq C-key "$root/key.gpg" "$signal_name real restore allocation leaves key unchanged"
+    assert_file_eq C-list "$root/release.list" "$signal_name real restore allocation leaves list unchanged"
+    assert_file_eq C-source "$root/release.sources" "$signal_name real restore allocation leaves source unchanged"
+    assert_eq 700 "$(stat -c %a "$root/state/apt-source-backups")" "$signal_name real restore preserves trusted backup state mode"
+    [[ -z "$(find "$root" \( -name 'xanmod-runtime-snapshot.*' -o -name '.xanmod-stage.*' \
+        -o -name '.xanmod-allocation-owner' -o -name '*.xanmod-owner.*' \) -print -quit)" ]] || fail "$signal_name real restore left allocation or proof residue"
+    pass "$signal_name real restore allocation leaves no candidate, proof, snapshot, or restore stage"
+    flock -n "$root/xanmod.lock" -c true || fail "$signal_name real restore allocation did not release lock"
+    pass "$signal_name real restore allocation releases lock"
+}
+
+run_restore_allocation_signal_case HUP 129
+run_restore_allocation_signal_case INT 130
+run_restore_allocation_signal_case TERM 143
+
 module_root="$TEST_DIR/module"
 make_layout "$module_root"
 env XANMOD_TEST_MODE=1 \
@@ -1409,7 +1844,8 @@ reset_state() {
     XANMOD_STAGED_KEY=""; XANMOD_STAGED_SOURCE=""; XANMOD_CANDIDATE_SOURCE=""
     XANMOD_ARMORED_KEY_TEMP=""; XANMOD_ACTIVE_APT_LISTS_DIR=""; XANMOD_ACTIVE_APT_LISTS_BUILDING=false
     XANMOD_ALLOCATION_CANDIDATE=""; XANMOD_ALLOCATION_KIND=""; XANMOD_ALLOCATION_OWNER_TOKEN=""
-    XANMOD_ALLOCATION_EXPECTED_MODE=""; XANMOD_ALLOCATION_STATE=""
+    XANMOD_ALLOCATION_EXPECTED_MODE=""; XANMOD_ALLOCATION_PROOF_OWNED=false; XANMOD_ALLOCATION_STATE=""
+    XANMOD_ALLOCATION_CRITICAL=false; XANMOD_ALLOCATION_PENDING_SIGNAL=""; XANMOD_ALLOCATION_PENDING_SIGNAL_STATUS=0
     XANMOD_RESTORE_STAGE=""
     XANMOD_BACKUP_STATE_DIR_CREATING=false; XANMOD_BACKUP_STATE_DIR_CREATED=false; XANMOD_BACKUP_STATE_DIR_PREEXISTED=false
     XANMOD_BACKUP_TRANSACTION_ACTIVE=false; XANMOD_BACKUP_SNAPSHOT_BUILDING=false; XANMOD_BACKUP_SNAPSHOT_REMOVED=false
@@ -1443,6 +1879,37 @@ restore_function() {
     local saved_name="$1" function_name="$2"
     eval "$(declare -f "$saved_name" | sed "1s/$saved_name/$function_name/")"
 }
+
+reset_state
+write_generation A
+take_xanmod_lock
+proof_release_failed=true
+rm() {
+    local last=${!#}
+    if [[ "$proof_release_failed" == true &&
+        "$last" == "$ROOT/tmp"/xanmod-backup-group.*/.xanmod-allocation-owner ]]; then
+        proof_release_failed=false
+        return 1
+    fi
+    command rm "$@"
+}
+rc=0; begin_xanmod_install_transaction > "$ROOT/begin-backup-proof-fail.log" 2>&1 || rc=$?
+assert_eq 1 "$rc" "begin backup snapshot proof release failure returns nonzero"
+assert_eq false "$XANMOD_GUARD_ACTIVE" "begin prepare failure clears transaction guards after cleanup"
+assert_eq '' "$XANMOD_ALLOCATION_CANDIDATE" "begin prepare failure clears pending allocation candidate"
+assert_eq false "$XANMOD_ALLOCATION_PROOF_OWNED" "begin prepare failure clears proof ownership state"
+assert_eq '' "$XANMOD_BACKUP_GROUP_SNAPSHOT_DIR" "begin prepare failure clears backup snapshot path"
+assert_eq '' "$XANMOD_BACKUP_STAGE_DIR" "begin prepare failure clears backup stage path"
+assert_eq false "$XANMOD_BACKUP_TRANSACTION_ACTIVE" "begin prepare failure clears backup transaction state"
+[[ ! -e "$XANMOD_BACKUP_STATE_DIR" && ! -L "$XANMOD_BACKUP_STATE_DIR" ]] || fail "begin prepare failure left new empty state directory"
+pass "begin prepare failure removes new empty backup state directory"
+[[ -z "$(find "$ROOT" \( -name 'xanmod-backup-group.*' -o -name '.xanmod-backup-stage.*'     -o -name '.xanmod-allocation-owner' -o -name '*.xanmod-owner.*' \) -print -quit)" ]] || fail "begin prepare failure left candidate, proof, snapshot, or stage"
+pass "begin prepare failure leaves no candidate, proof, snapshot, or stage residue"
+assert_generation A "begin prepare failure formal generation"
+unset -f rm
+release_xanmod_lock
+flock -n "$XANMOD_LOCK" -c true || fail "begin prepare failure did not release lock"
+pass "begin prepare failure lock can be reacquired"
 
 reset_state
 ensure_xanmod_backup_state_dir
@@ -1809,11 +2276,14 @@ common_functions=(
     xanmod_formal_keyring_valid xanmod_list_source_configured xanmod_deb822_source_configured
     get_xanmod_source_file xanmod_source_matches_codename write_xanmod_deb822_source
     remove_xanmod_temp_directory remove_xanmod_temp_file xanmod_random_token
-    xanmod_allocation_proof_path xanmod_create_temp_directory_at_path xanmod_create_temp_file_at_path
-    xanmod_begin_pending_allocation xanmod_clear_pending_allocation xanmod_after_allocation_attempt_hook
+    xanmod_allocation_proof_path xanmod_create_allocation_proof_file xanmod_write_allocation_proof
+    xanmod_cleanup_created_allocation xanmod_create_temp_directory_at_path xanmod_create_temp_file_at_path
+    xanmod_begin_pending_allocation xanmod_clear_pending_allocation
+    xanmod_begin_allocation_critical_section xanmod_end_allocation_critical_section
+    xanmod_after_allocation_attempt_hook
     xanmod_run_pending_allocation_create xanmod_pending_allocation_proof_trusted
-    xanmod_pending_allocation_owned xanmod_release_pending_allocation_proof
-    cleanup_xanmod_pending_allocation xanmod_finish_pending_allocation
+    xanmod_pending_allocation_owned xanmod_mark_pending_allocation_residue
+    xanmod_release_pending_allocation_proof cleanup_xanmod_pending_allocation xanmod_finish_pending_allocation
     xanmod_allocate_temp_directory xanmod_allocate_temp_file cleanup_xanmod_active_apt_lists xanmod_source_is_usable
     capture_xanmod_snapshot_item cleanup_incomplete_xanmod_runtime_snapshot create_xanmod_runtime_snapshot restore_xanmod_snapshot_item
     restore_xanmod_runtime_snapshot discard_xanmod_runtime_snapshot restore_xanmod_saved_trap
