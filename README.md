@@ -430,11 +430,14 @@ sudo bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/t
 sudo bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/tools/setup-motd.sh) restore initial
 ```
 
-用于只部署动态登录欢迎信息，与 `modules/system-customize.sh` 使用相同 MOTD 模板和
-`previous`/`initial` 两级备份状态。已经运行系统定制模块时通常无需重复安装。静态欢迎文件会
-备份后替换为空的普通文件，避免 PAM 重复显示；动态脚本备份保存在
-`/var/lib/linux-setup/motd-backups`。状态面板直接显示 load average，不再为计算即时 CPU
-百分比而固定延迟每次登录。
+用于只部署动态登录欢迎信息，与 `modules/system-customize.sh` 使用相同模板、锁路径和组级
+`previous`/`initial` snapshot 格式。六个目标会先完整快照，再通过同目录 stage 原子替换；任一
+install/restore 提交失败或收到 HUP/INT/TERM 都会回滚整个文件组。状态目录为
+`/var/lib/linux-setup/motd-backups`，互斥锁为 `/run/lock/linux-setup-motd.lock`。
+
+相邻和旧状态目录中的 legacy 备份仅在六项目标完整、无冲突时原子导入，旧文件不会逐项移动。
+`SIGKILL` 无法被 Shell 捕获，可能留下可信 pending journal；下一次操作会先验证并恢复或清理。
+状态面板直接显示 load average，不再固定延迟每次登录。
 
 ### XanMod 内核
 
