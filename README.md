@@ -401,8 +401,13 @@ TERM→KILL 宽限，HUP/INT/TERM 会清理 timeout、sshpass、ssh/rsync 及其
 `-F none`、`IdentitiesOnly=yes`、`IdentityAgent=none` 和禁用 ControlMaster 等参数，只允许使用
 runtime 内的私钥副本；密码模式禁用 publickey 并限制为一次密码提示。私钥文件必须为当前用户和 GID
 所有、权限 `0400` 或 `0600`；密码文件必须为当前用户和 GID 所有且严格为 `0600`。临时密钥和
-`SSHPASS` 会在正常退出、失败以及信号退出后清理。runtime 在创建首个目录前安装清理 traps，并拒绝
-非 sticky 可写、owner/GID 不可信或包含符号链接组件的 `TMPDIR` 路径。
+`SSHPASS` 会在正常退出、失败以及信号退出后清理。runtime 在任何目录创建前先由父进程发布高熵
+candidate、building 状态及 allocator 身份；HUP/INT/TERM 会先终止并回收 allocator，再删除经证明
+属于本次运行的目录。`TMPDIR` 中非 sticky 可写、owner/GID 不可信或包含符号链接组件的路径会被拒绝。
+
+每个 worker 会在可信 `0700` runtime 中原子发布 `0600` session 状态。主进程给 worker 留出完整
+TERM→KILL 清理余量；worker 无响应或异常退出时，主进程会根据 PID/start time/PGID/SID 独立枚举并
+清理同一 SID 的全部 PGID。清理失败会保留状态和 runtime，阻止重试或启动下一台服务器。
 
 默认持久化 `known_hosts`。脚本会验证从根目录到文件父目录的完整目录链；普通目录不得由组或其他用户
 写入，标准 root:root sticky `/tmp` 仍受支持，任意符号链接组件和非 sticky 可写祖先均会被拒绝。

@@ -81,6 +81,19 @@ assert_fail "reject newline in server" parse_server_info $'root@host\n-oProxyCom
 assert_fail "reject port zero" parse_server_info "root@host:0"
 assert_fail "reject port above 65535" parse_server_info "root@host:65536"
 
+(
+    trap - EXIT HUP INT TERM
+    proc_pid=$BASHPID
+    original_comm=$(<"/proc/$proc_pid/comm")
+    printf 'push ) worker' > "/proc/$proc_pid/comm"
+    read_process_record "$proc_pid" || fail "proc parser rejected comm with space and right parenthesis"
+    parsed_start="$PROC_START"
+    [[ "$PROC_PGID" =~ ^[0-9]+$ && "$PROC_SID" =~ ^[0-9]+$ && "$parsed_start" =~ ^[0-9]+$ ]] || fail "proc parser returned invalid identity fields"
+    process_identity_matches "$proc_pid" "$parsed_start" || fail "proc identity check failed for complex comm"
+    pass "proc stat parser handles comm with spaces and right parenthesis"
+    printf '%s\n' "$original_comm" > "/proc/$proc_pid/comm"
+)
+
 # Runtime initialization publishes only a verified 0700 directory and supports idempotent cleanup.
 (
     trap - EXIT HUP INT TERM
@@ -104,7 +117,7 @@ assert_fail "reject port above 65535" parse_server_info "root@host:65536"
     trap - EXIT HUP INT TERM
     TMPDIR="$TEST_DIR/runtime-create-fail"
     mkdir -m 0700 "$TMPDIR"
-    mktemp() { return 1; }
+    runtime_allocator_process() { return 1; }
     assert_fail "runtime creation failure returns nonzero" initialize_runtime
     assert_eq '' "$TEMP_DIR" "runtime creation failure publishes no directory"
 )
@@ -179,6 +192,88 @@ run_runtime_building_signal_case() {
 run_runtime_building_signal_case HUP 129
 run_runtime_building_signal_case INT 130
 run_runtime_building_signal_case TERM 143
+
+cat > "$TEST_DIR/runtime-allocator-signal-child.sh" <<'RUNTIME_ALLOCATOR_SIGNAL_CHILD'
+#!/usr/bin/env bash
+set -euo pipefail
+root="$1"
+script="$2"
+mkdir -m 0700 "$root/runtime"
+export TMPDIR="$root/runtime"
+source "$script"
+runtime_allocator_after_create_hook() {
+    printf '%s\n' "$1" > "$root/allocator-path"
+    touch "$root/ready"
+    while :; do sleep 1; done
+}
+install_runtime_traps
+initialize_runtime
+RUNTIME_ALLOCATOR_SIGNAL_CHILD
+chmod 0700 "$TEST_DIR/runtime-allocator-signal-child.sh"
+
+run_runtime_allocator_signal_case() {
+    local delivery="$1" signal_name="$2" expected_status="$3" root=""
+    local pid rc=0 watchdog
+    root="$TEST_DIR/runtime-allocator-$delivery-$signal_name"
+    mkdir -m 0700 "$root"
+    setsid env --default-signal=HUP,INT,TERM \
+        bash "$TEST_DIR/runtime-allocator-signal-child.sh" "$root" "$SCRIPT" > "$root/output.log" 2>&1 &
+    pid=$!
+    for _ in $(seq 1 200); do [[ -e "$root/ready" ]] && break; sleep 0.05; done
+    [[ -e "$root/ready" ]] || { cat "$root/output.log"; kill "$pid" 2>/dev/null || true; fail "$delivery/$signal_name allocator did not block after mkdir"; }
+    (sleep 15; kill -KILL "$pid" 2>/dev/null || true) & watchdog=$!
+    if [[ "$delivery" == direct ]]; then
+        kill "-$signal_name" "$pid"
+    else
+        kill "-$signal_name" -- "-$pid"
+    fi
+    wait "$pid" || rc=$?
+    kill "$watchdog" 2>/dev/null || true; wait "$watchdog" 2>/dev/null || true
+    assert_eq "$expected_status" "$rc" "$delivery $signal_name during allocator post-mkdir window returns conventional status"
+    for _ in $(seq 1 20); do
+        [[ -z "$(find "$root/runtime" -mindepth 1 -maxdepth 1 -name 'push-runtime.*' -print -quit)" ]] && break
+        sleep 0.05
+    done
+    [[ -z "$(find "$root/runtime" -mindepth 1 -maxdepth 1 -name 'push-runtime.*' -print -quit)" ]] || fail "$delivery/$signal_name allocator signal left candidate"
+    pass "$delivery $signal_name allocator helper and parent leave no runtime candidate"
+}
+
+for allocator_delivery in direct group; do
+    run_runtime_allocator_signal_case "$allocator_delivery" HUP 129
+    run_runtime_allocator_signal_case "$allocator_delivery" INT 130
+    run_runtime_allocator_signal_case "$allocator_delivery" TERM 143
+done
+
+(
+    trap - EXIT HUP INT TERM
+    root="$TEST_DIR/runtime-collision"; mkdir -m 0700 "$root" "$root/runtime"
+    collision="$root/runtime/push-runtime.collision"
+    mkdir -m 0700 "$collision"; printf keep > "$collision/owner-data"
+    counter="$root/token-counter"; printf 0 > "$counter"
+    runtime_random_token() {
+        local count; count=$(<"$counter"); ((count += 1)); printf '%s' "$count" > "$counter"
+        (( count == 1 )) && printf 'collision\n' || printf 'unique\n'
+    }
+    TMPDIR="$root/runtime"
+    initialize_runtime
+    [[ "$TEMP_DIR" == "$root/runtime/push-runtime.unique" ]] || fail "allocator collision did not retry a new candidate"
+    assert_file_eq keep "$collision/owner-data" "allocator collision preserves foreign directory"
+    cleanup_runtime
+    [[ -d "$collision" ]] || fail "runtime cleanup deleted collision directory"
+    pass "allocator collision is never classified as owned"
+    command rm -rf "$collision"
+)
+
+(
+    trap - EXIT HUP INT TERM
+    root="$TEST_DIR/runtime-helper-fail"; mkdir -m 0700 "$root" "$root/runtime"
+    TMPDIR="$root/runtime"
+    runtime_allocator_after_create_hook() { return 1; }
+    assert_fail "allocator helper failure returns nonzero" initialize_runtime
+    [[ "$RUNTIME_STATE" != initialized ]] || fail "allocator helper failure published initialized state"
+    [[ -z "$(find "$root/runtime" -name 'push-runtime.*' -print -quit)" ]] || fail "allocator helper failure left candidate"
+    pass "allocator helper cleans its candidate before failed handoff"
+)
 
 (
     trap - EXIT HUP INT TERM
@@ -1041,6 +1136,118 @@ EOF
     cleanup_runtime
 )
 
+(
+    trap - EXIT HUP INT TERM
+    root="$TEST_DIR/cleanup-barrier-transfer"; mkdir -m 0700 "$root" "$root/bin" "$root/runtime" "$root/capture"
+    cat > "$root/bin/timeout" <<'EOF'
+#!/usr/bin/env bash
+[[ ${1:-} == --kill-after=* ]] && shift
+shift
+exec "$@"
+EOF
+    cat > "$root/bin/rsync" <<'EOF'
+#!/usr/bin/env bash
+count=0; [[ -f "$CAPTURE_DIR/count" ]] && count=$(<"$CAPTURE_DIR/count")
+((count += 1)); printf '%s' "$count" > "$CAPTURE_DIR/count"
+sleep 0.2
+exit 0
+EOF
+    chmod 0700 "$root/bin"/*
+    PATH="$root/bin:$PATH"; export PATH CAPTURE_DIR="$root/capture"
+    TMPDIR="$root/runtime"; initialize_runtime
+    AUTH_METHOD=key; RUNTIME_KEY_FILE="$TEMP_DIR/key"; printf key > "$RUNTIME_KEY_FILE"; chmod 0600 "$RUNTIME_KEY_FILE"
+    SSH_WRAPPER="$TEMP_DIR/wrapper"; printf '#!/usr/bin/env bash\nexit 0\n' > "$SSH_WRAPPER"; chmod 0700 "$SSH_WRAPPER"
+    STRICT_HOST_KEY_CHECKING=accept-new; USER_KNOWN_HOSTS_FILE="$root/known_hosts"; ALLOW_INSECURE_HOST_KEY_STORAGE=false; prepare_known_hosts
+    CONNECTION_TIMEOUT=2; TOTAL_TIMEOUT=5; TIMEOUT_KILL_AFTER=1; MAX_RETRIES=3; RETRY_DELAY=1
+    RSYNC_ARCHIVE=true; RSYNC_COMPRESS=false; DELETE_EXTRA=false
+    eval "$(declare -f terminate_managed_session | sed '1s/terminate_managed_session/original_terminate_managed_session/')"
+    terminate_managed_session() { return 1; }
+    rc=0; retry_rsync good.example source destination > "$root/output.log" 2>&1 || rc=$?
+    assert_eq "$MANAGED_CLEANUP_FAILURE_STATUS" "$rc" "transfer cleanup failure returns dedicated barrier status"
+    assert_eq 1 "$(<"$root/capture/count")" "cleanup failure prevents second rsync attempt"
+    [[ "$WORKER_TRANSFER_CLEANUP_FAILED" == true && -n "$WORKER_TRANSFER_SID" && -f "$WORKER_SESSION_STATE_FILE" ]] || fail "cleanup failure did not preserve managed state"
+    state_hash=$(sha256sum "$WORKER_SESSION_STATE_FILE")
+    rc=0; run_managed_command "$TEMP_DIR/blocked-command" true || rc=$?
+    assert_eq "$MANAGED_CLEANUP_FAILURE_STATUS" "$rc" "retry barrier rejects new managed command"
+    assert_eq "$state_hash" "$(sha256sum "$WORKER_SESSION_STATE_FILE")" "retry barrier preserves old session state"
+    pass "cleanup failure state is not overwritten"
+    eval "$(declare -f original_terminate_managed_session | sed '1s/original_terminate_managed_session/terminate_managed_session/')"
+    terminate_worker_transfer
+    cleanup_runtime
+)
+
+(
+    trap - EXIT HUP INT TERM
+    root="$TEST_DIR/cleanup-barrier-auth"; mkdir -m 0700 "$root" "$root/bin" "$root/runtime" "$root/capture"
+    cat > "$root/bin/timeout" <<'EOF'
+#!/usr/bin/env bash
+[[ ${1:-} == --kill-after=* ]] && shift
+shift
+exec "$@"
+EOF
+    cat > "$root/bin/ssh" <<'EOF'
+#!/usr/bin/env bash
+count=0; [[ -f "$CAPTURE_DIR/count" ]] && count=$(<"$CAPTURE_DIR/count")
+((count += 1)); printf '%s' "$count" > "$CAPTURE_DIR/count"
+sleep 0.2
+exit 0
+EOF
+    chmod 0700 "$root/bin"/*
+    PATH="$root/bin:$PATH"; export PATH CAPTURE_DIR="$root/capture"
+    TMPDIR="$root/runtime"; initialize_runtime
+    key="$root/key"; printf key > "$key"; chmod 0600 "$key"
+    AUTH_METHOD=key; KEY_FILE="$key"; STRICT_HOST_KEY_CHECKING=accept-new
+    USER_KNOWN_HOSTS_FILE="$root/known_hosts"; ALLOW_INSECURE_HOST_KEY_STORAGE=false
+    CONNECTION_TIMEOUT=2; TOTAL_TIMEOUT=5; TIMEOUT_KILL_AFTER=1; SERVERS=(one.example two.example)
+    prepare_ssh_runtime
+    eval "$(declare -f terminate_managed_session | sed '1s/terminate_managed_session/original_terminate_managed_session/')"
+    terminate_managed_session() { return 1; }
+    rc=0; test_authentication > "$root/output.log" 2>&1 || rc=$?
+    assert_eq "$MANAGED_CLEANUP_FAILURE_STATUS" "$rc" "auth cleanup failure returns dedicated barrier status"
+    assert_eq 1 "$(<"$root/capture/count")" "auth cleanup failure stops later servers"
+    [[ -f "$WORKER_SESSION_STATE_FILE" ]] || fail "auth cleanup failure did not retain state file"
+    eval "$(declare -f original_terminate_managed_session | sed '1s/original_terminate_managed_session/terminate_managed_session/')"
+    terminate_worker_transfer
+    cleanup_runtime
+)
+
+(
+    trap - EXIT HUP INT TERM
+    root="$TEST_DIR/worker-state-fallback"; mkdir -m 0700 "$root" "$root/bin" "$root/runtime"
+    cat > "$root/bin/timeout" <<'EOF'
+#!/usr/bin/env bash
+[[ ${1:-} == --kill-after=* ]] && shift
+shift
+exec "$@"
+EOF
+    cat > "$root/bin/rsync" <<'EOF'
+#!/usr/bin/env bash
+sleep 0.1
+exit 0
+EOF
+    chmod 0700 "$root/bin"/*
+    PATH="$root/bin:$PATH"; export PATH
+    TMPDIR="$root/runtime"; initialize_runtime
+    AUTH_METHOD=key; RUNTIME_KEY_FILE="$TEMP_DIR/key"; printf key > "$RUNTIME_KEY_FILE"; chmod 0600 "$RUNTIME_KEY_FILE"
+    SSH_WRAPPER="$TEMP_DIR/wrapper"; printf '#!/usr/bin/env bash\nexit 0\n' > "$SSH_WRAPPER"; chmod 0700 "$SSH_WRAPPER"
+    STRICT_HOST_KEY_CHECKING=accept-new; USER_KNOWN_HOSTS_FILE="$root/known_hosts"; ALLOW_INSECURE_HOST_KEY_STORAGE=false; prepare_known_hosts
+    CONNECTION_TIMEOUT=2; TOTAL_TIMEOUT=5; TIMEOUT_KILL_AFTER=1; MAX_RETRIES=1; RETRY_DELAY=1
+    RSYNC_ARCHIVE=true; RSYNC_COMPRESS=false; DELETE_EXTRA=false; MAX_PARALLEL=1
+    eval "$(declare -f terminate_managed_session | sed '1s/terminate_managed_session/original_terminate_managed_session/')"
+    main_state_owner_pid=$BASHPID
+    terminate_managed_session() {
+        if [[ "$BASHPID" != "$main_state_owner_pid" ]]; then return 1; fi
+        original_terminate_managed_session "$@"
+    }
+    assert_fail "worker cleanup failure makes batch fail" run_server_batch source destination good.example
+    (( ${#ACTIVE_WORKER_STATE_FILES[@]} == 1 )) || fail "worker cleanup failure was not published to main"
+    cleanup_published_worker_sessions
+    assert_eq 0 "${#ACTIVE_WORKER_STATE_FILES[@]}" "main fallback consumes worker cleanup state"
+    pass "worker cleanup failure is recoverable by main from trusted state file"
+    eval "$(declare -f original_terminate_managed_session | sed '1s/original_terminate_managed_session/terminate_managed_session/')"
+    cleanup_runtime
+)
+
 run_accounting_failure_case() {
     local failure_kind="$1" root="$TEST_DIR/accounting-$1"
     (
@@ -1141,6 +1348,7 @@ EOF
     chmod 0600 "$root/config.conf"
     cat > "$root/bin/timeout" <<'EOF'
 #!/usr/bin/env bash
+trap '' HUP INT TERM
 printf '%s\n' "$$" > "$PID_DIR/timeout.pid"
 [[ ${1:-} == --kill-after=* ]] && shift
 shift
@@ -1149,6 +1357,7 @@ wait "$!"
 EOF
     cat > "$root/bin/sshpass" <<'EOF'
 #!/usr/bin/env bash
+trap '' HUP INT TERM
 printf '%s\n' "$$" > "$PID_DIR/sshpass.pid"
 [[ ${1:-} == -e ]] && shift
 "$@" &
@@ -1156,12 +1365,15 @@ wait "$!"
 EOF
     cat > "$root/bin/rsync" <<'EOF'
 #!/usr/bin/env bash
+trap '' HUP INT TERM
+set -m
 printf '%s\n' "$$" > "$PID_DIR/rsync.pid"
 ssh fake-target &
 wait "$!"
 EOF
     cat > "$root/bin/ssh" <<'EOF'
 #!/usr/bin/env bash
+trap '' HUP INT TERM
 printf '%s\n' "$$" > "$PID_DIR/ssh.pid"
 sleep 300 &
 printf '%s\n' "$!" > "$PID_DIR/leaf.pid"
@@ -1173,26 +1385,33 @@ EOF
 
 run_process_tree_signal_case() {
     local signal_name="$1" expected_status="$2"
-    local root="$TEST_DIR/process-$signal_name" pid rc=0 watchdog unrelated worker_pid timeout_pid
+    local root="$TEST_DIR/process-$signal_name" main_pid rc=0 watchdog unrelated worker_pid timeout_pid ssh_pid managed_sid timeout_pgid
     write_signal_fixture "$root"
     mkdir -m 0700 "$root/pids"
     sleep 60 & unrelated=$!
     (
         cd "$root"
-        exec env PATH="$root/bin:$PATH" TMPDIR="$root/runtime" PID_DIR="$root/pids" \
+        exec env --default-signal=HUP,INT,TERM PATH="$root/bin:$PATH" TMPDIR="$root/runtime" PID_DIR="$root/pids" \
             "$SCRIPT" "$root/source" '/remote/path'
     ) > "$root/output.log" 2>&1 &
-    pid=$!
+    main_pid=$!
     for _ in $(seq 1 300); do
         [[ -f "$root/pids/timeout.pid" && -f "$root/pids/sshpass.pid" && -f "$root/pids/rsync.pid" && -f "$root/pids/ssh.pid" && -f "$root/pids/leaf.pid" ]] && break
         sleep 0.05
     done
-    [[ -f "$root/pids/leaf.pid" ]] || { cat "$root/output.log"; kill "$pid" "$unrelated" 2>/dev/null || true; fail "$signal_name process tree did not start"; }
+    [[ -f "$root/pids/leaf.pid" ]] || { cat "$root/output.log"; kill "$main_pid" "$unrelated" 2>/dev/null || true; fail "$signal_name process tree did not start"; }
     timeout_pid=$(<"$root/pids/timeout.pid")
+    ssh_pid=$(<"$root/pids/ssh.pid")
+    read_process_record "$timeout_pid" || fail "$signal_name cannot parse timeout proc stat"
+    managed_sid="$PROC_SID"; timeout_pgid="$PROC_PGID"
+    read_process_record "$ssh_pid" || fail "$signal_name cannot parse ssh proc stat"
+    assert_eq "$managed_sid" "$PROC_SID" "$signal_name extra SSH PGID remains in managed SID"
+    [[ "$timeout_pgid" != "$PROC_PGID" ]] || fail "$signal_name fixture did not create a second PGID"
+    pass "$signal_name cleanup fixture contains multiple PGIDs in one SID"
     worker_pid=$(awk '{print $4}' "/proc/$timeout_pid/stat")
-    (sleep 15; kill -KILL "$pid" 2>/dev/null || true) & watchdog=$!
-    kill "-$signal_name" "$pid"
-    wait "$pid" || rc=$?
+    (sleep 15; kill -KILL "$main_pid" 2>/dev/null || true) & watchdog=$!
+    kill "-$signal_name" "$main_pid"
+    wait "$main_pid" || rc=$?
     kill "$watchdog" 2>/dev/null || true; wait "$watchdog" 2>/dev/null || true
     assert_eq "$expected_status" "$rc" "$signal_name returns conventional push signal status"
     for pid_file in timeout sshpass rsync ssh leaf; do
@@ -1219,5 +1438,38 @@ run_process_tree_signal_case() {
 run_process_tree_signal_case HUP 129
 run_process_tree_signal_case INT 130
 run_process_tree_signal_case TERM 143
+
+cat > "$TEST_DIR/worker-grace-child.sh" <<'WORKER_GRACE_CHILD'
+#!/usr/bin/env bash
+set -euo pipefail
+script="$1"
+shift
+source "$script"
+worker_after_session_cleanup_hook() {
+    touch "$WORKER_GRACE_MARKER"
+    sleep 0.5
+}
+main "$@"
+WORKER_GRACE_CHILD
+chmod 0700 "$TEST_DIR/worker-grace-child.sh"
+
+(
+    trap - EXIT HUP INT TERM
+    root="$TEST_DIR/worker-grace"; write_signal_fixture "$root"; mkdir -m 0700 "$root/pids"
+    marker="$root/worker-cleanup-finished"; rc=0
+    (
+        cd "$root"
+        exec env --default-signal=HUP,INT,TERM PATH="$root/bin:$PATH" TMPDIR="$root/runtime" PID_DIR="$root/pids" \
+            WORKER_GRACE_MARKER="$marker" bash "$TEST_DIR/worker-grace-child.sh" "$SCRIPT" "$root/source" /remote/path
+    ) > "$root/output.log" 2>&1 &
+    pid=$!
+    for _ in $(seq 1 300); do [[ -f "$root/pids/leaf.pid" ]] && break; sleep 0.05; done
+    [[ -f "$root/pids/leaf.pid" ]] || { cat "$root/output.log"; kill "$pid" 2>/dev/null || true; fail "worker grace fixture did not start"; }
+    kill -TERM "$pid"
+    wait "$pid" || rc=$?
+    assert_eq 143 "$rc" "main preserves TERM status while waiting for worker cleanup"
+    [[ -e "$marker" ]] || fail "main killed worker before managed-session cleanup hook"
+    pass "main TERM grace exceeds worker TERM/KILL/final-verification duration"
+)
 
 printf 'All push tests passed.\n'

@@ -39,22 +39,36 @@ RUNTIME_TRAPS_INSTALLED=false
 RUNTIME_ALLOCATION_CRITICAL=false
 RUNTIME_PENDING_SIGNAL=""
 RUNTIME_PENDING_SIGNAL_STATUS=0
+RUNTIME_ALLOCATOR_PID=""
+RUNTIME_ALLOCATOR_START=""
+RUNTIME_CANDIDATE_CREATED=false
 
 PARSED_PORT=""
 PARSED_SSH_TARGET=""
 PARSED_RSYNC_TARGET=""
 PARSED_DISPLAY_TARGET=""
+PROC_STATE=""
+PROC_PGID=""
+PROC_SID=""
+PROC_START=""
+PROC_UID=""
 
 WORKER_TRANSFER_PID=""
 WORKER_TRANSFER_PGID=""
 WORKER_TRANSFER_SID=""
 WORKER_TRANSFER_START=""
+WORKER_TRANSFER_CLEANUP_FAILED=false
+WORKER_SESSION_STATE_FILE=""
 WORKER_OUTPUT_FILE=""
 
 declare -a SERVERS=()
 declare -A TASKS=()
 declare -A ACTIVE_WORKERS=()
+declare -A ACTIVE_WORKER_STATE_FILES=()
+declare -A ACTIVE_WORKER_STATE_STARTS=()
 BATCH_WORKER_FAILED=false
+MANAGED_CLEANUP_FAILURE_STATUS=125
+RUNTIME_ALLOCATOR_COLLISION_STATUS=17
 declare -a CONFIG_SERVERS_BUFFER=()
 declare -A CONFIG_TASKS_BUFFER=()
 
@@ -400,7 +414,7 @@ check_and_generate_config() {
 
 check_dependencies() {
     local operation="$1" cmd
-    local -a required=(ssh timeout stat dirname basename mkdir chmod mktemp ln rm cat id setsid awk tr wc sleep date)
+    local -a required=(ssh timeout stat dirname basename mkdir chmod mktemp ln rm cat id setsid awk od tr wc sleep date)
     [[ "$operation" == transfer ]] && required+=(rsync flock)
     [[ "${AUTH_METHOD:-}" == password ]] && required+=(sshpass)
     local -a missing=()
@@ -543,6 +557,138 @@ runtime_end_allocation_critical() {
     fi
 }
 
+runtime_allocator_after_create_hook() {
+    :
+}
+
+runtime_random_token() {
+    local token=""
+    token=$(od -An -N16 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n') || return 1
+    [[ "$token" =~ ^[0-9a-f]{32}$ ]] || return 1
+    printf '%s\n' "$token"
+}
+
+runtime_allocator_child_cleanup() {
+    if [[ "$RUNTIME_ALLOCATOR_CHILD_CREATED" == true &&
+        ( -e "$RUNTIME_ALLOCATOR_CHILD_PATH" || -L "$RUNTIME_ALLOCATOR_CHILD_PATH" ) ]]; then
+        if [[ -d "$RUNTIME_ALLOCATOR_CHILD_PATH" && ! -L "$RUNTIME_ALLOCATOR_CHILD_PATH" ]]; then
+            rmdir -- "$RUNTIME_ALLOCATOR_CHILD_PATH" || {
+                echo -e "${RED}${ICON_ERROR} allocator 自有 candidate 清理失败: $RUNTIME_ALLOCATOR_CHILD_PATH${NC}" >&2
+                return 1
+            }
+        else
+            echo -e "${RED}${ICON_ERROR} allocator candidate 类型已变化: $RUNTIME_ALLOCATOR_CHILD_PATH${NC}" >&2
+            return 1
+        fi
+    fi
+}
+
+runtime_allocator_child_signal() {
+    local status="$1"
+    trap - EXIT HUP INT TERM
+    runtime_allocator_child_cleanup || true
+    exit "$status"
+}
+
+runtime_allocator_process() {
+    local candidate="$1"
+    RUNTIME_ALLOCATOR_CHILD_PATH="$candidate"
+    RUNTIME_ALLOCATOR_CHILD_CREATED=false
+    trap 'runtime_allocator_child_signal 129' HUP
+    trap 'runtime_allocator_child_signal 130' INT
+    trap 'runtime_allocator_child_signal 143' TERM
+    kill -STOP "$BASHPID"
+    if ! mkdir -m 0700 -- "$candidate" 2>/dev/null; then
+        return "$RUNTIME_ALLOCATOR_COLLISION_STATUS"
+    fi
+    RUNTIME_ALLOCATOR_CHILD_CREATED=true
+    if ! runtime_allocator_after_create_hook "$candidate"; then
+        runtime_allocator_child_cleanup || true
+        return 1
+    fi
+    return 0
+}
+
+start_runtime_allocator() {
+    local candidate="$1" start="" allocator_state=""
+    [[ -z "$RUNTIME_ALLOCATOR_PID" && -z "$RUNTIME_ALLOCATOR_START" ]] || return 1
+    runtime_begin_allocation_critical || return 1
+    runtime_allocator_process "$candidate" &
+    RUNTIME_ALLOCATOR_PID=$!
+    for _ in {1..100}; do
+        if read_process_record "$RUNTIME_ALLOCATOR_PID"; then
+            start=$PROC_START
+            allocator_state=$PROC_STATE
+            [[ "$allocator_state" == T ]] && break
+        fi
+        kill -0 "$RUNTIME_ALLOCATOR_PID" 2>/dev/null || break
+        sleep 0.01
+    done
+    RUNTIME_ALLOCATOR_START="$start"
+    if [[ -z "$RUNTIME_ALLOCATOR_START" || "$allocator_state" != T ]]; then
+        kill -CONT "$RUNTIME_ALLOCATOR_PID" 2>/dev/null || true
+        kill -TERM "$RUNTIME_ALLOCATOR_PID" 2>/dev/null || true
+        wait "$RUNTIME_ALLOCATOR_PID" 2>/dev/null || true
+        RUNTIME_ALLOCATOR_PID=""
+        RUNTIME_ALLOCATOR_START=""
+        if [[ ! -e "$candidate" && ! -L "$candidate" ]]; then
+            TEMP_DIR=""
+            RUNTIME_STATE=none
+            RUNTIME_CANDIDATE_CREATED=false
+            RUNTIME_PARENT=""
+            RUNTIME_PARENT_DEV=""
+            RUNTIME_PARENT_INODE=""
+        fi
+        runtime_end_allocation_critical
+        return 1
+    fi
+    if [[ -z "$RUNTIME_PENDING_SIGNAL" ]]; then
+        kill -CONT "$RUNTIME_ALLOCATOR_PID" 2>/dev/null || true
+    fi
+    runtime_end_allocation_critical
+    return 0
+}
+
+wait_runtime_allocator() {
+    local allocator_status=0
+    [[ -n "$RUNTIME_ALLOCATOR_PID" ]] || return 1
+    runtime_begin_allocation_critical || return 1
+    wait "$RUNTIME_ALLOCATOR_PID" || allocator_status=$?
+    if [[ -n "$RUNTIME_PENDING_SIGNAL" ]]; then
+        if [[ -n "$RUNTIME_ALLOCATOR_START" ]] &&
+            process_identity_matches "$RUNTIME_ALLOCATOR_PID" "$RUNTIME_ALLOCATOR_START"; then
+            kill -CONT "$RUNTIME_ALLOCATOR_PID" 2>/dev/null || true
+            kill -TERM "$RUNTIME_ALLOCATOR_PID" 2>/dev/null || true
+        fi
+        allocator_status=0
+        wait "$RUNTIME_ALLOCATOR_PID" 2>/dev/null || allocator_status=$?
+    fi
+    if (( allocator_status == 0 )); then
+        RUNTIME_CANDIDATE_CREATED=true
+    fi
+    RUNTIME_ALLOCATOR_PID=""
+    RUNTIME_ALLOCATOR_START=""
+    runtime_end_allocation_critical
+    return "$allocator_status"
+}
+
+terminate_runtime_allocator() {
+    local allocator_status=0
+    [[ -n "$RUNTIME_ALLOCATOR_PID" ]] || return 0
+    if [[ -n "$RUNTIME_ALLOCATOR_START" ]] &&
+        process_identity_matches "$RUNTIME_ALLOCATOR_PID" "$RUNTIME_ALLOCATOR_START"; then
+        kill -CONT "$RUNTIME_ALLOCATOR_PID" 2>/dev/null || true
+        kill -TERM "$RUNTIME_ALLOCATOR_PID" 2>/dev/null || true
+    fi
+    wait "$RUNTIME_ALLOCATOR_PID" 2>/dev/null || allocator_status=$?
+    if (( allocator_status == 0 )); then
+        RUNTIME_CANDIDATE_CREATED=true
+    fi
+    RUNTIME_ALLOCATOR_PID=""
+    RUNTIME_ALLOCATOR_START=""
+    return 0
+}
+
 runtime_building_hook() {
     :
 }
@@ -577,6 +723,7 @@ initialize_runtime() {
     local parent="${TMPDIR:-/tmp}" candidate="" metadata=""
     local dev inode owner gid mode trusted_gid
     local success_file failed_file wrapper parent_dev parent_inode
+    local token="" allocator_status=0 attempt
 
     [[ "$RUNTIME_STATE" == none && "$RUNTIME_INITIALIZED" == false && -z "$TEMP_DIR" ]] || return 1
     [[ "$parent" =~ ^[A-Za-z0-9_./-]+$ ]] || {
@@ -592,17 +739,42 @@ initialize_runtime() {
     RUNTIME_PARENT_DEV="$parent_dev"
     RUNTIME_PARENT_INODE="$parent_inode"
 
-    runtime_begin_allocation_critical || return 1
-    if candidate=$(mktemp -d "$parent/push-runtime.XXXXXXXXXX"); then
+    for attempt in {1..64}; do
+        token=$(runtime_random_token) || return 1
+        candidate="$parent/push-runtime.$token"
         TEMP_DIR="$candidate"
+        TEMP_DIR_DEV=""
+        TEMP_DIR_INODE=""
         RUNTIME_STATE=building
-    else
-        candidate=""
-    fi
-    runtime_end_allocation_critical
-    if [[ -z "$candidate" ]]; then
-        echo -e "${RED}${ICON_ERROR} 无法创建 push runtime 目录${NC}" >&2
-        RUNTIME_PARENT=""; RUNTIME_PARENT_DEV=""; RUNTIME_PARENT_INODE=""
+        RUNTIME_CANDIDATE_CREATED=false
+        start_runtime_allocator "$candidate" || {
+            echo -e "${RED}${ICON_ERROR} 无法启动 runtime allocator: $candidate${NC}" >&2
+            return 1
+        }
+        allocator_status=0
+        wait_runtime_allocator || allocator_status=$?
+        if (( allocator_status == 0 )); then
+            break
+        fi
+        if (( allocator_status == RUNTIME_ALLOCATOR_COLLISION_STATUS )) &&
+            [[ -e "$candidate" || -L "$candidate" ]]; then
+            TEMP_DIR=""
+            RUNTIME_STATE=none
+            RUNTIME_CANDIDATE_CREATED=false
+            continue
+        fi
+        if [[ -e "$candidate" || -L "$candidate" ]]; then
+            echo -e "${RED}${ICON_ERROR} allocator 失败并留下未接管 candidate: $candidate${NC}" >&2
+            return 1
+        fi
+        TEMP_DIR=""
+        RUNTIME_STATE=none
+        RUNTIME_CANDIDATE_CREATED=false
+        echo -e "${RED}${ICON_ERROR} runtime allocator 创建失败${NC}" >&2
+        return 1
+    done
+    if [[ "$RUNTIME_CANDIDATE_CREATED" != true || -z "$TEMP_DIR" ]]; then
+        echo -e "${RED}${ICON_ERROR} runtime allocator 未能创建可接管目录${NC}" >&2
         return 1
     fi
     runtime_building_hook "$candidate"
@@ -643,22 +815,63 @@ initialize_runtime() {
     ACTIVE_WORKERS=()
 }
 
-get_process_start_time() {
+read_process_stat() {
+    local pid="$1" stat_line="" stat_rest="" stat_fd
+    local -a fields=()
+
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+    { exec {stat_fd}<"/proc/$pid/stat"; } 2>/dev/null || return 1
+    IFS= read -r stat_line <&"$stat_fd" || [[ -n "$stat_line" ]] || { exec {stat_fd}<&- || true; return 1; }
+    exec {stat_fd}<&- || true
+    [[ "$stat_line" == "$pid ("* && "$stat_line" == *") "* ]] || return 1
+    stat_rest=${stat_line##*) }
+    read -r -a fields <<< "$stat_rest"
+    (( ${#fields[@]} >= 20 )) || return 1
+    PROC_STATE=${fields[0]}
+    PROC_PGID=${fields[2]}
+    PROC_SID=${fields[3]}
+    PROC_START=${fields[19]}
+}
+
+read_process_uid() {
+    local pid="$1" uid_line="" status_key status_value status_fd
+    { exec {status_fd}<"/proc/$pid/status"; } 2>/dev/null || return 1
+    while read -r status_key status_value _ <&"$status_fd"; do
+        if [[ "$status_key" == Uid: ]]; then
+            uid_line=$status_value
+            break
+        fi
+    done
+    exec {status_fd}<&- || true
+    [[ "$uid_line" =~ ^[0-9]+$ ]] || return 1
+    PROC_UID=$uid_line
+}
+
+read_process_record() {
     local pid="$1"
-    [[ "$pid" =~ ^[0-9]+$ && -r "/proc/$pid/stat" ]] || return 1
-    awk '{print $22}' "/proc/$pid/stat" 2>/dev/null
+    read_process_stat "$pid" || return 1
+    read_process_uid "$pid"
+}
+
+get_process_start_time() {
+    read_process_record "$1" || return 1
+    printf '%s\n' "$PROC_START"
 }
 
 get_process_group_id() {
-    local pid="$1"
-    [[ "$pid" =~ ^[0-9]+$ && -r "/proc/$pid/stat" ]] || return 1
-    awk '{print $5}' "/proc/$pid/stat" 2>/dev/null
+    read_process_record "$1" || return 1
+    printf '%s\n' "$PROC_PGID"
+}
+
+get_process_session_id() {
+    read_process_record "$1" || return 1
+    printf '%s\n' "$PROC_SID"
 }
 
 process_identity_matches() {
-    local pid="$1" expected_start="$2" current=""
-    current=$(get_process_start_time "$pid") || return 1
-    [[ "$current" == "$expected_start" ]]
+    local pid="$1" expected_start="$2"
+    read_process_record "$pid" || return 1
+    [[ "$PROC_START" == "$expected_start" && "$PROC_UID" == "$EUID" ]]
 }
 
 job_is_active() {
@@ -677,23 +890,58 @@ prune_active_workers() {
             wait "$pid" 2>/dev/null || wait_status=$?
             (( wait_status == 0 || wait_status == 127 )) || BATCH_WORKER_FAILED=true
             unset 'ACTIVE_WORKERS[$pid]'
+            if [[ -n "${ACTIVE_WORKER_STATE_FILES[$pid]:-}" &&
+                ! -e "${ACTIVE_WORKER_STATE_FILES[$pid]}" && ! -L "${ACTIVE_WORKER_STATE_FILES[$pid]}" ]]; then
+                unset 'ACTIVE_WORKER_STATE_FILES[$pid]'
+                unset 'ACTIVE_WORKER_STATE_STARTS[$pid]'
+            fi
         fi
     done
 }
 
+cleanup_published_worker_sessions() {
+    local worker_pid file worker_start cleanup_failed=false
+
+    for worker_pid in "${!ACTIVE_WORKER_STATE_FILES[@]}"; do
+        file=${ACTIVE_WORKER_STATE_FILES[$worker_pid]}
+        worker_start=${ACTIVE_WORKER_STATE_STARTS[$worker_pid]:-}
+        if [[ ! -e "$file" && ! -L "$file" ]]; then
+            if [[ -z "${ACTIVE_WORKERS[$worker_pid]:-}" ]]; then
+                unset 'ACTIVE_WORKER_STATE_FILES[$worker_pid]'
+                unset 'ACTIVE_WORKER_STATE_STARTS[$worker_pid]'
+            fi
+            continue
+        fi
+        if [[ -z "$worker_start" ]] ||
+            ! cleanup_worker_session_state_file "$file" "$worker_pid" "$worker_start"; then
+            echo -e "${RED}${ICON_ERROR} 主进程无法清理 worker session 状态: $file${NC}" >&2
+            cleanup_failed=true
+            continue
+        fi
+        unset 'ACTIVE_WORKER_STATE_FILES[$worker_pid]'
+        unset 'ACTIVE_WORKER_STATE_STARTS[$worker_pid]'
+    done
+    [[ "$cleanup_failed" == false ]]
+}
+
 terminate_active_workers() {
-    local pid _
+    local pid _ cleanup_failed=false
+
     prune_active_workers
     for pid in "${!ACTIVE_WORKERS[@]}"; do
         if job_is_active "$pid" && process_identity_matches "$pid" "${ACTIVE_WORKERS[$pid]}"; then
             kill -TERM "$pid" 2>/dev/null || true
         fi
     done
-    for _ in {1..20}; do
+    # Worker 的 managed-session TERM/KILL/核验最长约 4 秒；主进程给出 7 秒余量。
+    for _ in {1..70}; do
         prune_active_workers
         (( ${#ACTIVE_WORKERS[@]} == 0 )) && break
         sleep 0.1
     done
+
+    cleanup_published_worker_sessions || cleanup_failed=true
+
     for pid in "${!ACTIVE_WORKERS[@]}"; do
         if job_is_active "$pid" && process_identity_matches "$pid" "${ACTIVE_WORKERS[$pid]}"; then
             kill -KILL "$pid" 2>/dev/null || true
@@ -703,6 +951,9 @@ terminate_active_workers() {
         wait "$pid" 2>/dev/null || true
         unset 'ACTIVE_WORKERS[$pid]'
     done
+    cleanup_published_worker_sessions || cleanup_failed=true
+
+    [[ "$cleanup_failed" == false ]]
 }
 
 cleanup_runtime() {
@@ -710,6 +961,7 @@ cleanup_runtime() {
 
     [[ "$RUNTIME_CLEANUP_ACTIVE" == false ]] || return 0
     RUNTIME_CLEANUP_ACTIVE=true
+    terminate_runtime_allocator || cleanup_failed=true
     terminate_worker_transfer || cleanup_failed=true
     terminate_active_workers || cleanup_failed=true
     unset SSHPASS
@@ -724,6 +976,15 @@ cleanup_runtime() {
         building)
             if [[ ! -e "$TEMP_DIR" && ! -L "$TEMP_DIR" ]]; then
                 :
+            elif [[ "$RUNTIME_CANDIDATE_CREATED" != true ]]; then
+                for _ in {1..40}; do
+                    [[ ! -e "$TEMP_DIR" && ! -L "$TEMP_DIR" ]] && break
+                    sleep 0.05
+                done
+                if [[ -e "$TEMP_DIR" || -L "$TEMP_DIR" ]]; then
+                    echo -e "${RED}${ICON_ERROR} building candidate 存在但 allocator 未证明创建所有权: $TEMP_DIR${NC}" >&2
+                    cleanup_failed=true
+                fi
             elif ! runtime_building_directory_trusted; then
                 echo -e "${RED}${ICON_ERROR} 拒绝删除无法证明所有权的 building runtime: $TEMP_DIR${NC}" >&2
                 cleanup_failed=true
@@ -765,7 +1026,12 @@ cleanup_runtime() {
         RUNTIME_ALLOCATION_CRITICAL=false
         RUNTIME_PENDING_SIGNAL=""
         RUNTIME_PENDING_SIGNAL_STATUS=0
+        RUNTIME_ALLOCATOR_PID=""
+        RUNTIME_ALLOCATOR_START=""
+        RUNTIME_CANDIDATE_CREATED=false
         ACTIVE_WORKERS=()
+        ACTIVE_WORKER_STATE_FILES=()
+        ACTIVE_WORKER_STATE_STARTS=()
     fi
     RUNTIME_CLEANUP_ACTIVE=false
     [[ "$cleanup_failed" == false ]]
@@ -787,6 +1053,11 @@ runtime_signal_handler() {
         if [[ -z "$RUNTIME_PENDING_SIGNAL" ]]; then
             RUNTIME_PENDING_SIGNAL_STATUS="$status"
             RUNTIME_PENDING_SIGNAL="$signal_name"
+        fi
+        if [[ -n "$RUNTIME_ALLOCATOR_PID" && -n "$RUNTIME_ALLOCATOR_START" ]] &&
+            process_identity_matches "$RUNTIME_ALLOCATOR_PID" "$RUNTIME_ALLOCATOR_START"; then
+            kill -CONT "$RUNTIME_ALLOCATOR_PID" 2>/dev/null || true
+            kill -TERM "$RUNTIME_ALLOCATOR_PID" 2>/dev/null || true
         fi
         return 0
     fi
@@ -1042,66 +1313,237 @@ validate_transfer_path() {
     ! contains_control_character "$value"
 }
 
-get_process_session_id() {
-    local pid="$1"
-    [[ "$pid" =~ ^[0-9]+$ && -r "/proc/$pid/stat" ]] || return 1
-    awk '{print $6}' "/proc/$pid/stat" 2>/dev/null
+
+worker_session_state_file_trusted() {
+    local file="$1" metadata="" owner gid mode trusted_gid
+    [[ -f "$file" && ! -L "$file" && "$file" == "$TEMP_DIR"/worker-session.*.state ]] || return 1
+    metadata=$(stat -Lc '%u:%g:%a' -- "$file" 2>/dev/null) || return 1
+    IFS=: read -r owner gid mode <<< "$metadata"
+    trusted_gid=$(current_gid) || return 1
+    [[ "$owner" == "$EUID" && "$gid" == "$trusted_gid" && "$mode" == 600 ]]
+}
+
+publish_worker_session_state() {
+    local lifecycle_state="$1" worker_pid worker_start token stage=""
+    local state_file=""
+
+    runtime_directory_trusted || return 1
+    worker_pid=$BASHPID
+    worker_start=$(get_process_start_time "$worker_pid") || return 1
+    state_file="$TEMP_DIR/worker-session.$worker_pid.state"
+    token=$(runtime_random_token) || return 1
+    stage="$TEMP_DIR/.worker-session.$worker_pid.$token.tmp"
+    if ! (umask 077; set -o noclobber; : > "$stage") 2>/dev/null; then
+        return 1
+    fi
+    if ! printf 'version=1\nstate=%s\nworker_pid=%s\nworker_start=%s\nleader_pid=%s\nleader_start=%s\npgid=%s\nsid=%s\n' \
+        "$lifecycle_state" "$worker_pid" "$worker_start" \
+        "$WORKER_TRANSFER_PID" "$WORKER_TRANSFER_START" \
+        "$WORKER_TRANSFER_PGID" "$WORKER_TRANSFER_SID" > "$stage"; then
+        rm -f -- "$stage" || true
+        return 1
+    fi
+    chmod 0600 "$stage" || { rm -f -- "$stage" || true; return 1; }
+    mv -fT -- "$stage" "$state_file" || { rm -f -- "$stage" || true; return 1; }
+    worker_session_state_file_trusted "$state_file" || return 1
+    WORKER_SESSION_STATE_FILE="$state_file"
+}
+
+remove_worker_session_state() {
+    local state_file="${WORKER_SESSION_STATE_FILE:-}"
+    [[ -n "$state_file" ]] || return 0
+    if [[ ! -e "$state_file" && ! -L "$state_file" ]]; then
+        WORKER_SESSION_STATE_FILE=""
+        return 0
+    fi
+    worker_session_state_file_trusted "$state_file" || return 1
+    rm -f -- "$state_file" || return 1
+    WORKER_SESSION_STATE_FILE=""
+}
+
+read_worker_session_state() {
+    local file="$1" line key value line_count=0
+    local -A seen=()
+
+    worker_session_state_file_trusted "$file" || return 1
+    SESSION_STATE=""; SESSION_WORKER_PID=""; SESSION_WORKER_START=""
+    SESSION_LEADER_PID=""; SESSION_LEADER_START=""; SESSION_PGID=""; SESSION_SID=""
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        ((line_count += 1))
+        [[ "$line" == *=* ]] || return 1
+        key=${line%%=*}; value=${line#*=}
+        [[ -z "${seen[$key]:-}" ]] || return 1
+        seen[$key]=1
+        case "$key" in
+            version) [[ "$value" == 1 ]] || return 1 ;;
+            state) SESSION_STATE=$value ;;
+            worker_pid) SESSION_WORKER_PID=$value ;;
+            worker_start) SESSION_WORKER_START=$value ;;
+            leader_pid) SESSION_LEADER_PID=$value ;;
+            leader_start) SESSION_LEADER_START=$value ;;
+            pgid) SESSION_PGID=$value ;;
+            sid) SESSION_SID=$value ;;
+            *) return 1 ;;
+        esac
+    done < "$file"
+    (( line_count == 8 )) || return 1
+    [[ "$SESSION_STATE" == active || "$SESSION_STATE" == cleanup_failed ]] || return 1
+    for value in "$SESSION_WORKER_PID" "$SESSION_WORKER_START" "$SESSION_LEADER_PID" \
+        "$SESSION_LEADER_START" "$SESSION_PGID" "$SESSION_SID"; do
+        [[ "$value" =~ ^[0-9]+$ ]] || return 1
+    done
+}
+
+cleanup_worker_session_state_file() {
+    local file="$1" expected_worker_pid="$2" expected_worker_start="$3"
+
+    [[ -e "$file" || -L "$file" ]] || return 0
+    read_worker_session_state "$file" || {
+        echo -e "${RED}${ICON_ERROR} worker session 状态文件不可信: $file${NC}" >&2
+        return 1
+    }
+    [[ "$SESSION_WORKER_PID" == "$expected_worker_pid" &&
+        "$SESSION_WORKER_START" == "$expected_worker_start" ]] || return 1
+    terminate_managed_session "$SESSION_LEADER_PID" "$SESSION_LEADER_START" \
+        "$SESSION_PGID" "$SESSION_SID" || return 1
+    rm -f -- "$file" || return 1
+}
+
+collect_owned_session_processes() {
+    local expected_sid="$1" members_variable="$2" pgids_variable="$3"
+    local stat_file pid pgid existing existing_pgid
+    local -n members_ref="$members_variable"
+    local -n pgids_ref="$pgids_variable"
+
+    members_ref=()
+    pgids_ref=()
+    for stat_file in /proc/[0-9]*/stat; do
+        [[ -r "$stat_file" ]] || continue
+        pid=${stat_file#/proc/}; pid=${pid%/stat}
+        read_process_stat "$pid" || continue
+        [[ "$PROC_SID" == "$expected_sid" && "$PROC_STATE" != Z ]] || continue
+        read_process_uid "$pid" || continue
+        if [[ "$PROC_UID" != "$EUID" ]]; then
+            echo -e "${RED}${ICON_ERROR} 受管 SID $expected_sid 包含不可信 UID 进程: $pid/$PROC_UID${NC}" >&2
+            return 2
+        fi
+        members_ref+=("$pid")
+        pgid=$PROC_PGID
+        existing=false
+        for existing_pgid in "${pgids_ref[@]}"; do
+            [[ "$existing_pgid" == "$pgid" ]] && existing=true
+        done
+        [[ "$existing" == true ]] || pgids_ref+=("$pgid")
+    done
 }
 
 owned_session_has_live_members() {
-    local expected_sid="$1" stat_file state sid
-    for stat_file in /proc/[0-9]*/stat; do
-        [[ -r "$stat_file" ]] || continue
-        read -r state sid < <(awk '{print $3, $6}' "$stat_file" 2>/dev/null) || continue
-        [[ "$sid" == "$expected_sid" && "$state" != Z ]] && return 0
+    local expected_sid="$1"
+    local -a members=() pgids=()
+    collect_owned_session_processes "$expected_sid" members pgids || return 2
+    (( ${#members[@]} > 0 ))
+}
+
+managed_leader_identity_trusted() {
+    local leader_pid="$1" leader_start="$2" expected_pgid="$3" expected_sid="$4"
+    if [[ ! -e "/proc/$leader_pid" ]]; then
+        return 0
+    fi
+    read_process_record "$leader_pid" || return 1
+    [[ "$PROC_UID" == "$EUID" && "$PROC_START" == "$leader_start" &&
+        "$PROC_PGID" == "$expected_pgid" && "$PROC_SID" == "$expected_sid" ]]
+}
+
+terminate_managed_session() {
+    local leader_pid="$1" leader_start="$2" expected_pgid="$3" expected_sid="$4"
+    local current_sid="" current_pgid="" pgid _ cleanup_failed=false
+    local -a members=() pgids=()
+
+    [[ "$leader_pid" =~ ^[0-9]+$ && "$leader_start" =~ ^[0-9]+$ &&
+        "$expected_pgid" =~ ^[0-9]+$ && "$expected_sid" =~ ^[0-9]+$ ]] || return 1
+    read_process_record "$$" || return 1
+    current_sid=$PROC_SID
+    current_pgid=$PROC_PGID
+    [[ "$expected_sid" != "$current_sid" ]] || return 1
+    managed_leader_identity_trusted "$leader_pid" "$leader_start" "$expected_pgid" "$expected_sid" || {
+        echo -e "${RED}${ICON_ERROR} 受管 session leader 身份不可信: $leader_pid${NC}" >&2
+        return 1
+    }
+    collect_owned_session_processes "$expected_sid" members pgids || return 1
+    (( ${#members[@]} > 0 )) || return 0
+
+    for pgid in "${pgids[@]}"; do
+        [[ "$pgid" =~ ^[0-9]+$ && "$pgid" != "$current_pgid" ]] || {
+            cleanup_failed=true
+            continue
+        }
+        kill -TERM -- "-$pgid" 2>/dev/null || true
     done
-    return 1
+    sleep 2
+    collect_owned_session_processes "$expected_sid" members pgids || cleanup_failed=true
+    if (( ${#members[@]} > 0 )); then
+        for pgid in "${pgids[@]}"; do
+            [[ "$pgid" =~ ^[0-9]+$ && "$pgid" != "$current_pgid" ]] || {
+                cleanup_failed=true
+                continue
+            }
+            kill -KILL -- "-$pgid" 2>/dev/null || true
+        done
+        sleep 0.2
+        collect_owned_session_processes "$expected_sid" members pgids || cleanup_failed=true
+    fi
+    if (( ${#members[@]} > 0 )); then
+        echo -e "${RED}${ICON_ERROR} 受管 SID $expected_sid 仍有活动 PID: ${members[*]}${NC}" >&2
+        cleanup_failed=true
+    fi
+    [[ "$cleanup_failed" == false ]]
 }
 
 worker_transfer_identity_matches() {
-    local pgid="" sid=""
     [[ -n "$WORKER_TRANSFER_PID" && -n "$WORKER_TRANSFER_START" ]] || return 1
-    process_identity_matches "$WORKER_TRANSFER_PID" "$WORKER_TRANSFER_START" || return 1
-    pgid=$(get_process_group_id "$WORKER_TRANSFER_PID") || return 1
-    sid=$(get_process_session_id "$WORKER_TRANSFER_PID") || return 1
-    [[ "$pgid" == "$WORKER_TRANSFER_PGID" && "$sid" == "$WORKER_TRANSFER_SID" &&
-        "$pgid" == "$WORKER_TRANSFER_PID" && "$sid" == "$WORKER_TRANSFER_PID" ]]
+    read_process_record "$WORKER_TRANSFER_PID" || return 1
+    [[ "$PROC_UID" == "$EUID" && "$PROC_START" == "$WORKER_TRANSFER_START" &&
+        "$PROC_PGID" == "$WORKER_TRANSFER_PGID" && "$PROC_SID" == "$WORKER_TRANSFER_SID" &&
+        "$PROC_PGID" == "$WORKER_TRANSFER_PID" && "$PROC_SID" == "$WORKER_TRANSFER_PID" ]]
+}
+
+worker_after_session_cleanup_hook() {
+    :
 }
 
 terminate_worker_transfer() {
-    local _ should_signal=false cleanup_failed=false
+    local cleanup_failed=false had_session=false
 
-    if worker_transfer_identity_matches; then
-        should_signal=true
-    elif [[ -n "$WORKER_TRANSFER_SID" ]] && owned_session_has_live_members "$WORKER_TRANSFER_SID"; then
-        should_signal=true
-    fi
-    if [[ "$should_signal" == true ]]; then
-        kill -TERM -- "-$WORKER_TRANSFER_PGID" 2>/dev/null || true
-        for _ in {1..20}; do
-            owned_session_has_live_members "$WORKER_TRANSFER_SID" || break
-            sleep 0.1
-        done
-        if owned_session_has_live_members "$WORKER_TRANSFER_SID"; then
-            kill -KILL -- "-$WORKER_TRANSFER_PGID" 2>/dev/null || true
-            for _ in {1..20}; do
-                owned_session_has_live_members "$WORKER_TRANSFER_SID" || break
-                sleep 0.05
-            done
+    if [[ -n "$WORKER_TRANSFER_PID" || -n "$WORKER_TRANSFER_PGID" ||
+        -n "$WORKER_TRANSFER_SID" || -n "$WORKER_TRANSFER_START" ]]; then
+        had_session=true
+        if [[ -z "$WORKER_TRANSFER_PID" || -z "$WORKER_TRANSFER_PGID" ||
+            -z "$WORKER_TRANSFER_SID" || -z "$WORKER_TRANSFER_START" ]] ||
+            ! terminate_managed_session "$WORKER_TRANSFER_PID" "$WORKER_TRANSFER_START" \
+                "$WORKER_TRANSFER_PGID" "$WORKER_TRANSFER_SID"; then
+            cleanup_failed=true
         fi
     fi
     [[ -z "$WORKER_TRANSFER_PID" ]] || wait "$WORKER_TRANSFER_PID" 2>/dev/null || true
-    if [[ -n "$WORKER_TRANSFER_SID" ]] && owned_session_has_live_members "$WORKER_TRANSFER_SID"; then
-        echo -e "${RED}${ICON_ERROR} 受管 session 仍有活动后代: $WORKER_TRANSFER_SID${NC}" >&2
+    if [[ "$cleanup_failed" == false && "$had_session" == true ]] && ! worker_after_session_cleanup_hook; then
         cleanup_failed=true
     fi
-    if [[ "$cleanup_failed" == false ]]; then
-        WORKER_TRANSFER_PID=""
-        WORKER_TRANSFER_PGID=""
-        WORKER_TRANSFER_SID=""
-        WORKER_TRANSFER_START=""
+    if [[ "$cleanup_failed" == false ]] && ! remove_worker_session_state; then
+        echo -e "${RED}${ICON_ERROR} managed session 已结束但状态文件删除失败: $WORKER_SESSION_STATE_FILE${NC}" >&2
+        cleanup_failed=true
     fi
-    [[ "$cleanup_failed" == false ]]
+    if [[ "$cleanup_failed" == true ]]; then
+        WORKER_TRANSFER_CLEANUP_FAILED=true
+        [[ -z "$WORKER_SESSION_STATE_FILE" ]] || publish_worker_session_state cleanup_failed || true
+        return 1
+    fi
+    WORKER_TRANSFER_PID=""
+    WORKER_TRANSFER_PGID=""
+    WORKER_TRANSFER_SID=""
+    WORKER_TRANSFER_START=""
+    WORKER_TRANSFER_CLEANUP_FAILED=false
+    WORKER_SESSION_STATE_FILE=""
+    return 0
 }
 
 worker_signal_handler() {
@@ -1115,9 +1557,27 @@ worker_signal_handler() {
 worker_exit_handler() {
     local status="$?"
     trap - EXIT
-    terminate_worker_transfer
+    if ! terminate_worker_transfer && (( status == 0 )); then
+        status=$MANAGED_CLEANUP_FAILURE_STATUS
+    fi
     [[ -z "$WORKER_OUTPUT_FILE" ]] || rm -f -- "$WORKER_OUTPUT_FILE" 2>/dev/null || true
     exit "$status"
+}
+
+clear_unpublished_exited_session() {
+    local -a members=() pgids=()
+    [[ -z "$WORKER_SESSION_STATE_FILE" && -n "$WORKER_TRANSFER_SID" ]] || return 1
+    collect_owned_session_processes "$WORKER_TRANSFER_SID" members pgids || return 1
+    if (( ${#members[@]} > 0 )); then
+        echo -e "${RED}${ICON_ERROR} 未发布身份的已退出 session 仍有活动成员: ${members[*]}${NC}" >&2
+        WORKER_TRANSFER_CLEANUP_FAILED=true
+        return 1
+    fi
+    WORKER_TRANSFER_PID=""
+    WORKER_TRANSFER_PGID=""
+    WORKER_TRANSFER_SID=""
+    WORKER_TRANSFER_START=""
+    WORKER_TRANSFER_CLEANUP_FAILED=false
 }
 
 run_managed_command() {
@@ -1126,6 +1586,13 @@ run_managed_command() {
     local -a command=("$@")
     local exit_code=0 pgid="" sid=""
 
+    if [[ "$WORKER_TRANSFER_CLEANUP_FAILED" == true ||
+        -n "$WORKER_TRANSFER_PID" || -n "$WORKER_TRANSFER_PGID" ||
+        -n "$WORKER_TRANSFER_SID" || -n "$WORKER_TRANSFER_START" ||
+        -n "$WORKER_SESSION_STATE_FILE" ]]; then
+        echo -e "${RED}${ICON_ERROR} 上一次 managed session 生命周期尚未清理，拒绝启动新命令${NC}" >&2
+        return "$MANAGED_CLEANUP_FAILURE_STATUS"
+    fi
     WORKER_OUTPUT_FILE="$output_file"
     if ! (umask 077; set -o noclobber; : > "$output_file") 2>/dev/null; then
         return 1
@@ -1145,10 +1612,19 @@ run_managed_command() {
     if [[ -z "$WORKER_TRANSFER_START" || "$pgid" != "$WORKER_TRANSFER_PID" || "$sid" != "$WORKER_TRANSFER_PID" ]]; then
         if ! job_is_active "$WORKER_TRANSFER_PID"; then
             if wait "$WORKER_TRANSFER_PID"; then exit_code=0; else exit_code=$?; fi
-            terminate_worker_transfer || return 1
+            clear_unpublished_exited_session || return "$MANAGED_CLEANUP_FAILURE_STATUS"
             return "$exit_code"
         fi
-        terminate_worker_transfer || true
+        if ! terminate_worker_transfer; then
+            return "$MANAGED_CLEANUP_FAILURE_STATUS"
+        fi
+        return 1
+    fi
+    if ! publish_worker_session_state active; then
+        echo -e "${RED}${ICON_ERROR} 无法发布 managed session 状态${NC}" >&2
+        if ! terminate_worker_transfer; then
+            return "$MANAGED_CLEANUP_FAILURE_STATUS"
+        fi
         return 1
     fi
     if wait "$WORKER_TRANSFER_PID"; then
@@ -1156,7 +1632,7 @@ run_managed_command() {
     else
         exit_code=$?
     fi
-    terminate_worker_transfer || return 1
+    terminate_worker_transfer || return "$MANAGED_CLEANUP_FAILURE_STATUS"
     return "$exit_code"
 }
 
@@ -1202,6 +1678,10 @@ retry_rsync() {
         WORKER_OUTPUT_FILE=""
         case "$exit_code" in
             0) return 0 ;;
+            "$MANAGED_CLEANUP_FAILURE_STATUS")
+                echo -e "${RED}${ICON_ERROR} managed session 清理失败，停止 rsync 重试${NC}" >&2
+                return "$MANAGED_CLEANUP_FAILURE_STATUS"
+                ;;
             23|24)
                 [[ -n "$output" ]] && echo -e "${RED}    $output${NC}" >&2
                 return 1
@@ -1255,14 +1735,19 @@ record_result() {
 }
 
 push_to_server() {
-    local server_info="$1" src="$2" dst="$3" index="$4" total="$5" display=""
+    local server_info="$1" src="$2" dst="$3" index="$4" total="$5" display="" transfer_status=0
     trap 'worker_signal_handler 129' HUP
     trap 'worker_signal_handler 130' INT
     trap 'worker_signal_handler 143' TERM
     trap worker_exit_handler EXIT
     display=$(format_server_info "$server_info") || return 1
     echo -e "${BLUE}[${index}/${total}]${NC} ${ICON_WORKING} ${CYAN}$display${NC}"
-    if retry_rsync "$server_info" "$src" "$dst"; then
+    retry_rsync "$server_info" "$src" "$dst" || transfer_status=$?
+    if (( transfer_status == MANAGED_CLEANUP_FAILURE_STATUS )); then
+        echo -e "${RED}${ICON_ERROR} $display managed session 清理失败${NC}" >&2
+        return "$MANAGED_CLEANUP_FAILURE_STATUS"
+    fi
+    if (( transfer_status == 0 )); then
         if ! record_result success "$server_info"; then
             echo -e "${RED}${ICON_ERROR} $display 传输成功但结果记录失败${NC}" >&2
             return 1
@@ -1290,6 +1775,8 @@ launch_worker() {
     done
     if [[ -n "$start" ]]; then
         ACTIVE_WORKERS["$pid"]="$start"
+        ACTIVE_WORKER_STATE_FILES["$pid"]="$TEMP_DIR/worker-session.$pid.state"
+        ACTIVE_WORKER_STATE_STARTS["$pid"]="$start"
     else
         wait "$pid" || wait_status=$?
         (( wait_status == 0 || wait_status == 127 )) || BATCH_WORKER_FAILED=true
@@ -1415,6 +1902,10 @@ test_authentication() {
             status=1
         }
         WORKER_OUTPUT_FILE=""
+        if (( exit_code == MANAGED_CLEANUP_FAILURE_STATUS )); then
+            echo -e "${RED}${ICON_ERROR} 认证 session 清理失败，停止后续服务器${NC}" >&2
+            return "$MANAGED_CLEANUP_FAILURE_STATUS"
+        fi
         if (( exit_code == 0 )); then
             echo -e "${GREEN}${ICON_SUCCESS} $display:$port 认证成功${NC}"
         else
