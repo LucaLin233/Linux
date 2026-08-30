@@ -67,6 +67,7 @@ declare -A ACTIVE_WORKERS=()
 declare -A ACTIVE_WORKER_STATE_FILES=()
 declare -A ACTIVE_WORKER_STATE_STARTS=()
 BATCH_WORKER_FAILED=false
+BATCH_WORKER_ERROR=false
 MANAGED_CLEANUP_FAILURE_STATUS=125
 RUNTIME_ALLOCATOR_COLLISION_STATUS=17
 declare -a CONFIG_SERVERS_BUFFER=()
@@ -882,13 +883,61 @@ job_is_active() {
     return 1
 }
 
+record_worker_wait_status() {
+    local wait_status="$1"
+    if (( wait_status == MANAGED_CLEANUP_FAILURE_STATUS )); then
+        BATCH_WORKER_FAILED=true
+    elif (( wait_status != 0 && wait_status != 127 )); then
+        BATCH_WORKER_ERROR=true
+    fi
+}
+
+runtime_has_published_worker_state() {
+    local state_file
+    [[ -n "$TEMP_DIR" ]] || return 1
+    for state_file in "$TEMP_DIR"/worker-session.*.state; do
+        [[ -e "$state_file" || -L "$state_file" ]] && return 0
+    done
+    return 1
+}
+
+has_unresolved_exited_worker_state() {
+    local worker_pid state_file
+    for worker_pid in "${!ACTIVE_WORKER_STATE_FILES[@]}"; do
+        [[ -n "${ACTIVE_WORKERS[$worker_pid]:-}" ]] && continue
+        state_file=${ACTIVE_WORKER_STATE_FILES[$worker_pid]}
+        if [[ -e "$state_file" || -L "$state_file" ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+batch_schedule_barrier_present() {
+    [[ "$BATCH_WORKER_FAILED" == true ]] || has_unresolved_exited_worker_state
+}
+
+reset_batch_lifecycle_barrier() {
+    if (( ${#ACTIVE_WORKERS[@]} != 0 || ${#ACTIVE_WORKER_STATE_FILES[@]} != 0 ||
+        ${#ACTIVE_WORKER_STATE_STARTS[@]} != 0 )) ||
+        [[ -n "$WORKER_TRANSFER_PID" || -n "$WORKER_TRANSFER_PGID" ||
+            -n "$WORKER_TRANSFER_SID" || -n "$WORKER_TRANSFER_START" ||
+            -n "$WORKER_SESSION_STATE_FILE" || "$WORKER_TRANSFER_CLEANUP_FAILED" == true ]] ||
+        runtime_has_published_worker_state; then
+        echo -e "${RED}${ICON_ERROR} worker lifecycle barrier 尚未安全清空${NC}" >&2
+        return 1
+    fi
+    BATCH_WORKER_FAILED=false
+    BATCH_WORKER_ERROR=false
+}
+
 prune_active_workers() {
     local pid wait_status=0
     for pid in "${!ACTIVE_WORKERS[@]}"; do
         if ! job_is_active "$pid" || ! process_identity_matches "$pid" "${ACTIVE_WORKERS[$pid]}"; then
             wait_status=0
             wait "$pid" 2>/dev/null || wait_status=$?
-            (( wait_status == 0 || wait_status == 127 )) || BATCH_WORKER_FAILED=true
+            record_worker_wait_status "$wait_status"
             unset 'ACTIVE_WORKERS[$pid]'
             if [[ -n "${ACTIVE_WORKER_STATE_FILES[$pid]:-}" &&
                 ! -e "${ACTIVE_WORKER_STATE_FILES[$pid]}" && ! -L "${ACTIVE_WORKER_STATE_FILES[$pid]}" ]]; then
@@ -1779,7 +1828,7 @@ launch_worker() {
         ACTIVE_WORKER_STATE_STARTS["$pid"]="$start"
     else
         wait "$pid" || wait_status=$?
-        (( wait_status == 0 || wait_status == 127 )) || BATCH_WORKER_FAILED=true
+        record_worker_wait_status "$wait_status"
     fi
 }
 
@@ -1787,20 +1836,45 @@ wait_for_worker_slot() {
     local wait_status=0
     while :; do
         prune_active_workers
+        if batch_schedule_barrier_present; then
+            return "$MANAGED_CLEANUP_FAILURE_STATUS"
+        fi
         (( ${#ACTIVE_WORKERS[@]} < MAX_PARALLEL )) && return 0
+
         wait_status=0
         wait -n 2>/dev/null || wait_status=$?
-        (( wait_status == 0 || wait_status == 127 )) || BATCH_WORKER_FAILED=true
+        record_worker_wait_status "$wait_status"
+        if [[ "$BATCH_WORKER_FAILED" == true ]]; then
+            return "$MANAGED_CLEANUP_FAILURE_STATUS"
+        fi
+
+        prune_active_workers
+        if batch_schedule_barrier_present; then
+            return "$MANAGED_CLEANUP_FAILURE_STATUS"
+        fi
     done
 }
 
 wait_for_all_workers() {
     local wait_status=0
-    while (( ${#ACTIVE_WORKERS[@]} > 0 )); do
+    while :; do
+        prune_active_workers
+        if batch_schedule_barrier_present; then
+            return "$MANAGED_CLEANUP_FAILURE_STATUS"
+        fi
+        (( ${#ACTIVE_WORKERS[@]} == 0 )) && return 0
+
         wait_status=0
         wait -n 2>/dev/null || wait_status=$?
-        (( wait_status == 0 || wait_status == 127 )) || BATCH_WORKER_FAILED=true
+        record_worker_wait_status "$wait_status"
+        if [[ "$BATCH_WORKER_FAILED" == true ]]; then
+            return "$MANAGED_CLEANUP_FAILURE_STATUS"
+        fi
+
         prune_active_workers
+        if batch_schedule_barrier_present; then
+            return "$MANAGED_CLEANUP_FAILURE_STATUS"
+        fi
     done
 }
 
@@ -1810,26 +1884,70 @@ result_line_count() {
     wc -l < "$file"
 }
 
+stop_batch_after_lifecycle_failure() {
+    BATCH_WORKER_FAILED=true
+    if ! terminate_active_workers; then
+        echo -e "${RED}${ICON_ERROR} batch lifecycle 清理未完成，已保留 runtime 与状态文件${NC}" >&2
+    fi
+    return "$MANAGED_CLEANUP_FAILURE_STATUS"
+}
+
 run_server_batch() {
     local src="$1" dst="$2"
     shift 2
     local -a servers=("$@")
-    local index=0 total=${#servers[@]} server
+    local index=0 total=${#servers[@]} server wait_status=0
     local success_before failed_before success_after failed_after recorded
 
+    if [[ "$BATCH_WORKER_FAILED" == true || ${#ACTIVE_WORKERS[@]} -ne 0 ||
+        ${#ACTIVE_WORKER_STATE_FILES[@]} -ne 0 || ${#ACTIVE_WORKER_STATE_STARTS[@]} -ne 0 ]] || runtime_has_published_worker_state; then
+        echo -e "${RED}${ICON_ERROR} 旧 batch lifecycle barrier 尚未安全 reset${NC}" >&2
+        return "$MANAGED_CLEANUP_FAILURE_STATUS"
+    fi
+
+    BATCH_WORKER_ERROR=false
     success_before=$(result_line_count "$SUCCESS_FILE") || return 1
     failed_before=$(result_line_count "$FAILED_FILE") || return 1
-    BATCH_WORKER_FAILED=false
     for server in "${servers[@]}"; do
         ((index += 1))
-        wait_for_worker_slot || return 1
+        wait_status=0
+        wait_for_worker_slot || wait_status=$?
+        if (( wait_status == MANAGED_CLEANUP_FAILURE_STATUS )); then
+            stop_batch_after_lifecycle_failure
+            return "$MANAGED_CLEANUP_FAILURE_STATUS"
+        elif (( wait_status != 0 )); then
+            return "$wait_status"
+        fi
+
+        if batch_schedule_barrier_present; then
+            stop_batch_after_lifecycle_failure
+            return "$MANAGED_CLEANUP_FAILURE_STATUS"
+        fi
         launch_worker "$server" "$src" "$dst" "$index" "$total"
+        prune_active_workers
+        if batch_schedule_barrier_present; then
+            stop_batch_after_lifecycle_failure
+            return "$MANAGED_CLEANUP_FAILURE_STATUS"
+        fi
     done
-    wait_for_all_workers
+
+    wait_status=0
+    wait_for_all_workers || wait_status=$?
+    if (( wait_status == MANAGED_CLEANUP_FAILURE_STATUS )); then
+        stop_batch_after_lifecycle_failure
+        return "$MANAGED_CLEANUP_FAILURE_STATUS"
+    elif (( wait_status != 0 )); then
+        return "$wait_status"
+    fi
+
     success_after=$(result_line_count "$SUCCESS_FILE") || return 1
     failed_after=$(result_line_count "$FAILED_FILE") || return 1
     recorded=$((success_after - success_before + failed_after - failed_before))
-    if [[ "$BATCH_WORKER_FAILED" == true || "$recorded" -ne "$total" ]]; then
+    if [[ "$BATCH_WORKER_FAILED" == true ]]; then
+        stop_batch_after_lifecycle_failure
+        return "$MANAGED_CLEANUP_FAILURE_STATUS"
+    fi
+    if [[ "$BATCH_WORKER_ERROR" == true || "$recorded" -ne "$total" ]]; then
         echo -e "${RED}${ICON_ERROR} batch accounting 不完整: expected=$total recorded=$recorded${NC}" >&2
         return 1
     fi
@@ -1954,13 +2072,23 @@ resolve_transfer_arguments() {
 }
 
 run_transfer() {
-    local src="$1" dst="$2" final_failed=0
-    if ! run_server_batch "$src" "$dst" "${SERVERS[@]}"; then
+    local src="$1" dst="$2" final_failed=0 batch_status=0 retry_status=0
+
+    run_server_batch "$src" "$dst" "${SERVERS[@]}" || batch_status=$?
+    if (( batch_status == MANAGED_CLEANUP_FAILURE_STATUS )); then
+        echo -e "${RED}${ICON_ERROR} batch lifecycle failure，停止汇总与交互重试${NC}" >&2
+        return "$MANAGED_CLEANUP_FAILURE_STATUS"
+    elif (( batch_status != 0 )); then
         echo -e "${RED}${ICON_ERROR} 结果记录不完整，拒绝输出成功汇总${NC}" >&2
         return 1
     fi
+
     show_summary
-    if ! interactive_retry "$src" "$dst"; then
+    interactive_retry "$src" "$dst" || retry_status=$?
+    if (( retry_status == MANAGED_CLEANUP_FAILURE_STATUS )); then
+        echo -e "${RED}${ICON_ERROR} 重试 batch lifecycle failure${NC}" >&2
+        return "$MANAGED_CLEANUP_FAILURE_STATUS"
+    elif (( retry_status != 0 )); then
         echo -e "${RED}${ICON_ERROR} 重试结果记录不完整${NC}" >&2
         return 1
     fi

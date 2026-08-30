@@ -230,7 +230,7 @@ run_runtime_allocator_signal_case() {
     wait "$pid" || rc=$?
     kill "$watchdog" 2>/dev/null || true; wait "$watchdog" 2>/dev/null || true
     assert_eq "$expected_status" "$rc" "$delivery $signal_name during allocator post-mkdir window returns conventional status"
-    for _ in $(seq 1 20); do
+    for _ in $(seq 1 100); do
         [[ -z "$(find "$root/runtime" -mindepth 1 -maxdepth 1 -name 'push-runtime.*' -print -quit)" ]] && break
         sleep 0.05
     done
@@ -1239,12 +1239,120 @@ EOF
         if [[ "$BASHPID" != "$main_state_owner_pid" ]]; then return 1; fi
         original_terminate_managed_session "$@"
     }
-    assert_fail "worker cleanup failure makes batch fail" run_server_batch source destination good.example
-    (( ${#ACTIVE_WORKER_STATE_FILES[@]} == 1 )) || fail "worker cleanup failure was not published to main"
-    cleanup_published_worker_sessions
+    rc=0; run_server_batch source destination good.example || rc=$?
+    assert_eq "$MANAGED_CLEANUP_FAILURE_STATUS" "$rc" "worker cleanup failure makes batch return lifecycle status"
+    assert_eq 0 "${#ACTIVE_WORKERS[@]}" "main fallback leaves no active worker"
     assert_eq 0 "${#ACTIVE_WORKER_STATE_FILES[@]}" "main fallback consumes worker cleanup state"
-    pass "worker cleanup failure is recoverable by main from trusted state file"
+    [[ "$BATCH_WORKER_FAILED" == true ]] || fail "worker cleanup failure did not retain global batch barrier"
+    pass "worker cleanup failure is recovered by main but barrier remains"
     eval "$(declare -f original_terminate_managed_session | sed '1s/original_terminate_managed_session/terminate_managed_session/')"
+    reset_batch_lifecycle_barrier
+    cleanup_runtime
+)
+
+setup_batch_lifecycle_fixture() {
+    local root="$1"
+    mkdir -m 0700 "$root" "$root/bin" "$root/runtime" "$root/capture"
+    cat > "$root/bin/timeout" <<'EOF'
+#!/usr/bin/env bash
+[[ ${1:-} == --kill-after=* ]] && shift
+shift
+exec "$@"
+EOF
+    cat > "$root/bin/rsync" <<'EOF'
+#!/usr/bin/env bash
+last=${!#}
+exec 9>>"$CAPTURE_DIR/calls.lock"
+flock -x 9
+printf '%s\n' "$last" >> "$CAPTURE_DIR/calls"
+flock -u 9
+for host in one.example two.example three.example four.example recovered.example; do
+    [[ "$last" == *"$host"* ]] && touch "$CAPTURE_DIR/$host"
+done
+for _ in {1..100}; do
+    current=$(wc -l < "$CAPTURE_DIR/calls")
+    (( current >= ${BATCH_FIXTURE_EXPECTED_STARTS:-1} )) && break
+    sleep 0.05
+done
+sleep 0.2
+exit 0
+EOF
+    chmod 0700 "$root/bin"/*
+    PATH="$root/bin:$PATH"; export PATH CAPTURE_DIR="$root/capture"
+    BATCH_FIXTURE_EXPECTED_STARTS=1; export BATCH_FIXTURE_EXPECTED_STARTS
+    TMPDIR="$root/runtime"; initialize_runtime
+    AUTH_METHOD=key; RUNTIME_KEY_FILE="$TEMP_DIR/key"; printf key > "$RUNTIME_KEY_FILE"; chmod 0600 "$RUNTIME_KEY_FILE"
+    SSH_WRAPPER="$TEMP_DIR/wrapper"; printf '#!/usr/bin/env bash\nexit 0\n' > "$SSH_WRAPPER"; chmod 0700 "$SSH_WRAPPER"
+    STRICT_HOST_KEY_CHECKING=accept-new; USER_KNOWN_HOSTS_FILE="$root/known_hosts"; ALLOW_INSECURE_HOST_KEY_STORAGE=false; prepare_known_hosts
+    CONNECTION_TIMEOUT=2; TOTAL_TIMEOUT=5; TIMEOUT_KILL_AFTER=1; MAX_RETRIES=1; RETRY_DELAY=1
+    RSYNC_ARCHIVE=true; RSYNC_COMPRESS=false; DELETE_EXTRA=false
+}
+
+(
+    trap - EXIT HUP INT TERM
+    root="$TEST_DIR/batch-barrier-serial"
+    setup_batch_lifecycle_fixture "$root"
+    MAX_PARALLEL=1
+    eval "$(declare -f terminate_managed_session | sed '1s/terminate_managed_session/original_terminate_managed_session/')"
+    terminate_managed_session() { return 1; }
+
+    rc=0; run_server_batch source destination one.example two.example three.example > "$root/first.log" 2>&1 || rc=$?
+    assert_eq "$MANAGED_CLEANUP_FAILURE_STATUS" "$rc" "serial batch returns lifecycle cleanup status"
+    assert_eq 1 "$(wc -l < "$root/capture/calls")" "serial cleanup failure starts exactly one rsync"
+    [[ -e "$root/capture/one.example" && ! -e "$root/capture/two.example" && ! -e "$root/capture/three.example" ]] || fail "serial barrier launched a later server"
+    if grep -Fq '成功:' "$root/first.log"; then fail "serial lifecycle failure printed success summary"; fi
+    assert_eq 1 "${#ACTIVE_WORKER_STATE_FILES[@]}" "serial failure preserves first worker state file"
+    state_file=${ACTIVE_WORKER_STATE_FILES[${!ACTIVE_WORKER_STATE_FILES[@]}]}
+    state_hash=$(sha256sum "$state_file")
+
+    rc=0; run_server_batch source destination four.example > "$root/second.log" 2>&1 || rc=$?
+    assert_eq "$MANAGED_CLEANUP_FAILURE_STATUS" "$rc" "second batch is rejected by lifecycle barrier"
+    assert_eq 1 "$(wc -l < "$root/capture/calls")" "second batch starts no additional rsync"
+    assert_eq "$state_hash" "$(sha256sum "$state_file")" "second batch preserves old worker state"
+    pass "serial cleanup barrier blocks later servers and subsequent batches"
+
+    eval "$(declare -f original_terminate_managed_session | sed '1s/original_terminate_managed_session/terminate_managed_session/')"
+    terminate_active_workers
+    assert_eq 0 "${#ACTIVE_WORKERS[@]}" "barrier recovery clears active workers"
+    assert_eq 0 "${#ACTIVE_WORKER_STATE_FILES[@]}" "barrier recovery clears published states"
+    assert_eq 0 "${#ACTIVE_WORKER_STATE_STARTS[@]}" "barrier recovery clears state identities"
+    runtime_has_published_worker_state && fail "barrier recovery left a runtime state file"
+    reset_batch_lifecycle_barrier
+    [[ "$BATCH_WORKER_FAILED" == false ]] || fail "safe barrier reset did not clear flag"
+    run_server_batch source destination recovered.example
+    assert_eq 2 "$(wc -l < "$root/capture/calls")" "new batch starts only after explicit safe reset"
+    [[ -e "$root/capture/recovered.example" ]] || fail "recovered batch did not run"
+    pass "barrier recovery permits a new batch after complete cleanup and reset"
+    cleanup_runtime
+)
+
+(
+    trap - EXIT HUP INT TERM
+    root="$TEST_DIR/batch-barrier-parallel"
+    setup_batch_lifecycle_fixture "$root"
+    MAX_PARALLEL=2
+    BATCH_FIXTURE_EXPECTED_STARTS=2; export BATCH_FIXTURE_EXPECTED_STARTS
+    sleep 60 & unrelated=$!
+    eval "$(declare -f terminate_managed_session | sed '1s/terminate_managed_session/original_terminate_managed_session/')"
+    main_batch_owner=$BASHPID
+    terminate_managed_session() {
+        if [[ "$BASHPID" != "$main_batch_owner" ]]; then return 1; fi
+        original_terminate_managed_session "$@"
+    }
+
+    rc=0; run_server_batch source destination one.example two.example three.example four.example > "$root/output.log" 2>&1 || rc=$?
+    assert_eq "$MANAGED_CLEANUP_FAILURE_STATUS" "$rc" "parallel batch returns lifecycle cleanup status"
+    assert_eq 2 "$(wc -l < "$root/capture/calls")" "parallel cleanup failure starts only first two rsync commands"
+    [[ -e "$root/capture/one.example" && -e "$root/capture/two.example" ]] || fail "parallel fixture did not start first two servers"
+    [[ ! -e "$root/capture/three.example" && ! -e "$root/capture/four.example" ]] || fail "parallel barrier launched waiting servers"
+    assert_eq 0 "${#ACTIVE_WORKERS[@]}" "parallel barrier safely stops or waits active workers"
+    assert_eq 0 "${#ACTIVE_WORKER_STATE_FILES[@]}" "parallel barrier executes published session fallback"
+    kill -0 "$unrelated" 2>/dev/null || fail "parallel barrier terminated unrelated process"
+    pass "parallel barrier stops scheduling and preserves unrelated processes"
+
+    eval "$(declare -f original_terminate_managed_session | sed '1s/original_terminate_managed_session/terminate_managed_session/')"
+    reset_batch_lifecycle_barrier
+    kill "$unrelated" 2>/dev/null || true; wait "$unrelated" 2>/dev/null || true
     cleanup_runtime
 )
 
