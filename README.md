@@ -392,16 +392,24 @@ cd Linux
 
 默认生成当前目录的 `config.conf`，采用排他创建且权限为 `600`；已有文件、目录或符号链接均不会被覆盖。
 `tools/push.sh` 已带可执行位，可直接使用上述 `./tools/push.sh` 命令。配置作为受信任 Bash 文件从已验证的
-文件描述符加载，只接受当前运行用户所有、当前 GID、可读且禁止组或其他用户写入的普通文件。
+文件描述符加载，只接受当前运行用户和当前 GID 所有、权限严格为 `0400` 或 `0600` 的普通文件。
+旧配置若为 `0644`、`0640` 等权限，运行前必须执行 `chmod 600 config.conf`。
 
 `--test-auth` 会连接全部配置服务器，并仅执行无副作用的 SSH `true`；不会运行 rsync，也不会写入或删除
-远端文件。密钥文件必须为当前用户和 GID 所有、权限 `0400` 或 `0600`；脚本会将已验证内容复制到
-`0700` runtime 目录中的 `0600` 临时副本。密码文件必须为当前用户和 GID 所有且权限严格为 `0600`。
-临时密钥和 `SSHPASS` 会在正常退出、失败以及 HUP/INT/TERM 后清理。
+远端文件。认证和传输都在独立 session/process group 中运行，并使用 `TOTAL_TIMEOUT` 加短固定
+TERM→KILL 宽限，HUP/INT/TERM 会清理 timeout、sshpass、ssh/rsync 及其后代。密钥模式通过
+`-F none`、`IdentitiesOnly=yes`、`IdentityAgent=none` 和禁用 ControlMaster 等参数，只允许使用
+runtime 内的私钥副本；密码模式禁用 publickey 并限制为一次密码提示。私钥文件必须为当前用户和 GID
+所有、权限 `0400` 或 `0600`；密码文件必须为当前用户和 GID 所有且严格为 `0600`。临时密钥和
+`SSHPASS` 会在正常退出、失败以及信号退出后清理。runtime 在创建首个目录前安装清理 traps，并拒绝
+非 sticky 可写、owner/GID 不可信或包含符号链接组件的 `TMPDIR` 路径。
 
-默认持久化 `known_hosts`。其父目录必须由当前用户和 GID 所有且禁止组或其他用户写入；文件必须是
-当前用户和 GID 所有、owner 可读写且禁止组或其他用户写入的普通文件，安全的 `0600`/`0644` 均可。
-将其指向 `/dev/null` 仍须显式设置 `ALLOW_INSECURE_HOST_KEY_STORAGE="true"`，并会输出 MITM 警告。
+默认持久化 `known_hosts`。脚本会验证从根目录到文件父目录的完整目录链；普通目录不得由组或其他用户
+写入，标准 root:root sticky `/tmp` 仍受支持，任意符号链接组件和非 sticky 可写祖先均会被拒绝。
+传给 OpenSSH 的路径只允许字母、数字、点、下划线、斜杠和连字符，避免 `%h`、`${VAR}`、空白、
+引号或反斜杠被再次解释。文件必须为当前用户和 GID 所有、owner 可读写且禁止组或其他用户写入，
+安全的 `0600`/`0644` 均可。将其指向 `/dev/null` 仍须显式设置
+`ALLOW_INSECURE_HOST_KEY_STORAGE="true"`，并会输出 MITM 警告。
 
 示例配置默认 `DELETE_EXTRA="false"`，不会删除目标端多余文件。启用删除时，交互执行必须输入
 `DELETE`；非交互执行还须显式设置 `ALLOW_DELETE_EXTRA="true"`。rsync 使用参数数组、

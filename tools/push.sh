@@ -18,6 +18,7 @@ ICON_WARNING="⚠️ "; ICON_CONFIG="⚙️ "; ICON_LOCK="🔒"
 
 CONNECTION_TIMEOUT=30
 TOTAL_TIMEOUT=300
+TIMEOUT_KILL_AFTER=2
 MAX_RETRIES=3
 RETRY_DELAY=5
 
@@ -28,21 +29,32 @@ SSH_WRAPPER=""
 RUNTIME_KEY_FILE=""
 TEMP_DIR_DEV=""
 TEMP_DIR_INODE=""
+RUNTIME_STATE="none"
+RUNTIME_PARENT=""
+RUNTIME_PARENT_DEV=""
+RUNTIME_PARENT_INODE=""
 RUNTIME_INITIALIZED=false
 RUNTIME_CLEANUP_ACTIVE=false
 RUNTIME_TRAPS_INSTALLED=false
+RUNTIME_ALLOCATION_CRITICAL=false
+RUNTIME_PENDING_SIGNAL=""
+RUNTIME_PENDING_SIGNAL_STATUS=0
 
 PARSED_PORT=""
-PARSED_TARGET=""
+PARSED_SSH_TARGET=""
+PARSED_RSYNC_TARGET=""
+PARSED_DISPLAY_TARGET=""
 
 WORKER_TRANSFER_PID=""
 WORKER_TRANSFER_PGID=""
+WORKER_TRANSFER_SID=""
 WORKER_TRANSFER_START=""
 WORKER_OUTPUT_FILE=""
 
 declare -a SERVERS=()
 declare -A TASKS=()
 declare -A ACTIVE_WORKERS=()
+BATCH_WORKER_FAILED=false
 declare -a CONFIG_SERVERS_BUFFER=()
 declare -A CONFIG_TASKS_BUFFER=()
 
@@ -97,8 +109,8 @@ validate_opened_file_metadata() {
 
     case "$purpose" in
         config)
-            (( (mode_value & 0022) == 0 )) || {
-                echo -e "${RED}${ICON_ERROR} 配置文件不能允许组或其他用户写入${NC}" >&2
+            [[ "$mode" == 400 || "$mode" == 600 ]] || {
+                echo -e "${RED}${ICON_ERROR} 配置文件权限必须是 0400 或 0600${NC}" >&2
                 return 1
             }
             ;;
@@ -276,6 +288,53 @@ path_has_symlink_component() {
     return 1
 }
 
+trusted_directory_component() {
+    local directory="$1" metadata="" owner gid mode trusted_gid mode_value=0
+
+    [[ -d "$directory" && ! -L "$directory" && -x "$directory" ]] || return 1
+    metadata=$(stat -Lc '%u:%g:%a' -- "$directory" 2>/dev/null) || return 1
+    IFS=: read -r owner gid mode <<< "$metadata"
+    trusted_gid=$(current_gid) || return 1
+    [[ "$mode" =~ ^[0-7]{3,4}$ ]] || return 1
+    mode_value=$((8#$mode))
+    if (( (mode_value & 0022) != 0 )); then
+        (( (mode_value & 01000) != 0 )) || return 1
+        [[ "$owner" == 0 && "$gid" == 0 ]] || return 1
+    else
+        [[ ( "$owner" == 0 && "$gid" == 0 ) ||
+            ( "$owner" == "$EUID" && "$gid" == "$trusted_gid" ) ]] || return 1
+    fi
+}
+
+validate_existing_directory_chain() {
+    local directory="$1" current="/" component
+    local -a components=()
+
+    [[ "$directory" == /* ]] || return 1
+    path_has_symlink_component "$directory" && return 1
+    trusted_directory_component / || return 1
+    IFS=/ read -r -a components <<< "${directory#/}"
+    for component in "${components[@]}"; do
+        [[ -n "$component" ]] || continue
+        if [[ "$current" == / ]]; then
+            current="/$component"
+        else
+            current="$current/$component"
+        fi
+        [[ -e "$current" ]] || return 1
+        trusted_directory_component "$current" || return 1
+    done
+}
+
+capture_directory_identity() {
+    local directory="$1" dev_variable="$2" inode_variable="$3"
+    local metadata="" captured_dev captured_inode
+    metadata=$(stat -Lc '%d:%i' -- "$directory" 2>/dev/null) || return 1
+    IFS=: read -r captured_dev captured_inode <<< "$metadata"
+    printf -v "$dev_variable" '%s' "$captured_dev"
+    printf -v "$inode_variable" '%s' "$captured_inode"
+}
+
 secure_directory_metadata() {
     local directory="$1" metadata="" owner gid mode
     local trusted_gid="" mode_value=0
@@ -393,15 +452,19 @@ parse_server_info() {
 
     PARSED_PORT="$port"
     if [[ "$host" == *:* ]]; then
-        PARSED_TARGET="$user@[$host]"
+        PARSED_SSH_TARGET="$user@$host"
+        PARSED_RSYNC_TARGET="$user@[$host]"
+        PARSED_DISPLAY_TARGET="$user@[$host]"
     else
-        PARSED_TARGET="$user@$host"
+        PARSED_SSH_TARGET="$user@$host"
+        PARSED_RSYNC_TARGET="$user@$host"
+        PARSED_DISPLAY_TARGET="$user@$host"
     fi
 }
 
 format_server_info() {
     parse_server_info "$1" || return 1
-    printf '%s:%s\n' "$PARSED_TARGET" "$PARSED_PORT"
+    printf '%s:%s\n' "$PARSED_DISPLAY_TARGET" "$PARSED_PORT"
 }
 
 validate_config() {
@@ -461,62 +524,121 @@ validate_config() {
     }
 }
 
-runtime_directory_trusted() {
+runtime_begin_allocation_critical() {
+    [[ "$RUNTIME_ALLOCATION_CRITICAL" == false ]] || return 1
+    RUNTIME_PENDING_SIGNAL=""
+    RUNTIME_PENDING_SIGNAL_STATUS=0
+    RUNTIME_ALLOCATION_CRITICAL=true
+}
+
+runtime_end_allocation_critical() {
+    local signal_name="" signal_status=0
+    RUNTIME_ALLOCATION_CRITICAL=false
+    signal_name="$RUNTIME_PENDING_SIGNAL"
+    signal_status="$RUNTIME_PENDING_SIGNAL_STATUS"
+    RUNTIME_PENDING_SIGNAL=""
+    RUNTIME_PENDING_SIGNAL_STATUS=0
+    if [[ -n "$signal_name" ]]; then
+        runtime_signal_handler "$signal_name" "$signal_status"
+    fi
+}
+
+runtime_building_hook() {
+    :
+}
+
+runtime_parent_trusted() {
+    local dev="" inode=""
+    [[ -n "$RUNTIME_PARENT" && -d "$RUNTIME_PARENT" && ! -L "$RUNTIME_PARENT" ]] || return 1
+    validate_existing_directory_chain "$RUNTIME_PARENT" || return 1
+    capture_directory_identity "$RUNTIME_PARENT" dev inode || return 1
+    [[ "$dev" == "$RUNTIME_PARENT_DEV" && "$inode" == "$RUNTIME_PARENT_INODE" ]]
+}
+
+runtime_building_directory_trusted() {
     local metadata="" dev inode owner gid mode trusted_gid
+    runtime_parent_trusted || return 1
     [[ -n "$TEMP_DIR" && -d "$TEMP_DIR" && ! -L "$TEMP_DIR" ]] || return 1
     metadata=$(stat -Lc '%d:%i:%u:%g:%a' -- "$TEMP_DIR" 2>/dev/null) || return 1
     IFS=: read -r dev inode owner gid mode <<< "$metadata"
     trusted_gid=$(current_gid) || return 1
-    [[ "$dev" == "$TEMP_DIR_DEV" && "$inode" == "$TEMP_DIR_INODE" && "$owner" == "$EUID" && "$gid" == "$trusted_gid" && "$mode" == 700 ]]
+    [[ "$owner" == "$EUID" && "$gid" == "$trusted_gid" && "$mode" == 700 ]] || return 1
+    if [[ -n "$TEMP_DIR_DEV" || -n "$TEMP_DIR_INODE" ]]; then
+        [[ "$dev" == "$TEMP_DIR_DEV" && "$inode" == "$TEMP_DIR_INODE" ]] || return 1
+    fi
+}
+
+runtime_directory_trusted() {
+    [[ "$RUNTIME_STATE" == initialized ]] || return 1
+    runtime_building_directory_trusted
 }
 
 initialize_runtime() {
     local parent="${TMPDIR:-/tmp}" candidate="" metadata=""
     local dev inode owner gid mode trusted_gid
-    local success_file failed_file wrapper
+    local success_file failed_file wrapper parent_dev parent_inode
 
-    [[ "$RUNTIME_INITIALIZED" == false && -z "$TEMP_DIR" ]] || return 1
+    [[ "$RUNTIME_STATE" == none && "$RUNTIME_INITIALIZED" == false && -z "$TEMP_DIR" ]] || return 1
     [[ "$parent" =~ ^[A-Za-z0-9_./-]+$ ]] || {
         echo -e "${RED}${ICON_ERROR} TMPDIR 包含不适合 rsync remote-shell 参数的字符: $parent${NC}" >&2
         return 1
     }
-    [[ -d "$parent" && ! -L "$parent" ]] || return 1
-    candidate=$(mktemp -d "$parent/push-runtime.XXXXXXXXXX") || {
-        echo -e "${RED}${ICON_ERROR} 无法创建 push runtime 目录${NC}" >&2
+    validate_existing_directory_chain "$parent" || {
+        echo -e "${RED}${ICON_ERROR} TMPDIR 路径包含可替换或不可信目录: $parent${NC}" >&2
         return 1
     }
+    capture_directory_identity "$parent" parent_dev parent_inode || return 1
+    RUNTIME_PARENT="$parent"
+    RUNTIME_PARENT_DEV="$parent_dev"
+    RUNTIME_PARENT_INODE="$parent_inode"
+
+    runtime_begin_allocation_critical || return 1
+    if candidate=$(mktemp -d "$parent/push-runtime.XXXXXXXXXX"); then
+        TEMP_DIR="$candidate"
+        RUNTIME_STATE=building
+    else
+        candidate=""
+    fi
+    runtime_end_allocation_critical
+    if [[ -z "$candidate" ]]; then
+        echo -e "${RED}${ICON_ERROR} 无法创建 push runtime 目录${NC}" >&2
+        RUNTIME_PARENT=""; RUNTIME_PARENT_DEV=""; RUNTIME_PARENT_INODE=""
+        return 1
+    fi
+    runtime_building_hook "$candidate"
+
     metadata=$(stat -Lc '%d:%i:%u:%g:%a' -- "$candidate" 2>/dev/null) || {
-        rm -rf -- "$candidate"
+        cleanup_runtime || true
         return 1
     }
     IFS=: read -r dev inode owner gid mode <<< "$metadata"
     trusted_gid=$(current_gid) || {
-        rm -rf -- "$candidate"
+        cleanup_runtime || true
         return 1
     }
+    TEMP_DIR_DEV="$dev"
+    TEMP_DIR_INODE="$inode"
     if [[ ! -d "$candidate" || -L "$candidate" || "$owner" != "$EUID" || "$gid" != "$trusted_gid" || "$mode" != 700 ]]; then
         echo -e "${RED}${ICON_ERROR} 新建 runtime 目录未通过 owner/mode 校验: $candidate${NC}" >&2
-        rm -rf -- "$candidate"
+        cleanup_runtime || true
         return 1
     fi
     success_file="$candidate/success"
     failed_file="$candidate/failed"
     wrapper="$candidate/ssh-wrapper"
     if ! (umask 077; set -o noclobber; : > "$success_file"; : > "$failed_file") 2>/dev/null; then
-        rm -rf -- "$candidate"
+        cleanup_runtime || true
         return 1
     fi
     [[ -f "$success_file" && ! -L "$success_file" && -f "$failed_file" && ! -L "$failed_file" ]] || {
-        rm -rf -- "$candidate"
+        cleanup_runtime || true
         return 1
     }
 
-    TEMP_DIR="$candidate"
     SUCCESS_FILE="$success_file"
     FAILED_FILE="$failed_file"
     SSH_WRAPPER="$wrapper"
-    TEMP_DIR_DEV="$dev"
-    TEMP_DIR_INODE="$inode"
+    RUNTIME_STATE=initialized
     RUNTIME_INITIALIZED=true
     ACTIVE_WORKERS=()
 }
@@ -548,10 +670,12 @@ job_is_active() {
 }
 
 prune_active_workers() {
-    local pid
+    local pid wait_status=0
     for pid in "${!ACTIVE_WORKERS[@]}"; do
         if ! job_is_active "$pid" || ! process_identity_matches "$pid" "${ACTIVE_WORKERS[$pid]}"; then
-            wait "$pid" 2>/dev/null || true
+            wait_status=0
+            wait "$pid" 2>/dev/null || wait_status=$?
+            (( wait_status == 0 || wait_status == 127 )) || BATCH_WORKER_FAILED=true
             unset 'ACTIVE_WORKERS[$pid]'
         fi
     done
@@ -586,20 +710,45 @@ cleanup_runtime() {
 
     [[ "$RUNTIME_CLEANUP_ACTIVE" == false ]] || return 0
     RUNTIME_CLEANUP_ACTIVE=true
+    terminate_worker_transfer || cleanup_failed=true
     terminate_active_workers || cleanup_failed=true
     unset SSHPASS
 
-    if [[ -n "$TEMP_DIR" ]]; then
-        if [[ ! -e "$TEMP_DIR" && ! -L "$TEMP_DIR" ]]; then
-            :
-        elif ! runtime_directory_trusted; then
-            echo -e "${RED}${ICON_ERROR} 拒绝删除无法证明所有权的 runtime 路径: $TEMP_DIR${NC}" >&2
+    case "$RUNTIME_STATE" in
+        none)
+            if [[ -n "$TEMP_DIR" || -e "${TEMP_DIR:-}" || -L "${TEMP_DIR:-}" ]]; then
+                echo -e "${RED}${ICON_ERROR} runtime 路径存在但无 building/initialized 状态: $TEMP_DIR${NC}" >&2
+                cleanup_failed=true
+            fi
+            ;;
+        building)
+            if [[ ! -e "$TEMP_DIR" && ! -L "$TEMP_DIR" ]]; then
+                :
+            elif ! runtime_building_directory_trusted; then
+                echo -e "${RED}${ICON_ERROR} 拒绝删除无法证明所有权的 building runtime: $TEMP_DIR${NC}" >&2
+                cleanup_failed=true
+            elif ! rm -rf -- "$TEMP_DIR"; then
+                echo -e "${RED}${ICON_ERROR} building runtime 删除失败: $TEMP_DIR${NC}" >&2
+                cleanup_failed=true
+            fi
+            ;;
+        initialized)
+            if [[ ! -e "$TEMP_DIR" && ! -L "$TEMP_DIR" ]]; then
+                :
+            elif ! runtime_directory_trusted; then
+                echo -e "${RED}${ICON_ERROR} 拒绝删除无法证明 inode 所有权的 runtime: $TEMP_DIR${NC}" >&2
+                cleanup_failed=true
+            elif ! rm -rf -- "$TEMP_DIR"; then
+                echo -e "${RED}${ICON_ERROR} runtime 目录删除失败: $TEMP_DIR${NC}" >&2
+                cleanup_failed=true
+            fi
+            ;;
+        *)
+            echo -e "${RED}${ICON_ERROR} 未知 runtime 生命周期状态: $RUNTIME_STATE${NC}" >&2
             cleanup_failed=true
-        elif ! rm -rf -- "$TEMP_DIR"; then
-            echo -e "${RED}${ICON_ERROR} runtime 目录删除失败: $TEMP_DIR${NC}" >&2
-            cleanup_failed=true
-        fi
-    fi
+            ;;
+    esac
+
     if [[ "$cleanup_failed" == false ]]; then
         TEMP_DIR=""
         SUCCESS_FILE=""
@@ -608,29 +757,48 @@ cleanup_runtime() {
         RUNTIME_KEY_FILE=""
         TEMP_DIR_DEV=""
         TEMP_DIR_INODE=""
+        RUNTIME_PARENT=""
+        RUNTIME_PARENT_DEV=""
+        RUNTIME_PARENT_INODE=""
+        RUNTIME_STATE=none
         RUNTIME_INITIALIZED=false
+        RUNTIME_ALLOCATION_CRITICAL=false
+        RUNTIME_PENDING_SIGNAL=""
+        RUNTIME_PENDING_SIGNAL_STATUS=0
+        ACTIVE_WORKERS=()
     fi
     RUNTIME_CLEANUP_ACTIVE=false
     [[ "$cleanup_failed" == false ]]
 }
 
 runtime_exit_handler() {
-    local status="$?"
+    local status="$?" cleanup_status=0
     trap - EXIT
-    cleanup_runtime || true
+    cleanup_runtime || cleanup_status=$?
+    if (( cleanup_status != 0 && status == 0 )); then
+        status=1
+    fi
     exit "$status"
 }
 
 runtime_signal_handler() {
     local signal_name="$1" status="$2"
+    if [[ "$RUNTIME_ALLOCATION_CRITICAL" == true ]]; then
+        if [[ -z "$RUNTIME_PENDING_SIGNAL" ]]; then
+            RUNTIME_PENDING_SIGNAL_STATUS="$status"
+            RUNTIME_PENDING_SIGNAL="$signal_name"
+        fi
+        return 0
+    fi
     trap - EXIT HUP INT TERM
     echo -e "${YELLOW}${ICON_STOP} 收到 $signal_name，正在终止本次 push 进程树${NC}" >&2
-    cleanup_runtime || true
+    if ! cleanup_runtime; then
+        echo -e "${RED}${ICON_ERROR} $signal_name 清理未完成，已保留残留路径供检查${NC}" >&2
+    fi
     exit "$status"
 }
 
 install_runtime_traps() {
-    [[ "$RUNTIME_INITIALIZED" == true ]] || return 1
     [[ "$RUNTIME_TRAPS_INSTALLED" == false ]] || return 0
     trap runtime_exit_handler EXIT
     trap 'runtime_signal_handler HUP 129' HUP
@@ -706,22 +874,16 @@ ensure_secure_directory_chain() {
     local directory="$1" current="$1" ancestor="" item="" index
     local -a missing=()
 
-    [[ "$directory" == /* ]] || {
-        echo -e "${RED}${ICON_ERROR} known_hosts 父目录必须是绝对路径: $directory${NC}" >&2
-        return 1
-    }
-    if path_has_symlink_component "$directory"; then
-        echo -e "${RED}${ICON_ERROR} known_hosts 父目录路径包含符号链接: $directory${NC}" >&2
-        return 1
-    fi
+    [[ "$directory" == /* ]] || return 1
+    path_has_symlink_component "$directory" && return 1
     while [[ ! -e "$current" && ! -L "$current" ]]; do
         missing+=("$current")
         ancestor=$(dirname -- "$current") || return 1
         [[ "$ancestor" != "$current" ]] || return 1
         current="$ancestor"
     done
-    secure_directory_metadata "$current" || {
-        echo -e "${RED}${ICON_ERROR} known_hosts 父目录不可信: $current${NC}" >&2
+    validate_existing_directory_chain "$current" || {
+        echo -e "${RED}${ICON_ERROR} known_hosts 祖先目录不可信: $current${NC}" >&2
         return 1
     }
     for ((index=${#missing[@]} - 1; index >= 0; index--)); do
@@ -731,17 +893,48 @@ ensure_secure_directory_chain() {
         elif [[ ! -e "$item" && ! -L "$item" ]]; then
             return 1
         fi
-        secure_directory_metadata "$item" || {
-            echo -e "${RED}${ICON_ERROR} known_hosts 父目录不可信: $item${NC}" >&2
+        validate_existing_directory_chain "$item" || {
+            echo -e "${RED}${ICON_ERROR} known_hosts 新建目录链不可信: $item${NC}" >&2
             return 1
         }
     done
-    ! path_has_symlink_component "$directory"
+}
+
+known_hosts_path_literal_safe() {
+    local path="$1"
+    [[ "$path" =~ ^/[A-Za-z0-9_./-]+$ ]] || return 1
+    case "$path/" in
+        *'//'*) return 1 ;;
+        *'/./'*) return 1 ;;
+        *'/../'*) return 1 ;;
+    esac
+}
+
+validate_known_hosts_file() {
+    local known_hosts="$USER_KNOWN_HOSTS_FILE" directory="" metadata=""
+    local owner gid mode trusted_gid mode_value=0
+
+    if [[ "$known_hosts" == /dev/null ]]; then
+        [[ "$ALLOW_INSECURE_HOST_KEY_STORAGE" == true ]]
+        return
+    fi
+    known_hosts_path_literal_safe "$known_hosts" || {
+        echo -e "${RED}${ICON_ERROR} known_hosts 路径包含 OpenSSH 会再次解释的字符: $known_hosts${NC}" >&2
+        return 1
+    }
+    directory=$(dirname -- "$known_hosts") || return 1
+    validate_existing_directory_chain "$directory" || return 1
+    [[ -f "$known_hosts" && ! -L "$known_hosts" ]] || return 1
+    metadata=$(stat -Lc '%u:%g:%a' -- "$known_hosts") || return 1
+    IFS=: read -r owner gid mode <<< "$metadata"
+    trusted_gid=$(current_gid) || return 1
+    [[ "$owner" == "$EUID" && "$gid" == "$trusted_gid" && "$mode" =~ ^[0-7]{3,4}$ ]] || return 1
+    mode_value=$((8#$mode))
+    (( (mode_value & 0600) == 0600 && (mode_value & 0022) == 0 ))
 }
 
 prepare_known_hosts() {
-    local known_hosts="$USER_KNOWN_HOSTS_FILE" directory="" metadata=""
-    local owner gid mode trusted_gid mode_value=0
+    local known_hosts="$USER_KNOWN_HOSTS_FILE" directory=""
 
     contains_control_character "$known_hosts" && return 1
     if [[ "$known_hosts" == /dev/null ]]; then
@@ -749,7 +942,10 @@ prepare_known_hosts() {
         echo -e "${RED}${ICON_WARNING} known_hosts 使用 /dev/null，无法持久验证指纹，存在 MITM 风险。${NC}" >&2
         return 0
     fi
-    [[ "$known_hosts" == /* ]] || return 1
+    known_hosts_path_literal_safe "$known_hosts" || {
+        echo -e "${RED}${ICON_ERROR} known_hosts 路径只允许保守的绝对路径字符且禁止 . 或 .. 组件${NC}" >&2
+        return 1
+    }
     directory=$(dirname -- "$known_hosts") || return 1
     ensure_secure_directory_chain "$directory" || return 1
     if [[ ! -e "$known_hosts" && ! -L "$known_hosts" ]]; then
@@ -757,17 +953,15 @@ prepare_known_hosts() {
             [[ -e "$known_hosts" || -L "$known_hosts" ]] || return 1
         fi
     fi
-    [[ -f "$known_hosts" && ! -L "$known_hosts" ]] || {
-        echo -e "${RED}${ICON_ERROR} known_hosts 必须是非符号链接普通文件${NC}" >&2
+    validate_known_hosts_file || {
+        echo -e "${RED}${ICON_ERROR} known_hosts 文件或目录链不可信: $known_hosts${NC}" >&2
         return 1
     }
-    metadata=$(stat -Lc '%u:%g:%a' -- "$known_hosts") || return 1
-    IFS=: read -r owner gid mode <<< "$metadata"
-    trusted_gid=$(current_gid) || return 1
-    [[ "$owner" == "$EUID" && "$gid" == "$trusted_gid" && "$mode" =~ ^[0-7]{3,4}$ ]] || return 1
-    mode_value=$((8#$mode))
-    (( (mode_value & 0600) == 0600 && (mode_value & 0022) == 0 )) || {
-        echo -e "${RED}${ICON_ERROR} known_hosts 必须 owner 可读写且禁止组/其他用户写入${NC}" >&2
+}
+
+revalidate_known_hosts() {
+    validate_known_hosts_file || {
+        echo -e "${RED}${ICON_ERROR} SSH 启动前 known_hosts 重新验证失败: $USER_KNOWN_HOSTS_FILE${NC}" >&2
         return 1
     }
 }
@@ -780,18 +974,37 @@ create_ssh_wrapper() {
 #!/usr/bin/env bash
 set -eu
 args=(
+    -F none
     -p "$PUSH_SSH_PORT"
     -o "ConnectTimeout=$PUSH_CONNECTION_TIMEOUT"
     -o "StrictHostKeyChecking=$PUSH_STRICT_HOST_KEY_CHECKING"
     -o "UserKnownHostsFile=$PUSH_USER_KNOWN_HOSTS_FILE"
     -o LogLevel=ERROR
+    -o IdentitiesOnly=yes
+    -o IdentityAgent=none
+    -o IdentityFile=none
+    -o CertificateFile=none
+    -o ControlMaster=no
+    -o ControlPath=none
+    -o ClearAllForwardings=yes
+    -o ForkAfterAuthentication=no
 )
 if [[ "$PUSH_AUTH_METHOD" == key ]]; then
-    args+=(-o BatchMode=yes -i "$PUSH_KEY_FILE")
+    args+=(
+        -o BatchMode=yes
+        -o PreferredAuthentications=publickey
+        -o PubkeyAuthentication=yes
+        -o PasswordAuthentication=no
+        -o KbdInteractiveAuthentication=no
+        -i "$PUSH_KEY_FILE"
+    )
 else
     args+=(
         -o BatchMode=no
         -o PreferredAuthentications=password
+        -o PubkeyAuthentication=no
+        -o PasswordAuthentication=yes
+        -o KbdInteractiveAuthentication=no
         -o NumberOfPasswordPrompts=1
     )
 fi
@@ -829,30 +1042,66 @@ validate_transfer_path() {
     ! contains_control_character "$value"
 }
 
+get_process_session_id() {
+    local pid="$1"
+    [[ "$pid" =~ ^[0-9]+$ && -r "/proc/$pid/stat" ]] || return 1
+    awk '{print $6}' "/proc/$pid/stat" 2>/dev/null
+}
+
+owned_session_has_live_members() {
+    local expected_sid="$1" stat_file state sid
+    for stat_file in /proc/[0-9]*/stat; do
+        [[ -r "$stat_file" ]] || continue
+        read -r state sid < <(awk '{print $3, $6}' "$stat_file" 2>/dev/null) || continue
+        [[ "$sid" == "$expected_sid" && "$state" != Z ]] && return 0
+    done
+    return 1
+}
+
 worker_transfer_identity_matches() {
+    local pgid="" sid=""
     [[ -n "$WORKER_TRANSFER_PID" && -n "$WORKER_TRANSFER_START" ]] || return 1
     process_identity_matches "$WORKER_TRANSFER_PID" "$WORKER_TRANSFER_START" || return 1
-    local pgid=""
     pgid=$(get_process_group_id "$WORKER_TRANSFER_PID") || return 1
-    [[ "$pgid" == "$WORKER_TRANSFER_PGID" && "$pgid" == "$WORKER_TRANSFER_PID" ]]
+    sid=$(get_process_session_id "$WORKER_TRANSFER_PID") || return 1
+    [[ "$pgid" == "$WORKER_TRANSFER_PGID" && "$sid" == "$WORKER_TRANSFER_SID" &&
+        "$pgid" == "$WORKER_TRANSFER_PID" && "$sid" == "$WORKER_TRANSFER_PID" ]]
 }
 
 terminate_worker_transfer() {
-    local _
+    local _ should_signal=false cleanup_failed=false
+
     if worker_transfer_identity_matches; then
+        should_signal=true
+    elif [[ -n "$WORKER_TRANSFER_SID" ]] && owned_session_has_live_members "$WORKER_TRANSFER_SID"; then
+        should_signal=true
+    fi
+    if [[ "$should_signal" == true ]]; then
         kill -TERM -- "-$WORKER_TRANSFER_PGID" 2>/dev/null || true
         for _ in {1..20}; do
-            worker_transfer_identity_matches || break
+            owned_session_has_live_members "$WORKER_TRANSFER_SID" || break
             sleep 0.1
         done
-        if worker_transfer_identity_matches; then
+        if owned_session_has_live_members "$WORKER_TRANSFER_SID"; then
             kill -KILL -- "-$WORKER_TRANSFER_PGID" 2>/dev/null || true
+            for _ in {1..20}; do
+                owned_session_has_live_members "$WORKER_TRANSFER_SID" || break
+                sleep 0.05
+            done
         fi
-        wait "$WORKER_TRANSFER_PID" 2>/dev/null || true
     fi
-    WORKER_TRANSFER_PID=""
-    WORKER_TRANSFER_PGID=""
-    WORKER_TRANSFER_START=""
+    [[ -z "$WORKER_TRANSFER_PID" ]] || wait "$WORKER_TRANSFER_PID" 2>/dev/null || true
+    if [[ -n "$WORKER_TRANSFER_SID" ]] && owned_session_has_live_members "$WORKER_TRANSFER_SID"; then
+        echo -e "${RED}${ICON_ERROR} 受管 session 仍有活动后代: $WORKER_TRANSFER_SID${NC}" >&2
+        cleanup_failed=true
+    fi
+    if [[ "$cleanup_failed" == false ]]; then
+        WORKER_TRANSFER_PID=""
+        WORKER_TRANSFER_PGID=""
+        WORKER_TRANSFER_SID=""
+        WORKER_TRANSFER_START=""
+    fi
+    [[ "$cleanup_failed" == false ]]
 }
 
 worker_signal_handler() {
@@ -871,11 +1120,11 @@ worker_exit_handler() {
     exit "$status"
 }
 
-run_transfer_command() {
+run_managed_command() {
     local output_file="$1"
     shift
     local -a command=("$@")
-    local exit_code=0 pgid=""
+    local exit_code=0 pgid="" sid=""
 
     WORKER_OUTPUT_FILE="$output_file"
     if ! (umask 077; set -o noclobber; : > "$output_file") 2>/dev/null; then
@@ -884,26 +1133,22 @@ run_transfer_command() {
     setsid "${command[@]}" > "$output_file" 2>&1 &
     WORKER_TRANSFER_PID=$!
     WORKER_TRANSFER_PGID="$WORKER_TRANSFER_PID"
+    WORKER_TRANSFER_SID="$WORKER_TRANSFER_PID"
     for _ in {1..50}; do
         WORKER_TRANSFER_START=$(get_process_start_time "$WORKER_TRANSFER_PID" 2>/dev/null || true)
         pgid=$(get_process_group_id "$WORKER_TRANSFER_PID" 2>/dev/null || true)
-        [[ -n "$WORKER_TRANSFER_START" && "$pgid" == "$WORKER_TRANSFER_PID" ]] && break
+        sid=$(get_process_session_id "$WORKER_TRANSFER_PID" 2>/dev/null || true)
+        [[ -n "$WORKER_TRANSFER_START" && "$pgid" == "$WORKER_TRANSFER_PID" && "$sid" == "$WORKER_TRANSFER_PID" ]] && break
         kill -0 "$WORKER_TRANSFER_PID" 2>/dev/null || break
         sleep 0.01
     done
-    if [[ -z "$WORKER_TRANSFER_START" || "$pgid" != "$WORKER_TRANSFER_PID" ]]; then
+    if [[ -z "$WORKER_TRANSFER_START" || "$pgid" != "$WORKER_TRANSFER_PID" || "$sid" != "$WORKER_TRANSFER_PID" ]]; then
         if ! job_is_active "$WORKER_TRANSFER_PID"; then
-            if wait "$WORKER_TRANSFER_PID"; then
-                exit_code=0
-            else
-                exit_code=$?
-            fi
-            WORKER_TRANSFER_PID=""
-            WORKER_TRANSFER_PGID=""
-            WORKER_TRANSFER_START=""
+            if wait "$WORKER_TRANSFER_PID"; then exit_code=0; else exit_code=$?; fi
+            terminate_worker_transfer || return 1
             return "$exit_code"
         fi
-        terminate_worker_transfer
+        terminate_worker_transfer || true
         return 1
     fi
     if wait "$WORKER_TRANSFER_PID"; then
@@ -911,10 +1156,12 @@ run_transfer_command() {
     else
         exit_code=$?
     fi
-    WORKER_TRANSFER_PID=""
-    WORKER_TRANSFER_PGID=""
-    WORKER_TRANSFER_START=""
+    terminate_worker_transfer || return 1
     return "$exit_code"
+}
+
+run_transfer_command() {
+    run_managed_command "$@"
 }
 
 retry_rsync() {
@@ -925,7 +1172,7 @@ retry_rsync() {
     validate_transfer_path "$src" && validate_transfer_path "$dst" || return 1
     parse_server_info "$server_info" || return 1
     port="$PARSED_PORT"
-    target="$PARSED_TARGET"
+    target="$PARSED_RSYNC_TARGET"
     rsync_opts=(--protect-args "--timeout=$CONNECTION_TIMEOUT")
     [[ "$RSYNC_ARCHIVE" == true ]] && rsync_opts+=(-a) || rsync_opts+=(-r)
     [[ "$RSYNC_COMPRESS" == true ]] && rsync_opts+=(-z)
@@ -940,7 +1187,8 @@ retry_rsync() {
     while (( attempt <= MAX_RETRIES )); do
         (( attempt > 1 )) && sleep "$RETRY_DELAY"
         export PUSH_SSH_PORT="$port"
-        command=(timeout "$TOTAL_TIMEOUT")
+        revalidate_known_hosts || return 1
+        command=(timeout "--kill-after=${TIMEOUT_KILL_AFTER}" "$TOTAL_TIMEOUT")
         [[ "$AUTH_METHOD" == password ]] && command+=(sshpass -e)
         command+=(rsync "${rsync_opts[@]}" -e "$SSH_WRAPPER" -- "$src" "$target:$dst")
         output_file="$TEMP_DIR/transfer.$BASHPID.$attempt"
@@ -966,18 +1214,44 @@ retry_rsync() {
     return 1
 }
 
+append_result_record() {
+    local file="$1" server="$2"
+    printf '%s\n' "$server" >> "$file"
+}
+
+close_result_lock_fd() {
+    local lock_fd="$1"
+    exec {lock_fd}>&-
+}
+
 record_result() {
-    local result="$1" server="$2" file lock_fd
+    local result="$1" server="$2" file="" lock_file="" lock_fd=""
+
     if [[ "$result" == success ]]; then
         file="$SUCCESS_FILE"
-        exec {lock_fd}>"$SUCCESS_FILE.lock"
+        lock_file="$SUCCESS_FILE.lock"
     else
         file="$FAILED_FILE"
-        exec {lock_fd}>"$FAILED_FILE.lock"
+        lock_file="$FAILED_FILE.lock"
     fi
-    flock -x "$lock_fd"
-    printf '%s\n' "$server" >> "$file"
-    exec {lock_fd}>&-
+    if ! exec {lock_fd}>>"$lock_file"; then
+        echo -e "${RED}${ICON_ERROR} 无法打开结果锁文件: $lock_file${NC}" >&2
+        return 1
+    fi
+    if ! flock -x "$lock_fd"; then
+        echo -e "${RED}${ICON_ERROR} 无法锁定结果文件: $lock_file${NC}" >&2
+        close_result_lock_fd "$lock_fd" || true
+        return 1
+    fi
+    if ! append_result_record "$file" "$server"; then
+        echo -e "${RED}${ICON_ERROR} 无法记录 $result 结果: $file${NC}" >&2
+        close_result_lock_fd "$lock_fd" || true
+        return 1
+    fi
+    if ! close_result_lock_fd "$lock_fd"; then
+        echo -e "${RED}${ICON_ERROR} 无法关闭结果锁 fd: $lock_file${NC}" >&2
+        return 1
+    fi
 }
 
 push_to_server() {
@@ -989,16 +1263,23 @@ push_to_server() {
     display=$(format_server_info "$server_info") || return 1
     echo -e "${BLUE}[${index}/${total}]${NC} ${ICON_WORKING} ${CYAN}$display${NC}"
     if retry_rsync "$server_info" "$src" "$dst"; then
-        record_result success "$server_info"
+        if ! record_result success "$server_info"; then
+            echo -e "${RED}${ICON_ERROR} $display 传输成功但结果记录失败${NC}" >&2
+            return 1
+        fi
         echo -e "${GREEN}[${index}/${total}] ${ICON_SUCCESS} $display${NC}"
     else
-        record_result failed "$server_info"
+        if ! record_result failed "$server_info"; then
+            echo -e "${RED}${ICON_ERROR} $display 传输失败且结果记录失败${NC}" >&2
+            return 1
+        fi
         echo -e "${RED}[${index}/${total}] ${ICON_ERROR} $display${NC}"
     fi
+    return 0
 }
 
 launch_worker() {
-    local server="$1" src="$2" dst="$3" index="$4" total="$5" pid start=""
+    local server="$1" src="$2" dst="$3" index="$4" total="$5" pid start="" wait_status=0
     push_to_server "$server" "$src" "$dst" "$index" "$total" &
     pid=$!
     for _ in {1..20}; do
@@ -1010,23 +1291,36 @@ launch_worker() {
     if [[ -n "$start" ]]; then
         ACTIVE_WORKERS["$pid"]="$start"
     else
-        wait "$pid" 2>/dev/null || true
+        wait "$pid" || wait_status=$?
+        (( wait_status == 0 || wait_status == 127 )) || BATCH_WORKER_FAILED=true
     fi
 }
 
 wait_for_worker_slot() {
+    local wait_status=0
     while :; do
         prune_active_workers
         (( ${#ACTIVE_WORKERS[@]} < MAX_PARALLEL )) && return 0
-        wait -n 2>/dev/null || true
+        wait_status=0
+        wait -n 2>/dev/null || wait_status=$?
+        (( wait_status == 0 || wait_status == 127 )) || BATCH_WORKER_FAILED=true
     done
 }
 
 wait_for_all_workers() {
+    local wait_status=0
     while (( ${#ACTIVE_WORKERS[@]} > 0 )); do
-        wait -n 2>/dev/null || true
+        wait_status=0
+        wait -n 2>/dev/null || wait_status=$?
+        (( wait_status == 0 || wait_status == 127 )) || BATCH_WORKER_FAILED=true
         prune_active_workers
     done
+}
+
+result_line_count() {
+    local file="$1"
+    [[ -f "$file" ]] || { printf '0\n'; return 0; }
+    wc -l < "$file"
 }
 
 run_server_batch() {
@@ -1034,12 +1328,24 @@ run_server_batch() {
     shift 2
     local -a servers=("$@")
     local index=0 total=${#servers[@]} server
+    local success_before failed_before success_after failed_after recorded
+
+    success_before=$(result_line_count "$SUCCESS_FILE") || return 1
+    failed_before=$(result_line_count "$FAILED_FILE") || return 1
+    BATCH_WORKER_FAILED=false
     for server in "${servers[@]}"; do
         ((index += 1))
-        wait_for_worker_slot
+        wait_for_worker_slot || return 1
         launch_worker "$server" "$src" "$dst" "$index" "$total"
     done
     wait_for_all_workers
+    success_after=$(result_line_count "$SUCCESS_FILE") || return 1
+    failed_after=$(result_line_count "$FAILED_FILE") || return 1
+    recorded=$((success_after - success_before + failed_after - failed_before))
+    if [[ "$BATCH_WORKER_FAILED" == true || "$recorded" -ne "$total" ]]; then
+        echo -e "${RED}${ICON_ERROR} batch accounting 不完整: expected=$total recorded=$recorded${NC}" >&2
+        return 1
+    fi
 }
 
 show_summary() {
@@ -1060,36 +1366,60 @@ interactive_retry() {
     while IFS= read -r server; do
         [[ -n "$server" ]] && failed_servers+=("$server")
     done < "$FAILED_FILE"
-    : > "$FAILED_FILE"
-    rm -f -- "$FAILED_FILE.lock"
+    if ! : > "$FAILED_FILE"; then
+        echo -e "${RED}${ICON_ERROR} 无法截断失败结果文件: $FAILED_FILE${NC}" >&2
+        return 1
+    fi
+    if [[ -e "$FAILED_FILE.lock" || -L "$FAILED_FILE.lock" ]]; then
+        rm -f -- "$FAILED_FILE.lock" || {
+            echo -e "${RED}${ICON_ERROR} 无法清理失败结果锁: $FAILED_FILE.lock${NC}" >&2
+            return 1
+        }
+    fi
     run_server_batch "$src" "$dst" "${failed_servers[@]}"
 }
 
 test_authentication() {
-    local server port target status=0
+    local server port target display status=0 output_file="" output="" exit_code=0 index=0
     local -a command
 
     echo -e "${CYAN}${ICON_CONFIG} 对全部配置服务器执行无副作用 SSH true 认证测试${NC}"
     for server in "${SERVERS[@]}"; do
+        ((index += 1))
         if ! parse_server_info "$server"; then
             status=1
             continue
         fi
         port="$PARSED_PORT"
-        target="$PARSED_TARGET"
+        target="$PARSED_SSH_TARGET"
+        display="$PARSED_DISPLAY_TARGET"
         export PUSH_SSH_PORT="$port"
         export PUSH_CONNECTION_TIMEOUT="$CONNECTION_TIMEOUT"
         export PUSH_STRICT_HOST_KEY_CHECKING="$STRICT_HOST_KEY_CHECKING"
         export PUSH_USER_KNOWN_HOSTS_FILE="$USER_KNOWN_HOSTS_FILE"
         export PUSH_AUTH_METHOD="$AUTH_METHOD"
         export PUSH_KEY_FILE="$RUNTIME_KEY_FILE"
-        command=(timeout "$TOTAL_TIMEOUT")
+        revalidate_known_hosts || return 1
+        command=(timeout "--kill-after=${TIMEOUT_KILL_AFTER}" "$TOTAL_TIMEOUT")
         [[ "$AUTH_METHOD" == password ]] && command+=(sshpass -e)
         command+=("$SSH_WRAPPER" "$target" true)
-        if "${command[@]}"; then
-            echo -e "${GREEN}${ICON_SUCCESS} $target:$port 认证成功${NC}"
+        output_file="$TEMP_DIR/auth.$BASHPID.$index"
+        if run_managed_command "$output_file" "${command[@]}"; then
+            exit_code=0
         else
-            echo -e "${RED}${ICON_ERROR} $target:$port 认证失败${NC}" >&2
+            exit_code=$?
+        fi
+        output=$(<"$output_file")
+        rm -f -- "$output_file" || {
+            echo -e "${RED}${ICON_ERROR} 认证输出文件残留: $output_file${NC}" >&2
+            status=1
+        }
+        WORKER_OUTPUT_FILE=""
+        if (( exit_code == 0 )); then
+            echo -e "${GREEN}${ICON_SUCCESS} $display:$port 认证成功${NC}"
+        else
+            echo -e "${RED}${ICON_ERROR} $display:$port 认证失败${NC}" >&2
+            [[ -n "$output" ]] && echo -e "${RED}$output${NC}" >&2
             status=1
         fi
     done
@@ -1134,9 +1464,15 @@ resolve_transfer_arguments() {
 
 run_transfer() {
     local src="$1" dst="$2" final_failed=0
-    run_server_batch "$src" "$dst" "${SERVERS[@]}"
+    if ! run_server_batch "$src" "$dst" "${SERVERS[@]}"; then
+        echo -e "${RED}${ICON_ERROR} 结果记录不完整，拒绝输出成功汇总${NC}" >&2
+        return 1
+    fi
     show_summary
-    interactive_retry "$src" "$dst"
+    if ! interactive_retry "$src" "$dst"; then
+        echo -e "${RED}${ICON_ERROR} 重试结果记录不完整${NC}" >&2
+        return 1
+    fi
     [[ -f "$FAILED_FILE" ]] && final_failed=$(wc -l < "$FAILED_FILE")
     (( final_failed == 0 ))
 }
@@ -1166,8 +1502,8 @@ main() {
 
     if [[ "${1:-}" == --test-auth ]]; then
         check_dependencies auth || return 1
-        initialize_runtime || return 1
         install_runtime_traps || return 1
+        initialize_runtime || return 1
         prepare_ssh_runtime || return 1
         test_authentication
         return
@@ -1179,8 +1515,8 @@ main() {
     }
     prepare_delete_authorization || return 1
     check_dependencies transfer || return 1
-    initialize_runtime || return 1
     install_runtime_traps || return 1
+    initialize_runtime || return 1
     prepare_ssh_runtime || return 1
     run_transfer "$src" "$dst"
 }

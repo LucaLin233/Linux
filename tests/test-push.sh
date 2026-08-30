@@ -24,6 +24,13 @@ assert_fail() {
     pass "$name"
 }
 
+process_is_running() {
+    local pid="$1" state=""
+    [[ -r "/proc/$pid/stat" ]] || return 1
+    state=$(awk '{print $3}' "/proc/$pid/stat" 2>/dev/null) || return 1
+    [[ "$state" != Z ]]
+}
+
 # Source must not create runtime files, inspect configuration, modify SSHPASS, or replace traps.
 source_root="$TEST_DIR/source"
 mkdir -m 0700 "$source_root"
@@ -56,12 +63,15 @@ trap 'rm -rf "$TEST_DIR"' EXIT
 DEFAULT_USER=root
 DEFAULT_PORT=22
 parse_server_info "admin@example.com:2222" || fail "parse DNS server"
-assert_eq admin@example.com "$PARSED_TARGET" "parse DNS target"
+assert_eq admin@example.com "$PARSED_SSH_TARGET" "parse DNS SSH target"
+assert_eq admin@example.com "$PARSED_RSYNC_TARGET" "parse DNS rsync target"
 assert_eq 2222 "$PARSED_PORT" "parse explicit port"
 parse_server_info "root@192.0.2.10" || fail "parse IPv4 server"
-assert_eq root@192.0.2.10 "$PARSED_TARGET" "parse IPv4 target"
+assert_eq root@192.0.2.10 "$PARSED_SSH_TARGET" "parse IPv4 SSH target"
 parse_server_info "root@[2001:db8::1]:2200" || fail "parse IPv6 server"
-assert_eq 'root@[2001:db8::1]' "$PARSED_TARGET" "preserve IPv6 brackets"
+assert_eq 'root@2001:db8::1' "$PARSED_SSH_TARGET" "direct SSH IPv6 target omits brackets"
+assert_eq 'root@[2001:db8::1]' "$PARSED_RSYNC_TARGET" "rsync IPv6 target preserves brackets"
+assert_eq 'root@[2001:db8::1]' "$PARSED_DISPLAY_TARGET" "display IPv6 target preserves brackets"
 assert_eq 2200 "$PARSED_PORT" "parse IPv6 port"
 assert_fail "reject bare IPv6" parse_server_info "2001:db8::1"
 assert_fail "reject leading-dash user" parse_server_info "-o@host"
@@ -131,6 +141,109 @@ assert_fail "reject port above 65535" parse_server_info "root@host:65536"
     cleanup_runtime
 )
 
+cat > "$TEST_DIR/runtime-building-signal-child.sh" <<'RUNTIME_BUILDING_SIGNAL_CHILD'
+#!/usr/bin/env bash
+set -euo pipefail
+root="$1"
+script="$2"
+mkdir -m 0700 "$root/runtime"
+export TMPDIR="$root/runtime"
+source "$script"
+runtime_building_hook() {
+    printf '%s\n' "$1" > "$root/building-path"
+    touch "$root/ready"
+    while :; do sleep 1; done
+}
+install_runtime_traps
+initialize_runtime
+RUNTIME_BUILDING_SIGNAL_CHILD
+chmod 0700 "$TEST_DIR/runtime-building-signal-child.sh"
+
+run_runtime_building_signal_case() {
+    local signal_name="$1" expected_status="$2" root=""
+    local pid rc=0
+    root="$TEST_DIR/runtime-building-$signal_name"
+    mkdir -m 0700 "$root"
+    env --default-signal=HUP,INT,TERM \
+        bash "$TEST_DIR/runtime-building-signal-child.sh" "$root" "$SCRIPT" > "$root/output.log" 2>&1 &
+    pid=$!
+    for _ in $(seq 1 200); do [[ -e "$root/ready" ]] && break; sleep 0.05; done
+    [[ -e "$root/ready" ]] || { cat "$root/output.log"; kill "$pid" 2>/dev/null || true; fail "$signal_name runtime building hook did not block"; }
+    kill "-$signal_name" "$pid"
+    wait "$pid" || rc=$?
+    assert_eq "$expected_status" "$rc" "$signal_name during first runtime metadata window returns conventional status"
+    [[ -z "$(find "$root/runtime" -mindepth 1 -maxdepth 1 -name 'push-runtime.*' -print -quit)" ]] || fail "$signal_name runtime building signal left runtime"
+    pass "$signal_name runtime building cleanup removes incomplete directory and files"
+}
+
+run_runtime_building_signal_case HUP 129
+run_runtime_building_signal_case INT 130
+run_runtime_building_signal_case TERM 143
+
+(
+    trap - EXIT HUP INT TERM
+    root="$TEST_DIR/runtime-unsafe-parent"; mkdir -m 0777 "$root"; mkdir -m 0700 "$root/child"
+    TMPDIR="$root/child"
+    assert_fail "reject non-sticky writable TMPDIR ancestor" initialize_runtime
+    [[ -z "$(find "$root" -name 'push-runtime.*' -print -quit)" ]] || fail "unsafe TMPDIR ancestor created runtime"
+    pass "unsafe TMPDIR ancestor fails before mktemp"
+)
+
+(
+    trap - EXIT HUP INT TERM
+    TMPDIR=/tmp
+    initialize_runtime
+    runtime_path="$TEMP_DIR"
+    assert_eq 700 "$(stat -c %a "$runtime_path")" "sticky /tmp supports EUID-owned 0700 runtime"
+    cleanup_runtime
+)
+
+cat > "$TEST_DIR/runtime-exit-cleanup-child.sh" <<'RUNTIME_EXIT_CLEANUP_CHILD'
+#!/usr/bin/env bash
+set -euo pipefail
+root="$1"
+script="$2"
+requested_status="$3"
+mkdir -m 0700 "$root/runtime"
+export TMPDIR="$root/runtime"
+source "$script"
+install_runtime_traps
+initialize_runtime
+printf '%s\n' "$TEMP_DIR" > "$root/runtime-path"
+rm() {
+    local last=${!#}
+    [[ "$last" == "$TEMP_DIR" ]] && return 1
+    command rm "$@"
+}
+exit "$requested_status"
+RUNTIME_EXIT_CLEANUP_CHILD
+chmod 0700 "$TEST_DIR/runtime-exit-cleanup-child.sh"
+
+run_runtime_exit_cleanup_failure_case() {
+    local original_status="$1" expected_status="$2" root="$TEST_DIR/runtime-exit-fail-$1" rc=0 path=""
+    mkdir -m 0700 "$root"
+    bash "$TEST_DIR/runtime-exit-cleanup-child.sh" "$root" "$SCRIPT" "$original_status" > "$root/output.log" 2>&1 || rc=$?
+    assert_eq "$expected_status" "$rc" "EXIT cleanup failure maps original $original_status to $expected_status"
+    path=$(<"$root/runtime-path")
+    [[ -d "$path" ]] || fail "EXIT cleanup failure did not preserve runtime path"
+    grep -Fq "$path" "$root/output.log" || fail "EXIT cleanup failure omitted runtime residue path"
+    pass "EXIT cleanup failure preserves and reports runtime residue"
+    command rm -rf -- "$path"
+}
+
+run_runtime_exit_cleanup_failure_case 0 1
+run_runtime_exit_cleanup_failure_case 7 7
+
+(
+    trap - EXIT HUP INT TERM
+    root="$TEST_DIR/runtime-unowned-state"; mkdir -m 0700 "$root"
+    TEMP_DIR="$root"; RUNTIME_STATE=none; RUNTIME_INITIALIZED=false
+    assert_fail "runtime path without lifecycle state is residue error" cleanup_runtime
+    [[ -d "$root" ]] || fail "state-less runtime cleanup deleted unproven path"
+    pass "state-less runtime cleanup preserves unproven path"
+    TEMP_DIR=""
+)
+
 # Config loading uses an opened, verified fd and preserves indexed/associative arrays.
 config_root="$TEST_DIR/config"
 mkdir -m 0700 "$config_root"
@@ -148,6 +261,17 @@ assert_eq '/src/:/dst/' "${TASKS[copy]}" "load protected config associative arra
 
 ln -s "$config" "$config_root/config-link.conf"
 assert_fail "reject symlink config" load_config "$config_root/config-link.conf"
+chmod 0400 "$config"
+load_config "$config"
+pass "accept owner-only 0400 config"
+chmod 0644 "$config"
+assert_fail "reject 0644 config before source" load_config "$config"
+chmod 0640 "$config"
+assert_fail "reject 0640 config before source" load_config "$config"
+chmod 0440 "$config"
+assert_fail "reject 0440 config before source" load_config "$config"
+chmod 0660 "$config"
+assert_fail "reject 0660 config before source" load_config "$config"
 chmod 0622 "$config"
 assert_fail "reject group-writable config" load_config "$config"
 chmod 0000 "$config"
@@ -491,12 +615,30 @@ for known_identity_case in file-owner file-gid dir-owner dir-gid; do
     )
 done
 
+for forbidden_known_suffix in 'known hosts' '%h' '${VAR}' '"quoted"' 'back\slash' '../escape' './known'; do
+    (
+        trap - EXIT HUP INT TERM
+        root=$(mktemp -d "$TEST_DIR/known-literal.XXXXXX"); chmod 0700 "$root"
+        USER_KNOWN_HOSTS_FILE="$root/$forbidden_known_suffix"
+        ALLOW_INSECURE_HOST_KEY_STORAGE=false
+        assert_fail "reject known_hosts literal path $forbidden_known_suffix" prepare_known_hosts
+    )
+done
+
+(
+    trap - EXIT HUP INT TERM
+    root="$TEST_DIR/known-unsafe-ancestor"; mkdir -m 0777 "$root"; mkdir -m 0700 "$root/child"
+    USER_KNOWN_HOSTS_FILE="$root/child/known_hosts"; ALLOW_INSECURE_HOST_KEY_STORAGE=false
+    assert_fail "reject non-sticky writable known_hosts ancestor" prepare_known_hosts
+)
+
 # --test-auth must execute real fake SSH true calls for every server without rsync.
 (
     trap - EXIT HUP INT TERM
     root="$TEST_DIR/auth-key"; mkdir -m 0700 "$root" "$root/bin" "$root/capture"
     cat > "$root/bin/timeout" <<'EOF'
 #!/usr/bin/env bash
+[[ ${1:-} == --kill-after=* ]] && shift
 shift
 exec "$@"
 EOF
@@ -511,6 +653,9 @@ EOF
 count=0; [[ -f "$CAPTURE_DIR/count" ]] && count=$(<"$CAPTURE_DIR/count")
 ((count += 1)); printf '%s' "$count" > "$CAPTURE_DIR/count"
 printf '%s\n' "$@" > "$CAPTURE_DIR/ssh.$count"
+for argument in "$@"; do
+    [[ "$argument" == *@\[* ]] && exit 90
+done
 [[ " $* " == *' bad.example '* ]] && exit 1
 exit 0
 EOF
@@ -527,19 +672,39 @@ EOF
     USER_KNOWN_HOSTS_FILE="$root/ssh/known_hosts"; ALLOW_INSECURE_HOST_KEY_STORAGE=false
     CONNECTION_TIMEOUT=12; TOTAL_TIMEOUT=20
     SERVERS=("root@example.com:2200" "admin@192.0.2.1" "root@[2001:db8::1]:2222")
+    mkdir -p "$root/home/.ssh"
+    printf 'IdentityFile /tmp/hostile-key\nControlMaster auto\n' > "$root/home/.ssh/config"
+    export HOME="$root/home" SSH_AUTH_SOCK="$root/hostile-agent.sock"
     initialize_runtime; prepare_ssh_runtime
     runtime_key="$RUNTIME_KEY_FILE"
     test_authentication
     assert_eq 3 "$(<"$root/capture/count")" "test-auth executes SSH for every configured server"
     for call in "$root/capture"/ssh.*; do
         grep -Fxq true "$call" || fail "test-auth omitted no-op true command"
-        grep -Fxq 'BatchMode=yes' "$call" || fail "key test-auth omitted BatchMode=yes"
+        for required_option in 'BatchMode=yes' 'IdentitiesOnly=yes' 'IdentityAgent=none' \
+            'IdentityFile=none' 'CertificateFile=none' \
+            'PreferredAuthentications=publickey' 'PasswordAuthentication=no' \
+            'KbdInteractiveAuthentication=no' 'ControlMaster=no' 'ControlPath=none' \
+            'ClearAllForwardings=yes' 'ForkAfterAuthentication=no'; do
+            grep -Fxq "$required_option" "$call" || fail "key test-auth omitted $required_option"
+        done
+        grep -Fxq none "$call" || fail "key test-auth omitted -F none"
         grep -Fxq "$runtime_key" "$call" || fail "key test-auth did not use runtime key copy"
+        if grep -Fq /tmp/hostile-key "$call"; then fail "hostile SSH IdentityFile leaked into argv"; fi
     done
-    pass "key test-auth uses BatchMode and verified runtime key copy"
+    pass "key test-auth isolates identity, agent, config, and connection sharing"
+    grep -Fxq 'root@2001:db8::1' "$root/capture/ssh.3" || fail "direct SSH IPv6 target retained brackets"
+    pass "direct SSH IPv6 target is unbracketed"
     grep -Fxq 'UserKnownHostsFile='"$USER_KNOWN_HOSTS_FILE" "$root/capture/ssh.1" || fail "test-auth omitted known_hosts path"
     [[ ! -e "$root/capture/rsync-called" ]] || fail "test-auth called rsync"
     pass "test-auth performs no rsync or remote write"
+    auth_count_before=$(<"$root/capture/count")
+    command mv "$USER_KNOWN_HOSTS_FILE" "$USER_KNOWN_HOSTS_FILE.real"
+    ln -s "$USER_KNOWN_HOSTS_FILE.real" "$USER_KNOWN_HOSTS_FILE"
+    assert_fail "SSH start revalidates known_hosts path" test_authentication
+    assert_eq "$auth_count_before" "$(<"$root/capture/count")" "failed known_hosts revalidation starts no SSH"
+    command rm -f "$USER_KNOWN_HOSTS_FILE"
+    command mv "$USER_KNOWN_HOSTS_FILE.real" "$USER_KNOWN_HOSTS_FILE"
     cleanup_runtime
     [[ ! -e "$runtime_key" ]] || fail "test-auth cleanup left runtime key"
 )
@@ -549,6 +714,7 @@ EOF
     root="$TEST_DIR/auth-password"; mkdir -m 0700 "$root" "$root/bin" "$root/capture"
     cat > "$root/bin/timeout" <<'EOF'
 #!/usr/bin/env bash
+[[ ${1:-} == --kill-after=* ]] && shift
 shift
 exec "$@"
 EOF
@@ -573,9 +739,13 @@ EOF
     initialize_runtime; prepare_ssh_runtime
     test_authentication
     assert_file_eq secret "$root/capture/password-seen" "password test-auth passes SSHPASS through sshpass -e"
-    grep -Fxq 'PreferredAuthentications=password' "$root/capture/ssh" || fail "password wrapper omitted PreferredAuthentications"
-    grep -Fxq 'NumberOfPasswordPrompts=1' "$root/capture/ssh" || fail "password wrapper omitted prompt limit"
-    pass "password test-auth limits authentication and password prompts"
+    for required_option in 'PreferredAuthentications=password' 'PubkeyAuthentication=no' \
+        'PasswordAuthentication=yes' 'KbdInteractiveAuthentication=no' \
+        'NumberOfPasswordPrompts=1' 'ControlMaster=no' 'ControlPath=none'; do
+        grep -Fxq "$required_option" "$root/capture/ssh" || fail "password wrapper omitted $required_option"
+    done
+    grep -Fxq none "$root/capture/ssh" || fail "password wrapper omitted -F none"
+    pass "password test-auth disables publickey and limits password prompts"
     SERVERS=("user@bad.example")
     assert_fail "test-auth returns nonzero when any server fails" test_authentication
     cleanup_runtime
@@ -583,12 +753,130 @@ EOF
     pass "test-auth cleanup unsets SSHPASS"
 )
 
+write_auth_signal_fixture() {
+    local root="$1" mode="$2"
+    mkdir -m 0700 "$root" "$root/bin" "$root/runtime" "$root/ssh" "$root/pids"
+    if [[ "$mode" == key ]]; then
+        printf key-material > "$root/key"; chmod 0600 "$root/key"
+        auth_config=$(cat <<EOF
+AUTH_METHOD="key"
+KEY_FILE="$root/key"
+EOF
+)
+    else
+        auth_config=$(cat <<'EOF'
+AUTH_METHOD="password"
+PASSWORD_METHOD="inline"
+PASSWORD="auth-signal-secret"
+EOF
+)
+    fi
+    cat > "$root/config.conf" <<EOF
+$auth_config
+DEFAULT_PORT=22
+DEFAULT_USER="root"
+MAX_PARALLEL=1
+CONNECTION_TIMEOUT=5
+TOTAL_TIMEOUT=60
+MAX_RETRIES=1
+RETRY_DELAY=1
+DELETE_EXTRA="false"
+ALLOW_DELETE_EXTRA="false"
+RSYNC_ARCHIVE="true"
+RSYNC_COMPRESS="false"
+SERVERS=("root@[2001:db8::10]:2222")
+declare -A TASKS=()
+ENABLE_LOGGING="false"
+STRICT_HOST_KEY_CHECKING="accept-new"
+USER_KNOWN_HOSTS_FILE="$root/ssh/known_hosts"
+ALLOW_INSECURE_HOST_KEY_STORAGE="false"
+EOF
+    chmod 0600 "$root/config.conf"
+    cat > "$root/bin/timeout" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$$" > "$PID_DIR/timeout.pid"
+[[ ${1:-} == --kill-after=* ]] && shift
+shift
+"$@" &
+wait "$!"
+EOF
+    cat > "$root/bin/sshpass" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$$" > "$PID_DIR/sshpass.pid"
+[[ ${1:-} == -e ]] && shift
+"$@" &
+wait "$!"
+EOF
+    cat > "$root/bin/ssh" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$$" > "$PID_DIR/ssh.pid"
+for argument in "$@"; do [[ "$argument" == *@\[* ]] && exit 90; done
+sleep 300 &
+printf '%s\n' "$!" > "$PID_DIR/leaf.pid"
+wait "$!"
+EOF
+    cat > "$root/bin/rsync" <<'EOF'
+#!/usr/bin/env bash
+touch "$PID_DIR/rsync-unexpected"
+exit 1
+EOF
+    chmod 0700 "$root/bin"/*
+}
+
+run_auth_process_tree_signal_case() {
+    local mode="$1" signal_name="$2" expected_status="$3"
+    local root="$TEST_DIR/auth-process-$mode-$signal_name" pid rc=0 watchdog unrelated
+    write_auth_signal_fixture "$root" "$mode"
+    sleep 60 & unrelated=$!
+    (
+        cd "$root"
+        exec env --default-signal=HUP,INT,TERM PATH="$root/bin:$PATH" TMPDIR="$root/runtime" PID_DIR="$root/pids" \
+            "$SCRIPT" --test-auth
+    ) > "$root/output.log" 2>&1 &
+    pid=$!
+    for _ in $(seq 1 300); do
+        if [[ -f "$root/pids/timeout.pid" && -f "$root/pids/ssh.pid" && -f "$root/pids/leaf.pid" ]]; then
+            [[ "$mode" == key || -f "$root/pids/sshpass.pid" ]] && break
+        fi
+        sleep 0.05
+    done
+    [[ -f "$root/pids/leaf.pid" ]] || { cat "$root/output.log"; kill "$pid" "$unrelated" 2>/dev/null || true; fail "$mode/$signal_name auth process tree did not start"; }
+    (sleep 15; kill -KILL "$pid" 2>/dev/null || true) & watchdog=$!
+    kill "-$signal_name" "$pid"
+    wait "$pid" || rc=$?
+    kill "$watchdog" 2>/dev/null || true; wait "$watchdog" 2>/dev/null || true
+    assert_eq "$expected_status" "$rc" "$mode test-auth $signal_name returns conventional status"
+    for pid_file in timeout ssh leaf; do
+        child_pid=$(<"$root/pids/$pid_file.pid")
+        process_is_running "$child_pid" && fail "$mode/$signal_name left $pid_file process"
+    done
+    if [[ "$mode" == password ]]; then
+        child_pid=$(<"$root/pids/sshpass.pid")
+        process_is_running "$child_pid" && fail "$mode/$signal_name left sshpass process"
+    fi
+    pass "$mode test-auth $signal_name terminates timeout, sshpass/ssh, and leaf descendants"
+    [[ -z "$(find "$root/runtime" -mindepth 1 -maxdepth 1 -name 'push-runtime.*' -print -quit)" ]] || fail "$mode/$signal_name left auth runtime"
+    [[ ! -e "$root/pids/rsync-unexpected" ]] || fail "$mode/$signal_name test-auth called rsync"
+    pass "$mode test-auth $signal_name removes runtime without rsync"
+    kill -0 "$unrelated" 2>/dev/null || fail "$mode/$signal_name terminated unrelated process"
+    kill "$unrelated" 2>/dev/null || true; wait "$unrelated" 2>/dev/null || true
+    [[ -z "${SSHPASS:-}" ]] || fail "$mode/$signal_name leaked SSHPASS"
+    pass "$mode test-auth $signal_name preserves unrelated process and leaves no SSHPASS"
+}
+
+for auth_mode in key password; do
+    run_auth_process_tree_signal_case "$auth_mode" HUP 129
+    run_auth_process_tree_signal_case "$auth_mode" INT 130
+    run_auth_process_tree_signal_case "$auth_mode" TERM 143
+done
+
 # rsync argv boundaries, protect-args, special paths, option matrices, and no shell injection.
 (
     trap - EXIT HUP INT TERM
     root="$TEST_DIR/rsync-argv"; mkdir -m 0700 "$root" "$root/bin" "$root/capture" "$root/runtime"
     cat > "$root/bin/timeout" <<'EOF'
 #!/usr/bin/env bash
+[[ ${1:-} == --kill-after=* ]] && shift
 shift
 exec "$@"
 EOF
@@ -608,7 +896,8 @@ EOF
     TMPDIR="$root/runtime"; initialize_runtime
     AUTH_METHOD=key; RUNTIME_KEY_FILE="$TEMP_DIR/key"; printf key > "$RUNTIME_KEY_FILE"; chmod 0600 "$RUNTIME_KEY_FILE"
     SSH_WRAPPER="$TEMP_DIR/ssh-wrapper"; printf '#!/usr/bin/env bash\nexit 0\n' > "$SSH_WRAPPER"; chmod 0700 "$SSH_WRAPPER"
-    STRICT_HOST_KEY_CHECKING=accept-new; USER_KNOWN_HOSTS_FILE="$root/known hosts"
+    STRICT_HOST_KEY_CHECKING=accept-new; USER_KNOWN_HOSTS_FILE="$root/known_hosts"; ALLOW_INSECURE_HOST_KEY_STORAGE=false
+    prepare_known_hosts
     CONNECTION_TIMEOUT=9; TOTAL_TIMEOUT=20; MAX_RETRIES=1; RETRY_DELAY=1
     RSYNC_ARCHIVE=true; RSYNC_COMPRESS=true; DELETE_EXTRA=true
     cd "$root"
@@ -653,6 +942,7 @@ EOF
     root="$TEST_DIR/rsync-status"; mkdir -m 0700 "$root" "$root/bin" "$root/state" "$root/runtime"
     cat > "$root/bin/timeout" <<'EOF'
 #!/usr/bin/env bash
+[[ ${1:-} == --kill-after=* ]] && shift
 shift
 exec "$@"
 EOF
@@ -678,7 +968,8 @@ EOF
     TMPDIR="$root/runtime"; initialize_runtime
     AUTH_METHOD=key; RUNTIME_KEY_FILE="$TEMP_DIR/key"; printf key > "$RUNTIME_KEY_FILE"; chmod 0600 "$RUNTIME_KEY_FILE"
     SSH_WRAPPER="$TEMP_DIR/wrapper"; printf '#!/usr/bin/env bash\nexit 0\n' > "$SSH_WRAPPER"; chmod 0700 "$SSH_WRAPPER"
-    STRICT_HOST_KEY_CHECKING=accept-new; USER_KNOWN_HOSTS_FILE="$root/known"
+    STRICT_HOST_KEY_CHECKING=accept-new; USER_KNOWN_HOSTS_FILE="$root/known"; ALLOW_INSECURE_HOST_KEY_STORAGE=false
+    prepare_known_hosts
     CONNECTION_TIMEOUT=5; TOTAL_TIMEOUT=10; MAX_RETRIES=1; RETRY_DELAY=1
     RSYNC_ARCHIVE=true; RSYNC_COMPRESS=false; DELETE_EXTRA=false; MAX_PARALLEL=2
     SERVERS=(good1 good2 good3 good4)
@@ -694,6 +985,102 @@ EOF
     assert_eq 2 "$(wc -l < "$FAILED_FILE")" "all failures record every server"
     cleanup_runtime
 )
+
+# TOTAL_TIMEOUT is a hard TERM-to-KILL boundary for resistant transfer and auth trees.
+(
+    trap - EXIT HUP INT TERM
+    root="$TEST_DIR/hard-timeout-transfer"; mkdir -m 0700 "$root" "$root/bin" "$root/runtime" "$root/pids"
+    cat > "$root/bin/rsync" <<'EOF'
+#!/usr/bin/env bash
+trap '' TERM
+printf '%s\n' "$$" > "$PID_DIR/rsync.pid"
+bash -c 'trap "" TERM; printf "%s\n" "$$" > "$PID_DIR/leaf.pid"; while :; do sleep 1; done' &
+wait "$!"
+EOF
+    chmod 0700 "$root/bin/rsync"
+    PATH="$root/bin:$PATH"; export PATH PID_DIR="$root/pids"
+    TMPDIR="$root/runtime"; initialize_runtime
+    AUTH_METHOD=key; RUNTIME_KEY_FILE="$TEMP_DIR/key"; printf key > "$RUNTIME_KEY_FILE"; chmod 0600 "$RUNTIME_KEY_FILE"
+    SSH_WRAPPER="$TEMP_DIR/wrapper"; printf '#!/usr/bin/env bash\nexit 0\n' > "$SSH_WRAPPER"; chmod 0700 "$SSH_WRAPPER"
+    STRICT_HOST_KEY_CHECKING=accept-new; USER_KNOWN_HOSTS_FILE="$root/known_hosts"; ALLOW_INSECURE_HOST_KEY_STORAGE=false; prepare_known_hosts
+    CONNECTION_TIMEOUT=2; TOTAL_TIMEOUT=1; TIMEOUT_KILL_AFTER=1; MAX_RETRIES=1; RETRY_DELAY=1
+    RSYNC_ARCHIVE=true; RSYNC_COMPRESS=false; DELETE_EXTRA=false
+    start=$(date +%s)
+    assert_fail "TERM-resistant transfer hits hard timeout" retry_rsync good.example source destination
+    duration=$(($(date +%s) - start))
+    (( duration <= 5 )) || fail "hard transfer timeout exceeded bounded grace"
+    for pid_file in rsync leaf; do child_pid=$(<"$root/pids/$pid_file.pid"); process_is_running "$child_pid" && fail "hard transfer timeout left $pid_file"; done
+    pass "hard transfer timeout KILLs resistant command and descendants before retry"
+    cleanup_runtime
+)
+
+(
+    trap - EXIT HUP INT TERM
+    root="$TEST_DIR/hard-timeout-auth"; mkdir -m 0700 "$root" "$root/bin" "$root/runtime" "$root/pids"
+    cat > "$root/bin/ssh" <<'EOF'
+#!/usr/bin/env bash
+trap '' TERM
+printf '%s\n' "$$" > "$PID_DIR/ssh.pid"
+bash -c 'trap "" TERM; printf "%s\n" "$$" > "$PID_DIR/leaf.pid"; while :; do sleep 1; done' &
+wait "$!"
+EOF
+    chmod 0700 "$root/bin/ssh"
+    PATH="$root/bin:$PATH"; export PATH PID_DIR="$root/pids"
+    TMPDIR="$root/runtime"; initialize_runtime
+    key="$root/key"; printf key > "$key"; chmod 0600 "$key"
+    AUTH_METHOD=key; KEY_FILE="$key"; STRICT_HOST_KEY_CHECKING=accept-new
+    USER_KNOWN_HOSTS_FILE="$root/known_hosts"; ALLOW_INSECURE_HOST_KEY_STORAGE=false
+    CONNECTION_TIMEOUT=2; TOTAL_TIMEOUT=1; TIMEOUT_KILL_AFTER=1; SERVERS=(good.example)
+    prepare_ssh_runtime
+    start=$(date +%s)
+    assert_fail "TERM-resistant auth hits hard timeout" test_authentication
+    duration=$(($(date +%s) - start))
+    (( duration <= 5 )) || fail "hard auth timeout exceeded bounded grace"
+    for pid_file in ssh leaf; do child_pid=$(<"$root/pids/$pid_file.pid"); process_is_running "$child_pid" && fail "hard auth timeout left $pid_file"; done
+    pass "hard auth timeout KILLs resistant SSH and descendants"
+    cleanup_runtime
+)
+
+run_accounting_failure_case() {
+    local failure_kind="$1" root="$TEST_DIR/accounting-$1"
+    (
+        trap - EXIT HUP INT TERM
+        mkdir -m 0700 "$root" "$root/bin" "$root/runtime"
+        cat > "$root/bin/timeout" <<'EOF'
+#!/usr/bin/env bash
+[[ ${1:-} == --kill-after=* ]] && shift
+shift
+exec "$@"
+EOF
+        cat > "$root/bin/rsync" <<'EOF'
+#!/usr/bin/env bash
+sleep 0.1
+exit 0
+EOF
+        chmod 0700 "$root/bin"/*
+        PATH="$root/bin:$PATH"; export PATH
+        TMPDIR="$root/runtime"; initialize_runtime
+        AUTH_METHOD=key; RUNTIME_KEY_FILE="$TEMP_DIR/key"; printf key > "$RUNTIME_KEY_FILE"; chmod 0600 "$RUNTIME_KEY_FILE"
+        SSH_WRAPPER="$TEMP_DIR/wrapper"; printf '#!/usr/bin/env bash\nexit 0\n' > "$SSH_WRAPPER"; chmod 0700 "$SSH_WRAPPER"
+        STRICT_HOST_KEY_CHECKING=accept-new; USER_KNOWN_HOSTS_FILE="$root/known_hosts"; ALLOW_INSECURE_HOST_KEY_STORAGE=false; prepare_known_hosts
+        CONNECTION_TIMEOUT=2; TOTAL_TIMEOUT=5; TIMEOUT_KILL_AFTER=1; MAX_RETRIES=1; RETRY_DELAY=1
+        RSYNC_ARCHIVE=true; RSYNC_COMPRESS=false; DELETE_EXTRA=false; MAX_PARALLEL=1; SERVERS=(good.example)
+        case "$failure_kind" in
+            flock) flock() { return 1; } ;;
+            append) append_result_record() { return 1; } ;;
+            close) close_result_lock_fd() { return 1; } ;;
+        esac
+        assert_fail "$failure_kind result recording failure makes push fail" run_transfer source destination > "$root/output.log" 2>&1
+        if grep -Fq '成功: 1/1' "$root/output.log"; then fail "$failure_kind accounting failure printed false success summary"; fi
+        grep -Fq '结果记录不完整' "$root/output.log" || fail "$failure_kind accounting failure omitted explicit error"
+        pass "$failure_kind accounting failure suppresses false success summary"
+        cleanup_runtime
+    )
+}
+
+run_accounting_failure_case flock
+run_accounting_failure_case append
+run_accounting_failure_case close
 
 # Delete authorization remains explicit.
 (
@@ -755,6 +1142,7 @@ EOF
     cat > "$root/bin/timeout" <<'EOF'
 #!/usr/bin/env bash
 printf '%s\n' "$$" > "$PID_DIR/timeout.pid"
+[[ ${1:-} == --kill-after=* ]] && shift
 shift
 "$@" &
 wait "$!"
@@ -782,12 +1170,6 @@ EOF
     chmod 0700 "$root/bin"/*
 }
 
-process_is_running() {
-    local pid="$1" state=""
-    [[ -r "/proc/$pid/stat" ]] || return 1
-    state=$(awk '{print $3}' "/proc/$pid/stat" 2>/dev/null) || return 1
-    [[ "$state" != Z ]]
-}
 
 run_process_tree_signal_case() {
     local signal_name="$1" expected_status="$2"
