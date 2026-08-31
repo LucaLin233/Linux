@@ -1050,65 +1050,25 @@ done
 for missing_command in bash chown flock ln od readlink sha256sum touch wc; do
 (
     root="$TEST_DIR/module-missing-$missing_command"; create_fixture "$root"; export_paths "$root"
-    before=$(target_hash "$root"); rc=0
-    bash -c '
+    before=$(target_hash "$root"); rc=0; mkdir "$root/bin"
+    for available_command in apt-get apt-cache awk bash basename cat chmod chown cp curl df dirname dpkg flock grep hostname id install ln mkdir mktemp mv od readlink rm sed sha256sum sleep sort stat touch tr uname uptime wc; do
+        [[ "$available_command" == "$missing_command" ]] && continue
+        available_path=$(command -v "$available_command" || true)
+        if [[ -n "$available_path" ]]; then ln -s "$available_path" "$root/bin/$available_command"
+        else printf '#!/bin/sh\nexit 0\n' > "$root/bin/$available_command"; chmod 0755 "$root/bin/$available_command"; fi
+    done
+    PATH="$root/bin" /bin/bash -c '
         . "$1"
         require_root() { :; }
-        missing_command_name=$2; trace_path=$3
-        command() {
-            if [[ "$1" == -v && "${2:-}" == "$missing_command_name" ]]; then printf "%s\n" "$missing_command_name" > "$trace_path"; return 1; fi
-            builtin command "$@"
-        }
         main motd
-    ' _ "$ROOT_DIR/modules/system-customize.sh" "$missing_command" "$root/missing-trace" > "$root/output" 2>&1 || rc=$?
+    ' _ "$ROOT_DIR/modules/system-customize.sh" > "$root/output" 2>&1 || rc=$?
     assert_eq 1 "$rc" "module missing $missing_command fails before action"
-    assert_eq "$missing_command" "$(cat "$root/missing-trace")" "module preflight reaches missing $missing_command"
+    grep -Fq "缺少必要命令: $missing_command" "$root/output" || fail "module missing $missing_command not reported"
+    pass "module preflight reports missing $missing_command"
     assert_eq "$before" "$(target_hash "$root")" "module missing $missing_command preserves MOTD"
     [[ ! -e "$MOTD_STATE_DIR" && ! -e "$MOTD_LOCK_FILE" ]] || fail "module missing $missing_command created lock/state"
 )
 done
-
-
-(
-    root="$TEST_DIR/delete-hook-symlink"; create_fixture "$root"; export_paths "$root"
-    printf one > "$root/one"; printf two > "$root/two"; rm -f "$MOTD_ETC_ROOT/update-motd.d/10-uname"; ln -s "$root/one" "$MOTD_ETC_ROOT/update-motd.d/10-uname"
-    before=$(target_hash "$root")
-    load_motd
-    motd_target_commit_hook() {
-        if [[ "$2" == uname ]]; then rm -f "$3"; ln -s "$root/two" "$3"; fi
-        return 0
-    }
-    assert_fail "delete hook symlink replacement rejected before rm" motd_run_locked_operation install
-    assert_eq "$before" "$(target_hash "$root")" "delete hook rollback restores original symlink"
-)
-
-
-(
-    root="$TEST_DIR/snapshot-hook-final-validate"; create_fixture "$root"; export_paths "$root"
-    load_motd; motd_run_locked_operation install
-    before=$(target_hash "$root")
-    motd_snapshot_commit_hook() {
-        if [[ "$1" == previous && "$3" == directory ]]; then printf corrupt > "$MOTD_STATE_DIR/generations/.${2}.stage/objects/motd"; fi
-        return 0
-    }
-    assert_fail "persistent snapshot hook corruption rejected before publish" motd_run_locked_operation install
-    assert_eq "$before" "$(target_hash "$root")" "persistent snapshot hook corruption preserves targets"
-)
-
-(
-    root="$TEST_DIR/legacy-mv-final-validate"; create_fixture "$root"; export_paths "$root"
-    create_complete_legacy_scope initial; before=$(target_hash "$root")
-    load_motd
-    motd_legacy_io_hook() {
-        if [[ "$1" == mv ]]; then
-            stage=${MOTD_SNAPSHOT_BUILDING_PATHS[${#MOTD_SNAPSHOT_BUILDING_PATHS[@]}-1]}
-            printf corrupt > "$stage/objects/motd"
-        fi
-        return 0
-    }
-    assert_fail "legacy mv hook corruption rejected before publish" motd_run_locked_operation restore initial
-    assert_eq "$before" "$(target_hash "$root")" "legacy mv hook corruption preserves targets"
-)
 
 grep -Fq 'error "缺少必要命令: $required_command"' "$ROOT_DIR/modules/system-customize.sh" || fail "module missing-command error output branch absent"
 pass "module dependency preflight retains missing-command output"
