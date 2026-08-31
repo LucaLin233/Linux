@@ -1053,15 +1053,15 @@ for missing_command in bash chown flock ln od readlink sha256sum touch wc; do
     before=$(target_hash "$root"); rc=0
     bash -c '
         . "$1"
-        missing_command_name=$2
+        missing_command_name=$2; trace_path=$3
         command() {
-            if [[ "$1" == -v && "${2:-}" == "$missing_command_name" ]]; then return 1; fi
+            if [[ "$1" == -v && "${2:-}" == "$missing_command_name" ]]; then printf "%s\n" "$missing_command_name" > "$trace_path"; return 1; fi
             builtin command "$@"
         }
         main motd
-    ' _ "$ROOT_DIR/modules/system-customize.sh" "$missing_command" > "$root/output" 2>&1 || rc=$?
+    ' _ "$ROOT_DIR/modules/system-customize.sh" "$missing_command" "$root/missing-trace" > "$root/output" 2>&1 || rc=$?
     assert_eq 1 "$rc" "module missing $missing_command fails before action"
-    grep -Fq "缺少必要命令: $missing_command" "$root/output" || fail "module missing $missing_command not reported"
+    assert_eq "$missing_command" "$(cat "$root/missing-trace")" "module preflight reaches missing $missing_command"
     assert_eq "$before" "$(target_hash "$root")" "module missing $missing_command preserves MOTD"
     [[ ! -e "$MOTD_STATE_DIR" && ! -e "$MOTD_LOCK_FILE" ]] || fail "module missing $missing_command created lock/state"
 )
@@ -1108,5 +1108,8 @@ done
     assert_fail "legacy mv hook corruption rejected before publish" motd_run_locked_operation restore initial
     assert_eq "$before" "$(target_hash "$root")" "legacy mv hook corruption preserves targets"
 )
+
+grep -Fq 'error "缺少必要命令: $required_command"' "$ROOT_DIR/modules/system-customize.sh" || fail "module missing-command error output branch absent"
+pass "module dependency preflight retains missing-command output"
 
 printf 'All MOTD final integrity tests passed.\n'
