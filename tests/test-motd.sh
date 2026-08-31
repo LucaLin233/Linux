@@ -1180,4 +1180,80 @@ done
     assert_eq "$legacy_times" "$(stat -c %X:%Y "$MOTD_STATE_DIR/motd.initial-backup")" "legacy root metadata validation/import preserves timestamps"; pass "legal state root regular, symlink, and markers import"
 )
 
-printf 'All MOTD noop/state validation tests passed.\n'
+
+for rollback_impl in tool module; do
+    for rollback_damage in motd-content issue-mode custom-inode absent-regular absent-symlink absent-fifo symlink-target; do
+    (
+        root="$TEST_DIR/rollback-final-$rollback_impl-$rollback_damage"; create_fixture "$root"; export_paths "$root"
+        if [[ "$rollback_impl" == tool ]]; then load_motd; else . "$ROOT_DIR/modules/system-customize.sh"; fi
+        motd_run_locked_operation install
+        case "$rollback_damage" in
+            motd-content) printf 'pre-run-motd\n' > "$MOTD_ETC_ROOT/motd" ;;
+            issue-mode) chmod 0600 "$MOTD_ETC_ROOT/issue" ;;
+            custom-inode) printf 'pre-run-custom\n' > "$MOTD_ETC_ROOT/update-motd.d/00-custom-welcome"; chmod 0700 "$MOTD_ETC_ROOT/update-motd.d/00-custom-welcome" ;;
+            absent-regular|absent-symlink|absent-fifo) rm -f "$MOTD_ETC_ROOT/update-motd.d/50-motd-news" ;;
+            symlink-target) rm -f "$MOTD_ETC_ROOT/update-motd.d/10-uname"; ln -s "$root/original-link" "$MOTD_ETC_ROOT/update-motd.d/10-uname" ;;
+        esac
+        before=$(target_hash "$root")
+        before_pointers="$(cat "$MOTD_STATE_DIR/initial.current")|$(cat "$MOTD_STATE_DIR/previous.current")"
+        motd_target_commit_hook() { [[ "$2" != issue_net ]]; }
+        motd_rollback_hook() {
+            local id="$1" path target
+            [[ "$id" == motd_news ]] || return 0
+            case "$rollback_damage" in
+                motd-content) printf 'rollback-corrupt\n' > "$MOTD_ETC_ROOT/motd" ;;
+                issue-mode) chmod 0777 "$MOTD_ETC_ROOT/issue" ;;
+                custom-inode)
+                    path="$MOTD_ETC_ROOT/update-motd.d/00-custom-welcome"
+                    cp "$path" "${path}.replacement"; chmod 0700 "${path}.replacement"; mv -Tf "${path}.replacement" "$path"
+                    ;;
+                absent-regular|absent-symlink|absent-fifo)
+                    ROLLBACK_RECREATE_TARGET="$MOTD_ETC_ROOT/update-motd.d/50-motd-news"
+                    rm() {
+                        local status
+                        command rm "$@"; status=$?; unset -f rm
+                        case "$rollback_damage" in
+                            absent-regular) printf recreated > "$ROLLBACK_RECREATE_TARGET"; chmod 0755 "$ROLLBACK_RECREATE_TARGET" ;;
+                            absent-symlink) ln -s "$root/recreated-link" "$ROLLBACK_RECREATE_TARGET" ;;
+                            absent-fifo) mkfifo "$ROLLBACK_RECREATE_TARGET" ;;
+                        esac
+                        return "$status"
+                    }
+                    ;;
+                symlink-target) rm -f "$MOTD_ETC_ROOT/update-motd.d/10-uname"; ln -s "$root/changed-link" "$MOTD_ETC_ROOT/update-motd.d/10-uname" ;;
+            esac
+            return 0
+        }
+        assert_fail "$rollback_impl rollback final group rejects $rollback_damage" motd_run_locked_operation install
+        [[ -e "$MOTD_STATE_DIR/pending" ]] || fail "$rollback_impl rollback $rollback_damage lost pending"
+        transaction=$(cat "$MOTD_STATE_DIR/pending")
+        journal="$MOTD_TRANSACTION_PARENT/$transaction/journal"
+        grep -Fxq 'phase=active' "$journal" || fail "$rollback_impl rollback $rollback_damage journal not active"
+        [[ -d "$MOTD_TRANSACTION_PARENT/$transaction/rollback" ]] || fail "$rollback_impl rollback $rollback_damage lost rollback snapshot"
+        pass "$rollback_impl rollback $rollback_damage preserves active recovery evidence"
+        motd_target_commit_hook() { :; }; motd_rollback_hook() { :; }
+        motd_take_lock; motd_reconcile_state; motd_release_lock
+        assert_eq "$before" "$(target_hash "$root")" "$rollback_impl rollback $rollback_damage retry restores targets"
+        assert_eq "$before_pointers" "$(cat "$MOTD_STATE_DIR/initial.current")|$(cat "$MOTD_STATE_DIR/previous.current")" "$rollback_impl rollback $rollback_damage retry restores pointers"
+        [[ ! -e "$MOTD_STATE_DIR/pending" && -z "$(find "$MOTD_TRANSACTION_PARENT" -mindepth 1 -print -quit)" ]] || fail "$rollback_impl rollback $rollback_damage retry left journal"
+        assert_no_motd_residue "$root"; assert_eq 2 "$(generation_count "$MOTD_STATE_DIR/generations")" "$rollback_impl rollback $rollback_damage retry keeps bounded generations"
+        motd_take_lock; motd_release_lock
+    )
+    done
+
+done
+
+for rollback_impl in tool module; do
+(
+    root="$TEST_DIR/rollback-final-success-$rollback_impl"; create_fixture "$root"; export_paths "$root"
+    if [[ "$rollback_impl" == tool ]]; then load_motd; else . "$ROOT_DIR/modules/system-customize.sh"; fi
+    motd_run_locked_operation install; printf 'normal-pre-run\n' > "$MOTD_ETC_ROOT/motd"; before=$(target_hash "$root")
+    motd_target_commit_hook() { [[ "$2" != issue_net ]]; }
+    assert_fail "$rollback_impl normal rollback still returns original operation failure" motd_run_locked_operation install
+    assert_eq "$before" "$(target_hash "$root")" "$rollback_impl normal rollback final group succeeds"
+    [[ ! -e "$MOTD_STATE_DIR/pending" && -z "$(find "$MOTD_TRANSACTION_PARENT" -mindepth 1 -print -quit)" ]] || fail "$rollback_impl normal rollback left journal"
+    assert_no_motd_residue "$root"
+)
+done
+
+printf 'All MOTD rollback final validation tests passed.\n'

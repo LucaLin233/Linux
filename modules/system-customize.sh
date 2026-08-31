@@ -1366,7 +1366,7 @@ motd_validate_committed_replace_target() {
     esac
 }
 
-motd_validate_committed_target_group() {
+motd_validate_applied_target_group() {
     local id
     for id in "${MOTD_TARGET_IDS[@]}"; do
         case "${MOTD_TARGET_ACTION[$id]:-}" in
@@ -1526,7 +1526,7 @@ motd_commit_target_plan() {
         if [[ "$rollback_mode" == false ]]; then motd_transaction_phase_hook "target-committed-$id" || return 1; fi
     done
     [[ "$failed" == false ]] || return 1
-    [[ "$rollback_mode" == true ]] || motd_validate_committed_target_group
+    motd_validate_applied_target_group
 }
 
 motd_prepare_state_layout() {
