@@ -51,6 +51,8 @@ declare -gA MOTD_TARGET_ACTION=() MOTD_TARGET_STAGE=()
 declare -gA MOTD_STAGE_DEV=() MOTD_STAGE_INO=() MOTD_STAGE_TYPE=() MOTD_STAGE_UID=() MOTD_STAGE_GID=()
 declare -gA MOTD_STAGE_MODE=() MOTD_STAGE_DIGEST=() MOTD_STAGE_LINK=() MOTD_STAGE_ATIME=() MOTD_STAGE_MTIME=()
 declare -gA MOTD_DELETE_DEV=() MOTD_DELETE_INO=() MOTD_DELETE_TYPE=() MOTD_DELETE_LINK=()
+declare -gA MOTD_NOOP_STATE=() MOTD_NOOP_DEV=() MOTD_NOOP_INO=() MOTD_NOOP_UID=() MOTD_NOOP_GID=()
+declare -gA MOTD_NOOP_MODE=() MOTD_NOOP_DIGEST=() MOTD_NOOP_ATIME=() MOTD_NOOP_MTIME=() MOTD_NOOP_LINK=()
 for MOTD_INDEX in "${!MOTD_TARGET_IDS[@]}"; do
     MOTD_PATH_BY_ID["${MOTD_TARGET_IDS[$MOTD_INDEX]}"]="${MOTD_TARGET_PATHS[$MOTD_INDEX]}"
 done
@@ -427,6 +429,17 @@ motd_find_legacy_state() {
         done
     done < <(motd_legacy_prefixes_for_id "$id")
     (( count == 1 )) || { (( count == 0 )) && return 2; error "legacy MOTD 状态冲突: $id/$scope"; return 1; }
+}
+
+motd_validate_legacy_regular_metadata() {
+    local path="$1" parent metadata owner gid mode
+    parent=$(motd_path_parent "$path") || return 1
+    motd_validate_directory_chain "$parent" || return 1
+    [[ -f "$path" && ! -L "$path" ]] || return 1
+    metadata=$(stat -c '%u:%g:%a' -- "$path") || return 1
+    IFS=: read -r owner gid mode <<< "$metadata"
+    [[ "$owner" == "$MOTD_TRUSTED_UID" && "$gid" == "$MOTD_TRUSTED_GID" && "$mode" =~ ^[0-7]{3,4}$ ]] || return 1
+    (( (8#$mode & 0022) == 0 ))
 }
 
 motd_validate_legacy_symlink() {
@@ -828,6 +841,18 @@ motd_cleanup_root_stages() {
     [[ "$failed" == false ]]
 }
 
+motd_validate_state_legacy_object() {
+    local path="$1" name=${1##*/} kind
+    if [[ "$name" =~ ^(motd|issue|issue\.net|00-custom-welcome|10-uname|50-motd-news)\.initial-(backup|absent|unknown)$ ]]; then kind=${BASH_REMATCH[2]}
+    elif [[ "$name" =~ ^(motd|issue|issue\.net|00-custom-welcome|10-uname|50-motd-news)\.previous-(backup|absent)$ ]]; then kind=${BASH_REMATCH[2]}
+    else return 1; fi
+    case "$kind" in
+        backup) if [[ -L "$path" ]]; then motd_validate_legacy_symlink "$path"; else motd_validate_legacy_regular_metadata "$path"; fi ;;
+        absent|unknown) motd_validate_legacy_marker "$path" ;;
+        *) return 1 ;;
+    esac
+}
+
 motd_validate_state_root_entries() {
     local saved path name failed=false
     saved=$(shopt -p nullglob dotglob || true); shopt -s nullglob dotglob
@@ -838,8 +863,8 @@ motd_validate_state_root_entries() {
             transactions) motd_validate_secure_directory "$path" || failed=true ;;
             initial.current|previous.current|pending) ;;
             *)
-                if [[ ! "$name" =~ ^(motd|issue|issue\.net|00-custom-welcome|10-uname|50-motd-news)\.(initial|previous)-(backup|absent|unknown)$ ]]; then
-                    error "未知 MOTD state root 对象: $path"; failed=true
+                if ! motd_validate_state_legacy_object "$path"; then
+                    error "非法 MOTD state root legacy 对象: $path"; failed=true
                 fi
                 ;;
         esac
@@ -1118,14 +1143,14 @@ motd_clear_transaction_globals() {
     MOTD_TRANSACTION_ACTIVE=false; MOTD_TRANSACTION_COMMITTED=false; MOTD_ROLLBACK_MODE=false; MOTD_TRANSACTION_LIFECYCLE=none
     MOTD_TRANSACTION_ID=""; MOTD_TRANSACTION_OPERATION=""; MOTD_TRANSACTION_BUILDING_PATH=""; MOTD_TRANSACTION_FINAL_PATH=""; MOTD_TRANSACTION_DIR=""
     MOTD_INITIAL_OLD=absent; MOTD_PREVIOUS_OLD=absent; MOTD_INITIAL_NEW=-; MOTD_PREVIOUS_NEW=-
-    MOTD_TARGET_ACTION=(); MOTD_TARGET_STAGE=(); MOTD_STAGE_DEV=(); MOTD_STAGE_INO=(); MOTD_STAGE_TYPE=(); MOTD_STAGE_UID=(); MOTD_STAGE_GID=(); MOTD_STAGE_MODE=(); MOTD_STAGE_DIGEST=(); MOTD_STAGE_LINK=(); MOTD_STAGE_ATIME=(); MOTD_STAGE_MTIME=(); MOTD_DELETE_DEV=(); MOTD_DELETE_INO=(); MOTD_DELETE_TYPE=(); MOTD_DELETE_LINK=()
+    MOTD_TARGET_ACTION=(); MOTD_TARGET_STAGE=(); MOTD_STAGE_DEV=(); MOTD_STAGE_INO=(); MOTD_STAGE_TYPE=(); MOTD_STAGE_UID=(); MOTD_STAGE_GID=(); MOTD_STAGE_MODE=(); MOTD_STAGE_DIGEST=(); MOTD_STAGE_LINK=(); MOTD_STAGE_ATIME=(); MOTD_STAGE_MTIME=(); MOTD_DELETE_DEV=(); MOTD_DELETE_INO=(); MOTD_DELETE_TYPE=(); MOTD_DELETE_LINK=(); MOTD_NOOP_STATE=(); MOTD_NOOP_DEV=(); MOTD_NOOP_INO=(); MOTD_NOOP_UID=(); MOTD_NOOP_GID=(); MOTD_NOOP_MODE=(); MOTD_NOOP_DIGEST=(); MOTD_NOOP_ATIME=(); MOTD_NOOP_MTIME=(); MOTD_NOOP_LINK=()
     MOTD_SNAPSHOT_BUILDING_PATHS=(); MOTD_SNAPSHOT_FINAL_PATHS=(); MOTD_POINTER_STAGE_PATHS=(); MOTD_PENDING_STAGE_PATHS=(); MOTD_NEW_GENERATIONS=(); MOTD_ALL_TARGET_STAGE_PATHS=()
 }
 
 motd_reset_target_plan() {
     MOTD_TARGET_ACTION=(); MOTD_TARGET_STAGE=(); MOTD_STAGE_DEV=(); MOTD_STAGE_INO=(); MOTD_STAGE_TYPE=()
     MOTD_STAGE_UID=(); MOTD_STAGE_GID=(); MOTD_STAGE_MODE=(); MOTD_STAGE_DIGEST=(); MOTD_STAGE_LINK=()
-    MOTD_STAGE_ATIME=(); MOTD_STAGE_MTIME=(); MOTD_DELETE_DEV=(); MOTD_DELETE_INO=(); MOTD_DELETE_TYPE=(); MOTD_DELETE_LINK=()
+    MOTD_STAGE_ATIME=(); MOTD_STAGE_MTIME=(); MOTD_DELETE_DEV=(); MOTD_DELETE_INO=(); MOTD_DELETE_TYPE=(); MOTD_DELETE_LINK=(); MOTD_NOOP_STATE=(); MOTD_NOOP_DEV=(); MOTD_NOOP_INO=(); MOTD_NOOP_UID=(); MOTD_NOOP_GID=(); MOTD_NOOP_MODE=(); MOTD_NOOP_DIGEST=(); MOTD_NOOP_ATIME=(); MOTD_NOOP_MTIME=(); MOTD_NOOP_LINK=()
 }
 
 MOTD_ALLOCATED_PATH=""
@@ -1223,6 +1248,10 @@ motd_record_delete_target() {
         MOTD_DELETE_TYPE[$id]=regular; MOTD_DELETE_LINK[$id]=-
     elif [[ ! -e "$path" ]]; then
         dev=-; inode=-; MOTD_DELETE_TYPE[$id]=absent; MOTD_DELETE_LINK[$id]=-
+    elif [[ ! -d "$path" ]]; then
+        metadata=$(stat -c '%d:%i:%f' -- "$path") || return 1
+        IFS=: read -r dev inode link <<< "$metadata"
+        MOTD_DELETE_TYPE[$id]=other; MOTD_DELETE_LINK[$id]=$link
     else return 1; fi
     MOTD_DELETE_DEV[$id]=$dev; MOTD_DELETE_INO[$id]=$inode
 }
@@ -1242,8 +1271,111 @@ motd_validate_delete_target() {
             [[ "$dev" == "${MOTD_DELETE_DEV[$id]}" && "$inode" == "${MOTD_DELETE_INO[$id]}" ]]
             ;;
         absent) [[ ! -e "$path" && ! -L "$path" ]] ;;
+        other)
+            [[ -e "$path" && ! -L "$path" && ! -d "$path" ]] || return 1
+            metadata=$(stat -c '%d:%i:%f' -- "$path") || return 1
+            IFS=: read -r dev inode link <<< "$metadata"
+            [[ "$dev" == "${MOTD_DELETE_DEV[$id]}" && "$inode" == "${MOTD_DELETE_INO[$id]}" && "$link" == "${MOTD_DELETE_LINK[$id]}" ]]
+            ;;
         *) return 1 ;;
     esac
+}
+
+motd_record_noop_target() {
+    local id="$1" path=${MOTD_PATH_BY_ID[$1]} metadata uid gid mode dev inode atime mtime digest link
+    if [[ -L "$path" ]]; then
+        metadata=$(motd_stat_stage_numeric "$path") || return 1
+        IFS=: read -r uid gid mode dev inode atime mtime <<< "$metadata"
+        link=$(readlink -- "$path") || return 1
+        MOTD_NOOP_STATE[$id]=symlink; MOTD_NOOP_LINK[$id]=$link
+    elif [[ -f "$path" ]]; then
+        metadata=$(motd_stat_stage_numeric "$path") || return 1
+        IFS=: read -r uid gid mode dev inode atime mtime <<< "$metadata"
+        digest=$(sha256sum "$path") || return 1
+        touch -a -d "@$atime" "$path" || return 1
+        touch -m -d "@$mtime" "$path" || return 1
+        metadata=$(motd_stat_stage_numeric "$path") || return 1
+        [[ "$metadata" == "$uid:$gid:$mode:$dev:$inode:$atime:$mtime" ]] || return 1
+        MOTD_NOOP_STATE[$id]=regular; MOTD_NOOP_DIGEST[$id]=${digest%% *}
+    elif [[ ! -e "$path" ]]; then
+        uid=-; gid=-; mode=-; dev=-; inode=-; atime=-; mtime=-
+        MOTD_NOOP_STATE[$id]=absent
+    else return 1; fi
+    MOTD_NOOP_UID[$id]=$uid; MOTD_NOOP_GID[$id]=$gid; MOTD_NOOP_MODE[$id]=$mode
+    MOTD_NOOP_DEV[$id]=$dev; MOTD_NOOP_INO[$id]=$inode; MOTD_NOOP_ATIME[$id]=$atime; MOTD_NOOP_MTIME[$id]=$mtime
+}
+
+motd_validate_noop_target() {
+    local id="$1" path=${MOTD_PATH_BY_ID[$1]} metadata uid gid mode dev inode atime mtime digest link
+    case "${MOTD_NOOP_STATE[$id]:-}" in
+        absent) [[ ! -e "$path" && ! -L "$path" ]] ;;
+        symlink)
+            [[ -L "$path" ]] || return 1
+            metadata=$(motd_stat_stage_numeric "$path") || return 1
+            IFS=: read -r uid gid mode dev inode atime mtime <<< "$metadata"
+            link=$(readlink -- "$path") || return 1
+            [[ "$link" == "${MOTD_NOOP_LINK[$id]}" ]] || return 1
+            metadata=$(motd_stat_stage_numeric "$path") || return 1
+            IFS=: read -r uid gid mode dev inode atime mtime <<< "$metadata"
+            [[ "$uid" == "${MOTD_NOOP_UID[$id]}" && "$gid" == "${MOTD_NOOP_GID[$id]}" && "$dev" == "${MOTD_NOOP_DEV[$id]}" && "$inode" == "${MOTD_NOOP_INO[$id]}" ]]
+            ;;
+        regular)
+            [[ -f "$path" && ! -L "$path" ]] || return 1
+            metadata=$(motd_stat_stage_numeric "$path") || return 1
+            IFS=: read -r uid gid mode dev inode atime mtime <<< "$metadata"
+            [[ "$uid" == "${MOTD_NOOP_UID[$id]}" && "$gid" == "${MOTD_NOOP_GID[$id]}" && "$mode" == "${MOTD_NOOP_MODE[$id]}" && "$dev" == "${MOTD_NOOP_DEV[$id]}" && "$inode" == "${MOTD_NOOP_INO[$id]}" && "$atime" == "${MOTD_NOOP_ATIME[$id]}" && "$mtime" == "${MOTD_NOOP_MTIME[$id]}" ]] || return 1
+            digest=$(sha256sum "$path") || return 1
+            [[ "${digest%% *}" == "${MOTD_NOOP_DIGEST[$id]}" ]] || return 1
+            touch -a -d "@${MOTD_NOOP_ATIME[$id]}" "$path" || return 1
+            touch -m -d "@${MOTD_NOOP_MTIME[$id]}" "$path" || return 1
+            metadata=$(motd_stat_stage_numeric "$path") || return 1
+            [[ "$metadata" == "${MOTD_NOOP_UID[$id]}:${MOTD_NOOP_GID[$id]}:${MOTD_NOOP_MODE[$id]}:${MOTD_NOOP_DEV[$id]}:${MOTD_NOOP_INO[$id]}:${MOTD_NOOP_ATIME[$id]}:${MOTD_NOOP_MTIME[$id]}" ]]
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+motd_validate_committed_replace_target() {
+    local id="$1" path=${MOTD_PATH_BY_ID[$1]} metadata uid gid mode dev inode atime mtime digest link
+    metadata=$(motd_stat_stage_numeric "$path") || return 1
+    IFS=: read -r uid gid mode dev inode atime mtime <<< "$metadata"
+    [[ "$uid" == "${MOTD_STAGE_UID[$id]}" && "$gid" == "${MOTD_STAGE_GID[$id]}" && "$mode" == "${MOTD_STAGE_MODE[$id]}" && "$dev" == "${MOTD_STAGE_DEV[$id]}" && "$inode" == "${MOTD_STAGE_INO[$id]}" ]] || return 1
+    case "${MOTD_STAGE_TYPE[$id]}" in
+        regular)
+            [[ -f "$path" && ! -L "$path" ]] || return 1
+            digest=$(sha256sum "$path") || return 1
+            [[ "${digest%% *}" == "${MOTD_STAGE_DIGEST[$id]}" ]] || return 1
+            if [[ "${MOTD_STAGE_ATIME[$id]}" != - ]]; then
+                touch -a -d "@${MOTD_STAGE_ATIME[$id]}" "$path" || return 1
+                touch -m -d "@${MOTD_STAGE_MTIME[$id]}" "$path" || return 1
+            fi
+            metadata=$(motd_stat_stage_numeric "$path") || return 1
+            IFS=: read -r uid gid mode dev inode atime mtime <<< "$metadata"
+            [[ "$uid" == "${MOTD_STAGE_UID[$id]}" && "$gid" == "${MOTD_STAGE_GID[$id]}" && "$mode" == "${MOTD_STAGE_MODE[$id]}" && "$dev" == "${MOTD_STAGE_DEV[$id]}" && "$inode" == "${MOTD_STAGE_INO[$id]}" ]] || return 1
+            [[ "${MOTD_STAGE_ATIME[$id]}" == - || ( "$atime" == "${MOTD_STAGE_ATIME[$id]}" && "$mtime" == "${MOTD_STAGE_MTIME[$id]}" ) ]]
+            ;;
+        symlink)
+            [[ -L "$path" ]] || return 1
+            link=$(readlink -- "$path") || return 1
+            [[ "$link" == "${MOTD_STAGE_LINK[$id]}" ]] || return 1
+            metadata=$(motd_stat_stage_numeric "$path") || return 1
+            IFS=: read -r uid gid mode dev inode atime mtime <<< "$metadata"
+            [[ "$uid" == "${MOTD_STAGE_UID[$id]}" && "$gid" == "${MOTD_STAGE_GID[$id]}" && "$mode" == "${MOTD_STAGE_MODE[$id]}" && "$dev" == "${MOTD_STAGE_DEV[$id]}" && "$inode" == "${MOTD_STAGE_INO[$id]}" ]]
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+motd_validate_committed_target_group() {
+    local id
+    for id in "${MOTD_TARGET_IDS[@]}"; do
+        case "${MOTD_TARGET_ACTION[$id]:-}" in
+            replace) motd_validate_committed_replace_target "$id" || { error "提交后正式目标完整性失败: $id"; return 1; } ;;
+            delete) [[ ! -e "${MOTD_PATH_BY_ID[$id]}" && ! -L "${MOTD_PATH_BY_ID[$id]}" ]] || { error "提交后 delete 目标仍存在: $id"; return 1; } ;;
+            noop) motd_validate_noop_target "$id" || { error "提交后 noop 目标完整性失败: $id"; return 1; } ;;
+            *) return 1 ;;
+        esac
+    done
 }
 
 motd_validate_all_target_stages() {
@@ -1252,7 +1384,7 @@ motd_validate_all_target_stages() {
         case "${MOTD_TARGET_ACTION[$id]:-}" in
             replace) motd_validate_target_stage "$id" || { error "MOTD stage 完整性失败: $id"; return 1; } ;;
             delete) [[ -z "${MOTD_TARGET_STAGE[$id]:-}" ]] && motd_validate_delete_target "$id" || return 1 ;;
-            noop) [[ -z "${MOTD_TARGET_STAGE[$id]:-}" ]] || return 1 ;;
+            noop) [[ -z "${MOTD_TARGET_STAGE[$id]:-}" ]] && motd_validate_noop_target "$id" || return 1 ;;
             *) return 1 ;;
         esac
     done
@@ -1301,6 +1433,7 @@ motd_prepare_snapshot_plan() {
                 ;;
             unknown)
                 warn "MOTD 初始状态未知，显式 no-op: ${MOTD_PATH_BY_ID[$id]}"
+                motd_record_noop_target "$id" || return 1
                 MOTD_TARGET_ACTION[$id]=noop; MOTD_TARGET_STAGE[$id]=""
                 ;;
             *) return 1 ;;
@@ -1336,6 +1469,7 @@ motd_prepare_install_plan() {
                 ;;
             uname|motd_news)
                 if [[ ! -e "$path" && ! -L "$path" ]]; then
+                    motd_record_noop_target "$id" || return 1
                     MOTD_TARGET_ACTION[$id]=noop; MOTD_TARGET_STAGE[$id]=""
                 elif [[ -L "$path" ]]; then
                     motd_record_delete_target "$id" || return 1
@@ -1380,12 +1514,19 @@ motd_commit_target_plan() {
                 fi
                 rm -f -- "$path" || { error "目标删除失败: $id"; [[ "$rollback_mode" == true ]] && { failed=true; continue; }; return 1; }
                 ;;
-            noop) ;;
+            noop)
+                if ! motd_validate_noop_target "$id"; then
+                    error "hook 后 noop 目标完整性失败: $id"
+                    [[ "$rollback_mode" == true ]] && { failed=true; continue; }
+                    return 1
+                fi
+                ;;
             *) return 1 ;;
         esac
         if [[ "$rollback_mode" == false ]]; then motd_transaction_phase_hook "target-committed-$id" || return 1; fi
     done
-    [[ "$failed" == false ]]
+    [[ "$failed" == false ]] || return 1
+    [[ "$rollback_mode" == true ]] || motd_validate_committed_target_group
 }
 
 motd_prepare_state_layout() {

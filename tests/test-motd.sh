@@ -1073,4 +1073,111 @@ done
 grep -Fq 'error "缺少必要命令: $required_command"' "$ROOT_DIR/modules/system-customize.sh" || fail "module missing-command error output branch absent"
 pass "module dependency preflight retains missing-command output"
 
-printf 'All MOTD final integrity tests passed.\n'
+
+for noop_impl in tool module; do
+    for noop_created_type in regular symlink fifo; do
+    (
+        root="$TEST_DIR/noop-absent-$noop_impl-$noop_created_type"; create_fixture "$root"; export_paths "$root"
+        path="$MOTD_ETC_ROOT/update-motd.d/50-motd-news"; before=$(target_hash "$root")
+        if [[ "$noop_impl" == tool ]]; then load_motd; else . "$ROOT_DIR/modules/system-customize.sh"; fi
+        motd_target_commit_hook() { if [[ "$2" == motd_news ]]; then case "$noop_created_type" in regular) printf created > "$3"; chmod 0755 "$3" ;; symlink) ln -s "$root/external" "$3" ;; fifo) mkfifo "$3" ;; esac; fi; return 0; }
+        assert_fail "$noop_impl absent noop rejects $noop_created_type creation" motd_run_locked_operation install
+        assert_eq "$before" "$(target_hash "$root")" "$noop_impl absent noop $noop_created_type rolls back group"
+        [[ ! -e "$path" && ! -L "$path" ]] || fail "$noop_impl absent noop $noop_created_type left created object"
+        assert_no_motd_residue "$root"; motd_take_lock; motd_release_lock
+    )
+    done
+done
+
+for noop_impl in tool module; do
+    for noop_change in regular-content regular-mode regular-inode regular-symlink symlink-target absent-regular; do
+    (
+        root="$TEST_DIR/noop-unknown-$noop_impl-$noop_change"; create_fixture "$root"; export_paths "$root"
+        printf '# linux-setup:managed-motd\n' > "$MOTD_ETC_ROOT/update-motd.d/00-custom-welcome"; chmod 0755 "$MOTD_ETC_ROOT/update-motd.d/00-custom-welcome"
+        if [[ "$noop_impl" == tool ]]; then load_motd; else . "$ROOT_DIR/modules/system-customize.sh"; fi
+        motd_run_locked_operation install
+        case "$noop_change" in regular-content|regular-symlink) target_id=motd ;; regular-mode) target_id=issue ;; regular-inode) target_id=custom_welcome ;; symlink-target) target_id="uname"; rm -f "${MOTD_PATH_BY_ID[$target_id]}"; ln -s "$root/link-one" "${MOTD_PATH_BY_ID[$target_id]}" ;; absent-regular) target_id=motd_news ;; esac
+        before=$(target_hash "$root")
+        motd_target_commit_hook() { local id="$2" path="$3" replacement; [[ "$id" == "$target_id" ]] || return 0; case "$noop_change" in regular-content) printf changed > "$path" ;; regular-mode) chmod 0600 "$path" ;; regular-inode) replacement="${path}.replacement"; cp "$path" "$replacement"; chmod 0755 "$replacement"; mv -Tf "$replacement" "$path" ;; regular-symlink) rm -f "$path"; ln -s "$root/other" "$path" ;; symlink-target) rm -f "$path"; ln -s "$root/link-two" "$path" ;; absent-regular) printf created > "$path"; chmod 0755 "$path" ;; esac; return 0; }
+        assert_fail "$noop_impl unknown noop rejects $noop_change" motd_run_locked_operation restore initial
+        assert_eq "$before" "$(target_hash "$root")" "$noop_impl unknown noop $noop_change rolls back group"
+        assert_no_motd_residue "$root"; motd_take_lock; motd_release_lock
+    )
+    done
+done
+
+for group_impl in tool module; do
+    for group_change in motd-content issue-mode custom-inode; do
+    (
+        root="$TEST_DIR/final-group-$group_impl-$group_change"; create_fixture "$root"; export_paths "$root"; before=$(target_hash "$root")
+        if [[ "$group_impl" == tool ]]; then load_motd; else . "$ROOT_DIR/modules/system-customize.sh"; fi
+        motd_transaction_phase_hook() { local phase="$1" path replacement; [[ "$phase" == target-committed-motd_news ]] || return 0; case "$group_change" in motd-content) printf changed > "$MOTD_ETC_ROOT/motd" ;; issue-mode) chmod 0600 "$MOTD_ETC_ROOT/issue" ;; custom-inode) path="$MOTD_ETC_ROOT/update-motd.d/00-custom-welcome"; replacement="${path}.replacement"; cp "$path" "$replacement"; chmod 0755 "$replacement"; mv -Tf "$replacement" "$path" ;; esac; }
+        assert_fail "$group_impl final group rejects $group_change" motd_run_locked_operation install
+        assert_eq "$before" "$(target_hash "$root")" "$group_impl final group $group_change rolls back all targets"
+        [[ ! -e "$MOTD_STATE_DIR/pending" ]] || fail "$group_impl final group $group_change left pending"
+        assert_no_motd_residue "$root"; motd_take_lock; motd_release_lock
+    )
+    done
+done
+
+for illegal_legacy_name in motd.previous-unknown issue.previous-unknown motd.invalid-backup evil.initial-backup; do
+(
+    root="$TEST_DIR/legacy-name-${illegal_legacy_name//[^a-zA-Z0-9]/-}"; create_fixture "$root"; export_paths "$root"; load_motd; motd_run_locked_operation install
+    object="$MOTD_STATE_DIR/$illegal_legacy_name"; printf invalid > "$object"; chmod 0600 "$object"; before=$(target_hash "$root"); pointers="$(cat "$MOTD_STATE_DIR/initial.current")|$(cat "$MOTD_STATE_DIR/previous.current")"
+    assert_fail "illegal legacy name $illegal_legacy_name rejected" motd_run_locked_operation install
+    assert_eq "$before" "$(target_hash "$root")" "illegal legacy name $illegal_legacy_name preserves targets"
+    assert_eq "$pointers" "$(cat "$MOTD_STATE_DIR/initial.current")|$(cat "$MOTD_STATE_DIR/previous.current")" "illegal legacy name $illegal_legacy_name preserves pointers"
+    [[ -e "$object" || -L "$object" ]] || fail "illegal legacy name $illegal_legacy_name evidence removed"; [[ ! -e "$MOTD_STATE_DIR/pending" ]] || fail "illegal legacy name $illegal_legacy_name created pending"; motd_take_lock; motd_release_lock
+)
+done
+
+for legacy_backup_kind in directory fifo socket writable wrong-owner wrong-gid device; do
+(
+    root="$TEST_DIR/legacy-backup-$legacy_backup_kind"; create_fixture "$root"; export_paths "$root"; load_motd; motd_run_locked_operation install; object="$MOTD_STATE_DIR/motd.initial-backup"
+    case "$legacy_backup_kind" in
+        directory) mkdir "$object" ;; fifo) mkfifo "$object" ;;
+        socket) if command -v python3 >/dev/null 2>&1; then python3 - "$object" <<'PY'
+import socket,sys
+s=socket.socket(socket.AF_UNIX); s.bind(sys.argv[1]); s.close()
+PY
+        else pass "socket legacy test skipped without python3"; exit 0; fi ;;
+        writable) printf bad > "$object"; chmod 0666 "$object" ;;
+        wrong-owner) if (( EUID == 0 )); then printf bad > "$object"; chmod 0600 "$object"; chown "$((MOTD_TRUSTED_UID+1)):$MOTD_TRUSTED_GID" "$object"; else pass "wrong-owner legacy test skipped without privilege"; exit 0; fi ;;
+        wrong-gid) if (( EUID == 0 )); then printf bad > "$object"; chmod 0600 "$object"; chown "$MOTD_TRUSTED_UID:$((MOTD_TRUSTED_GID+1))" "$object"; else pass "wrong-gid legacy test skipped without privilege"; exit 0; fi ;;
+        device) if (( EUID == 0 )) && mknod "$object" c 1 3 2>/dev/null; then :; else pass "device legacy test skipped without privilege"; exit 0; fi ;;
+    esac
+    before=$(target_hash "$root"); pointers="$(cat "$MOTD_STATE_DIR/initial.current")|$(cat "$MOTD_STATE_DIR/previous.current")"
+    assert_fail "legacy backup $legacy_backup_kind rejected" motd_run_locked_operation restore initial
+    assert_eq "$before" "$(target_hash "$root")" "legacy backup $legacy_backup_kind preserves targets"
+    assert_eq "$pointers" "$(cat "$MOTD_STATE_DIR/initial.current")|$(cat "$MOTD_STATE_DIR/previous.current")" "legacy backup $legacy_backup_kind preserves pointers"
+    [[ -e "$object" || -L "$object" ]] || fail "legacy backup $legacy_backup_kind evidence removed"; [[ ! -e "$MOTD_STATE_DIR/pending" ]] || fail "legacy backup $legacy_backup_kind created pending"; motd_take_lock; motd_release_lock
+)
+done
+
+for legacy_marker_name in motd.initial-absent issue.initial-unknown motd.previous-absent; do
+    for legacy_marker_kind in symlink directory fifo writable; do
+    (
+        root="$TEST_DIR/legacy-marker-${legacy_marker_name//[^a-zA-Z0-9]/-}-$legacy_marker_kind"; create_fixture "$root"; export_paths "$root"; load_motd; motd_run_locked_operation install; object="$MOTD_STATE_DIR/$legacy_marker_name"
+        case "$legacy_marker_kind" in symlink) ln -s "$root/missing" "$object" ;; directory) mkdir "$object" ;; fifo) mkfifo "$object" ;; writable) printf bad > "$object"; chmod 0666 "$object" ;; esac
+        before=$(target_hash "$root"); pointers="$(cat "$MOTD_STATE_DIR/initial.current")|$(cat "$MOTD_STATE_DIR/previous.current")"
+        assert_fail "legacy marker $legacy_marker_name $legacy_marker_kind rejected" motd_run_locked_operation install
+        assert_eq "$before" "$(target_hash "$root")" "legacy marker $legacy_marker_name $legacy_marker_kind preserves targets"
+        assert_eq "$pointers" "$(cat "$MOTD_STATE_DIR/initial.current")|$(cat "$MOTD_STATE_DIR/previous.current")" "legacy marker $legacy_marker_name $legacy_marker_kind preserves pointers"
+        [[ -e "$object" || -L "$object" ]] || fail "legacy marker $legacy_marker_name $legacy_marker_kind evidence removed"; [[ ! -e "$MOTD_STATE_DIR/pending" ]] || fail "legacy marker $legacy_marker_name $legacy_marker_kind created pending"; motd_take_lock; motd_release_lock
+    )
+    done
+done
+
+(
+    root="$TEST_DIR/legal-state-root-legacy"; create_fixture "$root"; export_paths "$root"; mkdir -p "$MOTD_STATE_DIR"; chmod 0700 "$MOTD_STATE_DIR"
+    cp -a "$MOTD_ETC_ROOT/motd" "$MOTD_STATE_DIR/motd.initial-backup"; printf target > "$root/symlink-target"; ln -s "$root/symlink-target" "$MOTD_STATE_DIR/issue.initial-backup"
+    : > "$MOTD_STATE_DIR/issue.net.initial-absent"; chmod 0600 "$MOTD_STATE_DIR/issue.net.initial-absent"; : > "$MOTD_STATE_DIR/00-custom-welcome.initial-unknown"; chmod 0600 "$MOTD_STATE_DIR/00-custom-welcome.initial-unknown"
+    cp -a "$MOTD_ETC_ROOT/update-motd.d/10-uname" "$MOTD_STATE_DIR/10-uname.initial-backup"; : > "$MOTD_STATE_DIR/50-motd-news.initial-absent"; chmod 0600 "$MOTD_STATE_DIR/50-motd-news.initial-absent"
+    touch -a -d @1000000000 "$MOTD_STATE_DIR/motd.initial-backup"; touch -m -d @1000200000 "$MOTD_STATE_DIR/motd.initial-backup"; legacy_times=$(stat -c %X:%Y "$MOTD_STATE_DIR/motd.initial-backup")
+    load_motd; motd_run_locked_operation restore initial
+    [[ -L "$MOTD_ETC_ROOT/issue" && "$(readlink "$MOTD_ETC_ROOT/issue")" == "$root/symlink-target" ]] || fail "legal state root symlink backup not imported"
+    assert_eq original "$(cat "$MOTD_ETC_ROOT/motd")" "legal state root regular backup imported"; [[ -e "$MOTD_STATE_DIR/initial.current" ]] || fail "legal state root import did not publish initial pointer"
+    assert_eq "$legacy_times" "$(stat -c %X:%Y "$MOTD_STATE_DIR/motd.initial-backup")" "legacy root metadata validation/import preserves timestamps"; pass "legal state root regular, symlink, and markers import"
+)
+
+printf 'All MOTD noop/state validation tests passed.\n'
