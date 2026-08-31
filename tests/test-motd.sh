@@ -1053,6 +1053,7 @@ for missing_command in bash chown flock ln od readlink sha256sum touch wc; do
     before=$(target_hash "$root"); rc=0
     bash -c '
         . "$1"
+        require_root() { :; }
         missing_command_name=$2; trace_path=$3
         command() {
             if [[ "$1" == -v && "${2:-}" == "$missing_command_name" ]]; then printf "%s\n" "$missing_command_name" > "$trace_path"; return 1; fi
