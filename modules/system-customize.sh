@@ -345,6 +345,10 @@ motd_append_captured_target() {
         chmod 0600 "$object" || return 1
         after=$(stat -c '%d:%i' -- "$source" 2>/dev/null) || return 1
         [[ "$after" == "$before" ]] || return 1
+        touch -a -d "@$atime" "$source" || return 1
+        touch -m -d "@$mtime" "$source" || return 1
+        after=$(stat -c '%d:%i:%X:%Y' -- "$source") || return 1
+        [[ "$after" == "$before:$atime:$mtime" ]] || return 1
         digest=$(sha256sum "$object") || return 1
         printf 'target|%s|regular|%s|%s|%s|%s|%s|%s\n' "$id" "$uid" "$gid" "$mode" "$atime" "$mtime" "${digest%% *}" >> "$manifest" || return 1
         return 0
@@ -466,6 +470,10 @@ motd_append_legacy_target() {
                 path_after=$(stat -c '%d:%i' -- "$path" 2>/dev/null) || { motd_close_legacy_fd || true; return 1; }
                 fd_after=$(stat -Lc '%d:%i' -- "/proc/$BASHPID/fd/$MOTD_LEGACY_FD") || { motd_close_legacy_fd || true; return 1; }
                 [[ "$path_after" == "$MOTD_LEGACY_DEV:$MOTD_LEGACY_INO" && "$fd_after" == "$path_after" ]] || { motd_close_legacy_fd || true; return 1; }
+                touch -a -d "@$MOTD_LEGACY_ATIME" "$path" || { motd_close_legacy_fd || true; return 1; }
+                touch -m -d "@$MOTD_LEGACY_MTIME" "$path" || { motd_close_legacy_fd || true; return 1; }
+                path_after=$(stat -c '%d:%i:%X:%Y' -- "$path") || { motd_close_legacy_fd || true; return 1; }
+                [[ "$path_after" == "$MOTD_LEGACY_DEV:$MOTD_LEGACY_INO:$MOTD_LEGACY_ATIME:$MOTD_LEGACY_MTIME" ]] || { motd_close_legacy_fd || true; return 1; }
                 motd_close_legacy_fd || return 1
                 motd_legacy_io_hook chown "$object" || return 1
                 chown "$MOTD_TRUSTED_UID:$MOTD_TRUSTED_GID" "$object" || return 1

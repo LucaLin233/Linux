@@ -1051,14 +1051,15 @@ for missing_command in bash chown flock ln od readlink sha256sum touch wc; do
 (
     root="$TEST_DIR/module-missing-$missing_command"; create_fixture "$root"; export_paths "$root"
     before=$(target_hash "$root"); rc=0
-    MISSING_COMMAND="$missing_command" bash -c '
+    bash -c '
         . "$1"
+        missing_command_name=$2
         command() {
-            if [[ "$1" == -v && "${2:-}" == "$MISSING_COMMAND" ]]; then return 1; fi
+            if [[ "$1" == -v && "${2:-}" == "$missing_command_name" ]]; then return 1; fi
             builtin command "$@"
         }
         main motd
-    ' _ "$ROOT_DIR/modules/system-customize.sh" > "$root/output" 2>&1 || rc=$?
+    ' _ "$ROOT_DIR/modules/system-customize.sh" "$missing_command" > "$root/output" 2>&1 || rc=$?
     assert_eq 1 "$rc" "module missing $missing_command fails before action"
     grep -Fq "缺少必要命令: $missing_command" "$root/output" || fail "module missing $missing_command not reported"
     assert_eq "$before" "$(target_hash "$root")" "module missing $missing_command preserves MOTD"
