@@ -230,7 +230,8 @@ run_runtime_allocator_signal_case() {
     wait "$pid" || rc=$?
     kill "$watchdog" 2>/dev/null || true; wait "$watchdog" 2>/dev/null || true
     assert_eq "$expected_status" "$rc" "$delivery $signal_name during allocator post-mkdir window returns conventional status"
-    for _ in $(seq 1 100); do
+    # allocator helper 与 parent 的 building 清理在高负载下可能晚于主 PID 退出；最多等待 15 秒观察受管 candidate 消失。
+    for _ in $(seq 1 300); do
         [[ -z "$(find "$root/runtime" -mindepth 1 -maxdepth 1 -name 'push-runtime.*' -print -quit)" ]] && break
         sleep 0.05
     done
@@ -848,6 +849,19 @@ EOF
     pass "test-auth cleanup unsets SSHPASS"
 )
 
+readonly AUTH_SIGNAL_READINESS_SECONDS=15
+# 生产清理上界约为主进程等待 worker 7s + 两轮 managed-session 2.2s + building 清理 2s；30s 超过两倍余量。
+readonly AUTH_SIGNAL_WATCHDOG_SECONDS=30
+
+declare -gA AUTH_READY_PID=() AUTH_READY_START=()
+AUTH_READY_STATE_FILE=""
+AUTH_READY_STATE_IDENTITY=""
+AUTH_READY_STATE_CONTENT=""
+AUTH_READY_PID_SIGNATURE=""
+AUTH_CASE_MAIN_PID=""; AUTH_CASE_MAIN_START=""
+AUTH_CASE_WATCHDOG_PID=""; AUTH_CASE_WATCHDOG_START=""
+AUTH_CASE_UNRELATED_PID=""; AUTH_CASE_UNRELATED_START=""
+
 write_auth_signal_fixture() {
     local root="$1" mode="$2"
     mkdir -m 0700 "$root" "$root/bin" "$root/runtime" "$root/ssh" "$root/pids"
@@ -889,26 +903,46 @@ EOF
     chmod 0600 "$root/config.conf"
     cat > "$root/bin/timeout" <<'EOF'
 #!/usr/bin/env bash
-printf '%s\n' "$$" > "$PID_DIR/timeout.pid"
+self=$BASHPID
+stage="$PID_DIR/.timeout.pid.$self"
+(umask 077; printf '%s\n' "$self" > "$stage")
+mv -fT -- "$stage" "$PID_DIR/timeout.pid"
+child=""
+cleanup() { local status="$1"; trap - HUP INT TERM; [[ -z "$child" ]] || { kill -TERM "$child" 2>/dev/null || true; wait "$child" 2>/dev/null || true; }; exit "$status"; }
+trap 'cleanup 129' HUP; trap 'cleanup 130' INT; trap 'cleanup 143' TERM
 [[ ${1:-} == --kill-after=* ]] && shift
 shift
-"$@" &
-wait "$!"
+"$@" & child=$!
+wait "$child"; status=$?; child=""; exit "$status"
 EOF
     cat > "$root/bin/sshpass" <<'EOF'
 #!/usr/bin/env bash
-printf '%s\n' "$$" > "$PID_DIR/sshpass.pid"
+self=$BASHPID
+stage="$PID_DIR/.sshpass.pid.$self"
+(umask 077; printf '%s\n' "$self" > "$stage")
+mv -fT -- "$stage" "$PID_DIR/sshpass.pid"
+child=""
+cleanup() { local status="$1"; trap - HUP INT TERM; [[ -z "$child" ]] || { kill -TERM "$child" 2>/dev/null || true; wait "$child" 2>/dev/null || true; }; exit "$status"; }
+trap 'cleanup 129' HUP; trap 'cleanup 130' INT; trap 'cleanup 143' TERM
 [[ ${1:-} == -e ]] && shift
-"$@" &
-wait "$!"
+"$@" & child=$!
+wait "$child"; status=$?; child=""; exit "$status"
 EOF
     cat > "$root/bin/ssh" <<'EOF'
 #!/usr/bin/env bash
-printf '%s\n' "$$" > "$PID_DIR/ssh.pid"
+self=$BASHPID
+stage="$PID_DIR/.ssh.pid.$self"
+(umask 077; printf '%s\n' "$self" > "$stage")
+mv -fT -- "$stage" "$PID_DIR/ssh.pid"
+leaf=""
+cleanup() { local status="$1"; trap - HUP INT TERM; [[ -z "$leaf" ]] || { kill -TERM "$leaf" 2>/dev/null || true; wait "$leaf" 2>/dev/null || true; }; exit "$status"; }
+trap 'cleanup 129' HUP; trap 'cleanup 130' INT; trap 'cleanup 143' TERM
 for argument in "$@"; do [[ "$argument" == *@\[* ]] && exit 90; done
-sleep 300 &
-printf '%s\n' "$!" > "$PID_DIR/leaf.pid"
-wait "$!"
+sleep 300 & leaf=$!
+stage="$PID_DIR/.leaf.pid.$BASHPID"
+(umask 077; printf '%s\n' "$leaf" > "$stage")
+mv -fT -- "$stage" "$PID_DIR/leaf.pid"
+wait "$leaf"; status=$?; leaf=""; exit "$status"
 EOF
     cat > "$root/bin/rsync" <<'EOF'
 #!/usr/bin/env bash
@@ -918,51 +952,242 @@ EOF
     chmod 0700 "$root/bin"/*
 }
 
-run_auth_process_tree_signal_case() {
-    local mode="$1" signal_name="$2" expected_status="$3"
-    local root="$TEST_DIR/auth-process-$mode-$signal_name" pid rc=0 watchdog unrelated
+read_auth_fixture_pid() {
+    local file="$1" name="$2" pid line_count
+    [[ -f "$file" && ! -L "$file" ]] || return 1
+    IFS= read -r pid < "$file" || return 1
+    line_count=$(wc -l < "$file") || return 1
+    [[ "$line_count" == 1 && "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+    read_process_record "$pid" || return 1
+    [[ "$PROC_UID" == "$EUID" && "$PROC_STATE" != Z ]] || return 1
+    AUTH_READY_PID[$name]=$pid
+    AUTH_READY_START[$name]=$PROC_START
+}
+
+capture_auth_session_readiness() {
+    local root="$1" mode="$2" main_pid="$3" saved state_file metadata owner gid mode_bits dev inode
+    local content line key value line_count=0 name pid signature=""
+    local -a state_files=() required=(timeout ssh leaf)
+    local -A values=() seen=()
+
+    AUTH_READY_PID=(); AUTH_READY_START=(); AUTH_READY_STATE_FILE=""; AUTH_READY_STATE_IDENTITY=""
+    AUTH_READY_STATE_CONTENT=""; AUTH_READY_PID_SIGNATURE=""
+    read_process_record "$main_pid" || return 1
+    [[ "$PROC_UID" == "$EUID" && "$PROC_STATE" != Z ]] || return 1
+    [[ "$mode" == key ]] || required+=(sshpass)
+    for name in "${required[@]}"; do
+        read_auth_fixture_pid "$root/pids/$name.pid" "$name" || return 1
+    done
+
+    saved=$(shopt -p nullglob || true); shopt -s nullglob
+    state_files=("$root"/runtime/push-runtime.*/worker-session.*.state)
+    eval "$saved"
+    (( ${#state_files[@]} == 1 )) || return 1
+    state_file=${state_files[0]}
+    [[ -f "$state_file" && ! -L "$state_file" ]] || return 1
+    metadata=$(stat -c '%u:%g:%a:%d:%i' -- "$state_file") || return 1
+    IFS=: read -r owner gid mode_bits dev inode <<< "$metadata"
+    [[ "$owner" == "$EUID" && "$gid" == "$(id -g)" && "$mode_bits" == 600 ]] || return 1
+    content=$(cat -- "$state_file" && printf '%s' '__AUTH_STATE_END__') || return 1
+    content=${content%__AUTH_STATE_END__}
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        ((line_count += 1)); [[ "$line" == *=* ]] || return 1
+        key=${line%%=*}; value=${line#*=}; [[ -z "${seen[$key]:-}" ]] || return 1; seen[$key]=1
+        case "$key" in
+            version) [[ "$value" == 1 ]] || return 1 ;;
+            state|worker_pid|worker_start|leader_pid|leader_start|pgid|sid) values[$key]=$value ;;
+            *) return 1 ;;
+        esac
+    done < "$state_file"
+    (( line_count == 8 && ${#seen[@]} == 8 )) || return 1
+    [[ "${values[state]:-}" == active ]] || return 1
+    for key in worker_pid worker_start leader_pid leader_start pgid sid; do
+        [[ "${values[$key]:-}" =~ ^[1-9][0-9]*$ ]] || return 1
+    done
+    [[ "${state_file##*/}" == "worker-session.${values[worker_pid]}.state" ]] || return 1
+    [[ "${values[leader_pid]}" == "${values[pgid]}" && "${values[leader_pid]}" == "${values[sid]}" ]] || return 1
+
+    read_process_record "${values[worker_pid]}" || return 1
+    [[ "$PROC_UID" == "$EUID" && "$PROC_STATE" != Z && "$PROC_START" == "${values[worker_start]}" ]] || return 1
+    read_process_record "${values[leader_pid]}" || return 1
+    [[ "$PROC_UID" == "$EUID" && "$PROC_STATE" != Z && "$PROC_START" == "${values[leader_start]}" &&
+        "$PROC_PGID" == "${values[pgid]}" && "$PROC_SID" == "${values[sid]}" ]] || return 1
+    for name in "${required[@]}"; do
+        pid=${AUTH_READY_PID[$name]}
+        read_process_record "$pid" || return 1
+        [[ "$PROC_UID" == "$EUID" && "$PROC_STATE" != Z && "$PROC_START" == "${AUTH_READY_START[$name]}" &&
+            "$PROC_PGID" == "${values[pgid]}" && "$PROC_SID" == "${values[sid]}" ]] || return 1
+        signature+="$name:$pid:${AUTH_READY_START[$name]}|"
+    done
+    AUTH_READY_STATE_FILE=$state_file
+    AUTH_READY_STATE_IDENTITY="$dev:$inode"
+    AUTH_READY_STATE_CONTENT=$content
+    AUTH_READY_PID_SIGNATURE=$signature
+}
+
+dump_auth_readiness_diagnostics() {
+    local root="$1" file pid
+    printf '%s\n' '--- auth readiness output.log ---' >&2
+    cat "$root/output.log" >&2 2>/dev/null || true
+    printf '%s\n' '--- auth readiness pid files ---' >&2
+    for file in "$root"/pids/*.pid; do
+        [[ -e "$file" || -L "$file" ]] || continue
+        printf '%s: ' "$file" >&2; cat "$file" >&2 2>/dev/null || true
+        pid=$(<"$file")
+        if [[ "$pid" =~ ^[1-9][0-9]*$ ]] && read_process_record "$pid"; then
+            printf 'proc pid=%s state=%s start=%s pgid=%s sid=%s uid=%s\n' "$pid" "$PROC_STATE" "$PROC_START" "$PROC_PGID" "$PROC_SID" "$PROC_UID" >&2
+        fi
+    done
+    printf '%s\n' '--- auth readiness runtime files ---' >&2
+    find "$root/runtime" -mindepth 1 -maxdepth 3 -printf '%y %m %p\n' 2>/dev/null | sort >&2 || true
+    printf '%s\n' '--- auth readiness session states ---' >&2
+    for file in "$root"/runtime/push-runtime.*/worker-session.*.state; do
+        [[ -e "$file" || -L "$file" ]] || continue
+        printf '[%s]\n' "$file" >&2; cat "$file" >&2 2>/dev/null || true
+    done
+}
+
+wait_for_auth_session_ready() {
+    local root="$1" mode="$2" main_pid="$3" deadline first_file first_identity first_content first_signature
+    deadline=$((SECONDS + AUTH_SIGNAL_READINESS_SECONDS))
+    while (( SECONDS < deadline )); do
+        if capture_auth_session_readiness "$root" "$mode" "$main_pid"; then
+            first_file=$AUTH_READY_STATE_FILE; first_identity=$AUTH_READY_STATE_IDENTITY
+            first_content=$AUTH_READY_STATE_CONTENT; first_signature=$AUTH_READY_PID_SIGNATURE
+            sleep 0.05
+            if capture_auth_session_readiness "$root" "$mode" "$main_pid" &&
+                [[ "$AUTH_READY_STATE_FILE" == "$first_file" && "$AUTH_READY_STATE_IDENTITY" == "$first_identity" &&
+                    "$AUTH_READY_STATE_CONTENT" == "$first_content" && "$AUTH_READY_PID_SIGNATURE" == "$first_signature" ]]; then
+                return 0
+            fi
+        fi
+        sleep 0.05
+    done
+    dump_auth_readiness_diagnostics "$root"
+    return 1
+}
+
+wait_for_test_process_start() {
+    local pid="$1" output_name="$2" _
+    for _ in {1..200}; do
+        if read_process_record "$pid" && [[ "$PROC_UID" == "$EUID" && "$PROC_STATE" != Z ]]; then
+            printf -v "$output_name" '%s' "$PROC_START"
+            return 0
+        fi
+        sleep 0.01
+    done
+    return 1
+}
+
+cleanup_auth_signal_case() {
+    local name pid start _
+    trap - EXIT HUP INT TERM
+    for name in watchdog main unrelated; do
+        case "$name" in
+            watchdog) pid=$AUTH_CASE_WATCHDOG_PID; start=$AUTH_CASE_WATCHDOG_START ;;
+            main) pid=$AUTH_CASE_MAIN_PID; start=$AUTH_CASE_MAIN_START ;;
+            unrelated) pid=$AUTH_CASE_UNRELATED_PID; start=$AUTH_CASE_UNRELATED_START ;;
+        esac
+        [[ -n "$pid" && -n "$start" ]] || continue
+        if process_identity_matches "$pid" "$start" && process_is_running "$pid"; then kill -TERM "$pid" 2>/dev/null || true; fi
+    done
+    for name in "${!AUTH_READY_PID[@]}"; do
+        pid=${AUTH_READY_PID[$name]}; start=${AUTH_READY_START[$name]:-}
+        [[ -n "$start" ]] || continue
+        if process_identity_matches "$pid" "$start" && process_is_running "$pid"; then kill -TERM "$pid" 2>/dev/null || true; fi
+    done
+    for _ in {1..40}; do
+        local active=false
+        for name in watchdog main unrelated; do
+            case "$name" in watchdog) pid=$AUTH_CASE_WATCHDOG_PID; start=$AUTH_CASE_WATCHDOG_START ;; main) pid=$AUTH_CASE_MAIN_PID; start=$AUTH_CASE_MAIN_START ;; unrelated) pid=$AUTH_CASE_UNRELATED_PID; start=$AUTH_CASE_UNRELATED_START ;; esac
+            [[ -n "$pid" && -n "$start" ]] || continue
+            process_identity_matches "$pid" "$start" && process_is_running "$pid" && active=true
+        done
+        [[ "$active" == false ]] && break
+        sleep 0.05
+    done
+    for name in watchdog main unrelated; do
+        case "$name" in watchdog) pid=$AUTH_CASE_WATCHDOG_PID; start=$AUTH_CASE_WATCHDOG_START ;; main) pid=$AUTH_CASE_MAIN_PID; start=$AUTH_CASE_MAIN_START ;; unrelated) pid=$AUTH_CASE_UNRELATED_PID; start=$AUTH_CASE_UNRELATED_START ;; esac
+        [[ -n "$pid" && -n "$start" ]] || continue
+        if process_identity_matches "$pid" "$start" && process_is_running "$pid"; then kill -KILL "$pid" 2>/dev/null || true; fi
+        wait "$pid" 2>/dev/null || true
+    done
+    for name in "${!AUTH_READY_PID[@]}"; do
+        pid=${AUTH_READY_PID[$name]}; start=${AUTH_READY_START[$name]:-}
+        [[ -n "$start" ]] || continue
+        if process_identity_matches "$pid" "$start" && process_is_running "$pid"; then kill -KILL "$pid" 2>/dev/null || true; fi
+    done
+}
+
+run_auth_process_tree_signal_case() (
+    local repeat="$1" mode="$2" signal_name="$3" expected_status="$4"
+    local root="$TEST_DIR/auth-process-$repeat-$mode-$signal_name" rc=0 child_pid child_start watchdog_stage
+    AUTH_READY_PID=(); AUTH_READY_START=()
+    AUTH_CASE_MAIN_PID=""; AUTH_CASE_MAIN_START=""; AUTH_CASE_WATCHDOG_PID=""; AUTH_CASE_WATCHDOG_START=""
+    AUTH_CASE_UNRELATED_PID=""; AUTH_CASE_UNRELATED_START=""
+    trap cleanup_auth_signal_case EXIT HUP INT TERM
     write_auth_signal_fixture "$root" "$mode"
-    sleep 60 & unrelated=$!
+    sleep 60 & AUTH_CASE_UNRELATED_PID=$!
+    wait_for_test_process_start "$AUTH_CASE_UNRELATED_PID" AUTH_CASE_UNRELATED_START || fail "$mode/$signal_name cannot identify unrelated process"
     (
         cd "$root"
         exec env --default-signal=HUP,INT,TERM PATH="$root/bin:$PATH" TMPDIR="$root/runtime" PID_DIR="$root/pids" \
             "$SCRIPT" --test-auth
     ) > "$root/output.log" 2>&1 &
-    pid=$!
-    for _ in $(seq 1 300); do
-        if [[ -f "$root/pids/timeout.pid" && -f "$root/pids/ssh.pid" && -f "$root/pids/leaf.pid" ]]; then
-            [[ "$mode" == key || -f "$root/pids/sshpass.pid" ]] && break
-        fi
-        sleep 0.05
-    done
-    [[ -f "$root/pids/leaf.pid" ]] || { cat "$root/output.log"; kill "$pid" "$unrelated" 2>/dev/null || true; fail "$mode/$signal_name auth process tree did not start"; }
-    (sleep 15; kill -KILL "$pid" 2>/dev/null || true) & watchdog=$!
-    kill "-$signal_name" "$pid"
-    wait "$pid" || rc=$?
-    kill "$watchdog" 2>/dev/null || true; wait "$watchdog" 2>/dev/null || true
-    assert_eq "$expected_status" "$rc" "$mode test-auth $signal_name returns conventional status"
-    for pid_file in timeout ssh leaf; do
-        child_pid=$(<"$root/pids/$pid_file.pid")
-        process_is_running "$child_pid" && fail "$mode/$signal_name left $pid_file process"
-    done
-    if [[ "$mode" == password ]]; then
-        child_pid=$(<"$root/pids/sshpass.pid")
-        process_is_running "$child_pid" && fail "$mode/$signal_name left sshpass process"
+    AUTH_CASE_MAIN_PID=$!
+    wait_for_test_process_start "$AUTH_CASE_MAIN_PID" AUTH_CASE_MAIN_START || fail "$mode/$signal_name cannot identify push process"
+    wait_for_auth_session_ready "$root" "$mode" "$AUTH_CASE_MAIN_PID" || fail "$mode/$signal_name auth session readiness timed out"
+    (
+        sleep_pid=""
+        trap '[[ -z "$sleep_pid" ]] || { kill -TERM "$sleep_pid" 2>/dev/null || true; wait "$sleep_pid" 2>/dev/null || true; }; exit 0' HUP INT TERM
+        sleep "$AUTH_SIGNAL_WATCHDOG_SECONDS" & sleep_pid=$!
+        wait "$sleep_pid" || exit 0
+        watchdog_stage="$root/pids/.watchdog-fired.$BASHPID"
+        (umask 077; printf 'fired\n' > "$watchdog_stage")
+        mv -fT -- "$watchdog_stage" "$root/pids/watchdog-fired"
+        kill -KILL "$AUTH_CASE_MAIN_PID" 2>/dev/null || true
+    ) &
+    AUTH_CASE_WATCHDOG_PID=$!
+    wait_for_test_process_start "$AUTH_CASE_WATCHDOG_PID" AUTH_CASE_WATCHDOG_START || fail "$mode/$signal_name cannot identify watchdog"
+    kill "-$signal_name" "$AUTH_CASE_MAIN_PID"
+    wait "$AUTH_CASE_MAIN_PID" || rc=$?
+    AUTH_CASE_MAIN_PID=""; AUTH_CASE_MAIN_START=""
+    if process_identity_matches "$AUTH_CASE_WATCHDOG_PID" "$AUTH_CASE_WATCHDOG_START" && process_is_running "$AUTH_CASE_WATCHDOG_PID"; then
+        kill -TERM "$AUTH_CASE_WATCHDOG_PID" 2>/dev/null || true
     fi
-    pass "$mode test-auth $signal_name terminates timeout, sshpass/ssh, and leaf descendants"
-    [[ -z "$(find "$root/runtime" -mindepth 1 -maxdepth 1 -name 'push-runtime.*' -print -quit)" ]] || fail "$mode/$signal_name left auth runtime"
-    [[ ! -e "$root/pids/rsync-unexpected" ]] || fail "$mode/$signal_name test-auth called rsync"
-    pass "$mode test-auth $signal_name removes runtime without rsync"
-    kill -0 "$unrelated" 2>/dev/null || fail "$mode/$signal_name terminated unrelated process"
-    kill "$unrelated" 2>/dev/null || true; wait "$unrelated" 2>/dev/null || true
-    [[ -z "${SSHPASS:-}" ]] || fail "$mode/$signal_name leaked SSHPASS"
-    pass "$mode test-auth $signal_name preserves unrelated process and leaves no SSHPASS"
-}
+    wait "$AUTH_CASE_WATCHDOG_PID" 2>/dev/null || true
+    if process_identity_matches "$AUTH_CASE_WATCHDOG_PID" "$AUTH_CASE_WATCHDOG_START" && process_is_running "$AUTH_CASE_WATCHDOG_PID"; then
+        fail "$mode/$signal_name left watchdog process"
+    fi
+    AUTH_CASE_WATCHDOG_PID=""; AUTH_CASE_WATCHDOG_START=""
+    [[ ! -e "$root/pids/watchdog-fired" ]] || fail "push signal cleanup exceeded watchdog deadline"
+    pass "$mode test-auth $signal_name run $repeat reaps watchdog before deadline"
+    assert_eq "$expected_status" "$rc" "$mode test-auth $signal_name run $repeat returns conventional status"
+    for name in "${!AUTH_READY_PID[@]}"; do
+        child_pid=${AUTH_READY_PID[$name]}; child_start=${AUTH_READY_START[$name]}
+        if process_identity_matches "$child_pid" "$child_start" && process_is_running "$child_pid"; then
+            fail "$mode/$signal_name run $repeat left $name process"
+        fi
+    done
+    pass "$mode test-auth $signal_name run $repeat terminates timeout, sshpass/ssh, and leaf descendants"
+    [[ -z "$(find "$root/runtime" -mindepth 1 -maxdepth 1 -name 'push-runtime.*' -print -quit)" ]] || fail "$mode/$signal_name run $repeat left auth runtime"
+    [[ -z "$(find "$root/runtime" -name 'worker-session.*.state' -print -quit)" ]] || fail "$mode/$signal_name run $repeat left session state"
+    [[ ! -e "$root/pids/rsync-unexpected" ]] || fail "$mode/$signal_name run $repeat test-auth called rsync"
+    pass "$mode test-auth $signal_name run $repeat removes runtime and session state without rsync"
+    process_identity_matches "$AUTH_CASE_UNRELATED_PID" "$AUTH_CASE_UNRELATED_START" && process_is_running "$AUTH_CASE_UNRELATED_PID" || fail "$mode/$signal_name run $repeat terminated unrelated process"
+    kill -TERM "$AUTH_CASE_UNRELATED_PID" 2>/dev/null || true; wait "$AUTH_CASE_UNRELATED_PID" 2>/dev/null || true
+    AUTH_CASE_UNRELATED_PID=""; AUTH_CASE_UNRELATED_START=""
+    [[ -z "${SSHPASS:-}" ]] || fail "$mode/$signal_name run $repeat leaked SSHPASS"
+    pass "$mode test-auth $signal_name run $repeat preserves unrelated process, reaps watchdog, and leaves no SSHPASS"
+    trap - EXIT HUP INT TERM
+)
 
-for auth_mode in key password; do
-    run_auth_process_tree_signal_case "$auth_mode" HUP 129
-    run_auth_process_tree_signal_case "$auth_mode" INT 130
-    run_auth_process_tree_signal_case "$auth_mode" TERM 143
+for auth_repeat in 1 2 3; do
+    for auth_mode in key password; do
+        run_auth_process_tree_signal_case "$auth_repeat" "$auth_mode" HUP 129
+        run_auth_process_tree_signal_case "$auth_repeat" "$auth_mode" INT 130
+        run_auth_process_tree_signal_case "$auth_repeat" "$auth_mode" TERM 143
+    done
 done
 
 # rsync argv boundaries, protect-args, special paths, option matrices, and no shell injection.
@@ -1269,7 +1494,8 @@ flock -u 9
 for host in one.example two.example three.example four.example recovered.example; do
     [[ "$last" == *"$host"* ]] && touch "$CAPTURE_DIR/$host"
 done
-for _ in {1..100}; do
+# 并行 barrier 用例必须等两个 worker 都发布调用；CI 高负载下给出 15 秒确定性上限。
+for _ in {1..300}; do
     current=$(wc -l < "$CAPTURE_DIR/calls")
     (( current >= ${BATCH_FIXTURE_EXPECTED_STARTS:-1} )) && break
     sleep 0.05
