@@ -66,6 +66,20 @@ declare -A TASKS=()
 declare -A ACTIVE_WORKERS=()
 declare -A ACTIVE_WORKER_STATE_FILES=()
 declare -A ACTIVE_WORKER_STATE_STARTS=()
+declare -A REGISTERING_WORKERS=()
+declare -A WORKER_REGISTRATION_READY_FILES=()
+declare -A WORKER_REGISTRATION_RELEASE_FILES=()
+declare -A WORKER_REGISTRATION_STARTS=()
+declare -A WORKER_REGISTRATION_STAGE_FILES=()
+WORKER_REGISTRATION_READY_FILE=""
+WORKER_REGISTRATION_RELEASE_FILE=""
+WORKER_REGISTRATION_STAGE_FILE=""
+WORKER_REGISTRATION_READY_DEV=""
+WORKER_REGISTRATION_READY_INODE=""
+WORKER_REGISTRATION_TIMEOUT_TICKS=100
+WORKER_REGISTRATION_CRITICAL=false
+WORKER_REGISTRATION_PENDING_SIGNAL=""
+WORKER_REGISTRATION_PENDING_STATUS=0
 BATCH_WORKER_FAILED=false
 BATCH_WORKER_ERROR=false
 MANAGED_CLEANUP_FAILURE_STATUS=125
@@ -694,6 +708,14 @@ runtime_building_hook() {
     :
 }
 
+worker_registration_phase_hook() {
+    :
+}
+
+parent_worker_registration_hook() {
+    :
+}
+
 runtime_parent_trusted() {
     local dev="" inode=""
     [[ -n "$RUNTIME_PARENT" && -d "$RUNTIME_PARENT" && ! -L "$RUNTIME_PARENT" ]] || return 1
@@ -870,9 +892,16 @@ get_process_session_id() {
 }
 
 process_identity_matches() {
-    local pid="$1" expected_start="$2"
-    read_process_record "$pid" || return 1
-    [[ "$PROC_START" == "$expected_start" && "$PROC_UID" == "$EUID" ]]
+    local pid="$1" expected_start="$2" _
+    for _ in {1..3}; do
+        if read_process_record "$pid"; then
+            [[ "$PROC_START" == "$expected_start" && "$PROC_UID" == "$EUID" ]]
+            return
+        fi
+        [[ -r "/proc/$pid/stat" ]] || return 1
+        sleep 0.01
+    done
+    return 1
 }
 
 job_is_active() {
@@ -881,6 +910,269 @@ job_is_active() {
         [[ "$pid" == "$expected" ]] && return 0
     done < <(jobs -pr)
     return 1
+}
+
+worker_registration_begin_critical() {
+    [[ "$WORKER_REGISTRATION_CRITICAL" == false ]] || return 1
+    WORKER_REGISTRATION_CRITICAL=true
+}
+
+worker_registration_end_critical() {
+    local signal_name="$WORKER_REGISTRATION_PENDING_SIGNAL" status="$WORKER_REGISTRATION_PENDING_STATUS"
+    WORKER_REGISTRATION_CRITICAL=false
+    WORKER_REGISTRATION_PENDING_SIGNAL=""; WORKER_REGISTRATION_PENDING_STATUS=0
+    [[ -z "$signal_name" ]] || runtime_signal_handler "$signal_name" "$status"
+}
+
+worker_registration_ready_path() {
+    local pid="$1"
+    [[ -n "$TEMP_DIR" && "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+    printf '%s/worker-registration.%s.ready\n' "$TEMP_DIR" "$pid"
+}
+
+worker_registration_release_path() {
+    local pid="$1"
+    [[ -n "$TEMP_DIR" && "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+    printf '%s/worker-registration.%s.release\n' "$TEMP_DIR" "$pid"
+}
+
+worker_registration_safe_unlink() {
+    local path="$1" metadata owner gid trusted_gid
+    [[ -n "$TEMP_DIR" && "$path" == "$TEMP_DIR"/* ]] || return 1
+    [[ -e "$path" || -L "$path" ]] || return 0
+    metadata=$(stat -c '%u:%g' -- "$path" 2>/dev/null) || return 1
+    IFS=: read -r owner gid <<< "$metadata"
+    trusted_gid=$(current_gid) || return 1
+    [[ "$owner" == "$EUID" && "$gid" == "$trusted_gid" ]] || return 1
+    [[ -f "$path" || -L "$path" ]] || return 1
+    rm -f -- "$path"
+}
+
+cleanup_worker_registration_for_pid() {
+    local pid="$1" ready release stage path failed=false saved
+    ready=${WORKER_REGISTRATION_READY_FILES[$pid]:-}
+    release=${WORKER_REGISTRATION_RELEASE_FILES[$pid]:-}
+    stage=${WORKER_REGISTRATION_STAGE_FILES[$pid]:-}
+    [[ -n "$ready" ]] || ready=$(worker_registration_ready_path "$pid") || return 1
+    [[ -n "$release" ]] || release=$(worker_registration_release_path "$pid") || return 1
+    for path in "$stage" "$ready" "$release"; do
+        [[ -n "$path" ]] || continue
+        worker_registration_safe_unlink "$path" || failed=true
+    done
+    saved=$(shopt -p nullglob || true); shopt -s nullglob
+    for path in "$TEMP_DIR"/.worker-registration."$pid".*.stage; do
+        worker_registration_safe_unlink "$path" || failed=true
+    done
+    eval "$saved"
+    if [[ "$failed" == false ]]; then
+        unset 'WORKER_REGISTRATION_READY_FILES[$pid]' 'WORKER_REGISTRATION_RELEASE_FILES[$pid]'
+        unset 'WORKER_REGISTRATION_STARTS[$pid]' 'WORKER_REGISTRATION_STAGE_FILES[$pid]'
+    fi
+    [[ "$failed" == false ]]
+}
+
+cleanup_all_worker_registration_residue() {
+    local pid path saved failed=false
+    [[ -n "$TEMP_DIR" ]] || return 0
+    for pid in "${!REGISTERING_WORKERS[@]}" "${!WORKER_REGISTRATION_READY_FILES[@]}"; do
+        [[ -n "$pid" ]] || continue
+        cleanup_worker_registration_for_pid "$pid" || failed=true
+    done
+    saved=$(shopt -p nullglob || true); shopt -s nullglob
+    for path in "$TEMP_DIR"/worker-registration.*.ready "$TEMP_DIR"/worker-registration.*.release \
+        "$TEMP_DIR"/.worker-registration.*.stage; do
+        worker_registration_safe_unlink "$path" || failed=true
+    done
+    eval "$saved"
+    [[ "$failed" == false ]]
+}
+
+publish_worker_registration_manifest() {
+    local final="$1" role="$2" pid="$3" content="$4" token stage
+    runtime_directory_trusted || return 1
+    [[ "$final" == "$TEMP_DIR"/worker-registration."$pid"."$role" ]] || return 1
+    [[ ! -e "$final" && ! -L "$final" ]] || return 1
+    token=$(runtime_random_token) || return 1
+    stage="$TEMP_DIR/.worker-registration.$pid.$role.$token.stage"
+    if [[ "$role" == ready ]]; then WORKER_REGISTRATION_STAGE_FILE=$stage; else WORKER_REGISTRATION_STAGE_FILES[$pid]=$stage; fi
+    if ! (umask 077; set -o noclobber; : > "$stage") 2>/dev/null; then return 1; fi
+    printf '%s' "$content" > "$stage" || return 1
+    chmod 0600 "$stage" || return 1
+    if [[ "$role" == ready ]]; then
+        read_worker_registration_manifest "$stage" ready || return 1
+    else
+        read_worker_registration_manifest "$stage" accepted || return 1
+    fi
+    mv -fT -- "$stage" "$final" || return 1
+    if [[ "$role" == ready ]]; then WORKER_REGISTRATION_STAGE_FILE=""; else unset 'WORKER_REGISTRATION_STAGE_FILES[$pid]'; fi
+}
+
+REGISTRATION_STATE=""; REGISTRATION_WORKER_PID=""; REGISTRATION_WORKER_START=""
+REGISTRATION_PARENT_PID=""; REGISTRATION_PARENT_START=""; REGISTRATION_READY_DEV=""; REGISTRATION_READY_INODE=""
+REGISTRATION_FILE_DEV=""; REGISTRATION_FILE_INODE=""
+read_worker_registration_manifest() {
+    local file="$1" expected_state="$2" line key value line_count=0 before after owner gid mode trusted_gid
+    local -A seen=()
+    [[ -f "$file" && ! -L "$file" ]] || return 1
+    before=$(stat -Lc '%d:%i:%u:%g:%a' -- "$file" 2>/dev/null) || return 1
+    IFS=: read -r REGISTRATION_FILE_DEV REGISTRATION_FILE_INODE owner gid mode <<< "$before"
+    trusted_gid=$(current_gid) || return 1
+    [[ "$owner" == "$EUID" && "$gid" == "$trusted_gid" && "$mode" == 600 ]] || return 1
+    REGISTRATION_STATE=""; REGISTRATION_WORKER_PID=""; REGISTRATION_WORKER_START=""
+    REGISTRATION_PARENT_PID=""; REGISTRATION_PARENT_START=""; REGISTRATION_READY_DEV=""; REGISTRATION_READY_INODE=""
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        ((line_count += 1)); [[ "$line" == *=* ]] || return 1
+        key=${line%%=*}; value=${line#*=}; [[ -z "${seen[$key]:-}" ]] || return 1; seen[$key]=1
+        case "$key" in
+            version) [[ "$value" == 1 ]] || return 1 ;;
+            state) REGISTRATION_STATE=$value ;;
+            worker_pid) REGISTRATION_WORKER_PID=$value ;;
+            worker_start) REGISTRATION_WORKER_START=$value ;;
+            parent_pid) REGISTRATION_PARENT_PID=$value ;;
+            parent_start) REGISTRATION_PARENT_START=$value ;;
+            ready_dev) REGISTRATION_READY_DEV=$value ;;
+            ready_inode) REGISTRATION_READY_INODE=$value ;;
+            *) return 1 ;;
+        esac
+    done < "$file"
+    [[ "$REGISTRATION_STATE" == "$expected_state" ]] || return 1
+    if [[ "$expected_state" == ready ]]; then
+        (( line_count == 6 && ${#seen[@]} == 6 )) || return 1
+        [[ -z "$REGISTRATION_READY_DEV" && -z "$REGISTRATION_READY_INODE" ]] || return 1
+    elif [[ "$expected_state" == accepted ]]; then
+        (( line_count == 8 && ${#seen[@]} == 8 )) || return 1
+        [[ "$REGISTRATION_READY_DEV" =~ ^[1-9][0-9]*$ && "$REGISTRATION_READY_INODE" =~ ^[1-9][0-9]*$ ]] || return 1
+    else return 1; fi
+    for value in "$REGISTRATION_WORKER_PID" "$REGISTRATION_WORKER_START" "$REGISTRATION_PARENT_PID" "$REGISTRATION_PARENT_START"; do
+        [[ "$value" =~ ^[1-9][0-9]*$ ]] || return 1
+    done
+    after=$(stat -Lc '%d:%i:%u:%g:%a' -- "$file" 2>/dev/null) || return 1
+    [[ "$after" == "$before" ]]
+}
+
+publish_worker_registration_ready() {
+    local pid="$1" start="$2" parent_pid="$3" parent_start="$4" content
+    WORKER_REGISTRATION_READY_FILE=$(worker_registration_ready_path "$pid") || return 1
+    WORKER_REGISTRATION_RELEASE_FILE=$(worker_registration_release_path "$pid") || return 1
+    content=$(printf 'version=1\nstate=ready\nworker_pid=%s\nworker_start=%s\nparent_pid=%s\nparent_start=%s\n' \
+        "$pid" "$start" "$parent_pid" "$parent_start") || return 1
+    publish_worker_registration_manifest "$WORKER_REGISTRATION_READY_FILE" ready "$pid" "$content" || return 1
+    read_worker_registration_manifest "$WORKER_REGISTRATION_READY_FILE" ready || return 1
+    [[ "$REGISTRATION_WORKER_PID" == "$pid" && "$REGISTRATION_WORKER_START" == "$start" &&
+        "$REGISTRATION_PARENT_PID" == "$parent_pid" && "$REGISTRATION_PARENT_START" == "$parent_start" ]] || return 1
+    WORKER_REGISTRATION_READY_DEV=$REGISTRATION_FILE_DEV
+    WORKER_REGISTRATION_READY_INODE=$REGISTRATION_FILE_INODE
+}
+
+publish_worker_registration_release() {
+    local pid="$1" start="$2" parent_pid="$3" parent_start="$4" ready_dev="$5" ready_inode="$6" final content
+    final=$(worker_registration_release_path "$pid") || return 1
+    content=$(printf 'version=1\nstate=accepted\nworker_pid=%s\nworker_start=%s\nparent_pid=%s\nparent_start=%s\nready_dev=%s\nready_inode=%s\n' \
+        "$pid" "$start" "$parent_pid" "$parent_start" "$ready_dev" "$ready_inode") || return 1
+    publish_worker_registration_manifest "$final" release "$pid" "$content" || return 1
+    [[ "$REGISTRATION_WORKER_PID" == "$pid" && "$REGISTRATION_WORKER_START" == "$start" &&
+        "$REGISTRATION_PARENT_PID" == "$parent_pid" && "$REGISTRATION_PARENT_START" == "$parent_start" &&
+        "$REGISTRATION_READY_DEV" == "$ready_dev" && "$REGISTRATION_READY_INODE" == "$ready_inode" ]]
+}
+
+validate_worker_registration_release() {
+    local pid="$1" start="$2" parent_pid="$3" parent_start="$4" ready_meta
+    read_worker_registration_manifest "$WORKER_REGISTRATION_RELEASE_FILE" accepted || return 1
+    [[ "$REGISTRATION_WORKER_PID" == "$pid" && "$REGISTRATION_WORKER_START" == "$start" &&
+        "$REGISTRATION_PARENT_PID" == "$parent_pid" && "$REGISTRATION_PARENT_START" == "$parent_start" &&
+        "$REGISTRATION_READY_DEV" == "$WORKER_REGISTRATION_READY_DEV" &&
+        "$REGISTRATION_READY_INODE" == "$WORKER_REGISTRATION_READY_INODE" ]] || return 1
+    ready_meta=$(stat -Lc '%d:%i' -- "$WORKER_REGISTRATION_READY_FILE" 2>/dev/null) || return 1
+    [[ "$ready_meta" == "$WORKER_REGISTRATION_READY_DEV:$WORKER_REGISTRATION_READY_INODE" ]]
+}
+
+worker_cleanup_own_registration() {
+    local failed=false path
+    for path in "$WORKER_REGISTRATION_STAGE_FILE" "$WORKER_REGISTRATION_READY_FILE" "$WORKER_REGISTRATION_RELEASE_FILE"; do
+        [[ -n "$path" ]] || continue
+        worker_registration_safe_unlink "$path" || failed=true
+    done
+    [[ "$failed" == false ]] && { WORKER_REGISTRATION_STAGE_FILE=""; WORKER_REGISTRATION_READY_FILE=""; WORKER_REGISTRATION_RELEASE_FILE=""; }
+    [[ "$failed" == false ]]
+}
+
+worker_registration_signal_handler() {
+    local status="$1"
+    trap - EXIT HUP INT TERM
+    worker_cleanup_own_registration || true
+    exit "$status"
+}
+
+worker_registration_exit_handler() {
+    local status="$?"
+    trap - EXIT HUP INT TERM
+    if ! worker_cleanup_own_registration && (( status == 0 )); then status=$MANAGED_CLEANUP_FAILURE_STATUS; fi
+    exit "$status"
+}
+
+worker_registration_verify_parent_identity() {
+    local parent_pid="$1" parent_start="$2" _
+    for _ in {1..20}; do
+        process_identity_matches "$parent_pid" "$parent_start" && return 0
+        [[ -r "/proc/$parent_pid/stat" ]] || return 1
+        sleep 0.01
+    done
+    return 1
+}
+
+registered_worker_entry() {
+    local parent_pid="$1" parent_start="$2" server="$3" src="$4" dst="$5" index="$6" total="$7"
+    local worker_pid=$BASHPID worker_start="" _
+    WORKER_REGISTRATION_CRITICAL=false
+    WORKER_REGISTRATION_PENDING_SIGNAL=""; WORKER_REGISTRATION_PENDING_STATUS=0
+    trap 'worker_registration_signal_handler 129' HUP
+    trap 'worker_registration_signal_handler 130' INT
+    trap 'worker_registration_signal_handler 143' TERM
+    trap worker_registration_exit_handler EXIT
+    worker_registration_phase_hook before-ready "$worker_pid" || { echo -e "${RED}${ICON_ERROR} worker registration before-ready hook 失败: $worker_pid${NC}" >&2; return 1; }
+    read_process_record "$worker_pid" || { echo -e "${RED}${ICON_ERROR} worker registration 无法读取自身身份: $worker_pid${NC}" >&2; return 1; }
+    [[ "$PROC_UID" == "$EUID" && "$PROC_STATE" != Z ]] || { echo -e "${RED}${ICON_ERROR} worker registration 自身身份不可信: $worker_pid${NC}" >&2; return 1; }
+    worker_start=$PROC_START
+    publish_worker_registration_ready "$worker_pid" "$worker_start" "$parent_pid" "$parent_start" || { echo -e "${RED}${ICON_ERROR} worker registration ready 发布失败: $worker_pid${NC}" >&2; return 1; }
+    worker_registration_phase_hook ready-published "$worker_pid" || { echo -e "${RED}${ICON_ERROR} worker registration ready-published hook 失败: $worker_pid${NC}" >&2; return 1; }
+    for _ in $(seq 1 "$WORKER_REGISTRATION_TIMEOUT_TICKS"); do
+        if ! process_identity_matches "$parent_pid" "$parent_start"; then
+            [[ -r "/proc/$parent_pid/stat" ]] || { echo -e "${RED}${ICON_ERROR} worker registration parent 身份已消失: $worker_pid${NC}" >&2; return 1; }
+            sleep 0.05
+            continue
+        fi
+        if [[ -e "$WORKER_REGISTRATION_RELEASE_FILE" || -L "$WORKER_REGISTRATION_RELEASE_FILE" ]]; then
+            validate_worker_registration_release "$worker_pid" "$worker_start" "$parent_pid" "$parent_start" || { echo -e "${RED}${ICON_ERROR} worker registration release 不可信: $worker_pid${NC}" >&2; return "$MANAGED_CLEANUP_FAILURE_STATUS"; }
+            worker_registration_phase_hook release-validated "$worker_pid" || { echo -e "${RED}${ICON_ERROR} worker registration release-validated hook 失败: $worker_pid${NC}" >&2; return 1; }
+            worker_cleanup_own_registration || { echo -e "${RED}${ICON_ERROR} worker registration handoff 清理失败: $worker_pid${NC}" >&2; return "$MANAGED_CLEANUP_FAILURE_STATUS"; }
+            worker_registration_verify_parent_identity "$parent_pid" "$parent_start" || { echo -e "${RED}${ICON_ERROR} worker registration handoff 后 parent 身份已消失: $worker_pid${NC}" >&2; return 1; }
+            worker_registration_phase_hook before-transfer "$worker_pid" || { echo -e "${RED}${ICON_ERROR} worker registration before-transfer hook 失败: $worker_pid${NC}" >&2; return 1; }
+            push_to_server "$server" "$src" "$dst" "$index" "$total"
+            return
+        fi
+        sleep 0.05
+    done
+    echo -e "${RED}${ICON_ERROR} worker registration release 等待超时: $worker_pid${NC}" >&2
+    return 1
+}
+
+terminate_registering_worker_job() {
+    local pid="$1" _ wait_status=0
+    if job_is_active "$pid"; then kill -TERM "$pid" 2>/dev/null || true; fi
+    for _ in {1..40}; do job_is_active "$pid" || break; sleep 0.05; done
+    if job_is_active "$pid"; then kill -KILL "$pid" 2>/dev/null || true; fi
+    for _ in {1..20}; do job_is_active "$pid" || break; sleep 0.05; done
+    job_is_active "$pid" && return 1
+    wait "$pid" 2>/dev/null || wait_status=$?
+    record_worker_wait_status "$wait_status"
+}
+
+terminate_registering_worker() {
+    local pid="$1" failed=false
+    terminate_registering_worker_job "$pid" || failed=true
+    cleanup_worker_registration_for_pid "$pid" || failed=true
+    unset 'REGISTERING_WORKERS[$pid]'
+    [[ "$failed" == false ]]
 }
 
 record_worker_wait_status() {
@@ -901,6 +1193,26 @@ runtime_has_published_worker_state() {
     return 1
 }
 
+runtime_has_worker_registration_state() {
+    local path
+    [[ -n "$TEMP_DIR" ]] || return 1
+    for path in "$TEMP_DIR"/worker-registration.*.ready "$TEMP_DIR"/worker-registration.*.release \
+        "$TEMP_DIR"/.worker-registration.*.stage; do
+        [[ -e "$path" || -L "$path" ]] && return 0
+    done
+    return 1
+}
+
+has_unresolved_worker_registration() {
+    local pid ready release
+    for pid in "${!WORKER_REGISTRATION_READY_FILES[@]}"; do
+        [[ -n "${REGISTERING_WORKERS[$pid]:-}" || -n "${ACTIVE_WORKERS[$pid]:-}" ]] && continue
+        ready=${WORKER_REGISTRATION_READY_FILES[$pid]:-}; release=${WORKER_REGISTRATION_RELEASE_FILES[$pid]:-}
+        [[ -e "$ready" || -L "$ready" || -e "$release" || -L "$release" ]] && return 0
+    done
+    return 1
+}
+
 has_unresolved_exited_worker_state() {
     local worker_pid state_file
     for worker_pid in "${!ACTIVE_WORKER_STATE_FILES[@]}"; do
@@ -914,16 +1226,18 @@ has_unresolved_exited_worker_state() {
 }
 
 batch_schedule_barrier_present() {
-    [[ "$BATCH_WORKER_FAILED" == true ]] || has_unresolved_exited_worker_state
+    [[ "$BATCH_WORKER_FAILED" == true ]] || has_unresolved_exited_worker_state || has_unresolved_worker_registration
 }
 
 reset_batch_lifecycle_barrier() {
     if (( ${#ACTIVE_WORKERS[@]} != 0 || ${#ACTIVE_WORKER_STATE_FILES[@]} != 0 ||
-        ${#ACTIVE_WORKER_STATE_STARTS[@]} != 0 )) ||
+        ${#ACTIVE_WORKER_STATE_STARTS[@]} != 0 || ${#REGISTERING_WORKERS[@]} != 0 ||
+        ${#WORKER_REGISTRATION_READY_FILES[@]} != 0 || ${#WORKER_REGISTRATION_RELEASE_FILES[@]} != 0 ||
+        ${#WORKER_REGISTRATION_STARTS[@]} != 0 || ${#WORKER_REGISTRATION_STAGE_FILES[@]} != 0 )) ||
         [[ -n "$WORKER_TRANSFER_PID" || -n "$WORKER_TRANSFER_PGID" ||
             -n "$WORKER_TRANSFER_SID" || -n "$WORKER_TRANSFER_START" ||
             -n "$WORKER_SESSION_STATE_FILE" || "$WORKER_TRANSFER_CLEANUP_FAILED" == true ]] ||
-        runtime_has_published_worker_state; then
+        runtime_has_published_worker_state || runtime_has_worker_registration_state; then
         echo -e "${RED}${ICON_ERROR} worker lifecycle barrier 尚未安全清空${NC}" >&2
         return 1
     fi
@@ -932,20 +1246,38 @@ reset_batch_lifecycle_barrier() {
 }
 
 prune_active_workers() {
-    local pid wait_status=0
+    local pid wait_status=0 failed=false ready release
     for pid in "${!ACTIVE_WORKERS[@]}"; do
-        if ! job_is_active "$pid" || ! process_identity_matches "$pid" "${ACTIVE_WORKERS[$pid]}"; then
-            wait_status=0
-            wait "$pid" 2>/dev/null || wait_status=$?
-            record_worker_wait_status "$wait_status"
-            unset 'ACTIVE_WORKERS[$pid]'
-            if [[ -n "${ACTIVE_WORKER_STATE_FILES[$pid]:-}" &&
-                ! -e "${ACTIVE_WORKER_STATE_FILES[$pid]}" && ! -L "${ACTIVE_WORKER_STATE_FILES[$pid]}" ]]; then
-                unset 'ACTIVE_WORKER_STATE_FILES[$pid]'
-                unset 'ACTIVE_WORKER_STATE_STARTS[$pid]'
+        if job_is_active "$pid"; then
+            if process_identity_matches "$pid" "${ACTIVE_WORKERS[$pid]}"; then
+                ready=${WORKER_REGISTRATION_READY_FILES[$pid]:-}; release=${WORKER_REGISTRATION_RELEASE_FILES[$pid]:-}
+                if [[ -n "$ready" && ! -e "$ready" && ! -L "$ready" &&
+                    -n "$release" && ! -e "$release" && ! -L "$release" ]]; then
+                    unset 'WORKER_REGISTRATION_READY_FILES[$pid]' 'WORKER_REGISTRATION_RELEASE_FILES[$pid]'
+                    unset 'WORKER_REGISTRATION_STARTS[$pid]' 'WORKER_REGISTRATION_STAGE_FILES[$pid]'
+                fi
+                continue
+            fi
+            if [[ -r "/proc/$pid/stat" ]] && { ! read_process_record "$pid" || [[ "$PROC_STATE" != Z ]]; }; then
+                if [[ "$BATCH_WORKER_FAILED" == false ]]; then
+                    echo -e "${RED}${ICON_ERROR} active worker 身份不可验证，停止调度并交由完整 grace 清理: pid=$pid expected_start=${ACTIVE_WORKERS[$pid]} actual_start=${PROC_START:-unknown} state=${PROC_STATE:-unknown} uid=${PROC_UID:-unknown}${NC}" >&2
+                fi
+                BATCH_WORKER_FAILED=true
+                failed=true
+                continue
             fi
         fi
+        wait_status=0
+        wait "$pid" 2>/dev/null || wait_status=$?
+        record_worker_wait_status "$wait_status"
+        unset 'ACTIVE_WORKERS[$pid]'
+        cleanup_worker_registration_for_pid "$pid" || { BATCH_WORKER_FAILED=true; failed=true; }
+        if [[ -n "${ACTIVE_WORKER_STATE_FILES[$pid]:-}" &&
+            ! -e "${ACTIVE_WORKER_STATE_FILES[$pid]}" && ! -L "${ACTIVE_WORKER_STATE_FILES[$pid]}" ]]; then
+            unset 'ACTIVE_WORKER_STATE_FILES[$pid]' 'ACTIVE_WORKER_STATE_STARTS[$pid]'
+        fi
     done
+    [[ "$failed" == false ]]
 }
 
 cleanup_published_worker_sessions() {
@@ -974,34 +1306,56 @@ cleanup_published_worker_sessions() {
 }
 
 terminate_active_workers() {
-    local pid _ cleanup_failed=false
+    local pid _ wait_status=0 cleanup_failed=false
 
-    prune_active_workers
+    for pid in "${!REGISTERING_WORKERS[@]}"; do
+        terminate_registering_worker "$pid" || cleanup_failed=true
+    done
+
+    # prune 只 reap 已退出 worker；active 身份信任失败仅建立 barrier，不缩短 grace。
+    prune_active_workers || cleanup_failed=true
     for pid in "${!ACTIVE_WORKERS[@]}"; do
-        if job_is_active "$pid" && process_identity_matches "$pid" "${ACTIVE_WORKERS[$pid]}"; then
+        if job_is_active "$pid"; then
+            # ACTIVE_WORKERS 只包含当前 shell 通过 $! 建立并完成 acceptance 的直接 child job。
             kill -TERM "$pid" 2>/dev/null || true
         fi
     done
-    # Worker 的 managed-session TERM/KILL/核验最长约 4 秒；主进程给出 7 秒余量。
+
+    # 保留原 active worker 约 7 秒完整 grace，允许 managed-session 清理、状态发布和 hook 完成。
     for _ in {1..70}; do
-        prune_active_workers
+        prune_active_workers || cleanup_failed=true
         (( ${#ACTIVE_WORKERS[@]} == 0 )) && break
         sleep 0.1
     done
 
     cleanup_published_worker_sessions || cleanup_failed=true
 
+    # 完整 grace 后仍存活的 accepted active worker 才允许 KILL。
     for pid in "${!ACTIVE_WORKERS[@]}"; do
-        if job_is_active "$pid" && process_identity_matches "$pid" "${ACTIVE_WORKERS[$pid]}"; then
+        if job_is_active "$pid"; then
             kill -KILL "$pid" 2>/dev/null || true
         fi
     done
-    for pid in "${!ACTIVE_WORKERS[@]}"; do
-        wait "$pid" 2>/dev/null || true
-        unset 'ACTIVE_WORKERS[$pid]'
+    for _ in {1..20}; do
+        prune_active_workers || cleanup_failed=true
+        (( ${#ACTIVE_WORKERS[@]} == 0 )) && break
+        sleep 0.05
     done
-    cleanup_published_worker_sessions || cleanup_failed=true
 
+    for pid in "${!ACTIVE_WORKERS[@]}"; do
+        if job_is_active "$pid"; then
+            cleanup_failed=true
+            continue
+        fi
+        wait_status=0
+        wait "$pid" 2>/dev/null || wait_status=$?
+        record_worker_wait_status "$wait_status"
+        unset 'ACTIVE_WORKERS[$pid]'
+        cleanup_worker_registration_for_pid "$pid" || cleanup_failed=true
+    done
+
+    cleanup_published_worker_sessions || cleanup_failed=true
+    cleanup_all_worker_registration_residue || cleanup_failed=true
     [[ "$cleanup_failed" == false ]]
 }
 
@@ -1081,6 +1435,19 @@ cleanup_runtime() {
         ACTIVE_WORKERS=()
         ACTIVE_WORKER_STATE_FILES=()
         ACTIVE_WORKER_STATE_STARTS=()
+        REGISTERING_WORKERS=()
+        WORKER_REGISTRATION_READY_FILES=()
+        WORKER_REGISTRATION_RELEASE_FILES=()
+        WORKER_REGISTRATION_STARTS=()
+        WORKER_REGISTRATION_STAGE_FILES=()
+        WORKER_REGISTRATION_READY_FILE=""
+        WORKER_REGISTRATION_RELEASE_FILE=""
+        WORKER_REGISTRATION_STAGE_FILE=""
+        WORKER_REGISTRATION_READY_DEV=""
+        WORKER_REGISTRATION_READY_INODE=""
+        WORKER_REGISTRATION_CRITICAL=false
+        WORKER_REGISTRATION_PENDING_SIGNAL=""
+        WORKER_REGISTRATION_PENDING_STATUS=0
     fi
     RUNTIME_CLEANUP_ACTIVE=false
     [[ "$cleanup_failed" == false ]]
@@ -1098,6 +1465,13 @@ runtime_exit_handler() {
 
 runtime_signal_handler() {
     local signal_name="$1" status="$2"
+    if [[ "$WORKER_REGISTRATION_CRITICAL" == true ]]; then
+        if [[ -z "$WORKER_REGISTRATION_PENDING_SIGNAL" ]]; then
+            WORKER_REGISTRATION_PENDING_SIGNAL=$signal_name
+            WORKER_REGISTRATION_PENDING_STATUS=$status
+        fi
+        return 0
+    fi
     if [[ "$RUNTIME_ALLOCATION_CRITICAL" == true ]]; then
         if [[ -z "$RUNTIME_PENDING_SIGNAL" ]]; then
             RUNTIME_PENDING_SIGNAL_STATUS="$status"
@@ -1812,30 +2186,86 @@ push_to_server() {
     return 0
 }
 
-launch_worker() {
-    local server="$1" src="$2" dst="$3" index="$4" total="$5" pid start="" wait_status=0
-    push_to_server "$server" "$src" "$dst" "$index" "$total" &
-    pid=$!
-    for _ in {1..20}; do
-        start=$(get_process_start_time "$pid" 2>/dev/null || true)
-        [[ -n "$start" ]] && break
-        kill -0 "$pid" 2>/dev/null || break
-        sleep 0.01
-    done
-    if [[ -n "$start" ]]; then
-        ACTIVE_WORKERS["$pid"]="$start"
-        ACTIVE_WORKER_STATE_FILES["$pid"]="$TEMP_DIR/worker-session.$pid.state"
-        ACTIVE_WORKER_STATE_STARTS["$pid"]="$start"
-    else
-        wait "$pid" || wait_status=$?
-        record_worker_wait_status "$wait_status"
+abort_worker_registration() {
+    local pid="$1" was_active="${2:-false}" failed=false
+    terminate_registering_worker_job "$pid" || failed=true
+    cleanup_worker_registration_for_pid "$pid" || failed=true
+    unset 'REGISTERING_WORKERS[$pid]'
+    if [[ "$was_active" == true ]]; then
+        unset 'ACTIVE_WORKERS[$pid]'
+        if [[ -n "${ACTIVE_WORKER_STATE_FILES[$pid]:-}" &&
+            ! -e "${ACTIVE_WORKER_STATE_FILES[$pid]}" && ! -L "${ACTIVE_WORKER_STATE_FILES[$pid]}" ]]; then
+            unset 'ACTIVE_WORKER_STATE_FILES[$pid]' 'ACTIVE_WORKER_STATE_STARTS[$pid]'
+        fi
     fi
+    [[ "$failed" == false ]]
+}
+
+launch_worker() {
+    local server="$1" src="$2" dst="$3" index="$4" total="$5"
+    local parent_pid=$BASHPID parent_start="" pid ready release ready_dev ready_inode _ wait_status=0
+    read_process_record "$parent_pid" || return "$MANAGED_CLEANUP_FAILURE_STATUS"
+    [[ "$PROC_UID" == "$EUID" && "$PROC_STATE" != Z ]] || return "$MANAGED_CLEANUP_FAILURE_STATUS"
+    parent_start=$PROC_START
+    worker_registration_begin_critical || return "$MANAGED_CLEANUP_FAILURE_STATUS"
+    registered_worker_entry "$parent_pid" "$parent_start" "$server" "$src" "$dst" "$index" "$total" &
+    pid=$!
+    ready="$TEMP_DIR/worker-registration.$pid.ready"
+    release="$TEMP_DIR/worker-registration.$pid.release"
+    REGISTERING_WORKERS[$pid]=direct
+    WORKER_REGISTRATION_READY_FILES[$pid]=$ready
+    WORKER_REGISTRATION_RELEASE_FILES[$pid]=$release
+    worker_registration_end_critical
+    parent_worker_registration_hook registering-created "$pid" "$ready" "$release" || {
+        abort_worker_registration "$pid" false || return "$MANAGED_CLEANUP_FAILURE_STATUS"; return 1; }
+    for _ in $(seq 1 "$WORKER_REGISTRATION_TIMEOUT_TICKS"); do
+        if [[ -e "$ready" || -L "$ready" ]]; then
+            parent_worker_registration_hook ready-observed "$pid" "$ready" "$release" || {
+                abort_worker_registration "$pid" false || return "$MANAGED_CLEANUP_FAILURE_STATUS"; return 1; }
+            if ! read_worker_registration_manifest "$ready" ready ||
+                [[ "$REGISTRATION_WORKER_PID" != "$pid" || "$REGISTRATION_PARENT_PID" != "$parent_pid" ||
+                    "$REGISTRATION_PARENT_START" != "$parent_start" ]] ||
+                ! job_is_active "$pid" || ! process_identity_matches "$pid" "$REGISTRATION_WORKER_START"; then
+                echo -e "${RED}${ICON_ERROR} worker registration ready 不可信: $pid${NC}" >&2
+                abort_worker_registration "$pid" false || return "$MANAGED_CLEANUP_FAILURE_STATUS"
+                return 1
+            fi
+            ready_dev=$REGISTRATION_FILE_DEV; ready_inode=$REGISTRATION_FILE_INODE
+            ACTIVE_WORKERS[$pid]=$REGISTRATION_WORKER_START
+            ACTIVE_WORKER_STATE_FILES[$pid]="$TEMP_DIR/worker-session.$pid.state"
+            ACTIVE_WORKER_STATE_STARTS[$pid]=$REGISTRATION_WORKER_START
+            WORKER_REGISTRATION_STARTS[$pid]=$REGISTRATION_WORKER_START
+            unset 'REGISTERING_WORKERS[$pid]'
+            parent_worker_registration_hook accepted-before-release "$pid" "$ready" "$release" || {
+                abort_worker_registration "$pid" true || return "$MANAGED_CLEANUP_FAILURE_STATUS"; return 1; }
+            if ! publish_worker_registration_release "$pid" "$REGISTRATION_WORKER_START" "$parent_pid" "$parent_start" "$ready_dev" "$ready_inode"; then
+                echo -e "${RED}${ICON_ERROR} worker registration release 发布失败: $pid${NC}" >&2
+                abort_worker_registration "$pid" true || return "$MANAGED_CLEANUP_FAILURE_STATUS"
+                return 1
+            fi
+            parent_worker_registration_hook release-published "$pid" "$ready" "$release" || {
+                abort_worker_registration "$pid" true || return "$MANAGED_CLEANUP_FAILURE_STATUS"; return 1; }
+            return 0
+        fi
+        if ! job_is_active "$pid"; then
+            wait_status=0; wait "$pid" 2>/dev/null || wait_status=$?
+            record_worker_wait_status "$wait_status"
+            cleanup_worker_registration_for_pid "$pid" || return "$MANAGED_CLEANUP_FAILURE_STATUS"
+            unset 'REGISTERING_WORKERS[$pid]'
+            (( wait_status == 0 )) && return 1
+            return "$wait_status"
+        fi
+        sleep 0.05
+    done
+    echo -e "${RED}${ICON_ERROR} worker registration ready 超时: $pid${NC}" >&2
+    abort_worker_registration "$pid" false || return "$MANAGED_CLEANUP_FAILURE_STATUS"
+    return 1
 }
 
 wait_for_worker_slot() {
     local wait_status=0
     while :; do
-        prune_active_workers
+        prune_active_workers || return "$MANAGED_CLEANUP_FAILURE_STATUS"
         if batch_schedule_barrier_present; then
             return "$MANAGED_CLEANUP_FAILURE_STATUS"
         fi
@@ -1848,7 +2278,7 @@ wait_for_worker_slot() {
             return "$MANAGED_CLEANUP_FAILURE_STATUS"
         fi
 
-        prune_active_workers
+        prune_active_workers || return "$MANAGED_CLEANUP_FAILURE_STATUS"
         if batch_schedule_barrier_present; then
             return "$MANAGED_CLEANUP_FAILURE_STATUS"
         fi
@@ -1858,7 +2288,7 @@ wait_for_worker_slot() {
 wait_for_all_workers() {
     local wait_status=0
     while :; do
-        prune_active_workers
+        prune_active_workers || return "$MANAGED_CLEANUP_FAILURE_STATUS"
         if batch_schedule_barrier_present; then
             return "$MANAGED_CLEANUP_FAILURE_STATUS"
         fi
@@ -1871,7 +2301,7 @@ wait_for_all_workers() {
             return "$MANAGED_CLEANUP_FAILURE_STATUS"
         fi
 
-        prune_active_workers
+        prune_active_workers || return "$MANAGED_CLEANUP_FAILURE_STATUS"
         if batch_schedule_barrier_present; then
             return "$MANAGED_CLEANUP_FAILURE_STATUS"
         fi
@@ -1900,7 +2330,10 @@ run_server_batch() {
     local success_before failed_before success_after failed_after recorded
 
     if [[ "$BATCH_WORKER_FAILED" == true || ${#ACTIVE_WORKERS[@]} -ne 0 ||
-        ${#ACTIVE_WORKER_STATE_FILES[@]} -ne 0 || ${#ACTIVE_WORKER_STATE_STARTS[@]} -ne 0 ]] || runtime_has_published_worker_state; then
+        ${#ACTIVE_WORKER_STATE_FILES[@]} -ne 0 || ${#ACTIVE_WORKER_STATE_STARTS[@]} -ne 0 ||
+        ${#REGISTERING_WORKERS[@]} -ne 0 || ${#WORKER_REGISTRATION_READY_FILES[@]} -ne 0 ||
+        ${#WORKER_REGISTRATION_RELEASE_FILES[@]} -ne 0 || ${#WORKER_REGISTRATION_STARTS[@]} -ne 0 ]] ||
+        runtime_has_published_worker_state || runtime_has_worker_registration_state; then
         echo -e "${RED}${ICON_ERROR} 旧 batch lifecycle barrier 尚未安全 reset${NC}" >&2
         return "$MANAGED_CLEANUP_FAILURE_STATUS"
     fi
@@ -1923,9 +2356,14 @@ run_server_batch() {
             stop_batch_after_lifecycle_failure
             return "$MANAGED_CLEANUP_FAILURE_STATUS"
         fi
-        launch_worker "$server" "$src" "$dst" "$index" "$total"
-        prune_active_workers
-        if batch_schedule_barrier_present; then
+        wait_status=0
+        launch_worker "$server" "$src" "$dst" "$index" "$total" || wait_status=$?
+        if (( wait_status != 0 )); then
+            (( wait_status == MANAGED_CLEANUP_FAILURE_STATUS )) && BATCH_WORKER_FAILED=true || BATCH_WORKER_ERROR=true
+            terminate_active_workers || return "$MANAGED_CLEANUP_FAILURE_STATUS"
+            return "$wait_status"
+        fi
+        if ! prune_active_workers || batch_schedule_barrier_present; then
             stop_batch_after_lifecycle_failure
             return "$MANAGED_CLEANUP_FAILURE_STATUS"
         fi
