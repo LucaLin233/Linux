@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2034  # Test globals are consumed by sourced tools/push.sh functions.
 set -euo pipefail
 
-readonly ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+readonly ROOT_DIR
 readonly SCRIPT="$ROOT_DIR/tools/push.sh"
-readonly TEST_DIR=$(mktemp -d)
+TEST_DIR=$(mktemp -d)
+readonly TEST_DIR
 trap 'rm -rf "$TEST_DIR"' EXIT
 
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
@@ -524,7 +527,7 @@ for password_case in symlink 0644 0660 unreadable empty; do
             unreadable) chmod 0000 "$password_file" ;;
             empty) : > "$password_file" ;;
         esac
-        PASSWORD_METHOD=file; PASSWORD_FILE="$password_file"
+        PASSWORD_METHOD="file"; PASSWORD_FILE="$password_file"
         assert_fail "reject password file $password_case" prepare_password_credentials
         cleanup_runtime
     )
@@ -533,7 +536,7 @@ done
 (
     trap - EXIT HUP INT TERM
     root="$TEST_DIR/password-owner"; mkdir -m 0700 "$root"; make_runtime "$root/runtime"
-    password_file="$root/password"; printf 'secret\n' > "$password_file"; chmod 0600 "$password_file"; PASSWORD_METHOD=file; PASSWORD_FILE="$password_file"
+    password_file="$root/password"; printf 'secret\n' > "$password_file"; chmod 0600 "$password_file"; PASSWORD_METHOD="file"; PASSWORD_FILE="$password_file"
     other_uid=65534; [[ "$other_uid" == "$EUID" ]] && other_uid=1
     stat() {
         local last=${!#}
@@ -550,7 +553,7 @@ done
     root="$TEST_DIR/password-toctou"; mkdir -m 0700 "$root"; make_runtime "$root/runtime"
     password_file="$root/password"; replacement="$root/replacement"
     printf 'verified-password\nsecond\n' > "$password_file"; printf 'replaced-password\n' > "$replacement"; chmod 0600 "$password_file" "$replacement"
-    PASSWORD_METHOD=file; PASSWORD_FILE="$password_file"
+    PASSWORD_METHOD="file"; PASSWORD_FILE="$password_file"
     secure_fd_open_hook() {
         if [[ "$1" == password-file ]]; then
             command mv "$2" "$2.opened"
@@ -570,11 +573,11 @@ done
     trap - EXIT HUP INT TERM
     root="$TEST_DIR/password-methods"; mkdir -m 0700 "$root"; make_runtime "$root/runtime"
     export PUSH_TEST_PASSWORD=env-secret
-    PASSWORD_METHOD=env; PASSWORD_ENV_VAR=PUSH_TEST_PASSWORD
+    PASSWORD_METHOD="env"; PASSWORD_ENV_VAR=PUSH_TEST_PASSWORD
     prepare_password_credentials
     assert_eq env-secret "$SSHPASS" "password env method remains supported"
     unset SSHPASS
-    PASSWORD_METHOD=inline; PASSWORD=inline-secret
+    PASSWORD_METHOD="inline"; PASSWORD=inline-secret
     prepare_password_credentials >/dev/null 2>"$root/inline.log"
     assert_eq inline-secret "$SSHPASS" "password inline method remains supported"
     grep -Fq '不推荐' "$root/inline.log" || fail "inline password warning missing"
@@ -675,7 +678,7 @@ done
     trap - EXIT HUP INT TERM
     root="$TEST_DIR/password-gid"; mkdir -m 0700 "$root"; make_runtime "$root/runtime"
     password_file="$root/password"; printf 'secret\n' > "$password_file"; chmod 0600 "$password_file"
-    PASSWORD_METHOD=file; PASSWORD_FILE="$password_file"
+    PASSWORD_METHOD="file"; PASSWORD_FILE="$password_file"
     other_gid=65534; [[ "$other_gid" == "$(id -g)" ]] && other_gid=1
     stat() {
         local last=${!#}
@@ -829,7 +832,7 @@ EOF
     chmod 0700 "$root/bin"/*
     PATH="$root/bin:$PATH"; export PATH CAPTURE_DIR="$root/capture"
     TMPDIR="$root/runtime"; mkdir -m 0700 "$TMPDIR"
-    AUTH_METHOD=password; PASSWORD_METHOD=env; PASSWORD_ENV_VAR=AUTH_TEST_PASSWORD; export AUTH_TEST_PASSWORD=secret
+    AUTH_METHOD=password; PASSWORD_METHOD="env"; PASSWORD_ENV_VAR=AUTH_TEST_PASSWORD; export AUTH_TEST_PASSWORD=secret
     STRICT_HOST_KEY_CHECKING=yes; USER_KNOWN_HOSTS_FILE="$root/known_hosts"; ALLOW_INSECURE_HOST_KEY_STORAGE=false
     CONNECTION_TIMEOUT=10; TOTAL_TIMEOUT=15; SERVERS=("user@example.com")
     initialize_runtime; prepare_ssh_runtime

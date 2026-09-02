@@ -59,6 +59,22 @@ WORKER_TRANSFER_SID=""
 WORKER_TRANSFER_START=""
 WORKER_TRANSFER_CLEANUP_FAILED=false
 WORKER_SESSION_STATE_FILE=""
+WORKER_SESSION_STATE_TRANSIENT_STATUS=75
+WORKER_SESSION_STATE_READ_ATTEMPTS=5
+WORKER_SESSION_PATH_DEV=""
+WORKER_SESSION_PATH_INODE=""
+WORKER_SESSION_PATH_OWNER=""
+WORKER_SESSION_PATH_GID=""
+WORKER_SESSION_PATH_MODE=""
+WORKER_SESSION_PATH_SIZE=""
+WORKER_SESSION_FD_DEV=""
+WORKER_SESSION_FD_INODE=""
+WORKER_SESSION_FD_OWNER=""
+WORKER_SESSION_FD_GID=""
+WORKER_SESSION_FD_MODE=""
+WORKER_SESSION_FD_SIZE=""
+SESSION_FILE_DEV=""
+SESSION_FILE_INODE=""
 WORKER_OUTPUT_FILE=""
 
 declare -a SERVERS=()
@@ -716,6 +732,14 @@ parent_worker_registration_hook() {
     :
 }
 
+worker_session_state_publish_hook() {
+    :
+}
+
+worker_session_state_read_hook() {
+    :
+}
+
 runtime_parent_trusted() {
     local dev="" inode=""
     [[ -n "$RUNTIME_PARENT" && -d "$RUNTIME_PARENT" && ! -L "$RUNTIME_PARENT" ]] || return 1
@@ -1286,6 +1310,10 @@ cleanup_published_worker_sessions() {
     for worker_pid in "${!ACTIVE_WORKER_STATE_FILES[@]}"; do
         file=${ACTIVE_WORKER_STATE_FILES[$worker_pid]}
         worker_start=${ACTIVE_WORKER_STATE_STARTS[$worker_pid]:-}
+        # Worker 仍在 ACTIVE/job 表中时可能继续原子发布状态；最终 fallback 必须等待 wait/reap。
+        if [[ -n "${ACTIVE_WORKERS[$worker_pid]:-}" ]] || job_is_active "$worker_pid"; then
+            continue
+        fi
         if [[ ! -e "$file" && ! -L "$file" ]]; then
             if [[ -z "${ACTIVE_WORKERS[$worker_pid]:-}" ]]; then
                 unset 'ACTIVE_WORKER_STATE_FILES[$worker_pid]'
@@ -1448,6 +1476,20 @@ cleanup_runtime() {
         WORKER_REGISTRATION_CRITICAL=false
         WORKER_REGISTRATION_PENDING_SIGNAL=""
         WORKER_REGISTRATION_PENDING_STATUS=0
+        WORKER_SESSION_PATH_DEV=""
+        WORKER_SESSION_PATH_INODE=""
+        WORKER_SESSION_PATH_OWNER=""
+        WORKER_SESSION_PATH_GID=""
+        WORKER_SESSION_PATH_MODE=""
+        WORKER_SESSION_PATH_SIZE=""
+        WORKER_SESSION_FD_DEV=""
+        WORKER_SESSION_FD_INODE=""
+        WORKER_SESSION_FD_OWNER=""
+        WORKER_SESSION_FD_GID=""
+        WORKER_SESSION_FD_MODE=""
+        WORKER_SESSION_FD_SIZE=""
+        SESSION_FILE_DEV=""
+        SESSION_FILE_INODE=""
     fi
     RUNTIME_CLEANUP_ACTIVE=false
     [[ "$cleanup_failed" == false ]]
@@ -1737,37 +1779,74 @@ validate_transfer_path() {
 }
 
 
+worker_session_state_path_metadata() {
+    local file="$1" metadata="" trusted_gid=""
+    [[ "$file" == "$TEMP_DIR"/worker-session.*.state ]] || return 1
+    [[ ! -L "$file" ]] || return 1
+    if [[ ! -e "$file" ]]; then return "$WORKER_SESSION_STATE_TRANSIENT_STATUS"; fi
+    [[ -f "$file" ]] || return 1
+    metadata=$(stat -Lc '%d:%i:%u:%g:%a:%s' -- "$file" 2>/dev/null) || return "$WORKER_SESSION_STATE_TRANSIENT_STATUS"
+    trusted_gid=$(current_gid) || return "$WORKER_SESSION_STATE_TRANSIENT_STATUS"
+    IFS=: read -r WORKER_SESSION_PATH_DEV WORKER_SESSION_PATH_INODE WORKER_SESSION_PATH_OWNER \
+        WORKER_SESSION_PATH_GID WORKER_SESSION_PATH_MODE WORKER_SESSION_PATH_SIZE <<< "$metadata"
+    [[ "$WORKER_SESSION_PATH_OWNER" == "$EUID" && "$WORKER_SESSION_PATH_GID" == "$trusted_gid" &&
+        "$WORKER_SESSION_PATH_MODE" == 600 && "$WORKER_SESSION_PATH_SIZE" =~ ^[0-9]+$ ]] || return 1
+    [[ -f "$file" && ! -L "$file" ]]
+}
+
 worker_session_state_file_trusted() {
-    local file="$1" metadata="" owner gid mode trusted_gid
-    [[ -f "$file" && ! -L "$file" && "$file" == "$TEMP_DIR"/worker-session.*.state ]] || return 1
-    metadata=$(stat -Lc '%u:%g:%a' -- "$file" 2>/dev/null) || return 1
-    IFS=: read -r owner gid mode <<< "$metadata"
-    trusted_gid=$(current_gid) || return 1
-    [[ "$owner" == "$EUID" && "$gid" == "$trusted_gid" && "$mode" == 600 ]]
+    worker_session_state_path_metadata "$1"
+}
+
+open_worker_session_state_fd() {
+    local file="$1" variable="$2" opened_fd=""
+    if ! exec {opened_fd}<"$file"; then return "$WORKER_SESSION_STATE_TRANSIENT_STATUS"; fi
+    printf -v "$variable" '%s' "$opened_fd"
+}
+
+close_worker_session_state_fd() {
+    local fd="$1"
+    exec {fd}<&-
+}
+
+worker_session_state_fd_metadata() {
+    local fd="$1" fd_path="" metadata="" trusted_gid=""
+    fd_path=$(fd_reference_path "$fd") || return "$WORKER_SESSION_STATE_TRANSIENT_STATUS"
+    [[ -f "$fd_path" ]] || return 1
+    metadata=$(stat -Lc '%d:%i:%u:%g:%a:%s' -- "$fd_path" 2>/dev/null) || return "$WORKER_SESSION_STATE_TRANSIENT_STATUS"
+    trusted_gid=$(current_gid) || return "$WORKER_SESSION_STATE_TRANSIENT_STATUS"
+    IFS=: read -r WORKER_SESSION_FD_DEV WORKER_SESSION_FD_INODE WORKER_SESSION_FD_OWNER \
+        WORKER_SESSION_FD_GID WORKER_SESSION_FD_MODE WORKER_SESSION_FD_SIZE <<< "$metadata"
+    [[ "$WORKER_SESSION_FD_OWNER" == "$EUID" && "$WORKER_SESSION_FD_GID" == "$trusted_gid" &&
+        "$WORKER_SESSION_FD_MODE" == 600 ]]
+}
+
+worker_session_state_path_matches() {
+    local file="$1" expected_dev="$2" expected_inode="$3" status=0
+    worker_session_state_path_metadata "$file" || status=$?
+    (( status == 0 )) || return "$status"
+    [[ "$WORKER_SESSION_PATH_DEV" == "$expected_dev" && "$WORKER_SESSION_PATH_INODE" == "$expected_inode" ]] ||
+        return "$WORKER_SESSION_STATE_TRANSIENT_STATUS"
 }
 
 publish_worker_session_state() {
-    local lifecycle_state="$1" worker_pid worker_start token stage=""
-    local state_file=""
-
+    local lifecycle_state="$1" worker_pid worker_start token stage="" state_file=""
     runtime_directory_trusted || return 1
     worker_pid=$BASHPID
     worker_start=$(get_process_start_time "$worker_pid") || return 1
     state_file="$TEMP_DIR/worker-session.$worker_pid.state"
     token=$(runtime_random_token) || return 1
     stage="$TEMP_DIR/.worker-session.$worker_pid.$token.tmp"
-    if ! (umask 077; set -o noclobber; : > "$stage") 2>/dev/null; then
-        return 1
-    fi
+    if ! (umask 077; set -o noclobber; : > "$stage") 2>/dev/null; then return 1; fi
     if ! printf 'version=1\nstate=%s\nworker_pid=%s\nworker_start=%s\nleader_pid=%s\nleader_start=%s\npgid=%s\nsid=%s\n' \
-        "$lifecycle_state" "$worker_pid" "$worker_start" \
-        "$WORKER_TRANSFER_PID" "$WORKER_TRANSFER_START" \
+        "$lifecycle_state" "$worker_pid" "$worker_start" "$WORKER_TRANSFER_PID" "$WORKER_TRANSFER_START" \
         "$WORKER_TRANSFER_PGID" "$WORKER_TRANSFER_SID" > "$stage"; then
-        rm -f -- "$stage" || true
-        return 1
+        rm -f -- "$stage" || true; return 1
     fi
     chmod 0600 "$stage" || { rm -f -- "$stage" || true; return 1; }
+    worker_session_state_publish_hook stage-ready "$lifecycle_state" "$state_file" "$stage" || { rm -f -- "$stage" || true; return 1; }
     mv -fT -- "$stage" "$state_file" || { rm -f -- "$stage" || true; return 1; }
+    worker_session_state_publish_hook after-rename "$lifecycle_state" "$state_file" "$stage" || return 1
     worker_session_state_file_trusted "$state_file" || return 1
     WORKER_SESSION_STATE_FILE="$state_file"
 }
@@ -1775,24 +1854,21 @@ publish_worker_session_state() {
 remove_worker_session_state() {
     local state_file="${WORKER_SESSION_STATE_FILE:-}"
     [[ -n "$state_file" ]] || return 0
-    if [[ ! -e "$state_file" && ! -L "$state_file" ]]; then
-        WORKER_SESSION_STATE_FILE=""
-        return 0
-    fi
+    if [[ ! -e "$state_file" && ! -L "$state_file" ]]; then WORKER_SESSION_STATE_FILE=""; return 0; fi
     worker_session_state_file_trusted "$state_file" || return 1
     rm -f -- "$state_file" || return 1
     WORKER_SESSION_STATE_FILE=""
 }
 
-read_worker_session_state() {
-    local file="$1" line key value line_count=0
+parse_worker_session_state_fd() {
+    local fd="$1" line="" key="" value=""
+    local -a lines=()
     local -A seen=()
-
-    worker_session_state_file_trusted "$file" || return 1
     SESSION_STATE=""; SESSION_WORKER_PID=""; SESSION_WORKER_START=""
     SESSION_LEADER_PID=""; SESSION_LEADER_START=""; SESSION_PGID=""; SESSION_SID=""
-    while IFS= read -r line || [[ -n "$line" ]]; do
-        ((line_count += 1))
+    mapfile -t -u "$fd" lines || return "$WORKER_SESSION_STATE_TRANSIENT_STATUS"
+    (( ${#lines[@]} == 8 )) || return 1
+    for line in "${lines[@]}"; do
         [[ "$line" == *=* ]] || return 1
         key=${line%%=*}; value=${line#*=}
         [[ -z "${seen[$key]:-}" ]] || return 1
@@ -1808,28 +1884,80 @@ read_worker_session_state() {
             sid) SESSION_SID=$value ;;
             *) return 1 ;;
         esac
-    done < "$file"
-    (( line_count == 8 )) || return 1
+    done
+    (( ${#seen[@]} == 8 )) || return 1
     [[ "$SESSION_STATE" == active || "$SESSION_STATE" == cleanup_failed ]] || return 1
     for value in "$SESSION_WORKER_PID" "$SESSION_WORKER_START" "$SESSION_LEADER_PID" \
         "$SESSION_LEADER_START" "$SESSION_PGID" "$SESSION_SID"; do
-        [[ "$value" =~ ^[0-9]+$ ]] || return 1
+        [[ "$value" =~ ^[1-9][0-9]*$ ]] || return 1
     done
+}
+
+read_worker_session_state() {
+    local file="$1" state_fd="" path_status=0 parse_status=0 final_status=0
+    local path_dev path_inode fd_dev fd_inode fd_size
+    worker_session_state_read_hook before-path "$file" || return "$WORKER_SESSION_STATE_TRANSIENT_STATUS"
+    worker_session_state_path_metadata "$file" || path_status=$?
+    (( path_status == 0 )) || return "$path_status"
+    path_dev=$WORKER_SESSION_PATH_DEV; path_inode=$WORKER_SESSION_PATH_INODE
+    worker_session_state_read_hook before-open "$file" || return "$WORKER_SESSION_STATE_TRANSIENT_STATUS"
+    open_worker_session_state_fd "$file" state_fd || return $?
+    worker_session_state_fd_metadata "$state_fd" || { final_status=$?; close_worker_session_state_fd "$state_fd" || true; return "$final_status"; }
+    fd_dev=$WORKER_SESSION_FD_DEV; fd_inode=$WORKER_SESSION_FD_INODE; fd_size=$WORKER_SESSION_FD_SIZE
+    if [[ "$fd_dev" != "$path_dev" || "$fd_inode" != "$path_inode" ]]; then
+        close_worker_session_state_fd "$state_fd" || true
+        return "$WORKER_SESSION_STATE_TRANSIENT_STATUS"
+    fi
+    worker_session_state_read_hook after-open "$file" "$state_fd" || { close_worker_session_state_fd "$state_fd" || true; return "$WORKER_SESSION_STATE_TRANSIENT_STATUS"; }
+    worker_session_state_path_matches "$file" "$fd_dev" "$fd_inode" || { final_status=$?; close_worker_session_state_fd "$state_fd" || true; return "$final_status"; }
+    parse_worker_session_state_fd "$state_fd" || parse_status=$?
+    worker_session_state_fd_metadata "$state_fd" || { final_status=$?; close_worker_session_state_fd "$state_fd" || true; return "$final_status"; }
+    if [[ "$WORKER_SESSION_FD_DEV" != "$fd_dev" || "$WORKER_SESSION_FD_INODE" != "$fd_inode" ||
+        "$WORKER_SESSION_FD_SIZE" != "$fd_size" ]]; then
+        close_worker_session_state_fd "$state_fd" || true
+        return 1
+    fi
+    worker_session_state_read_hook before-final-path "$file" "$state_fd" || { close_worker_session_state_fd "$state_fd" || true; return "$WORKER_SESSION_STATE_TRANSIENT_STATUS"; }
+    worker_session_state_path_matches "$file" "$fd_dev" "$fd_inode" || { final_status=$?; close_worker_session_state_fd "$state_fd" || true; return "$final_status"; }
+    close_worker_session_state_fd "$state_fd" || return "$WORKER_SESSION_STATE_TRANSIENT_STATUS"
+    (( parse_status == 0 )) || return "$parse_status"
+    SESSION_FILE_DEV=$fd_dev; SESSION_FILE_INODE=$fd_inode
 }
 
 cleanup_worker_session_state_file() {
     local file="$1" expected_worker_pid="$2" expected_worker_start="$3"
-
+    local attempt status=0 path_status=0 session_dev session_inode
     [[ -e "$file" || -L "$file" ]] || return 0
-    read_worker_session_state "$file" || {
-        echo -e "${RED}${ICON_ERROR} worker session 状态文件不可信: $file${NC}" >&2
-        return 1
-    }
-    [[ "$SESSION_WORKER_PID" == "$expected_worker_pid" &&
-        "$SESSION_WORKER_START" == "$expected_worker_start" ]] || return 1
-    terminate_managed_session "$SESSION_LEADER_PID" "$SESSION_LEADER_START" \
-        "$SESSION_PGID" "$SESSION_SID" || return 1
-    rm -f -- "$file" || return 1
+    for attempt in $(seq 1 "$WORKER_SESSION_STATE_READ_ATTEMPTS"); do
+        status=0
+        read_worker_session_state "$file" || status=$?
+        if (( status == WORKER_SESSION_STATE_TRANSIENT_STATUS )); then
+            (( attempt < WORKER_SESSION_STATE_READ_ATTEMPTS )) && { sleep 0.02; continue; }
+            echo -e "${RED}${ICON_ERROR} worker session 状态文件在有界重试后仍不稳定: $file${NC}" >&2
+            return 1
+        elif (( status != 0 )); then
+            echo -e "${RED}${ICON_ERROR} worker session 状态文件不可信: $file${NC}" >&2
+            return 1
+        fi
+        [[ "$SESSION_WORKER_PID" == "$expected_worker_pid" && "$SESSION_WORKER_START" == "$expected_worker_start" ]] || return 1
+        session_dev=$SESSION_FILE_DEV; session_inode=$SESSION_FILE_INODE
+        path_status=0
+        worker_session_state_path_matches "$file" "$session_dev" "$session_inode" || path_status=$?
+        if (( path_status == WORKER_SESSION_STATE_TRANSIENT_STATUS )); then
+            (( attempt < WORKER_SESSION_STATE_READ_ATTEMPTS )) && { sleep 0.02; continue; }
+            return 1
+        elif (( path_status != 0 )); then return 1; fi
+        terminate_managed_session "$SESSION_LEADER_PID" "$SESSION_LEADER_START" "$SESSION_PGID" "$SESSION_SID" || return 1
+        path_status=0
+        worker_session_state_path_matches "$file" "$session_dev" "$session_inode" || path_status=$?
+        if (( path_status == WORKER_SESSION_STATE_TRANSIENT_STATUS )); then
+            (( attempt < WORKER_SESSION_STATE_READ_ATTEMPTS )) && { sleep 0.02; continue; }
+            return 1
+        elif (( path_status != 0 )); then return 1; fi
+        rm -f -- "$file" || return 1
+        return 0
+    done
+    return 1
 }
 
 collect_owned_session_processes() {

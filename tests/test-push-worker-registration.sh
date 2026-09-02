@@ -291,6 +291,206 @@ for registration_phase in before-ready accepted-before-release release-validated
     run_registration_signal_case "$registration_phase" TERM 143
 done
 
+write_test_worker_session_manifest() {
+    local file="$1" state="$2" worker_pid="$3" worker_start="$4" leader_pid="$5" leader_start="$6" pgid="$7" sid="$8"
+    printf 'version=1\nstate=%s\nworker_pid=%s\nworker_start=%s\nleader_pid=%s\nleader_start=%s\npgid=%s\nsid=%s\n' \
+        "$state" "$worker_pid" "$worker_start" "$leader_pid" "$leader_start" "$pgid" "$sid" > "$file"
+    chmod 0600 "$file"
+}
+
+(
+    root="$TEST_DIR/session-dual-publish"; setup_fixture "$root"
+    : > "$root/capture/terminate-calls"
+    terminate_managed_session() { printf '%s:%s:%s:%s\n' "$@" >> "$root/capture/terminate-calls"; return 0; }
+    worker_session_state_publish_hook() {
+        local phase="$1" state="$2"
+        if [[ "$phase" == stage-ready && "$state" == cleanup_failed ]]; then
+            : > "$root/capture/stage.$BASHPID"
+            while [[ ! -e "$root/capture/release" ]]; do sleep 0.01; done
+        elif [[ "$phase" == after-rename && "$state" == cleanup_failed ]]; then
+            : > "$root/capture/renamed.$BASHPID"
+        fi
+    }
+    session_publisher() {
+        WORKER_TRANSFER_PID=$BASHPID; WORKER_TRANSFER_START=11
+        WORKER_TRANSFER_PGID=$BASHPID; WORKER_TRANSFER_SID=$BASHPID
+        publish_worker_session_state active
+        publish_worker_session_state cleanup_failed
+    }
+    session_publisher & first=$!; session_publisher & second=$!
+    first_start=$(get_process_start_time "$first"); second_start=$(get_process_start_time "$second")
+    ACTIVE_WORKERS[$first]=$first_start; ACTIVE_WORKERS[$second]=$second_start
+    ACTIVE_WORKER_STATE_FILES[$first]="$TEMP_DIR/worker-session.$first.state"
+    ACTIVE_WORKER_STATE_FILES[$second]="$TEMP_DIR/worker-session.$second.state"
+    ACTIVE_WORKER_STATE_STARTS[$first]=$first_start; ACTIVE_WORKER_STATE_STARTS[$second]=$second_start
+    for _ in {1..300}; do [[ -e "$root/capture/stage.$first" && -e "$root/capture/stage.$second" ]] && break; sleep 0.01; done
+    [[ -e "$root/capture/stage.$first" && -e "$root/capture/stage.$second" ]] || fail "dual publishers did not reach pre-rename hook"
+    cleanup_published_worker_sessions
+    assert_eq 2 "${#ACTIVE_WORKER_STATE_FILES[@]}" "fallback waits while both workers can still publish"
+    : > "$root/capture/release"
+    wait "$first"; wait "$second"
+    [[ -e "$root/capture/renamed.$first" && -e "$root/capture/renamed.$second" ]] || fail "dual publishers did not complete rename"
+    prune_active_workers
+    cleanup_published_worker_sessions
+    assert_eq 2 "$(wc -l < "$root/capture/terminate-calls")" "fallback processes both stable cleanup_failed manifests"
+    assert_eq 0 "${#ACTIVE_WORKER_STATE_FILES[@]}" "dual fallback clears both state maps"
+    assert_eq 0 "${#ACTIVE_WORKER_STATE_STARTS[@]}" "dual fallback clears both state identities"
+    runtime_has_published_worker_state && fail "dual fallback left worker session state"
+    cleanup_runtime; assert_no_registration_residue "$root"
+    pass "dual worker state transitions stabilize after wait/reap"
+)
+
+run_transient_state_case() (
+    kind="$1"; root="$TEST_DIR/session-transient-$kind"; setup_fixture "$root"
+    worker=11111; start=22222; file="$TEMP_DIR/worker-session.$worker.state"
+    write_test_worker_session_manifest "$file" cleanup_failed "$worker" "$start" 33333 44444 33333 33333
+    ACTIVE_WORKER_STATE_FILES[$worker]=$file; ACTIVE_WORKER_STATE_STARTS[$worker]=$start
+    : > "$root/capture/terminate-calls"
+    terminate_managed_session() { printf 'call\n' >> "$root/capture/terminate-calls"; return 0; }
+    failures=2
+    case "$kind" in
+        inode)
+            worker_session_state_read_hook() {
+                if [[ "$1" == after-open && "$failures" -gt 0 ]]; then
+                    next="$file.next.$failures"
+                    write_test_worker_session_manifest "$next" cleanup_failed "$worker" "$start" 33333 44444 33333 33333
+                    mv -fT "$next" "$file"; ((failures -= 1))
+                fi
+            }
+            ;;
+        open)
+            eval "$(declare -f open_worker_session_state_fd | sed '1s/open_worker_session_state_fd/original_open_worker_session_state_fd/')"
+            open_worker_session_state_fd() {
+                if (( failures > 0 )); then ((failures -= 1)); return "$WORKER_SESSION_STATE_TRANSIENT_STATUS"; fi
+                original_open_worker_session_state_fd "$@"
+            }
+            ;;
+        stat)
+            eval "$(declare -f worker_session_state_path_metadata | sed '1s/worker_session_state_path_metadata/original_worker_session_state_path_metadata/')"
+            worker_session_state_path_metadata() {
+                if (( failures > 0 )); then ((failures -= 1)); return "$WORKER_SESSION_STATE_TRANSIENT_STATUS"; fi
+                original_worker_session_state_path_metadata "$@"
+            }
+            ;;
+    esac
+    cleanup_published_worker_sessions
+    assert_eq 0 "${#ACTIVE_WORKER_STATE_FILES[@]}" "$kind transient failure clears state map after stabilization"
+    assert_eq 1 "$(wc -l < "$root/capture/terminate-calls")" "$kind transient failure performs one trusted session cleanup"
+    [[ ! -e "$file" ]] || fail "$kind transient failure left state file"
+    cleanup_runtime; pass "$kind transient worker state failure is bounded and recoverable"
+)
+run_transient_state_case inode
+run_transient_state_case open
+run_transient_state_case stat
+
+(
+    root="$TEST_DIR/session-not-reaped"; setup_fixture "$root"
+    sleep 300 & worker=$!; start=$(get_process_start_time "$worker")
+    file="$TEMP_DIR/worker-session.$worker.state"
+    write_test_worker_session_manifest "$file" cleanup_failed "$worker" "$start" 33333 44444 33333 33333
+    ACTIVE_WORKERS[$worker]=$start; ACTIVE_WORKER_STATE_FILES[$worker]=$file; ACTIVE_WORKER_STATE_STARTS[$worker]=$start
+    : > "$root/capture/terminate-calls"
+    terminate_managed_session() { printf call >> "$root/capture/terminate-calls"; return 0; }
+    cleanup_published_worker_sessions
+    assert_eq 1 "${#ACTIVE_WORKER_STATE_FILES[@]}" "fallback retains state while worker is not reaped"
+    assert_eq 0 "$(wc -c < "$root/capture/terminate-calls")" "fallback performs no session cleanup before reap"
+    kill -TERM "$worker"; wait "$worker" 2>/dev/null || true; prune_active_workers
+    cleanup_published_worker_sessions
+    assert_eq 0 "${#ACTIVE_WORKER_STATE_FILES[@]}" "fallback succeeds after worker reap"
+    cleanup_runtime; pass "worker reap gates final fallback"
+)
+
+run_permanent_state_case() (
+    kind="$1"; root="$TEST_DIR/session-permanent-$kind"; setup_fixture "$root"
+    worker=11111; start=22222; file="$TEMP_DIR/worker-session.$worker.state"
+    write_test_worker_session_manifest "$file" cleanup_failed "$worker" "$start" 33333 44444 33333 33333
+    ACTIVE_WORKER_STATE_FILES[$worker]=$file; ACTIVE_WORKER_STATE_STARTS[$worker]=$start
+    : > "$root/capture/terminate-calls"
+    terminate_managed_session() { printf call >> "$root/capture/terminate-calls"; return 0; }
+    case "$kind" in
+        symlink) mv "$file" "$file.real"; ln -s "$file.real" "$file" ;;
+        wrong-mode) chmod 0644 "$file" ;;
+        wrong-owner|wrong-gid)
+            stat() {
+                last=${!#}
+                if [[ "$last" == "$file" ]]; then
+                    raw=$(command stat -Lc '%d:%i:%u:%g:%a:%s' -- "$file")
+                    IFS=: read -r dev ino owner gid mode size <<< "$raw"
+                    [[ "$kind" == wrong-owner ]] && owner=$((EUID + 1)) || gid=$((gid + 1))
+                    printf '%s:%s:%s:%s:%s:%s\n' "$dev" "$ino" "$owner" "$gid" "$mode" "$size"
+                else command stat "$@"; fi
+            }
+            ;;
+        malformed) printf malformed > "$file" ;;
+        duplicate) printf 'worker_pid=11111\n' >> "$file" ;;
+        unknown) printf 'unexpected=value\n' >> "$file" ;;
+        missing) sed -i '/^sid=/d' "$file" ;;
+        pid-mismatch) sed -i 's/^worker_pid=.*/worker_pid=99999/' "$file" ;;
+        stable-tamper)
+            worker_session_state_read_hook() { [[ "$1" != after-open ]] || printf tampered > "$file"; }
+            ;;
+    esac
+    rc=0; cleanup_published_worker_sessions || rc=$?
+    (( rc != 0 )) || fail "$kind permanent state unexpectedly succeeded"
+    assert_eq 1 "${#ACTIVE_WORKER_STATE_FILES[@]}" "$kind permanent state preserves map evidence"
+    assert_eq 0 "$(wc -c < "$root/capture/terminate-calls")" "$kind permanent state executes no session cleanup"
+    [[ -e "$file" || -L "$file" ]] || fail "$kind permanent state deleted evidence"
+    unset 'ACTIVE_WORKER_STATE_FILES[$worker]' 'ACTIVE_WORKER_STATE_STARTS[$worker]'
+    command rm -f -- "$file" "$file.real" 2>/dev/null || true
+    cleanup_runtime; pass "$kind permanent worker state remains rejected"
+)
+for permanent_state in symlink wrong-mode wrong-owner wrong-gid malformed duplicate unknown missing pid-mismatch stable-tamper; do
+    run_permanent_state_case "$permanent_state"
+done
+
+run_parallel_fallback_iteration() (
+    run="$1"; root="$TEST_DIR/session-parallel-$run"; setup_fixture "$root"
+    # shellcheck disable=SC2034  # consumed by sourced run_server_batch
+    MAX_PARALLEL=2
+    push_to_server() {
+        local server="$1" lock_fd
+        exec {lock_fd}>>"$root/capture/calls.lock"; flock -x "$lock_fd"
+        printf '%s\n' "$server" >> "$root/capture/calls"; : > "$root/capture/ready.$server"
+        flock -u "$lock_fd"; exec {lock_fd}>&-
+        while [[ ! -e "$root/capture/release" ]]; do sleep 0.01; done
+        # shellcheck disable=SC2034  # consumed by sourced state publisher
+        WORKER_TRANSFER_PID=$BASHPID
+        # shellcheck disable=SC2034  # consumed by sourced state publisher
+        WORKER_TRANSFER_START=11
+        # shellcheck disable=SC2034  # consumed by sourced state publisher
+        WORKER_TRANSFER_PGID=$BASHPID
+        # shellcheck disable=SC2034  # consumed by sourced state publisher
+        WORKER_TRANSFER_SID=$BASHPID
+        publish_worker_session_state cleanup_failed
+        return "$MANAGED_CLEANUP_FAILURE_STATUS"
+    }
+    terminate_managed_session() { return 0; }
+    (
+        deadline=$((SECONDS + 15)); status=0
+        while (( SECONDS < deadline )); do
+            if [[ -e "$root/capture/ready.one.example" && -e "$root/capture/ready.two.example" ]]; then : > "$root/capture/release"; break; fi
+            sleep 0.01
+        done
+        [[ -e "$root/capture/release" ]] || { : > "$root/capture/coordinator-timeout"; : > "$root/capture/release"; status=1; }
+        while [[ ! -e "$root/capture/stop" ]]; do sleep 0.01; done
+        exit "$status"
+    ) & coordinator=$!
+    rc=0; run_server_batch source destination one.example two.example three.example four.example || rc=$?
+    : > "$root/capture/stop"; coordinator_rc=0; wait "$coordinator" || coordinator_rc=$?
+    assert_eq 0 "$coordinator_rc" "parallel fallback run $run coordinator releases both workers"
+    assert_eq "$MANAGED_CLEANUP_FAILURE_STATUS" "$rc" "parallel fallback run $run returns lifecycle status"
+    assert_eq 2 "$(wc -l < "$root/capture/calls")" "parallel fallback run $run starts only first two workers"
+    assert_eq 0 "${#ACTIVE_WORKERS[@]}" "parallel fallback run $run reaps active workers"
+    assert_eq 0 "${#ACTIVE_WORKER_STATE_FILES[@]}" "parallel fallback run $run clears state maps"
+    assert_eq 0 "${#ACTIVE_WORKER_STATE_STARTS[@]}" "parallel fallback run $run clears state identities"
+    [[ ! -e "$root/capture/ready.three.example" && ! -e "$root/capture/ready.four.example" ]] || fail "parallel fallback run $run launched later worker"
+    runtime_has_published_worker_state && fail "parallel fallback run $run left session state"
+    reset_batch_lifecycle_barrier; cleanup_runtime; assert_no_registration_residue "$root"
+)
+parallel_fallback_runs=${PUSH_WORKER_REGISTRATION_PARALLEL_STRESS:-1}
+for parallel_run in $(seq 1 "$parallel_fallback_runs"); do run_parallel_fallback_iteration "$parallel_run"; done
+pass "parallel fallback completed $parallel_fallback_runs deterministic run(s)"
+
 write_active_grace_fixture() {
     local root="$1"
     mkdir -m 0700 "$root" "$root/bin" "$root/runtime" "$root/ssh" "$root/pids"
