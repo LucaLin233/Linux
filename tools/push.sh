@@ -48,6 +48,7 @@ PARSED_SSH_TARGET=""
 PARSED_RSYNC_TARGET=""
 PARSED_DISPLAY_TARGET=""
 PROC_STATE=""
+PROC_PPID=""
 PROC_PGID=""
 PROC_SID=""
 PROC_START=""
@@ -58,6 +59,7 @@ WORKER_TRANSFER_PGID=""
 WORKER_TRANSFER_SID=""
 WORKER_TRANSFER_START=""
 WORKER_TRANSFER_CLEANUP_FAILED=false
+WORKER_SIGNAL_CLEANUP_ACTIVE=false
 WORKER_SESSION_STATE_FILE=""
 WORKER_SESSION_STATE_TRANSIENT_STATUS=75
 WORKER_SESSION_STATE_READ_ATTEMPTS=5
@@ -99,6 +101,7 @@ WORKER_REGISTRATION_PENDING_STATUS=0
 BATCH_WORKER_FAILED=false
 BATCH_WORKER_ERROR=false
 MANAGED_CLEANUP_FAILURE_STATUS=125
+MANAGED_PROCESS_REUSED_STATUS=3
 RUNTIME_ALLOCATOR_COLLISION_STATUS=17
 declare -a CONFIG_SERVERS_BUFFER=()
 declare -A CONFIG_TASKS_BUFFER=()
@@ -875,6 +878,7 @@ read_process_stat() {
     read -r -a fields <<< "$stat_rest"
     (( ${#fields[@]} >= 20 )) || return 1
     PROC_STATE=${fields[0]}
+    PROC_PPID=${fields[1]}
     PROC_PGID=${fields[2]}
     PROC_SID=${fields[3]}
     PROC_START=${fields[19]}
@@ -1349,8 +1353,8 @@ terminate_active_workers() {
         fi
     done
 
-    # 保留原 active worker 约 7 秒完整 grace，允许 managed-session 清理、状态发布和 hook 完成。
-    for _ in {1..70}; do
+    # 有序叶到根回收可能等待父进程 reap；保留约 10 秒完整 grace 供 session 清理和 hook 完成。
+    for _ in {1..100}; do
         prune_active_workers || cleanup_failed=true
         (( ${#ACTIVE_WORKERS[@]} == 0 )) && break
         sleep 0.1
@@ -1837,6 +1841,7 @@ publish_worker_session_state() {
     state_file="$TEMP_DIR/worker-session.$worker_pid.state"
     token=$(runtime_random_token) || return 1
     stage="$TEMP_DIR/.worker-session.$worker_pid.$token.tmp"
+    worker_session_state_publish_hook before-stage-create "$lifecycle_state" "$state_file" "$stage" || return 1
     if ! (umask 077; set -o noclobber; : > "$stage") 2>/dev/null; then return 1; fi
     if ! printf 'version=1\nstate=%s\nworker_pid=%s\nworker_start=%s\nleader_pid=%s\nleader_start=%s\npgid=%s\nsid=%s\n' \
         "$lifecycle_state" "$worker_pid" "$worker_start" "$WORKER_TRANSFER_PID" "$WORKER_TRANSFER_START" \
@@ -1849,6 +1854,7 @@ publish_worker_session_state() {
     worker_session_state_publish_hook after-rename "$lifecycle_state" "$state_file" "$stage" || return 1
     worker_session_state_file_trusted "$state_file" || return 1
     WORKER_SESSION_STATE_FILE="$state_file"
+    worker_session_state_publish_hook state-file-assigned "$lifecycle_state" "$state_file" "$stage" || return 1
 }
 
 remove_worker_session_state() {
@@ -1996,58 +2002,184 @@ owned_session_has_live_members() {
 }
 
 managed_leader_identity_trusted() {
-    local leader_pid="$1" leader_start="$2" expected_pgid="$3" expected_sid="$4"
-    if [[ ! -e "/proc/$leader_pid" ]]; then
-        return 0
-    fi
-    read_process_record "$leader_pid" || return 1
-    [[ "$PROC_UID" == "$EUID" && "$PROC_START" == "$leader_start" &&
-        "$PROC_PGID" == "$expected_pgid" && "$PROC_SID" == "$expected_sid" ]]
+    local leader_pid="$1" leader_start="$2" expected_pgid="$3" expected_sid="$4" record_status=0
+    [[ -e "/proc/$leader_pid" ]] || return 0
+    read_process_record_for_session_scan "$leader_pid" || record_status=$?
+    (( record_status == 2 )) && return 0
+    (( record_status == 0 )) || return 1
+    # 相同 PID 但 start 不同表示 PID 已复用；原 leader 已消失，绝不触碰新进程。
+    [[ "$PROC_START" == "$leader_start" ]] || return "$MANAGED_PROCESS_REUSED_STATUS"
+    [[ "$PROC_UID" == "$EUID" && "$PROC_PGID" == "$expected_pgid" && "$PROC_SID" == "$expected_sid" ]]
+}
+
+read_process_stat_for_session_scan() {
+    local pid="$1" _
+    for _ in {1..3}; do
+        read_process_stat "$pid" && return 0
+        [[ -e "/proc/$pid" ]] || return 2
+        sleep 0.005
+    done
+    return 1
+}
+
+read_process_uid_for_session_scan() {
+    local pid="$1" _
+    for _ in {1..3}; do
+        read_process_uid "$pid" && return 0
+        [[ -e "/proc/$pid" ]] || return 2
+        sleep 0.005
+    done
+    return 1
+}
+
+read_process_record_for_session_scan() {
+    local pid="$1" _
+    for _ in {1..3}; do
+        read_process_record "$pid" && return 0
+        [[ -e "/proc/$pid" ]] || return 2
+        sleep 0.005
+    done
+    return 1
+}
+
+# shellcheck disable=SC2034,SC2178  # Output arrays are populated through namerefs for callers.
+collect_owned_session_records() {
+    local expected_sid="$1" pids_variable="$2" starts_variable="$3" ppids_variable="$4"
+    local pgids_variable="$5" states_variable="$6" stat_file pid record_status=0
+    local -n pids_ref="$pids_variable" starts_ref="$starts_variable" ppids_ref="$ppids_variable"
+    local -n pgids_ref="$pgids_variable" states_ref="$states_variable"
+    pids_ref=(); starts_ref=(); ppids_ref=(); pgids_ref=(); states_ref=()
+    for stat_file in /proc/[0-9]*/stat; do
+        [[ -r "$stat_file" ]] || continue
+        pid=${stat_file#/proc/}; pid=${pid%/stat}
+        record_status=0
+        read_process_stat_for_session_scan "$pid" || record_status=$?
+        (( record_status == 2 )) && continue
+        (( record_status == 0 )) || return 1
+        [[ "$PROC_SID" == "$expected_sid" ]] || continue
+        record_status=0
+        read_process_uid_for_session_scan "$pid" || record_status=$?
+        (( record_status == 2 )) && continue
+        (( record_status == 0 )) || return 1
+        [[ "$PROC_UID" == "$EUID" ]] || {
+            echo -e "${RED}${ICON_ERROR} 受管 SID $expected_sid 包含不可信 UID 进程: $pid/$PROC_UID${NC}" >&2
+            return 2
+        }
+        pids_ref+=("$pid")
+        starts_ref[$pid]=$PROC_START
+        ppids_ref[$pid]=$PROC_PPID
+        pgids_ref[$pid]=$PROC_PGID
+        states_ref[$pid]=$PROC_STATE
+    done
+}
+
+session_process_identity_matches() {
+    local pid="$1" expected_start="$2" expected_sid="$3"
+    read_process_record "$pid" || return 1
+    [[ "$PROC_UID" == "$EUID" && "$PROC_START" == "$expected_start" && "$PROC_SID" == "$expected_sid" ]]
+}
+
+wait_for_session_process_reap() {
+    local pid="$1" expected_start="$2" expected_sid="$3" _
+    for _ in {1..30}; do
+        session_process_identity_matches "$pid" "$expected_start" "$expected_sid" || return 0
+        sleep 0.01
+    done
+    return 1
+}
+
+terminate_owned_session_leaf_first() {
+    local expected_sid="$1" leader_pid="$2" leader_start="$3" allow_leader_zombie="$4"
+    local cleanup_pass pid parent pgid state total leaves_for_group
+    local -a pids=() leaves=()
+    local -A starts=() ppids=() pgids=() states=() has_child=() group_total=() group_leaves=() group_signaled=()
+
+    for ((cleanup_pass=1; cleanup_pass<=16; cleanup_pass++)); do
+        collect_owned_session_records "$expected_sid" pids starts ppids pgids states || return 1
+        (( ${#pids[@]} > 0 )) || return 0
+        has_child=(); group_total=(); group_leaves=(); group_signaled=(); leaves=()
+        for pid in "${pids[@]}"; do
+            parent=${ppids[$pid]}
+            [[ -z "${starts[$parent]:-}" ]] || has_child[$parent]=1
+            pgid=${pgids[$pid]}; group_total[$pgid]=$(( ${group_total[$pgid]:-0} + 1 ))
+        done
+        for pid in "${pids[@]}"; do
+            [[ -z "${has_child[$pid]:-}" ]] || continue
+            leaves+=("$pid"); pgid=${pgids[$pid]}; group_leaves[$pgid]=$(( ${group_leaves[$pgid]:-0} + 1 ))
+        done
+        (( ${#leaves[@]} > 0 )) || return 1
+
+        for pid in "${leaves[@]}"; do
+            session_process_identity_matches "$pid" "${starts[$pid]}" "$expected_sid" || continue
+            [[ "$PROC_STATE" == Z ]] && continue
+            pgid=${pgids[$pid]}; total=${group_total[$pgid]}; leaves_for_group=${group_leaves[$pgid]}
+            if (( total == leaves_for_group )) && [[ -z "${group_signaled[$pgid]:-}" ]]; then
+                kill -CONT -- "-$pgid" 2>/dev/null || true
+                kill -TERM -- "-$pgid" 2>/dev/null || true
+                group_signaled[$pgid]=1
+            elif (( total != leaves_for_group )); then
+                kill -CONT "$pid" 2>/dev/null || true
+                kill -TERM "$pid" 2>/dev/null || true
+            fi
+        done
+        if (( cleanup_pass == 1 )); then sleep 2; else sleep 0.2; fi
+
+        for pid in "${leaves[@]}"; do
+            session_process_identity_matches "$pid" "${starts[$pid]}" "$expected_sid" || continue
+            state=$PROC_STATE
+            if [[ "$state" != Z ]]; then
+                kill -CONT "$pid" 2>/dev/null || true
+                kill -KILL "$pid" 2>/dev/null || true
+            fi
+            if ! wait_for_session_process_reap "$pid" "${starts[$pid]}" "$expected_sid"; then
+                if session_process_identity_matches "$pid" "${starts[$pid]}" "$expected_sid" &&
+                    [[ "$allow_leader_zombie" == true && "$pid" == "$leader_pid" && "$PROC_STATE" == Z ]]; then
+                    continue
+                fi
+                echo -e "${RED}${ICON_ERROR} 受管 SID $expected_sid 无法确认叶进程已回收: $pid/${PROC_STATE:-unknown}${NC}" >&2
+                return 1
+            fi
+        done
+    done
+
+    collect_owned_session_records "$expected_sid" pids starts ppids pgids states || return 1
+    for pid in "${pids[@]}"; do
+        if [[ "$allow_leader_zombie" == true && "$pid" == "$leader_pid" &&
+            "${starts[$pid]}" == "$leader_start" && "${states[$pid]}" == Z ]]; then
+            continue
+        fi
+        echo -e "${RED}${ICON_ERROR} 受管 SID $expected_sid 清理后仍有 PID: $pid/${states[$pid]}${NC}" >&2
+        return 1
+    done
+}
+
+owned_session_fully_reaped() {
+    local expected_sid="$1" pid
+    local -a pids=()
+    local -A starts=() ppids=() pgids=() states=()
+    collect_owned_session_records "$expected_sid" pids starts ppids pgids states || return 1
+    for pid in "${pids[@]}"; do
+        echo -e "${RED}${ICON_ERROR} 受管 SID $expected_sid wait 后仍有 PID: $pid/${states[$pid]}${NC}" >&2
+        return 1
+    done
 }
 
 terminate_managed_session() {
     local leader_pid="$1" leader_start="$2" expected_pgid="$3" expected_sid="$4"
-    local current_sid="" current_pgid="" pgid _ cleanup_failed=false
-    local -a members=() pgids=()
+    local allow_leader_zombie="${5:-false}" current_sid="" leader_status=0
 
-    [[ "$leader_pid" =~ ^[0-9]+$ && "$leader_start" =~ ^[0-9]+$ &&
-        "$expected_pgid" =~ ^[0-9]+$ && "$expected_sid" =~ ^[0-9]+$ ]] || return 1
+    [[ "$leader_pid" =~ ^[1-9][0-9]*$ && "$leader_start" =~ ^[1-9][0-9]*$ &&
+        "$expected_pgid" =~ ^[1-9][0-9]*$ && "$expected_sid" =~ ^[1-9][0-9]*$ ]] || return 1
     read_process_record "$$" || return 1
     current_sid=$PROC_SID
-    current_pgid=$PROC_PGID
     [[ "$expected_sid" != "$current_sid" ]] || return 1
-    managed_leader_identity_trusted "$leader_pid" "$leader_start" "$expected_pgid" "$expected_sid" || {
+    managed_leader_identity_trusted "$leader_pid" "$leader_start" "$expected_pgid" "$expected_sid" || leader_status=$?
+    if (( leader_status == MANAGED_PROCESS_REUSED_STATUS )); then return 0; fi
+    if (( leader_status != 0 )); then
         echo -e "${RED}${ICON_ERROR} 受管 session leader 身份不可信: $leader_pid${NC}" >&2
         return 1
-    }
-    collect_owned_session_processes "$expected_sid" members pgids || return 1
-    (( ${#members[@]} > 0 )) || return 0
-
-    for pgid in "${pgids[@]}"; do
-        [[ "$pgid" =~ ^[0-9]+$ && "$pgid" != "$current_pgid" ]] || {
-            cleanup_failed=true
-            continue
-        }
-        kill -TERM -- "-$pgid" 2>/dev/null || true
-    done
-    sleep 2
-    collect_owned_session_processes "$expected_sid" members pgids || cleanup_failed=true
-    if (( ${#members[@]} > 0 )); then
-        for pgid in "${pgids[@]}"; do
-            [[ "$pgid" =~ ^[0-9]+$ && "$pgid" != "$current_pgid" ]] || {
-                cleanup_failed=true
-                continue
-            }
-            kill -KILL -- "-$pgid" 2>/dev/null || true
-        done
-        sleep 0.2
-        collect_owned_session_processes "$expected_sid" members pgids || cleanup_failed=true
     fi
-    if (( ${#members[@]} > 0 )); then
-        echo -e "${RED}${ICON_ERROR} 受管 SID $expected_sid 仍有活动 PID: ${members[*]}${NC}" >&2
-        cleanup_failed=true
-    fi
-    [[ "$cleanup_failed" == false ]]
+    terminate_owned_session_leaf_first "$expected_sid" "$leader_pid" "$leader_start" "$allow_leader_zombie"
 }
 
 worker_transfer_identity_matches() {
@@ -2071,11 +2203,15 @@ terminate_worker_transfer() {
         if [[ -z "$WORKER_TRANSFER_PID" || -z "$WORKER_TRANSFER_PGID" ||
             -z "$WORKER_TRANSFER_SID" || -z "$WORKER_TRANSFER_START" ]] ||
             ! terminate_managed_session "$WORKER_TRANSFER_PID" "$WORKER_TRANSFER_START" \
-                "$WORKER_TRANSFER_PGID" "$WORKER_TRANSFER_SID"; then
+                "$WORKER_TRANSFER_PGID" "$WORKER_TRANSFER_SID" true; then
             cleanup_failed=true
         fi
     fi
     [[ -z "$WORKER_TRANSFER_PID" ]] || wait "$WORKER_TRANSFER_PID" 2>/dev/null || true
+    if [[ "$cleanup_failed" == false && "$had_session" == true && "$WORKER_SIGNAL_CLEANUP_ACTIVE" == true ]] &&
+        ! owned_session_fully_reaped "$WORKER_TRANSFER_SID"; then
+        cleanup_failed=true
+    fi
     if [[ "$cleanup_failed" == false && "$had_session" == true ]] && ! worker_after_session_cleanup_hook; then
         cleanup_failed=true
     fi
@@ -2100,6 +2236,7 @@ terminate_worker_transfer() {
 worker_signal_handler() {
     local status="$1"
     trap - EXIT HUP INT TERM
+    WORKER_SIGNAL_CLEANUP_ACTIVE=true
     terminate_worker_transfer
     [[ -z "$WORKER_OUTPUT_FILE" ]] || rm -f -- "$WORKER_OUTPUT_FILE" 2>/dev/null || true
     exit "$status"
@@ -2135,7 +2272,7 @@ run_managed_command() {
     local output_file="$1"
     shift
     local -a command=("$@")
-    local exit_code=0 pgid="" sid=""
+    local exit_code=0 pgid="" sid="" timeout_ticks=0 tick=0
 
     if [[ "$WORKER_TRANSFER_CLEANUP_FAILED" == true ||
         -n "$WORKER_TRANSFER_PID" || -n "$WORKER_TRANSFER_PGID" ||
@@ -2178,11 +2315,18 @@ run_managed_command() {
         fi
         return 1
     fi
-    if wait "$WORKER_TRANSFER_PID"; then
-        exit_code=0
-    else
-        exit_code=$?
+    timeout_ticks=$(( (TOTAL_TIMEOUT + TIMEOUT_KILL_AFTER) * 20 ))
+    for ((tick=0; tick<timeout_ticks; tick++)); do
+        job_is_active "$WORKER_TRANSFER_PID" || break
+        sleep 0.05
+    done
+    if job_is_active "$WORKER_TRANSFER_PID"; then
+        if ! terminate_worker_transfer; then
+            return "$MANAGED_CLEANUP_FAILURE_STATUS"
+        fi
+        return 124
     fi
+    if wait "$WORKER_TRANSFER_PID"; then exit_code=0; else exit_code=$?; fi
     terminate_worker_transfer || return "$MANAGED_CLEANUP_FAILURE_STATUS"
     return "$exit_code"
 }
@@ -2215,7 +2359,7 @@ retry_rsync() {
         (( attempt > 1 )) && sleep "$RETRY_DELAY"
         export PUSH_SSH_PORT="$port"
         revalidate_known_hosts || return 1
-        command=(timeout "--kill-after=${TIMEOUT_KILL_AFTER}" "$TOTAL_TIMEOUT")
+        command=(timeout "$TOTAL_TIMEOUT")
         [[ "$AUTH_METHOD" == password ]] && command+=(sshpass -e)
         command+=(rsync "${rsync_opts[@]}" -e "$SSH_WRAPPER" -- "$src" "$target:$dst")
         output_file="$TEMP_DIR/transfer.$BASHPID.$attempt"
@@ -2571,7 +2715,7 @@ test_authentication() {
         export PUSH_AUTH_METHOD="$AUTH_METHOD"
         export PUSH_KEY_FILE="$RUNTIME_KEY_FILE"
         revalidate_known_hosts || return 1
-        command=(timeout "--kill-after=${TIMEOUT_KILL_AFTER}" "$TOTAL_TIMEOUT")
+        command=(timeout "$TOTAL_TIMEOUT")
         [[ "$AUTH_METHOD" == password ]] && command+=(sshpass -e)
         command+=("$SSH_WRAPPER" "$target" true)
         output_file="$TEMP_DIR/auth.$BASHPID.$index"

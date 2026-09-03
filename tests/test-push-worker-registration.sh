@@ -47,6 +47,26 @@ fail() { failure_diagnostics; printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 pass() { printf 'PASS: %s\n' "$*"; }
 assert_eq() { [[ "$1" == "$2" ]] || fail "$3: expected '$1', got '$2'"; pass "$3"; }
 process_is_running() { local pid="$1" state; [[ -r "/proc/$pid/stat" ]] || return 1; state=$(awk '{print $3}' "/proc/$pid/stat" 2>/dev/null) || return 1; [[ "$state" != Z ]]; }
+test_process_identity_exists() {
+    local pid="$1" start="$2"
+    read_process_record "$pid" || return 1
+    [[ "$PROC_UID" == "$EUID" && "$PROC_START" == "$start" ]]
+}
+wait_test_process_identity_gone() {
+    local pid="$1" start="$2" _
+    for _ in {1..100}; do test_process_identity_exists "$pid" "$start" || return 0; sleep 0.05; done
+    return 1
+}
+wait_test_process_identity_present() {
+    local pid="$1" start="$2" _
+    for _ in {1..30}; do test_process_identity_exists "$pid" "$start" && return 0; [[ -r "/proc/$pid/stat" ]] || return 1; sleep 0.01; done
+    return 1
+}
+wait_test_process_start() {
+    local pid="$1" value="" _
+    for _ in {1..100}; do value=$(get_process_start_time "$pid" 2>/dev/null || true); [[ -n "$value" ]] && { printf '%s\n' "$value"; return 0; }; sleep 0.005; done
+    return 1
+}
 
 source_root="$TEST_DIR/source"; mkdir -m 0700 "$source_root"
 source_result=$(env TMPDIR="$source_root" SCRIPT="$SCRIPT" bash -c '
@@ -143,7 +163,7 @@ run_ready_failure_case() (
     WORKER_REGISTRATION_TIMEOUT_TICKS=10
     push_to_server() { : > "$root/capture/transfer"; return 0; }
     case "$kind" in
-        missing) worker_registration_phase_hook() { [[ "$1" != before-ready ]] || while :; do sleep 1; done; } ;;
+        missing) worker_registration_phase_hook() { [[ "$1" != before-ready ]] || while :; do :; done; } ;;
         malformed) parent_worker_registration_hook() { [[ "$1" != ready-observed ]] || printf malformed > "$3"; } ;;
         symlink) parent_worker_registration_hook() { [[ "$1" != ready-observed ]] || { rm -f "$3"; ln -s "$root/other" "$3"; }; } ;;
         pid-mismatch) parent_worker_registration_hook() { [[ "$1" != ready-observed ]] || sed -i 's/^worker_pid=.*/worker_pid=999999/' "$3"; } ;;
@@ -254,8 +274,8 @@ source "$script"
 initialize_runtime; install_runtime_traps
 WORKER_REGISTRATION_TIMEOUT_TICKS=200
 push_to_server() { printf 'push pid=%s root=%s\n' "$BASHPID" "$root" >> "$root/capture/transfer-calls"; : > "$root/capture/transfer"; return 0; }
-worker_registration_phase_hook() { local current="$1"; [[ "$phase" == "$current" ]] || return 0; : > "$root/capture/phase"; while :; do sleep 1; done; }
-parent_worker_registration_hook() { local current="$1"; [[ "$phase" == "$current" ]] || return 0; : > "$root/capture/phase"; while :; do sleep 1; done; }
+worker_registration_phase_hook() { local current="$1"; [[ "$phase" == "$current" ]] || return 0; : > "$root/capture/phase"; while :; do :; done; }
+parent_worker_registration_hook() { local current="$1"; [[ "$phase" == "$current" ]] || return 0; : > "$root/capture/phase"; while :; do :; done; }
 launch_worker one.example source destination 1 1
 wait_for_all_workers
 if [[ "$phase" == normal ]]; then [[ -e "$root/capture/transfer" ]] || { printf 'normal transfer missing\n' >&2; jobs -l >&2 || true; exit 91; }; fi
@@ -290,6 +310,18 @@ for registration_phase in before-ready accepted-before-release release-validated
     run_registration_signal_case "$registration_phase" INT 130
     run_registration_signal_case "$registration_phase" TERM 143
 done
+
+(
+    sleep 60 & reused_pid=$!
+    replacement_start=$(get_process_start_time "$reused_pid")
+    expected_start=$((replacement_start + 1))
+    eval "$(declare -f collect_owned_session_records | sed '1s/collect_owned_session_records/original_collect_owned_session_records/')"
+    collect_owned_session_records() { fail "PID reuse path attempted to inspect or terminate replacement session"; }
+    terminate_managed_session "$reused_pid" "$expected_start" "$reused_pid" "$reused_pid"
+    test_process_identity_exists "$reused_pid" "$replacement_start" || fail "PID reuse path touched replacement process"
+    kill -TERM "$reused_pid"; wait "$reused_pid" 2>/dev/null || true
+    pass "managed leader PID reuse is treated as original session gone"
+)
 
 write_test_worker_session_manifest() {
     local file="$1" state="$2" worker_pid="$3" worker_start="$4" leader_pid="$5" leader_start="$6" pgid="$7" sid="$8"
@@ -547,6 +579,10 @@ EOF
 #!/usr/bin/env bash
 trap '' HUP INT TERM
 printf '%s\n' "$$" > "$PID_DIR/ssh.pid"
+if [[ "${STATE_PUBLISH_MODE:-active}" == cleanup ]]; then
+    while [[ ! -e "$STATE_CLEANUP_RELEASE" ]]; do sleep 0.01; done
+    exit 0
+fi
 sleep 300 &
 printf '%s\n' "$!" > "$PID_DIR/leaf.pid"
 wait "$!"
@@ -611,6 +647,114 @@ run_active_grace_signal_case() {
 run_active_grace_signal_case HUP 129
 run_active_grace_signal_case INT 130
 run_active_grace_signal_case TERM 143
+
+cat > "$TEST_DIR/state-publication-child.sh" <<'CHILD'
+#!/usr/bin/env bash
+set -euo pipefail
+script="$1"
+shift
+source "$script"
+main_owner=$BASHPID
+eval "$(declare -f terminate_managed_session | sed '1s/terminate_managed_session/original_terminate_managed_session/')"
+terminate_managed_session() {
+    if [[ "$STATE_PUBLISH_MODE" == cleanup && "$BASHPID" != "$main_owner" ]]; then return 1; fi
+    original_terminate_managed_session "$@"
+}
+worker_session_state_publish_hook() {
+    local phase="$1" state="$2" state_file="$3" hook_stage="$4" marker_stage worker_start
+    if [[ "$STATE_PUBLISH_MODE" == cleanup && "$state" == active && "$phase" == state-file-assigned ]]; then
+        : > "$STATE_CLEANUP_RELEASE"
+    fi
+    [[ "$phase" == "$STATE_PUBLISH_PHASE" && "$state" == "$STATE_PUBLISH_STATE" ]] || return 0
+    [[ ! -e "$STATE_PUBLISH_MARKER" ]] || return 0
+    worker_start=""
+    for _ in {1..20}; do
+        if read_process_record "$BASHPID" && [[ "$PROC_UID" == "$EUID" && "$PROC_STATE" != Z ]]; then worker_start=$PROC_START; break; fi
+        sleep 0.01
+    done
+    [[ -n "$worker_start" ]] || return 1
+    marker_stage="$STATE_PUBLISH_MARKER.$BASHPID.stage"
+    (umask 077; set -o noclobber; : > "$marker_stage") || return 1
+    printf 'phase=%s\nstate=%s\nworker_pid=%s\nworker_start=%s\nleader_pid=%s\nleader_start=%s\npgid=%s\nsid=%s\nstate_file=%s\nhook_stage=%s\n' \
+        "$phase" "$state" "$BASHPID" "$worker_start" "$WORKER_TRANSFER_PID" "$WORKER_TRANSFER_START" \
+        "$WORKER_TRANSFER_PGID" "$WORKER_TRANSFER_SID" "$state_file" "$hook_stage" > "$marker_stage"
+    chmod 0600 "$marker_stage"; mv -fT "$marker_stage" "$STATE_PUBLISH_MARKER"
+    while :; do :; done
+}
+main "$@"
+CHILD
+chmod 0700 "$TEST_DIR/state-publication-child.sh"
+
+run_state_publication_signal_case() (
+    local state="$1" phase="$2" signal_name="$3" expected="$4" mode root main_pid="" main_start="" worker_pid="" worker_start="" leader_pid="" leader_start="" managed_sid=""
+    local watchdog="" watchdog_start="" unrelated="" unrelated_start="" rc=0 line key value marker state_file hook_stage
+    local -a session_pids=()
+    # shellcheck disable=SC2034  # Filled by collect_owned_session_records namerefs.
+    local -A session_starts=() session_ppids=() session_pgids=() session_states=()
+    cleanup_publication_fixture() {
+        [[ -z "$worker_pid" || -z "$worker_start" ]] || { test_process_identity_exists "$worker_pid" "$worker_start" && kill -KILL "$worker_pid" 2>/dev/null || true; }
+        [[ -z "$main_pid" || -z "$main_start" ]] || { test_process_identity_exists "$main_pid" "$main_start" && kill -KILL "$main_pid" 2>/dev/null || true; }
+        [[ -z "$watchdog" || -z "$watchdog_start" ]] || { test_process_identity_exists "$watchdog" "$watchdog_start" && kill -TERM "$watchdog" 2>/dev/null || true; }
+        [[ -z "$unrelated" || -z "$unrelated_start" ]] || { test_process_identity_exists "$unrelated" "$unrelated_start" && kill -TERM "$unrelated" 2>/dev/null || true; }
+        [[ -z "$main_pid" ]] || wait "$main_pid" 2>/dev/null || true
+        [[ -z "$watchdog" ]] || wait "$watchdog" 2>/dev/null || true
+        [[ -z "$unrelated" ]] || wait "$unrelated" 2>/dev/null || true
+    }
+    trap cleanup_publication_fixture EXIT
+    mode=active; [[ "$state" == cleanup_failed ]] && mode=cleanup
+    root="$TEST_DIR/state-publish-$state-$phase-$signal_name"; CURRENT_FIXTURE_ROOT=$root
+    write_active_grace_fixture "$root"
+    mkdir -m 0700 "$root/capture"
+    marker="$root/capture/publish-marker"
+    sleep 60 & unrelated=$!; unrelated_start=$(wait_test_process_start "$unrelated")
+    (
+        cd "$root"
+        exec env --default-signal=HUP,INT,TERM PATH="$root/bin:$PATH" TMPDIR="$root/runtime" PID_DIR="$root/pids" \
+            STATE_PUBLISH_MODE="$mode" STATE_PUBLISH_STATE="$state" STATE_PUBLISH_PHASE="$phase" STATE_PUBLISH_MARKER="$marker" \
+            STATE_CLEANUP_RELEASE="$root/capture/cleanup-release" bash "$TEST_DIR/state-publication-child.sh" "$SCRIPT" "$root/source" /remote/path
+    ) > "$root/output.log" 2>&1 &
+    main_pid=$!; main_start=$(wait_test_process_start "$main_pid")
+    for _ in {1..600}; do [[ -f "$marker" ]] && break; sleep 0.05; done
+    [[ -f "$marker" && ! -L "$marker" && "$(stat -Lc %a "$marker")" == 600 ]] || { cat "$root/output.log" >&2 || true; fail "$state/$phase/$signal_name did not reach publish hook"; }
+    while IFS= read -r line; do key=${line%%=*}; value=${line#*=}; case "$key" in worker_pid) worker_pid=$value;;worker_start) worker_start=$value;;leader_pid) leader_pid=$value;;leader_start) leader_start=$value;;sid) managed_sid=$value;;state_file) state_file=$value;;hook_stage) hook_stage=$value;;esac; done < "$marker"
+    [[ "$worker_pid" =~ ^[1-9][0-9]*$ && "$worker_start" =~ ^[1-9][0-9]*$ && "$managed_sid" =~ ^[1-9][0-9]*$ ]] || fail "$state/$phase/$signal_name marker identity malformed"
+    wait_test_process_identity_present "$worker_pid" "$worker_start" || { cat "$marker" >&2; fail "$state/$phase/$signal_name worker identity missing at hook"; }
+    test_watchdog_process 30 "$root/watchdog-timeout" "$main_pid" & watchdog=$!; watchdog_start=$(wait_test_process_start "$watchdog")
+    kill "-$signal_name" "$main_pid"; wait "$main_pid" || rc=$?
+    kill -TERM "$watchdog" 2>/dev/null || true; wait "$watchdog" 2>/dev/null || true
+    [[ ! -e "$root/watchdog-timeout" ]] || fail "$state/$phase/$signal_name watchdog fired"
+    assert_eq "$expected" "$rc" "$state/$phase preserves $signal_name status"
+    wait_test_process_identity_gone "$worker_pid" "$worker_start" || fail "$state/$phase/$signal_name left worker identity"
+    if [[ "$leader_pid" =~ ^[1-9][0-9]*$ && "$leader_start" =~ ^[1-9][0-9]*$ ]]; then
+        if ! wait_test_process_identity_gone "$leader_pid" "$leader_start"; then
+            read_process_record "$leader_pid" || true
+            printf 'leader remains pid=%s expected_start=%s actual_start=%s state=%s ppid=%s pgid=%s sid=%s\n' \
+                "$leader_pid" "$leader_start" "${PROC_START:-unknown}" "${PROC_STATE:-unknown}" "${PROC_PPID:-unknown}" "${PROC_PGID:-unknown}" "${PROC_SID:-unknown}" >&2
+            cat "/proc/$leader_pid/stat" >&2 2>/dev/null || true
+            fail "$state/$phase/$signal_name left leader identity"
+        fi
+    fi
+    collect_owned_session_records "$managed_sid" session_pids session_starts session_ppids session_pgids session_states || fail "$state/$phase/$signal_name cannot verify managed SID"
+    (( ${#session_pids[@]} == 0 )) || fail "$state/$phase/$signal_name left managed SID member: ${session_pids[*]}"
+    [[ -z "$(find "$root/runtime" -mindepth 1 -print -quit 2>/dev/null)" ]] || fail "$state/$phase/$signal_name left runtime/session/registration state"
+    [[ ! -e "$state_file" && ! -e "$hook_stage" && ! -L "$state_file" && ! -L "$hook_stage" ]] || fail "$state/$phase/$signal_name left publication path"
+    test_process_identity_exists "$unrelated" "$unrelated_start" || fail "$state/$phase/$signal_name killed unrelated process"
+    kill -TERM "$unrelated"; wait "$unrelated" 2>/dev/null || true
+    unrelated=""; unrelated_start=""; main_pid=""; main_start=""; watchdog=""; watchdog_start=""
+    trap - EXIT
+    pass "$state/$phase/$signal_name publication window cleans process tree and runtime"
+)
+publication_states=${PUSH_STATE_PUBLICATION_STATES:-"active cleanup_failed"}
+publication_phases=${PUSH_STATE_PUBLICATION_PHASES:-"before-stage-create stage-ready after-rename state-file-assigned"}
+publication_signals=${PUSH_STATE_PUBLICATION_SIGNALS:-"HUP INT TERM"}
+for publication_state in $publication_states; do
+    for publication_phase in $publication_phases; do
+        for publication_signal in $publication_signals; do
+            case "$publication_signal" in HUP) publication_status=129 ;; INT) publication_status=130 ;; TERM) publication_status=143 ;; *) fail "unknown publication signal" ;; esac
+            run_state_publication_signal_case "$publication_state" "$publication_phase" "$publication_signal" "$publication_status"
+        done
+    done
+done
 
 (
     root="$TEST_DIR/normal-parallel"; setup_fixture "$root"
