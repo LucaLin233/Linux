@@ -213,8 +213,13 @@ prune_identity_failure_case() (
     sleep 300 & worker=$!; read_process_record "$worker"; start=$PROC_START
     ACTIVE_WORKERS[$worker]=$start; ACTIVE_WORKER_STATE_FILES[$worker]="$TEMP_DIR/worker-session.$worker.state"; ACTIVE_WORKER_STATE_STARTS[$worker]=$start
     eval "$(declare -f process_identity_matches | sed '1s/process_identity_matches/original_process_identity_matches/')"
-    failures=1; [[ "$mode" == repeated ]] && failures=100
+    eval "$(declare -f read_process_record_for_session_scan | sed '1s/read_process_record_for_session_scan/original_read_process_record_for_session_scan/')"
+    failures=1; scan_failures=1; [[ "$mode" == repeated ]] && { failures=100; scan_failures=100; }
     process_identity_matches() { if [[ "$1" == "$worker" && "$failures" -gt 0 ]]; then ((failures -= 1)); return 1; fi; original_process_identity_matches "$@"; }
+    read_process_record_for_session_scan() {
+        if [[ "$1" == "$worker" && "$scan_failures" -gt 0 && -r "/proc/$worker/stat" ]]; then ((scan_failures -= 1)); return 1; fi
+        original_read_process_record_for_session_scan "$@"
+    }
     rc=0; prune_active_workers || rc=$?; (( rc != 0 )) || fail "$mode identity failure did not stop prune"
     [[ "$BATCH_WORKER_FAILED" == true ]] || fail "$mode identity failure did not set lifecycle barrier"
     process_is_running "$worker" || fail "$mode prune shortened active worker grace"
@@ -236,11 +241,14 @@ prune_identity_failure_case repeated
     # shellcheck disable=SC2034
     ACTIVE_WORKER_STATE_STARTS[$worker]=$start
     eval "$(declare -f process_identity_matches | sed '1s/process_identity_matches/original_process_identity_matches/')"
+    eval "$(declare -f read_process_record_for_session_scan | sed '1s/read_process_record_for_session_scan/original_read_process_record_for_session_scan/')"
     process_identity_matches() { [[ "$1" != "$worker" ]] && original_process_identity_matches "$@"; }
+    read_process_record_for_session_scan() { [[ "$1" != "$worker" || ! -r "/proc/$worker/stat" ]] && original_read_process_record_for_session_scan "$@"; }
     rc=0; wait_for_worker_slot || rc=$?
     assert_eq "$MANAGED_CLEANUP_FAILURE_STATUS" "$rc" "prune trust failure propagates 125"
     [[ -n "${ACTIVE_WORKERS[$worker]:-}" ]] || fail "prune trust failure discarded active worker evidence"
     eval "$(declare -f original_process_identity_matches | sed '1s/original_process_identity_matches/process_identity_matches/')"
+    eval "$(declare -f original_read_process_record_for_session_scan | sed '1s/original_read_process_record_for_session_scan/read_process_record_for_session_scan/')"
     eval "$(declare -f cleanup_all_worker_registration_residue | sed '1s/cleanup_all_worker_registration_residue/original_cleanup_all_worker_registration_residue/')"
     cleanup_all_worker_registration_residue() { return 1; }
     rc=0; stop_batch_after_lifecycle_failure || rc=$?
@@ -323,6 +331,210 @@ done
     pass "managed leader PID reuse is treated as original session gone"
 )
 
+cat > "$TEST_DIR/failed-reap-child.sh" <<'CHILD'
+#!/usr/bin/env bash
+set -euo pipefail
+script="$1" root="$2" mode="$3"
+mkdir -p -m 0700 "$root/runtime" "$root/capture"
+export TMPDIR="$root/runtime"
+source "$script"
+initialize_runtime
+setsid bash -c 'trap "" HUP INT TERM; while :; do :; done' & leader=$!
+for _ in {1..100}; do
+    leader_start=$(get_process_start_time "$leader" 2>/dev/null || true)
+    leader_pgid=$(get_process_group_id "$leader" 2>/dev/null || true)
+    leader_sid=$(get_process_session_id "$leader" 2>/dev/null || true)
+    [[ -n "$leader_start" && "$leader_pgid" == "$leader" && "$leader_sid" == "$leader" ]] && break
+    sleep 0.01
+done
+[[ -n "$leader_start" && "$leader_pgid" == "$leader" && "$leader_sid" == "$leader" ]] || exit 90
+printf '%s\n%s\n%s\n%s\n' "$leader" "$leader_start" "$leader_pgid" "$leader_sid" > "$root/capture/leader"
+WORKER_TRANSFER_PID=$leader
+WORKER_TRANSFER_START=$leader_start
+WORKER_TRANSFER_PGID=$leader_pgid
+WORKER_TRANSFER_SID=$leader_sid
+publish_worker_session_state active
+state_file=$WORKER_SESSION_STATE_FILE
+eval "$(declare -f terminate_managed_session | sed '1s/terminate_managed_session/original_terminate_managed_session/')"
+terminate_managed_session() { return 1; }
+start_ns=$(date +%s%N)
+rc=0
+terminate_worker_transfer || rc=$?
+elapsed_ns=$(( $(date +%s%N) - start_ns ))
+[[ "$rc" != 0 && "$elapsed_ns" -lt 2000000000 ]] || exit 91
+[[ "$WORKER_TRANSFER_PID" == "$leader" && "$WORKER_TRANSFER_START" == "$leader_start" &&
+    "$WORKER_TRANSFER_PGID" == "$leader_pgid" && "$WORKER_TRANSFER_SID" == "$leader_sid" &&
+    "$WORKER_TRANSFER_CLEANUP_FAILED" == true ]] || exit 92
+read_worker_session_state "$state_file"
+[[ "$SESSION_STATE" == cleanup_failed ]] || exit 93
+next_rc=0
+run_managed_command "$TEMP_DIR/forbidden-next-command" true || next_rc=$?
+[[ "$next_rc" == "$MANAGED_CLEANUP_FAILURE_STATUS" && ! -e "$TEMP_DIR/forbidden-next-command" ]] || exit 94
+printf 'rc=%s\nelapsed_ns=%s\nnext_rc=%s\nstate_file=%s\n' "$rc" "$elapsed_ns" "$next_rc" "$state_file" > "$root/capture/result"
+: > "$root/capture/returned"
+if [[ "$mode" == hold ]]; then
+    while [[ ! -e "$root/capture/release-worker" ]]; do sleep 0.01; done
+    for _ in {1..400}; do
+        reap_status=0
+        reap_direct_managed_leader "$leader" "$leader_start" "$leader_pgid" "$leader_sid" || reap_status=$?
+        case "$reap_status" in
+            0|"$MANAGED_PROCESS_REUSED_STATUS") break ;;
+            *) sleep 0.01 ;;
+        esac
+    done
+    (( reap_status == 0 || reap_status == MANAGED_PROCESS_REUSED_STATUS )) || exit 95
+    : > "$root/capture/reaped"
+    for _ in {1..400}; do
+        [[ ! -e "$state_file" && ! -L "$state_file" ]] && break
+        sleep 0.01
+    done
+    [[ ! -e "$state_file" && ! -L "$state_file" ]] || exit 96
+    terminate_managed_session() { original_terminate_managed_session "$@"; }
+else
+    for _ in {1..400}; do [[ -e "$root/capture/release-recovery" ]] && break; sleep 0.01; done
+    [[ -e "$root/capture/release-recovery" ]] || exit 97
+    terminate_managed_session() { original_terminate_managed_session "$@"; }
+fi
+cleanup_runtime
+CHILD
+chmod 0700 "$TEST_DIR/failed-reap-child.sh"
+
+run_failed_reap_case() {
+    local run="$1" root="$TEST_DIR/failed-reap-$1" child watchdog rc=0
+    bash "$TEST_DIR/failed-reap-child.sh" "$SCRIPT" "$root" recover > "$root.log" 2>&1 & child=$!
+    test_watchdog_process 3 "$root.watchdog-fired" "$child" & watchdog=$!
+    for _ in {1..80}; do [[ -e "$root/capture/returned" ]] && break; sleep 0.05; done
+    [[ -e "$root/capture/returned" ]] || { cat "$root.log" >&2 || true; fail "failed reap run $run did not return before watchdog"; }
+    kill -TERM "$watchdog" 2>/dev/null || true; wait "$watchdog" 2>/dev/null || true
+    [[ ! -e "$root.watchdog-fired" ]] || fail "failed reap run $run fired watchdog"
+    : > "$root/capture/release-recovery"
+    wait "$child" || rc=$?
+    [[ "$rc" == 0 ]] || cat "$root.log" >&2 2>/dev/null || true
+    assert_eq 0 "$rc" "failed managed-session reap run $run returns bounded"
+    [[ -z "$(find "$root/runtime" -name 'worker-session.*.state' -print -quit 2>/dev/null)" ]] || fail "failed reap run $run left worker-session state"
+}
+for failed_reap_run in $(seq 1 20); do run_failed_reap_case "$failed_reap_run"; done
+pass "failed managed-session reap remains bounded for 20 deterministic runs"
+
+(
+    trap - EXIT HUP INT TERM
+    root="$TEST_DIR/failed-reap-parent"; mkdir -p "$root/capture"; chmod 0700 "$root" "$root/capture"
+    bash "$TEST_DIR/failed-reap-child.sh" "$SCRIPT" "$root" hold > "$root.log" 2>&1 & worker=$!
+    worker_start=$(wait_test_process_start "$worker")
+    for _ in {1..80}; do [[ -e "$root/capture/returned" ]] && break; sleep 0.05; done
+    [[ -e "$root/capture/returned" ]] || fail "parent fallback worker did not return bounded"
+    mapfile -t leader_fields < "$root/capture/leader"
+    leader=${leader_fields[0]}; leader_start=${leader_fields[1]}; leader_sid=${leader_fields[3]}
+    state_file=$(sed -n 's/^state_file=//p' "$root/capture/result")
+    TEMP_DIR=$(dirname "$state_file")
+    ACTIVE_WORKERS=(); ACTIVE_WORKER_STATE_FILES=(); ACTIVE_WORKER_STATE_STARTS=()
+    BATCH_WORKER_FAILED=false
+    # shellcheck disable=SC2034  # Consumed by sourced worker accounting.
+    BATCH_WORKER_ERROR=false
+    MAX_PARALLEL=1
+    ACTIVE_WORKERS[$worker]=$worker_start
+    ACTIVE_WORKER_STATE_FILES[$worker]=$state_file
+    ACTIVE_WORKER_STATE_STARTS[$worker]=$worker_start
+    : > "$root/capture/release-worker"
+    wait_for_all_workers
+    assert_eq 0 "${#ACTIVE_WORKERS[@]}" "scheduler parent fallback reaps active worker"
+    assert_eq 0 "${#ACTIVE_WORKER_STATE_FILES[@]}" "scheduler parent fallback removes cleanup_failed state"
+    wait_test_process_identity_gone "$leader" "$leader_start" || fail "parent fallback left same-identity leader"
+    session_pids=(); session_starts=(); session_ppids=(); session_pgids=(); session_states=()
+    collect_owned_session_records "$leader_sid" session_pids session_starts session_ppids session_pgids session_states
+    assert_eq 0 "${#session_pids[@]}" "parent fallback leaves no managed SID member"
+    [[ ! -e "$state_file" && -e "$root/capture/reaped" ]] || fail "parent fallback evidence incomplete"
+    pass "parent fallback cleans a live failed session without PPID 1 zombie"
+)
+
+(
+    trap - EXIT HUP INT TERM
+    sleep 60 & replacement=$!
+    replacement_start=$(wait_test_process_start "$replacement")
+    wait_called=false
+    wait() { wait_called=true; return 1; }
+    reap_status=0
+    reap_direct_managed_leader "$replacement" "$((replacement_start + 1))" "$replacement" "$replacement" || reap_status=$?
+    assert_eq "$MANAGED_PROCESS_REUSED_STATUS" "$reap_status" "direct leader PID reuse returns safe status"
+    [[ "$wait_called" == false ]] || fail "direct leader PID reuse waited on replacement process"
+    test_process_identity_exists "$replacement" "$replacement_start" || fail "direct leader PID reuse touched replacement process"
+    kill -TERM "$replacement"; builtin wait "$replacement" 2>/dev/null || true
+    pass "direct leader PID reuse sends no signal and performs no wait"
+)
+
+(
+    trap - EXIT HUP INT TERM
+    leader=424242; leader_start=777777; wait_called=false; after_wait=false
+    # shellcheck disable=SC2034  # Test double fills caller arrays through namerefs.
+    collect_owned_session_records() {
+        local -n pids_ref="$2" starts_ref="$3" ppids_ref="$4" pgids_ref="$5" states_ref="$6"
+        pids_ref=(); starts_ref=(); ppids_ref=(); pgids_ref=(); states_ref=()
+        [[ "$after_wait" == false ]] || return 0
+        pids_ref=("$leader"); starts_ref[$leader]=$leader_start; ppids_ref[$leader]=$BASHPID
+        pgids_ref[$leader]=$leader; states_ref[$leader]=Z
+    }
+    read_process_record_for_session_scan() {
+        [[ "$after_wait" == false ]] || return 2
+        PROC_UID=$EUID; PROC_PPID=$BASHPID; PROC_START=$leader_start
+        PROC_STATE=Z; PROC_PGID=$leader; PROC_SID=$leader
+    }
+    wait() { wait_called=true; after_wait=true; return 0; }
+    reap_direct_managed_leader "$leader" "$leader_start" "$leader" "$leader"
+    [[ "$wait_called" == true ]] || fail "same-identity leader zombie was not wait/reaped"
+    pass "same-identity direct leader zombie is immediately wait/reaped"
+)
+
+cat > "$TEST_DIR/hard-timeout-cleanup-failure-child.sh" <<'CHILD'
+#!/usr/bin/env bash
+set -euo pipefail
+script="$1" root="$2"
+mkdir -p -m 0700 "$root/runtime" "$root/capture"
+export TMPDIR="$root/runtime"
+source "$script"
+initialize_runtime
+TOTAL_TIMEOUT=1
+TIMEOUT_KILL_AFTER=1
+eval "$(declare -f terminate_managed_session | sed '1s/terminate_managed_session/original_terminate_managed_session/')"
+failures=1
+terminate_managed_session() {
+    if (( failures > 0 )); then ((failures -= 1)); return 1; fi
+    original_terminate_managed_session "$@"
+}
+start_ns=$(date +%s%N)
+rc=0
+run_managed_command "$TEMP_DIR/hard-output" timeout 1 bash -c \
+    'trap "" HUP INT TERM; bash -c '\''trap "" HUP INT TERM; while :; do kill -STOP "$$"; done'\'' & wait "$!"' || rc=$?
+elapsed_ns=$(( $(date +%s%N) - start_ns ))
+[[ "$rc" == "$MANAGED_CLEANUP_FAILURE_STATUS" && "$elapsed_ns" -lt 5000000000 ]] || exit 90
+[[ "$WORKER_TRANSFER_CLEANUP_FAILED" == true && -n "$WORKER_TRANSFER_PID" && -f "$WORKER_SESSION_STATE_FILE" ]] || exit 91
+read_worker_session_state "$WORKER_SESSION_STATE_FILE"
+[[ "$SESSION_STATE" == cleanup_failed ]] || exit 92
+next_rc=0
+run_managed_command "$TEMP_DIR/forbidden-hard-next" true || next_rc=$?
+[[ "$next_rc" == "$MANAGED_CLEANUP_FAILURE_STATUS" && ! -e "$TEMP_DIR/forbidden-hard-next" ]] || exit 93
+printf 'rc=%s\nelapsed_ns=%s\nnext_rc=%s\n' "$rc" "$elapsed_ns" "$next_rc" > "$root/capture/result"
+: > "$root/capture/returned"
+terminate_worker_transfer
+cleanup_runtime
+CHILD
+chmod 0700 "$TEST_DIR/hard-timeout-cleanup-failure-child.sh"
+(
+    trap - EXIT HUP INT TERM
+    root="$TEST_DIR/hard-timeout-cleanup-failure"
+    bash "$TEST_DIR/hard-timeout-cleanup-failure-child.sh" "$SCRIPT" "$root" > "$root.log" 2>&1 & child=$!
+    test_watchdog_process 5 "$root.watchdog-fired" "$child" & watchdog=$!
+    for _ in {1..120}; do [[ -e "$root/capture/returned" ]] && break; sleep 0.05; done
+    [[ -e "$root/capture/returned" ]] || { cat "$root.log" >&2 || true; fail "hard timeout cleanup failure did not return bounded"; }
+    kill -TERM "$watchdog" 2>/dev/null || true; wait "$watchdog" 2>/dev/null || true
+    [[ ! -e "$root.watchdog-fired" ]] || fail "hard timeout cleanup failure fired watchdog"
+    rc=0; wait "$child" || rc=$?
+    assert_eq 0 "$rc" "hard timeout cleanup failure recovers fixture"
+    grep -Fxq "rc=$MANAGED_CLEANUP_FAILURE_STATUS" "$root/capture/result" || fail "hard timeout cleanup failure did not propagate 125"
+    grep -Fxq "next_rc=$MANAGED_CLEANUP_FAILURE_STATUS" "$root/capture/result" || fail "hard timeout cleanup failure allowed next command"
+    [[ -z "$(find "$root/runtime" -mindepth 1 -print -quit 2>/dev/null)" ]] || fail "hard timeout cleanup failure left runtime"
+    pass "hard timeout cleanup failure is bounded and blocks subsequent command"
+)
+
 write_test_worker_session_manifest() {
     local file="$1" state="$2" worker_pid="$3" worker_start="$4" leader_pid="$5" leader_start="$6" pgid="$7" sid="$8"
     printf 'version=1\nstate=%s\nworker_pid=%s\nworker_start=%s\nleader_pid=%s\nleader_start=%s\npgid=%s\nsid=%s\n' \
@@ -333,7 +545,7 @@ write_test_worker_session_manifest() {
 (
     root="$TEST_DIR/session-dual-publish"; setup_fixture "$root"
     : > "$root/capture/terminate-calls"
-    terminate_managed_session() { printf '%s:%s:%s:%s\n' "$@" >> "$root/capture/terminate-calls"; return 0; }
+    terminate_managed_session() { printf '%s:%s:%s:%s:%s\n' "$@" >> "$root/capture/terminate-calls"; return 0; }
     worker_session_state_publish_hook() {
         local phase="$1" state="$2"
         if [[ "$phase" == stage-ready && "$state" == cleanup_failed ]]; then
@@ -647,6 +859,81 @@ run_active_grace_signal_case() {
 run_active_grace_signal_case HUP 129
 run_active_grace_signal_case INT 130
 run_active_grace_signal_case TERM 143
+
+cat > "$TEST_DIR/live-cleanup-failure-child.sh" <<'CHILD'
+#!/usr/bin/env bash
+set -euo pipefail
+script="$1"
+shift
+source "$script"
+main_owner=$BASHPID
+eval "$(declare -f terminate_managed_session | sed '1s/terminate_managed_session/original_terminate_managed_session/')"
+terminate_managed_session() {
+    if [[ "$BASHPID" != "$main_owner" ]]; then return 1; fi
+    original_terminate_managed_session "$@"
+}
+main "$@"
+CHILD
+chmod 0700 "$TEST_DIR/live-cleanup-failure-child.sh"
+
+run_live_cleanup_failure_signal_case() (
+    trap - EXIT HUP INT TERM
+    local signal_name="$1" expected="$2" root main_pid main_start state_file="" saved_temp
+    local worker_pid="" worker_start="" leader_pid="" leader_start="" managed_sid="" watchdog="" unrelated="" unrelated_start="" rc=0
+    cleanup_live_failure_fixture() {
+        [[ -z "$worker_pid" || -z "$worker_start" ]] || { test_process_identity_exists "$worker_pid" "$worker_start" && kill -KILL "$worker_pid" 2>/dev/null || true; }
+        [[ -z "$main_pid" || -z "$main_start" ]] || { test_process_identity_exists "$main_pid" "$main_start" && kill -KILL "$main_pid" 2>/dev/null || true; }
+        [[ -z "$unrelated" || -z "$unrelated_start" ]] || { test_process_identity_exists "$unrelated" "$unrelated_start" && kill -TERM "$unrelated" 2>/dev/null || true; }
+        [[ -z "$main_pid" ]] || wait "$main_pid" 2>/dev/null || true
+        [[ -z "$watchdog" ]] || { kill -TERM "$watchdog" 2>/dev/null || true; wait "$watchdog" 2>/dev/null || true; }
+        [[ -z "$unrelated" ]] || wait "$unrelated" 2>/dev/null || true
+    }
+    trap cleanup_live_failure_fixture EXIT
+    local -a session_pids=()
+    # shellcheck disable=SC2034  # Filled by collect_owned_session_records namerefs.
+    local -A session_starts=() session_ppids=() session_pgids=() session_states=()
+    root="$TEST_DIR/live-cleanup-failure-$signal_name"; CURRENT_FIXTURE_ROOT=$root
+    write_active_grace_fixture "$root"
+    sleep 60 & unrelated=$!; unrelated_start=$(wait_test_process_start "$unrelated")
+    (
+        cd "$root"
+        exec env --default-signal=HUP,INT,TERM PATH="$root/bin:$PATH" TMPDIR="$root/runtime" PID_DIR="$root/pids" \
+            bash "$TEST_DIR/live-cleanup-failure-child.sh" "$SCRIPT" "$root/source" /remote/path
+    ) > "$root/output.log" 2>&1 &
+    main_pid=$!; main_start=$(wait_test_process_start "$main_pid")
+    for _ in {1..500}; do
+        state_file=$(find "$root/runtime" -type f -name 'worker-session.*.state' -print -quit 2>/dev/null || true)
+        [[ -n "$state_file" && -f "$root/pids/leaf.pid" ]] && break
+        sleep 0.05
+    done
+    [[ -n "$state_file" && -f "$root/pids/leaf.pid" ]] || fail "$signal_name cleanup-failure fixture did not reach live session"
+    saved_temp=$TEMP_DIR; TEMP_DIR=$(dirname "$state_file")
+    read_worker_session_state "$state_file" || fail "$signal_name cleanup-failure state unreadable"
+    worker_pid=$SESSION_WORKER_PID; worker_start=$SESSION_WORKER_START
+    leader_pid=$SESSION_LEADER_PID; leader_start=$SESSION_LEADER_START; managed_sid=$SESSION_SID
+    TEMP_DIR=$saved_temp
+    wait_test_process_identity_present "$worker_pid" "$worker_start" || fail "$signal_name cleanup-failure worker identity missing"
+    wait_test_process_identity_present "$leader_pid" "$leader_start" || fail "$signal_name cleanup-failure leader identity missing"
+    test_watchdog_process 30 "$root/watchdog-fired" "$main_pid" & watchdog=$!
+    kill "-$signal_name" "$main_pid"
+    wait "$main_pid" || rc=$?
+    kill -TERM "$watchdog" 2>/dev/null || true; wait "$watchdog" 2>/dev/null || true
+    [[ ! -e "$root/watchdog-fired" ]] || fail "$signal_name cleanup failure fired watchdog"
+    assert_eq "$expected" "$rc" "$signal_name cleanup failure preserves main signal status"
+    wait_test_process_identity_gone "$worker_pid" "$worker_start" || fail "$signal_name cleanup failure left worker identity"
+    wait_test_process_identity_gone "$leader_pid" "$leader_start" || fail "$signal_name cleanup failure left leader identity"
+    collect_owned_session_records "$managed_sid" session_pids session_starts session_ppids session_pgids session_states || fail "$signal_name cleanup failure cannot verify managed SID"
+    assert_eq 0 "${#session_pids[@]}" "$signal_name cleanup failure leaves no managed SID member or zombie"
+    [[ -z "$(find "$root/runtime" -mindepth 1 -print -quit 2>/dev/null)" ]] || fail "$signal_name cleanup failure left runtime or state"
+    test_process_identity_exists "$unrelated" "$unrelated_start" || fail "$signal_name cleanup failure killed unrelated process"
+    kill -TERM "$unrelated"; wait "$unrelated" 2>/dev/null || true
+    main_pid=""; main_start=""; watchdog=""; unrelated=""; unrelated_start=""
+    trap - EXIT
+    pass "$signal_name cleanup failure uses parent fallback without watchdog or zombie"
+)
+run_live_cleanup_failure_signal_case HUP 129
+run_live_cleanup_failure_signal_case INT 130
+run_live_cleanup_failure_signal_case TERM 143
 
 cat > "$TEST_DIR/state-publication-child.sh" <<'CHILD'
 #!/usr/bin/env bash

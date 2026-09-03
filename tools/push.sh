@@ -59,7 +59,6 @@ WORKER_TRANSFER_PGID=""
 WORKER_TRANSFER_SID=""
 WORKER_TRANSFER_START=""
 WORKER_TRANSFER_CLEANUP_FAILED=false
-WORKER_SIGNAL_CLEANUP_ACTIVE=false
 WORKER_SESSION_STATE_FILE=""
 WORKER_SESSION_STATE_TRANSIENT_STATUS=75
 WORKER_SESSION_STATE_READ_ATTEMPTS=5
@@ -102,6 +101,9 @@ BATCH_WORKER_FAILED=false
 BATCH_WORKER_ERROR=false
 MANAGED_CLEANUP_FAILURE_STATUS=125
 MANAGED_PROCESS_REUSED_STATUS=3
+MANAGED_LEADER_STILL_LIVE_STATUS=4
+MANAGED_LEADER_REAP_PENDING_STATUS=5
+WORKER_SESSION_STATE_NOT_READY_STATUS=76
 RUNTIME_ALLOCATOR_COLLISION_STATUS=17
 declare -a CONFIG_SERVERS_BUFFER=()
 declare -A CONFIG_TASKS_BUFFER=()
@@ -1273,25 +1275,78 @@ reset_batch_lifecycle_barrier() {
     BATCH_WORKER_ERROR=false
 }
 
+worker_session_state_maybe_cleanup_failed() {
+    local file="$1" version_line="" state_line=""
+    [[ -r "$file" ]] || return 1
+    {
+        IFS= read -r version_line
+        IFS= read -r state_line
+    } < "$file" || return 1
+    [[ "$version_line" == version=1 && "$state_line" == state=cleanup_failed ]]
+}
+
+cleanup_active_failed_worker_sessions() {
+    local worker_pid file worker_start status=0 failed=false
+
+    for worker_pid in "${!ACTIVE_WORKER_STATE_FILES[@]}"; do
+        [[ -n "${ACTIVE_WORKERS[$worker_pid]:-}" ]] || continue
+        file=${ACTIVE_WORKER_STATE_FILES[$worker_pid]:-}
+        worker_start=${ACTIVE_WORKER_STATE_STARTS[$worker_pid]:-}
+        [[ -n "$file" && -n "$worker_start" && ( -e "$file" || -L "$file" ) ]] || continue
+        # This is only a retry-friendly prefilter.  All authority still comes
+        # from the FD-pinned parser inside cleanup_worker_session_state_file.
+        worker_session_state_maybe_cleanup_failed "$file" || continue
+        status=0
+        cleanup_worker_session_state_file "$file" "$worker_pid" "$worker_start" true || status=$?
+        case "$status" in
+            0)
+                unset 'ACTIVE_WORKER_STATE_FILES[$worker_pid]'
+                unset 'ACTIVE_WORKER_STATE_STARTS[$worker_pid]'
+                ;;
+            "$WORKER_SESSION_STATE_TRANSIENT_STATUS"|"$WORKER_SESSION_STATE_NOT_READY_STATUS"|"$MANAGED_LEADER_REAP_PENDING_STATUS")
+                ;;
+            *)
+                failed=true
+                ;;
+        esac
+    done
+    [[ "$failed" == false ]]
+}
+
 prune_active_workers() {
-    local pid wait_status=0 failed=false ready release
+    local pid wait_status=0 failed=false ready release record_status=0 active_identity=false
     for pid in "${!ACTIVE_WORKERS[@]}"; do
         if job_is_active "$pid"; then
+            active_identity=false
             if process_identity_matches "$pid" "${ACTIVE_WORKERS[$pid]}"; then
+                active_identity=true
+            else
+                record_status=0
+                read_process_record_for_session_scan "$pid" || record_status=$?
+                if (( record_status == 0 )) && [[ "$PROC_UID" == "$EUID" &&
+                    "$PROC_START" == "${ACTIVE_WORKERS[$pid]}" && "$PROC_STATE" != Z ]]; then
+                    # A transient /proc read failed the first bounded identity
+                    # check, but the same live child identity was recovered.
+                    active_identity=true
+                elif (( record_status == 2 )) || { (( record_status == 0 )) &&
+                    [[ "$PROC_UID" == "$EUID" && "$PROC_START" == "${ACTIVE_WORKERS[$pid]}" && "$PROC_STATE" == Z ]]; }; then
+                    active_identity=false
+                else
+                    if [[ "$BATCH_WORKER_FAILED" == false ]]; then
+                        echo -e "${RED}${ICON_ERROR} active worker 身份不可验证，停止调度并交由完整 grace 清理: pid=$pid expected_start=${ACTIVE_WORKERS[$pid]} actual_start=${PROC_START:-unknown} state=${PROC_STATE:-unknown} uid=${PROC_UID:-unknown}${NC}" >&2
+                    fi
+                    BATCH_WORKER_FAILED=true
+                    failed=true
+                    continue
+                fi
+            fi
+            if [[ "$active_identity" == true ]]; then
                 ready=${WORKER_REGISTRATION_READY_FILES[$pid]:-}; release=${WORKER_REGISTRATION_RELEASE_FILES[$pid]:-}
                 if [[ -n "$ready" && ! -e "$ready" && ! -L "$ready" &&
                     -n "$release" && ! -e "$release" && ! -L "$release" ]]; then
                     unset 'WORKER_REGISTRATION_READY_FILES[$pid]' 'WORKER_REGISTRATION_RELEASE_FILES[$pid]'
                     unset 'WORKER_REGISTRATION_STARTS[$pid]' 'WORKER_REGISTRATION_STAGE_FILES[$pid]'
                 fi
-                continue
-            fi
-            if [[ -r "/proc/$pid/stat" ]] && { ! read_process_record "$pid" || [[ "$PROC_STATE" != Z ]]; }; then
-                if [[ "$BATCH_WORKER_FAILED" == false ]]; then
-                    echo -e "${RED}${ICON_ERROR} active worker 身份不可验证，停止调度并交由完整 grace 清理: pid=$pid expected_start=${ACTIVE_WORKERS[$pid]} actual_start=${PROC_START:-unknown} state=${PROC_STATE:-unknown} uid=${PROC_UID:-unknown}${NC}" >&2
-                fi
-                BATCH_WORKER_FAILED=true
-                failed=true
                 continue
             fi
         fi
@@ -1353,9 +1408,13 @@ terminate_active_workers() {
         fi
     done
 
-    # 有序叶到根回收可能等待父进程 reap；保留约 10 秒完整 grace 供 session 清理和 hook 完成。
+    # Give a worker that published cleanup_failed time to remain the direct
+    # parent while the coordinator terminates its managed session.  The worker
+    # then reaps the leader; the state file is removed only after that proof.
     for _ in {1..100}; do
+        cleanup_active_failed_worker_sessions || cleanup_failed=true
         prune_active_workers || cleanup_failed=true
+        cleanup_active_failed_worker_sessions || cleanup_failed=true
         (( ${#ACTIVE_WORKERS[@]} == 0 )) && break
         sleep 0.1
     done
@@ -1392,12 +1451,17 @@ terminate_active_workers() {
 }
 
 cleanup_runtime() {
-    local cleanup_failed=false
+    local cleanup_failed=false worker_cleanup_status=0 _
 
     [[ "$RUNTIME_CLEANUP_ACTIVE" == false ]] || return 0
     RUNTIME_CLEANUP_ACTIVE=true
     terminate_runtime_allocator || cleanup_failed=true
-    terminate_worker_transfer || cleanup_failed=true
+    worker_cleanup_status=1
+    for _ in {1..3}; do
+        if terminate_worker_transfer; then worker_cleanup_status=0; break; fi
+        sleep 0.02
+    done
+    (( worker_cleanup_status == 0 )) || cleanup_failed=true
     terminate_active_workers || cleanup_failed=true
     unset SSHPASS
 
@@ -1932,13 +1996,14 @@ read_worker_session_state() {
 
 cleanup_worker_session_state_file() {
     local file="$1" expected_worker_pid="$2" expected_worker_start="$3"
-    local attempt status=0 path_status=0 session_dev session_inode
+    local active_only="${4:-false}" attempt status=0 path_status=0 leader_status=0 session_dev session_inode
     [[ -e "$file" || -L "$file" ]] || return 0
     for attempt in $(seq 1 "$WORKER_SESSION_STATE_READ_ATTEMPTS"); do
         status=0
         read_worker_session_state "$file" || status=$?
         if (( status == WORKER_SESSION_STATE_TRANSIENT_STATUS )); then
             (( attempt < WORKER_SESSION_STATE_READ_ATTEMPTS )) && { sleep 0.02; continue; }
+            [[ "$active_only" == true ]] && return "$WORKER_SESSION_STATE_TRANSIENT_STATUS"
             echo -e "${RED}${ICON_ERROR} worker session 状态文件在有界重试后仍不稳定: $file${NC}" >&2
             return 1
         elif (( status != 0 )); then
@@ -1946,18 +2011,32 @@ cleanup_worker_session_state_file() {
             return 1
         fi
         [[ "$SESSION_WORKER_PID" == "$expected_worker_pid" && "$SESSION_WORKER_START" == "$expected_worker_start" ]] || return 1
+        [[ "$active_only" != true || "$SESSION_STATE" == cleanup_failed ]] || return "$WORKER_SESSION_STATE_NOT_READY_STATUS"
         session_dev=$SESSION_FILE_DEV; session_inode=$SESSION_FILE_INODE
         path_status=0
         worker_session_state_path_matches "$file" "$session_dev" "$session_inode" || path_status=$?
         if (( path_status == WORKER_SESSION_STATE_TRANSIENT_STATUS )); then
             (( attempt < WORKER_SESSION_STATE_READ_ATTEMPTS )) && { sleep 0.02; continue; }
+            [[ "$active_only" == true ]] && return "$WORKER_SESSION_STATE_TRANSIENT_STATUS"
             return 1
         elif (( path_status != 0 )); then return 1; fi
-        terminate_managed_session "$SESSION_LEADER_PID" "$SESSION_LEADER_START" "$SESSION_PGID" "$SESSION_SID" || return 1
+        # A parent cannot reap the worker's direct child.  Allow the trusted
+        # leader to become a zombie, then wait for the worker to reap it.
+        terminate_managed_session "$SESSION_LEADER_PID" "$SESSION_LEADER_START" \
+            "$SESSION_PGID" "$SESSION_SID" true || return 1
+        leader_status=0
+        managed_session_leader_reap_state "$SESSION_WORKER_PID" "$SESSION_WORKER_START" \
+            "$SESSION_LEADER_PID" "$SESSION_LEADER_START" "$SESSION_PGID" "$SESSION_SID" || leader_status=$?
+        case "$leader_status" in
+            0|"$MANAGED_PROCESS_REUSED_STATUS") ;;
+            "$MANAGED_LEADER_REAP_PENDING_STATUS") return "$MANAGED_LEADER_REAP_PENDING_STATUS" ;;
+            *) return 1 ;;
+        esac
         path_status=0
         worker_session_state_path_matches "$file" "$session_dev" "$session_inode" || path_status=$?
         if (( path_status == WORKER_SESSION_STATE_TRANSIENT_STATUS )); then
             (( attempt < WORKER_SESSION_STATE_READ_ATTEMPTS )) && { sleep 0.02; continue; }
+            [[ "$active_only" == true ]] && return "$WORKER_SESSION_STATE_TRANSIENT_STATUS"
             return 1
         elif (( path_status != 0 )); then return 1; fi
         rm -f -- "$file" || return 1
@@ -2043,7 +2122,7 @@ read_process_record_for_session_scan() {
 }
 
 # shellcheck disable=SC2034,SC2178  # Output arrays are populated through namerefs for callers.
-collect_owned_session_records() {
+collect_owned_session_records_once() {
     local expected_sid="$1" pids_variable="$2" starts_variable="$3" ppids_variable="$4"
     local pgids_variable="$5" states_variable="$6" stat_file pid record_status=0
     local -n pids_ref="$pids_variable" starts_ref="$starts_variable" ppids_ref="$ppids_variable"
@@ -2073,6 +2152,19 @@ collect_owned_session_records() {
     done
 }
 
+collect_owned_session_records() {
+    local expected_sid="$1" pids_variable="$2" starts_variable="$3" ppids_variable="$4"
+    local pgids_variable="$5" states_variable="$6" scan_status=0 attempt
+    for attempt in {1..3}; do
+        scan_status=0
+        collect_owned_session_records_once "$expected_sid" "$pids_variable" "$starts_variable" \
+            "$ppids_variable" "$pgids_variable" "$states_variable" || scan_status=$?
+        (( scan_status == 0 || scan_status == 2 )) && return "$scan_status"
+        (( attempt < 3 )) && sleep 0.01
+    done
+    return "$scan_status"
+}
+
 session_process_identity_matches() {
     local pid="$1" expected_start="$2" expected_sid="$3"
     read_process_record "$pid" || return 1
@@ -2097,6 +2189,11 @@ terminate_owned_session_leaf_first() {
     for ((cleanup_pass=1; cleanup_pass<=16; cleanup_pass++)); do
         collect_owned_session_records "$expected_sid" pids starts ppids pgids states || return 1
         (( ${#pids[@]} > 0 )) || return 0
+        if (( ${#pids[@]} == 1 )) && [[ "$allow_leader_zombie" == true &&
+            "${pids[0]}" == "$leader_pid" && "${starts[$leader_pid]}" == "$leader_start" &&
+            "${states[$leader_pid]}" == Z ]]; then
+            return 0
+        fi
         has_child=(); group_total=(); group_leaves=(); group_signaled=(); leaves=()
         for pid in "${pids[@]}"; do
             parent=${ppids[$pid]}
@@ -2164,13 +2261,113 @@ owned_session_fully_reaped() {
     done
 }
 
+managed_session_leader_reap_state() {
+    local worker_pid="$1" worker_start="$2" leader_pid="$3" leader_start="$4"
+    local expected_pgid="$5" expected_sid="$6" record_status=0
+    local leader_uid leader_ppid leader_pgid leader_sid leader_state
+    local worker_uid worker_state
+    local -a pids=()
+    local -A starts=() ppids=() pgids=() states=()
+
+    [[ "$worker_pid" =~ ^[1-9][0-9]*$ && "$worker_start" =~ ^[1-9][0-9]*$ &&
+        "$leader_pid" =~ ^[1-9][0-9]*$ && "$leader_start" =~ ^[1-9][0-9]*$ &&
+        "$expected_pgid" =~ ^[1-9][0-9]*$ && "$expected_sid" =~ ^[1-9][0-9]*$ ]] || return 1
+
+    read_process_record_for_session_scan "$leader_pid" || record_status=$?
+    if (( record_status == 2 )); then
+        collect_owned_session_records "$expected_sid" pids starts ppids pgids states || return 1
+        (( ${#pids[@]} == 0 )) || return 1
+        return 0
+    fi
+    (( record_status == 0 )) || return 1
+    [[ "$PROC_START" == "$leader_start" ]] || return "$MANAGED_PROCESS_REUSED_STATUS"
+    leader_uid=$PROC_UID
+    leader_ppid=$PROC_PPID
+    leader_pgid=$PROC_PGID
+    leader_sid=$PROC_SID
+    leader_state=$PROC_STATE
+    [[ "$leader_uid" == "$EUID" && "$leader_pgid" == "$expected_pgid" &&
+        "$leader_sid" == "$expected_sid" ]] || return 1
+    [[ "$leader_state" == Z ]] || return "$MANAGED_LEADER_STILL_LIVE_STATUS"
+
+    record_status=0
+    read_process_record_for_session_scan "$worker_pid" || record_status=$?
+    (( record_status == 0 )) || return 1
+    worker_uid=$PROC_UID
+    worker_state=$PROC_STATE
+    [[ "$worker_uid" == "$EUID" && "$worker_state" != Z &&
+        "$PROC_START" == "$worker_start" && "$leader_ppid" == "$worker_pid" ]] || return 1
+
+    collect_owned_session_records "$expected_sid" pids starts ppids pgids states || return 1
+    (( ${#pids[@]} == 1 )) && [[ "${pids[0]}" == "$leader_pid" &&
+        "${starts[$leader_pid]}" == "$leader_start" &&
+        "${pgids[$leader_pid]}" == "$expected_pgid" &&
+        "${states[$leader_pid]}" == Z ]] || return 1
+    return "$MANAGED_LEADER_REAP_PENDING_STATUS"
+}
+
+reap_direct_managed_leader() {
+    local leader_pid="$1" leader_start="$2" expected_pgid="$3" expected_sid="$4"
+    local expected_parent="${5:-$BASHPID}" record_status=0
+    local leader_state leader_ppid leader_pgid leader_sid leader_uid
+    local -a pids=()
+    local -A starts=() ppids=() pgids=() states=()
+
+    [[ "$leader_pid" =~ ^[1-9][0-9]*$ && "$leader_start" =~ ^[1-9][0-9]*$ &&
+        "$expected_pgid" =~ ^[1-9][0-9]*$ && "$expected_sid" =~ ^[1-9][0-9]*$ &&
+        "$expected_parent" =~ ^[1-9][0-9]*$ ]] || return 1
+
+    record_status=0
+    read_process_record_for_session_scan "$leader_pid" || record_status=$?
+    if (( record_status == 2 )); then
+        collect_owned_session_records "$expected_sid" pids starts ppids pgids states || return 1
+        (( ${#pids[@]} == 0 )) || return 1
+        # The PID is a known direct child from setsid; absent /proc means wait
+        # can only reap that child or return 127, never a live process.
+        wait "$leader_pid" 2>/dev/null || true
+        record_status=0
+        read_process_record_for_session_scan "$leader_pid" || record_status=$?
+        (( record_status == 2 )) && return 0
+        (( record_status == 0 )) || return 1
+        [[ "$PROC_START" != "$leader_start" ]] && return "$MANAGED_PROCESS_REUSED_STATUS"
+        return 1
+    fi
+    (( record_status == 0 )) || return 1
+    [[ "$PROC_START" == "$leader_start" ]] || return "$MANAGED_PROCESS_REUSED_STATUS"
+    leader_uid=$PROC_UID
+    leader_ppid=$PROC_PPID
+    leader_pgid=$PROC_PGID
+    leader_sid=$PROC_SID
+    leader_state=$PROC_STATE
+    [[ "$leader_uid" == "$EUID" && "$leader_ppid" == "$expected_parent" &&
+        "$leader_pgid" == "$expected_pgid" && "$leader_sid" == "$expected_sid" ]] || return 1
+
+    collect_owned_session_records "$expected_sid" pids starts ppids pgids states || return 1
+    (( ${#pids[@]} == 1 )) && [[ "${pids[0]}" == "$leader_pid" &&
+        "${starts[$leader_pid]}" == "$leader_start" &&
+        "${pgids[$leader_pid]}" == "$expected_pgid" ]] || return 1
+    [[ "$leader_state" == Z ]] || return "$MANAGED_LEADER_STILL_LIVE_STATUS"
+
+    wait "$leader_pid" 2>/dev/null || true
+    record_status=0
+    read_process_record_for_session_scan "$leader_pid" || record_status=$?
+    if (( record_status == 2 )); then
+        collect_owned_session_records "$expected_sid" pids starts ppids pgids states || return 1
+        (( ${#pids[@]} == 0 )) || return 1
+        return 0
+    fi
+    (( record_status == 0 )) || return 1
+    [[ "$PROC_START" != "$leader_start" ]] && return "$MANAGED_PROCESS_REUSED_STATUS"
+    return 1
+}
+
 terminate_managed_session() {
     local leader_pid="$1" leader_start="$2" expected_pgid="$3" expected_sid="$4"
     local allow_leader_zombie="${5:-false}" current_sid="" leader_status=0
 
     [[ "$leader_pid" =~ ^[1-9][0-9]*$ && "$leader_start" =~ ^[1-9][0-9]*$ &&
         "$expected_pgid" =~ ^[1-9][0-9]*$ && "$expected_sid" =~ ^[1-9][0-9]*$ ]] || return 1
-    read_process_record "$$" || return 1
+    read_process_record "$BASHPID" || return 1
     current_sid=$PROC_SID
     [[ "$expected_sid" != "$current_sid" ]] || return 1
     managed_leader_identity_trusted "$leader_pid" "$leader_start" "$expected_pgid" "$expected_sid" || leader_status=$?
@@ -2194,21 +2391,60 @@ worker_after_session_cleanup_hook() {
     :
 }
 
+worker_transfer_identity_complete() {
+    [[ "$WORKER_TRANSFER_PID" =~ ^[1-9][0-9]*$ && "$WORKER_TRANSFER_START" =~ ^[1-9][0-9]*$ &&
+        "$WORKER_TRANSFER_PGID" =~ ^[1-9][0-9]*$ && "$WORKER_TRANSFER_SID" =~ ^[1-9][0-9]*$ ]]
+}
+
+publish_worker_cleanup_failure_state() {
+    local attempt
+    worker_transfer_identity_complete || return 1
+    for attempt in {1..3}; do
+        publish_worker_session_state cleanup_failed && return 0
+        (( attempt < 3 )) && sleep 0.01
+    done
+    return 1
+}
+
+wait_for_parent_worker_reap() {
+    local attempt reap_status=0
+    worker_transfer_identity_complete || return 1
+    for attempt in {1..240}; do
+        reap_status=0
+        reap_direct_managed_leader "$WORKER_TRANSFER_PID" "$WORKER_TRANSFER_START" \
+            "$WORKER_TRANSFER_PGID" "$WORKER_TRANSFER_SID" || reap_status=$?
+        case "$reap_status" in
+            0|"$MANAGED_PROCESS_REUSED_STATUS") return 0 ;;
+            *) sleep 0.05 ;;
+        esac
+    done
+    return 1
+}
+
 terminate_worker_transfer() {
-    local cleanup_failed=false had_session=false
+    local cleanup_failed=false had_session=false leader_reused=false reap_status=0
 
     if [[ -n "$WORKER_TRANSFER_PID" || -n "$WORKER_TRANSFER_PGID" ||
         -n "$WORKER_TRANSFER_SID" || -n "$WORKER_TRANSFER_START" ]]; then
         had_session=true
-        if [[ -z "$WORKER_TRANSFER_PID" || -z "$WORKER_TRANSFER_PGID" ||
-            -z "$WORKER_TRANSFER_SID" || -z "$WORKER_TRANSFER_START" ]] ||
+        if ! worker_transfer_identity_complete ||
             ! terminate_managed_session "$WORKER_TRANSFER_PID" "$WORKER_TRANSFER_START" \
                 "$WORKER_TRANSFER_PGID" "$WORKER_TRANSFER_SID" true; then
             cleanup_failed=true
         fi
     fi
-    [[ -z "$WORKER_TRANSFER_PID" ]] || wait "$WORKER_TRANSFER_PID" 2>/dev/null || true
-    if [[ "$cleanup_failed" == false && "$had_session" == true && "$WORKER_SIGNAL_CLEANUP_ACTIVE" == true ]] &&
+
+    if [[ "$cleanup_failed" == false && "$had_session" == true ]]; then
+        reap_status=0
+        reap_direct_managed_leader "$WORKER_TRANSFER_PID" "$WORKER_TRANSFER_START" \
+            "$WORKER_TRANSFER_PGID" "$WORKER_TRANSFER_SID" || reap_status=$?
+        case "$reap_status" in
+            0) ;;
+            "$MANAGED_PROCESS_REUSED_STATUS") leader_reused=true ;;
+            *) cleanup_failed=true ;;
+        esac
+    fi
+    if [[ "$cleanup_failed" == false && "$had_session" == true && "$leader_reused" == false ]] &&
         ! owned_session_fully_reaped "$WORKER_TRANSFER_SID"; then
         cleanup_failed=true
     fi
@@ -2219,9 +2455,10 @@ terminate_worker_transfer() {
         echo -e "${RED}${ICON_ERROR} managed session 已结束但状态文件删除失败: $WORKER_SESSION_STATE_FILE${NC}" >&2
         cleanup_failed=true
     fi
+
     if [[ "$cleanup_failed" == true ]]; then
         WORKER_TRANSFER_CLEANUP_FAILED=true
-        [[ -z "$WORKER_SESSION_STATE_FILE" ]] || publish_worker_session_state cleanup_failed || true
+        publish_worker_cleanup_failure_state || true
         return 1
     fi
     WORKER_TRANSFER_PID=""
@@ -2236,8 +2473,11 @@ terminate_worker_transfer() {
 worker_signal_handler() {
     local status="$1"
     trap - EXIT HUP INT TERM
-    WORKER_SIGNAL_CLEANUP_ACTIVE=true
-    terminate_worker_transfer
+    if ! terminate_worker_transfer; then
+        # The parent may terminate the session while this shell remains the
+        # direct parent.  Reap only after the leader is proven exited/zombie.
+        wait_for_parent_worker_reap || true
+    fi
     [[ -z "$WORKER_OUTPUT_FILE" ]] || rm -f -- "$WORKER_OUTPUT_FILE" 2>/dev/null || true
     exit "$status"
 }
@@ -2245,8 +2485,9 @@ worker_signal_handler() {
 worker_exit_handler() {
     local status="$?"
     trap - EXIT
-    if ! terminate_worker_transfer && (( status == 0 )); then
+    if ! terminate_worker_transfer; then
         status=$MANAGED_CLEANUP_FAILURE_STATUS
+        wait_for_parent_worker_reap || true
     fi
     [[ -z "$WORKER_OUTPUT_FILE" ]] || rm -f -- "$WORKER_OUTPUT_FILE" 2>/dev/null || true
     exit "$status"
@@ -2535,48 +2776,30 @@ launch_worker() {
 }
 
 wait_for_worker_slot() {
-    local wait_status=0
+    local tick=0
     while :; do
+        if (( tick % 5 == 0 )); then cleanup_active_failed_worker_sessions || return "$MANAGED_CLEANUP_FAILURE_STATUS"; fi
         prune_active_workers || return "$MANAGED_CLEANUP_FAILURE_STATUS"
         if batch_schedule_barrier_present; then
             return "$MANAGED_CLEANUP_FAILURE_STATUS"
         fi
         (( ${#ACTIVE_WORKERS[@]} < MAX_PARALLEL )) && return 0
-
-        wait_status=0
-        wait -n 2>/dev/null || wait_status=$?
-        record_worker_wait_status "$wait_status"
-        if [[ "$BATCH_WORKER_FAILED" == true ]]; then
-            return "$MANAGED_CLEANUP_FAILURE_STATUS"
-        fi
-
-        prune_active_workers || return "$MANAGED_CLEANUP_FAILURE_STATUS"
-        if batch_schedule_barrier_present; then
-            return "$MANAGED_CLEANUP_FAILURE_STATUS"
-        fi
+        ((tick += 1))
+        sleep 0.05
     done
 }
 
 wait_for_all_workers() {
-    local wait_status=0
+    local tick=0
     while :; do
+        if (( tick % 5 == 0 )); then cleanup_active_failed_worker_sessions || return "$MANAGED_CLEANUP_FAILURE_STATUS"; fi
         prune_active_workers || return "$MANAGED_CLEANUP_FAILURE_STATUS"
         if batch_schedule_barrier_present; then
             return "$MANAGED_CLEANUP_FAILURE_STATUS"
         fi
         (( ${#ACTIVE_WORKERS[@]} == 0 )) && return 0
-
-        wait_status=0
-        wait -n 2>/dev/null || wait_status=$?
-        record_worker_wait_status "$wait_status"
-        if [[ "$BATCH_WORKER_FAILED" == true ]]; then
-            return "$MANAGED_CLEANUP_FAILURE_STATUS"
-        fi
-
-        prune_active_workers || return "$MANAGED_CLEANUP_FAILURE_STATUS"
-        if batch_schedule_barrier_present; then
-            return "$MANAGED_CLEANUP_FAILURE_STATUS"
-        fi
+        ((tick += 1))
+        sleep 0.05
     done
 }
 

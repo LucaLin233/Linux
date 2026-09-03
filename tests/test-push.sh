@@ -1249,6 +1249,8 @@ run_auth_process_tree_signal_case() (
     for name in "${!AUTH_READY_PID[@]}"; do
         child_pid=${AUTH_READY_PID[$name]}; child_start=${AUTH_READY_START[$name]}
         if process_identity_matches "$child_pid" "$child_start" && process_is_running "$child_pid"; then
+            dump_fixture_process "$name" "$child_pid" "$child_start"
+            cat "$root/output.log" >&2 2>/dev/null || true
             fail "$mode/$signal_name run $repeat left $name process"
         fi
     done
