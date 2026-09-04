@@ -1314,11 +1314,17 @@ cleanup_active_failed_worker_sessions() {
 }
 
 prune_active_workers() {
+    local mode="${1:-strict}"
     local pid wait_status=0 failed=false ready release record_status=0 active_identity=false
     for pid in "${!ACTIVE_WORKERS[@]}"; do
         if job_is_active "$pid"; then
             active_identity=false
-            if process_identity_matches "$pid" "${ACTIVE_WORKERS[$pid]}"; then
+            if [[ "$mode" == accepted-cleanup ]]; then
+                # ACTIVE_WORKERS contains only accepted direct child jobs.  A
+                # still-running Bash job owns its PID until wait/reap, so it
+                # cannot be a reused unrelated process.
+                active_identity=true
+            elif process_identity_matches "$pid" "${ACTIVE_WORKERS[$pid]}"; then
                 active_identity=true
             else
                 record_status=0
@@ -1332,6 +1338,13 @@ prune_active_workers() {
                     [[ "$PROC_UID" == "$EUID" && "$PROC_START" == "${ACTIVE_WORKERS[$pid]}" && "$PROC_STATE" == Z ]]; }; then
                     active_identity=false
                 else
+                    if [[ "$mode" == exiting ]]; then
+                        # terminate_active_workers already verified and sent
+                        # TERM to this accepted direct child; wait for its job
+                        # table transition instead of treating exit-time /proc
+                        # instability as a new scheduling trust failure.
+                        continue
+                    fi
                     if [[ "$BATCH_WORKER_FAILED" == false ]]; then
                         echo -e "${RED}${ICON_ERROR} active worker 身份不可验证，停止调度并交由完整 grace 清理: pid=$pid expected_start=${ACTIVE_WORKERS[$pid]} actual_start=${PROC_START:-unknown} state=${PROC_STATE:-unknown} uid=${PROC_UID:-unknown}${NC}" >&2
                     fi
@@ -1400,7 +1413,7 @@ terminate_active_workers() {
     done
 
     # prune 只 reap 已退出 worker；active 身份信任失败仅建立 barrier，不缩短 grace。
-    prune_active_workers || cleanup_failed=true
+    prune_active_workers accepted-cleanup || cleanup_failed=true
     for pid in "${!ACTIVE_WORKERS[@]}"; do
         if job_is_active "$pid"; then
             # ACTIVE_WORKERS 只包含当前 shell 通过 $! 建立并完成 acceptance 的直接 child job。
@@ -1413,7 +1426,7 @@ terminate_active_workers() {
     # then reaps the leader; the state file is removed only after that proof.
     for _ in {1..100}; do
         cleanup_active_failed_worker_sessions || cleanup_failed=true
-        prune_active_workers || cleanup_failed=true
+        prune_active_workers exiting || cleanup_failed=true
         cleanup_active_failed_worker_sessions || cleanup_failed=true
         (( ${#ACTIVE_WORKERS[@]} == 0 )) && break
         sleep 0.1
@@ -1428,7 +1441,7 @@ terminate_active_workers() {
         fi
     done
     for _ in {1..20}; do
-        prune_active_workers || cleanup_failed=true
+        prune_active_workers exiting || cleanup_failed=true
         (( ${#ACTIVE_WORKERS[@]} == 0 )) && break
         sleep 0.05
     done
@@ -1450,117 +1463,200 @@ terminate_active_workers() {
     [[ "$cleanup_failed" == false ]]
 }
 
-cleanup_runtime() {
-    local cleanup_failed=false worker_cleanup_status=0 _
-
-    [[ "$RUNTIME_CLEANUP_ACTIVE" == false ]] || return 0
-    RUNTIME_CLEANUP_ACTIVE=true
-    terminate_runtime_allocator || cleanup_failed=true
-    worker_cleanup_status=1
-    for _ in {1..3}; do
-        if terminate_worker_transfer; then worker_cleanup_status=0; break; fi
-        sleep 0.02
+terminate_worker_transfer_with_retries() {
+    local attempts="$1" attempt
+    [[ "$attempts" =~ ^[1-9][0-9]*$ ]] || return 1
+    for ((attempt=1; attempt<=attempts; attempt++)); do
+        terminate_worker_transfer && return 0
+        (( attempt < attempts )) && sleep 0.02
     done
-    (( worker_cleanup_status == 0 )) || cleanup_failed=true
-    terminate_active_workers || cleanup_failed=true
-    unset SSHPASS
+    return 1
+}
+
+runtime_lifecycle_globals_resolved() {
+    [[ -z "$RUNTIME_ALLOCATOR_PID" && -z "$RUNTIME_ALLOCATOR_START" &&
+        "$RUNTIME_ALLOCATION_CRITICAL" == false && -z "$RUNTIME_PENDING_SIGNAL" &&
+        "$RUNTIME_PENDING_SIGNAL_STATUS" == 0 ]] || return 1
+    [[ -z "$WORKER_TRANSFER_PID" && -z "$WORKER_TRANSFER_START" &&
+        -z "$WORKER_TRANSFER_PGID" && -z "$WORKER_TRANSFER_SID" &&
+        "$WORKER_TRANSFER_CLEANUP_FAILED" == false && -z "$WORKER_SESSION_STATE_FILE" ]] || return 1
+    (( ${#ACTIVE_WORKERS[@]} == 0 && ${#ACTIVE_WORKER_STATE_FILES[@]} == 0 &&
+        ${#ACTIVE_WORKER_STATE_STARTS[@]} == 0 && ${#REGISTERING_WORKERS[@]} == 0 &&
+        ${#WORKER_REGISTRATION_READY_FILES[@]} == 0 && ${#WORKER_REGISTRATION_RELEASE_FILES[@]} == 0 &&
+        ${#WORKER_REGISTRATION_STARTS[@]} == 0 && ${#WORKER_REGISTRATION_STAGE_FILES[@]} == 0 )) || return 1
+    [[ -z "$WORKER_REGISTRATION_READY_FILE" && -z "$WORKER_REGISTRATION_RELEASE_FILE" &&
+        -z "$WORKER_REGISTRATION_STAGE_FILE" && "$WORKER_REGISTRATION_CRITICAL" == false &&
+        -z "$WORKER_REGISTRATION_PENDING_SIGNAL" && "$WORKER_REGISTRATION_PENDING_STATUS" == 0 ]]
+}
+
+runtime_cleanup_final_proof() {
+    runtime_lifecycle_globals_resolved || {
+        echo -e "${RED}${ICON_ERROR} runtime lifecycle 尚有未解析状态，拒绝删除: ${TEMP_DIR:-<unset>}${NC}" >&2
+        return 1
+    }
 
     case "$RUNTIME_STATE" in
         none)
-            if [[ -n "$TEMP_DIR" || -e "${TEMP_DIR:-}" || -L "${TEMP_DIR:-}" ]]; then
+            [[ -z "$TEMP_DIR" && ! -e "${TEMP_DIR:-}" && ! -L "${TEMP_DIR:-}" ]] || {
                 echo -e "${RED}${ICON_ERROR} runtime 路径存在但无 building/initialized 状态: $TEMP_DIR${NC}" >&2
-                cleanup_failed=true
-            fi
+                return 1
+            }
+            return 0
             ;;
         building)
             if [[ ! -e "$TEMP_DIR" && ! -L "$TEMP_DIR" ]]; then
-                :
-            elif [[ "$RUNTIME_CANDIDATE_CREATED" != true ]]; then
-                for _ in {1..40}; do
-                    [[ ! -e "$TEMP_DIR" && ! -L "$TEMP_DIR" ]] && break
-                    sleep 0.05
-                done
-                if [[ -e "$TEMP_DIR" || -L "$TEMP_DIR" ]]; then
-                    echo -e "${RED}${ICON_ERROR} building candidate 存在但 allocator 未证明创建所有权: $TEMP_DIR${NC}" >&2
-                    cleanup_failed=true
-                fi
-            elif ! runtime_building_directory_trusted; then
-                echo -e "${RED}${ICON_ERROR} 拒绝删除无法证明所有权的 building runtime: $TEMP_DIR${NC}" >&2
-                cleanup_failed=true
-            elif ! rm -rf -- "$TEMP_DIR"; then
-                echo -e "${RED}${ICON_ERROR} building runtime 删除失败: $TEMP_DIR${NC}" >&2
-                cleanup_failed=true
+                [[ "$RUNTIME_CANDIDATE_CREATED" == false ]] || {
+                    echo -e "${RED}${ICON_ERROR} 已接管 building runtime 意外缺失: $TEMP_DIR${NC}" >&2
+                    return 1
+                }
+                return 0
             fi
+            [[ "$RUNTIME_CANDIDATE_CREATED" == true ]] || {
+                echo -e "${RED}${ICON_ERROR} building runtime 缺少 allocator 创建所有权证明: $TEMP_DIR${NC}" >&2
+                return 1
+            }
+            runtime_building_directory_trusted || {
+                echo -e "${RED}${ICON_ERROR} building runtime 身份不可信，拒绝删除: $TEMP_DIR${NC}" >&2
+                return 1
+            }
             ;;
         initialized)
-            if [[ ! -e "$TEMP_DIR" && ! -L "$TEMP_DIR" ]]; then
-                :
-            elif ! runtime_directory_trusted; then
-                echo -e "${RED}${ICON_ERROR} 拒绝删除无法证明 inode 所有权的 runtime: $TEMP_DIR${NC}" >&2
-                cleanup_failed=true
-            elif ! rm -rf -- "$TEMP_DIR"; then
-                echo -e "${RED}${ICON_ERROR} runtime 目录删除失败: $TEMP_DIR${NC}" >&2
-                cleanup_failed=true
-            fi
+            [[ -n "$TEMP_DIR_DEV" && -n "$TEMP_DIR_INODE" ]] && runtime_directory_trusted || {
+                echo -e "${RED}${ICON_ERROR} initialized runtime dev/inode 或信任边界不匹配，拒绝删除: $TEMP_DIR${NC}" >&2
+                return 1
+            }
             ;;
         *)
             echo -e "${RED}${ICON_ERROR} 未知 runtime 生命周期状态: $RUNTIME_STATE${NC}" >&2
-            cleanup_failed=true
+            return 1
             ;;
     esac
 
-    if [[ "$cleanup_failed" == false ]]; then
-        TEMP_DIR=""
-        SUCCESS_FILE=""
-        FAILED_FILE=""
-        SSH_WRAPPER=""
-        RUNTIME_KEY_FILE=""
-        TEMP_DIR_DEV=""
-        TEMP_DIR_INODE=""
-        RUNTIME_PARENT=""
-        RUNTIME_PARENT_DEV=""
-        RUNTIME_PARENT_INODE=""
-        RUNTIME_STATE=none
-        RUNTIME_INITIALIZED=false
-        RUNTIME_ALLOCATION_CRITICAL=false
-        RUNTIME_PENDING_SIGNAL=""
-        RUNTIME_PENDING_SIGNAL_STATUS=0
-        RUNTIME_ALLOCATOR_PID=""
-        RUNTIME_ALLOCATOR_START=""
-        RUNTIME_CANDIDATE_CREATED=false
-        ACTIVE_WORKERS=()
-        ACTIVE_WORKER_STATE_FILES=()
-        ACTIVE_WORKER_STATE_STARTS=()
-        REGISTERING_WORKERS=()
-        WORKER_REGISTRATION_READY_FILES=()
-        WORKER_REGISTRATION_RELEASE_FILES=()
-        WORKER_REGISTRATION_STARTS=()
-        WORKER_REGISTRATION_STAGE_FILES=()
-        WORKER_REGISTRATION_READY_FILE=""
-        WORKER_REGISTRATION_RELEASE_FILE=""
-        WORKER_REGISTRATION_STAGE_FILE=""
-        WORKER_REGISTRATION_READY_DEV=""
-        WORKER_REGISTRATION_READY_INODE=""
-        WORKER_REGISTRATION_CRITICAL=false
-        WORKER_REGISTRATION_PENDING_SIGNAL=""
-        WORKER_REGISTRATION_PENDING_STATUS=0
-        WORKER_SESSION_PATH_DEV=""
-        WORKER_SESSION_PATH_INODE=""
-        WORKER_SESSION_PATH_OWNER=""
-        WORKER_SESSION_PATH_GID=""
-        WORKER_SESSION_PATH_MODE=""
-        WORKER_SESSION_PATH_SIZE=""
-        WORKER_SESSION_FD_DEV=""
-        WORKER_SESSION_FD_INODE=""
-        WORKER_SESSION_FD_OWNER=""
-        WORKER_SESSION_FD_GID=""
-        WORKER_SESSION_FD_MODE=""
-        WORKER_SESSION_FD_SIZE=""
-        SESSION_FILE_DEV=""
-        SESSION_FILE_INODE=""
+    if runtime_has_published_worker_state || runtime_has_worker_registration_state; then
+        echo -e "${RED}${ICON_ERROR} runtime 中仍有 worker lifecycle state，拒绝删除: $TEMP_DIR${NC}" >&2
+        return 1
+    fi
+}
+
+clear_runtime_lifecycle_state() {
+    TEMP_DIR=""
+    SUCCESS_FILE=""
+    FAILED_FILE=""
+    SSH_WRAPPER=""
+    RUNTIME_KEY_FILE=""
+    TEMP_DIR_DEV=""
+    TEMP_DIR_INODE=""
+    RUNTIME_PARENT=""
+    RUNTIME_PARENT_DEV=""
+    RUNTIME_PARENT_INODE=""
+    RUNTIME_STATE=none
+    RUNTIME_INITIALIZED=false
+    RUNTIME_ALLOCATION_CRITICAL=false
+    RUNTIME_PENDING_SIGNAL=""
+    RUNTIME_PENDING_SIGNAL_STATUS=0
+    RUNTIME_ALLOCATOR_PID=""
+    RUNTIME_ALLOCATOR_START=""
+    RUNTIME_CANDIDATE_CREATED=false
+    WORKER_TRANSFER_PID=""
+    WORKER_TRANSFER_START=""
+    WORKER_TRANSFER_PGID=""
+    WORKER_TRANSFER_SID=""
+    WORKER_TRANSFER_CLEANUP_FAILED=false
+    WORKER_SESSION_STATE_FILE=""
+    WORKER_OUTPUT_FILE=""
+    ACTIVE_WORKERS=()
+    ACTIVE_WORKER_STATE_FILES=()
+    ACTIVE_WORKER_STATE_STARTS=()
+    REGISTERING_WORKERS=()
+    WORKER_REGISTRATION_READY_FILES=()
+    WORKER_REGISTRATION_RELEASE_FILES=()
+    WORKER_REGISTRATION_STARTS=()
+    WORKER_REGISTRATION_STAGE_FILES=()
+    WORKER_REGISTRATION_READY_FILE=""
+    WORKER_REGISTRATION_RELEASE_FILE=""
+    WORKER_REGISTRATION_STAGE_FILE=""
+    WORKER_REGISTRATION_READY_DEV=""
+    WORKER_REGISTRATION_READY_INODE=""
+    WORKER_REGISTRATION_CRITICAL=false
+    WORKER_REGISTRATION_PENDING_SIGNAL=""
+    WORKER_REGISTRATION_PENDING_STATUS=0
+    WORKER_SESSION_PATH_DEV=""
+    WORKER_SESSION_PATH_INODE=""
+    WORKER_SESSION_PATH_OWNER=""
+    WORKER_SESSION_PATH_GID=""
+    WORKER_SESSION_PATH_MODE=""
+    WORKER_SESSION_PATH_SIZE=""
+    WORKER_SESSION_FD_DEV=""
+    WORKER_SESSION_FD_INODE=""
+    WORKER_SESSION_FD_OWNER=""
+    WORKER_SESSION_FD_GID=""
+    WORKER_SESSION_FD_MODE=""
+    WORKER_SESSION_FD_SIZE=""
+    SESSION_FILE_DEV=""
+    SESSION_FILE_INODE=""
+}
+
+cleanup_runtime() {
+    local lifecycle_cleanup_failed=false removal_failed=false worker_cleanup_status=0
+
+    [[ "$RUNTIME_CLEANUP_ACTIVE" == false ]] || return 0
+    RUNTIME_CLEANUP_ACTIVE=true
+
+    # Phase 1: resolve all process/session/registration lifecycle state.  No
+    # runtime deletion is allowed when any operation in this phase fails.
+    terminate_runtime_allocator || lifecycle_cleanup_failed=true
+    worker_cleanup_status=0
+    terminate_worker_transfer_with_retries 10 || worker_cleanup_status=$?
+    (( worker_cleanup_status == 0 )) || lifecycle_cleanup_failed=true
+    terminate_active_workers || lifecycle_cleanup_failed=true
+    unset SSHPASS
+
+    if [[ "$lifecycle_cleanup_failed" == true ]]; then
+        echo -e "${RED}${ICON_ERROR} lifecycle cleanup 未完成，保留 runtime 与状态证据: ${TEMP_DIR:-<unset>}${NC}" >&2
+        RUNTIME_CLEANUP_ACTIVE=false
+        return 1
+    fi
+
+    # Phase 2: require a final proof that no known lifecycle evidence remains
+    # and that the runtime dev/inode trust boundary is unchanged.
+    if ! runtime_cleanup_final_proof; then
+        RUNTIME_CLEANUP_ACTIVE=false
+        return 1
+    fi
+
+    case "$RUNTIME_STATE" in
+        none)
+            ;;
+        building)
+            if [[ -e "$TEMP_DIR" || -L "$TEMP_DIR" ]]; then
+                if ! runtime_building_directory_trusted; then
+                    echo -e "${RED}${ICON_ERROR} 拒绝删除无法证明所有权的 building runtime: $TEMP_DIR${NC}" >&2
+                    removal_failed=true
+                elif ! rm -rf -- "$TEMP_DIR"; then
+                    echo -e "${RED}${ICON_ERROR} building runtime 删除失败: $TEMP_DIR${NC}" >&2
+                    removal_failed=true
+                fi
+            fi
+            ;;
+        initialized)
+            if ! runtime_directory_trusted; then
+                echo -e "${RED}${ICON_ERROR} 拒绝删除无法证明 inode 所有权的 runtime: $TEMP_DIR${NC}" >&2
+                removal_failed=true
+            elif ! rm -rf -- "$TEMP_DIR"; then
+                echo -e "${RED}${ICON_ERROR} runtime 目录删除失败: $TEMP_DIR${NC}" >&2
+                removal_failed=true
+            fi
+            ;;
+        *)
+            removal_failed=true
+            ;;
+    esac
+
+    if [[ "$removal_failed" == false ]]; then
+        clear_runtime_lifecycle_state
     fi
     RUNTIME_CLEANUP_ACTIVE=false
-    [[ "$cleanup_failed" == false ]]
+    [[ "$removal_failed" == false ]]
 }
 
 runtime_exit_handler() {
@@ -1597,7 +1693,7 @@ runtime_signal_handler() {
     trap - EXIT HUP INT TERM
     echo -e "${YELLOW}${ICON_STOP} 收到 $signal_name，正在终止本次 push 进程树${NC}" >&2
     if ! cleanup_runtime; then
-        echo -e "${RED}${ICON_ERROR} $signal_name 清理未完成，已保留残留路径供检查${NC}" >&2
+        echo -e "${RED}${ICON_ERROR} $signal_name 清理未完成，已保留残留 runtime 与状态供检查: ${TEMP_DIR:-<unset>}${NC}" >&2
     fi
     exit "$status"
 }
@@ -2093,32 +2189,41 @@ managed_leader_identity_trusted() {
 
 read_process_stat_for_session_scan() {
     local pid="$1" _
-    for _ in {1..3}; do
+    for _ in {1..10}; do
         read_process_stat "$pid" && return 0
         [[ -e "/proc/$pid" ]] || return 2
-        sleep 0.005
+        sleep 0.01
     done
     return 1
 }
 
 read_process_uid_for_session_scan() {
     local pid="$1" _
-    for _ in {1..3}; do
+    for _ in {1..10}; do
         read_process_uid "$pid" && return 0
         [[ -e "/proc/$pid" ]] || return 2
-        sleep 0.005
+        sleep 0.01
     done
     return 1
 }
 
 read_process_record_for_session_scan() {
-    local pid="$1" _
-    for _ in {1..3}; do
+    local pid="$1" _ first_start=""
+    for _ in {1..10}; do
         read_process_record "$pid" && return 0
         [[ -e "/proc/$pid" ]] || return 2
-        sleep 0.005
+        sleep 0.01
     done
-    return 1
+
+    # /proc/<pid>/status can transiently fail while stat remains readable.
+    # Bind a directory-owner fallback to two matching start-time snapshots so
+    # PID reuse cannot combine records from different processes.
+    read_process_stat "$pid" || { [[ -e "/proc/$pid" ]] && return 1 || return 2; }
+    first_start=$PROC_START
+    [[ -O "/proc/$pid" ]] || return 1
+    read_process_stat "$pid" || { [[ -e "/proc/$pid" ]] && return 1 || return 2; }
+    [[ "$PROC_START" == "$first_start" && -O "/proc/$pid" ]] || return 1
+    PROC_UID=$EUID
 }
 
 # shellcheck disable=SC2034,SC2178  # Output arrays are populated through namerefs for callers.
@@ -2155,12 +2260,12 @@ collect_owned_session_records_once() {
 collect_owned_session_records() {
     local expected_sid="$1" pids_variable="$2" starts_variable="$3" ppids_variable="$4"
     local pgids_variable="$5" states_variable="$6" scan_status=0 attempt
-    for attempt in {1..3}; do
+    for attempt in {1..5}; do
         scan_status=0
         collect_owned_session_records_once "$expected_sid" "$pids_variable" "$starts_variable" \
             "$ppids_variable" "$pgids_variable" "$states_variable" || scan_status=$?
         (( scan_status == 0 || scan_status == 2 )) && return "$scan_status"
-        (( attempt < 3 )) && sleep 0.01
+        (( attempt < 5 )) && sleep 0.02
     done
     return "$scan_status"
 }

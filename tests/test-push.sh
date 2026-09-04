@@ -1380,6 +1380,18 @@ EOF
     SERVERS=(good1 good2 good3 good4)
     run_transfer source destination
     assert_eq 2 "$(<"$root/state/max")" "sliding concurrency respects MAX_PARALLEL while keeping window full"
+    [[ "$BATCH_WORKER_FAILED" == false ]] || fail "sliding batch left lifecycle failure flag"
+    if (( ${#ACTIVE_WORKERS[@]} != 0 || ${#ACTIVE_WORKER_STATE_FILES[@]} != 0 ||
+        ${#ACTIVE_WORKER_STATE_STARTS[@]} != 0 || ${#REGISTERING_WORKERS[@]} != 0 ||
+        ${#WORKER_REGISTRATION_READY_FILES[@]} != 0 || ${#WORKER_REGISTRATION_RELEASE_FILES[@]} != 0 ||
+        ${#WORKER_REGISTRATION_STARTS[@]} != 0 || ${#WORKER_REGISTRATION_STAGE_FILES[@]} != 0 )); then
+        declare -p ACTIVE_WORKERS ACTIVE_WORKER_STATE_FILES ACTIVE_WORKER_STATE_STARTS REGISTERING_WORKERS \
+            WORKER_REGISTRATION_READY_FILES WORKER_REGISTRATION_RELEASE_FILES WORKER_REGISTRATION_STARTS \
+            WORKER_REGISTRATION_STAGE_FILES >&2
+        fail "sliding batch left lifecycle maps"
+    fi
+    runtime_has_published_worker_state && fail "sliding batch left worker-session state"
+    runtime_has_worker_registration_state && fail "sliding batch left registration state"
     : > "$SUCCESS_FILE"; : > "$FAILED_FILE"; : > "$root/state/current"; : > "$root/state/max"
     SERVERS=(good1 bad1 good2)
     assert_fail "partial server failure returns nonzero" run_transfer source destination
