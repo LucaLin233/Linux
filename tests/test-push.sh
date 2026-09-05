@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2034  # Test globals are consumed by sourced tools/push.sh functions.
 set -euo pipefail
 
-readonly ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+readonly ROOT_DIR
 readonly SCRIPT="$ROOT_DIR/tools/push.sh"
-readonly TEST_DIR=$(mktemp -d)
-trap 'rm -rf "$TEST_DIR"' EXIT
+TEST_DIR=$(mktemp -d)
+readonly TEST_DIR
+trap '[[ -e "$TEST_DIR/retain-fixture-evidence" ]] || rm -rf "$TEST_DIR"' EXIT
 
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 pass() { printf 'PASS: %s\n' "$*"; }
@@ -29,6 +32,85 @@ process_is_running() {
     [[ -r "/proc/$pid/stat" ]] || return 1
     state=$(awk '{print $3}' "/proc/$pid/stat" 2>/dev/null) || return 1
     [[ "$state" != Z ]]
+}
+
+fixture_current_identity() {
+    local pid="$1" stat_line="" stat_rest=""
+    local -a fields=()
+    FIXTURE_STATE=""; FIXTURE_START=""; FIXTURE_PPID=""; FIXTURE_PGID=""; FIXTURE_SID=""; FIXTURE_COMM=""
+    [[ "$pid" =~ ^[1-9][0-9]*$ && -r "/proc/$pid/stat" ]] || return 1
+    IFS= read -r stat_line < "/proc/$pid/stat" || return 1
+    [[ "$stat_line" == "$pid ("* && "$stat_line" == *") "* ]] || return 1
+    FIXTURE_COMM=${stat_line#*\(}; FIXTURE_COMM=${FIXTURE_COMM%%\) *}
+    stat_rest=${stat_line##*) }; read -r -a fields <<< "$stat_rest"
+    (( ${#fields[@]} >= 20 )) || return 1
+    FIXTURE_STATE=${fields[0]}; FIXTURE_PPID=${fields[1]}; FIXTURE_PGID=${fields[2]}
+    FIXTURE_SID=${fields[3]}; FIXTURE_START=${fields[19]}
+}
+
+fixture_identity_same() {
+    fixture_current_identity "$1" && [[ "$FIXTURE_START" == "$2" ]]
+}
+
+wait_fixture_start() {
+    local pid="$1" _
+    for _ in {1..100}; do
+        if fixture_current_identity "$pid"; then printf '%s\n' "$FIXTURE_START"; return 0; fi
+        sleep 0.005
+    done
+    return 1
+}
+
+read_fixture_identity() {
+    local file="$1" line="" key="" value="" count=0 metadata owner gid mode trusted_gid
+    FIXTURE_ROLE=""; FIXTURE_FILE_PID=""; FIXTURE_FILE_START=""; FIXTURE_FILE_PPID=""
+    FIXTURE_FILE_PGID=""; FIXTURE_FILE_SID=""; FIXTURE_FILE_STATE=""; FIXTURE_FILE_COMM=""
+    [[ -f "$file" && ! -L "$file" ]] || return 1
+    metadata=$(stat -Lc '%u:%g:%a' -- "$file") || return 1
+    IFS=: read -r owner gid mode <<< "$metadata"; trusted_gid=$(current_gid) || return 1
+    [[ "$owner" == "$EUID" && "$gid" == "$trusted_gid" && "$mode" == 600 ]] || return 1
+    while IFS= read -r line; do
+        ((count += 1)); [[ "$line" == *=* ]] || return 1
+        key=${line%%=*}; value=${line#*=}
+        case "$key" in
+            role) FIXTURE_ROLE=$value ;; pid) FIXTURE_FILE_PID=$value ;; start) FIXTURE_FILE_START=$value ;;
+            ppid) FIXTURE_FILE_PPID=$value ;; pgid) FIXTURE_FILE_PGID=$value ;; sid) FIXTURE_FILE_SID=$value ;;
+            state) FIXTURE_FILE_STATE=$value ;; comm) FIXTURE_FILE_COMM=$value ;; *) return 1 ;;
+        esac
+    done < "$file"
+    (( count == 8 )) && [[ "$FIXTURE_FILE_PID" =~ ^[1-9][0-9]*$ && "$FIXTURE_FILE_START" =~ ^[1-9][0-9]*$ &&
+        "$FIXTURE_FILE_PPID" =~ ^[0-9]+$ && "$FIXTURE_FILE_PGID" =~ ^[1-9][0-9]*$ && "$FIXTURE_FILE_SID" =~ ^[1-9][0-9]*$ ]]
+}
+
+wait_fixture_identity_gone() {
+    local pid="$1" start="$2" _
+    for _ in {1..100}; do fixture_identity_same "$pid" "$start" || return 0; sleep 0.05; done
+    return 1
+}
+
+dump_fixture_process() {
+    local role="$1" pid="$2" start="$3"
+    printf '%s\n' "=== $role pid=$pid expected_start=$start ===" >&2
+    if fixture_current_identity "$pid"; then
+        printf 'state=%s start=%s ppid=%s pgid=%s sid=%s comm=%s same=%s\n' \
+            "$FIXTURE_STATE" "$FIXTURE_START" "$FIXTURE_PPID" "$FIXTURE_PGID" "$FIXTURE_SID" "$FIXTURE_COMM" \
+            "$([[ "$FIXTURE_START" == "$start" ]] && echo yes || echo no)" >&2
+        cat "/proc/$pid/stat" >&2 2>/dev/null || true
+        cat "/proc/$pid/status" >&2 2>/dev/null || true
+        tr '\0' ' ' < "/proc/$pid/cmdline" >&2 2>/dev/null || true; echo >&2
+    else
+        echo absent >&2
+    fi
+}
+
+signal_test_watchdog() {
+    local root="$1" target_pid="$2" timer="" stage=""
+    trap '[[ -z "$timer" ]] || kill "$timer" 2>/dev/null || true; [[ -z "$timer" ]] || wait "$timer" 2>/dev/null || true; exit 0' HUP INT TERM
+    sleep 30 & timer=$!; wait "$timer" 2>/dev/null || exit 0
+    stage="$root/.watchdog-fired.$BASHPID.stage"
+    (umask 077; set -o noclobber; : > "$stage") || exit 1
+    mv -fT "$stage" "$root/watchdog-fired"
+    kill -KILL "$target_pid" 2>/dev/null || true
 }
 
 # Source must not create runtime files, inspect configuration, modify SSHPASS, or replace traps.
@@ -165,7 +247,7 @@ source "$script"
 runtime_building_hook() {
     printf '%s\n' "$1" > "$root/building-path"
     touch "$root/ready"
-    while :; do sleep 1; done
+    while :; do :; done
 }
 install_runtime_traps
 initialize_runtime
@@ -204,7 +286,7 @@ source "$script"
 runtime_allocator_after_create_hook() {
     printf '%s\n' "$1" > "$root/allocator-path"
     touch "$root/ready"
-    while :; do sleep 1; done
+    while :; do :; done
 }
 install_runtime_traps
 initialize_runtime
@@ -221,14 +303,15 @@ run_runtime_allocator_signal_case() {
     pid=$!
     for _ in $(seq 1 200); do [[ -e "$root/ready" ]] && break; sleep 0.05; done
     [[ -e "$root/ready" ]] || { cat "$root/output.log"; kill "$pid" 2>/dev/null || true; fail "$delivery/$signal_name allocator did not block after mkdir"; }
-    (sleep 15; kill -KILL "$pid" 2>/dev/null || true) & watchdog=$!
+    signal_test_watchdog "$root" "$pid" & watchdog=$!
     if [[ "$delivery" == direct ]]; then
         kill "-$signal_name" "$pid"
     else
         kill "-$signal_name" -- "-$pid"
     fi
     wait "$pid" || rc=$?
-    kill "$watchdog" 2>/dev/null || true; wait "$watchdog" 2>/dev/null || true
+    kill -TERM "$watchdog" 2>/dev/null || true; wait "$watchdog" 2>/dev/null || true
+    [[ ! -e "$root/watchdog-fired" ]] || fail "$delivery/$signal_name allocator watchdog fired"
     assert_eq "$expected_status" "$rc" "$delivery $signal_name during allocator post-mkdir window returns conventional status"
     # allocator helper 与 parent 的 building 清理在高负载下可能晚于主 PID 退出；最多等待 15 秒观察受管 candidate 消失。
     for _ in $(seq 1 300); do
@@ -524,7 +607,7 @@ for password_case in symlink 0644 0660 unreadable empty; do
             unreadable) chmod 0000 "$password_file" ;;
             empty) : > "$password_file" ;;
         esac
-        PASSWORD_METHOD=file; PASSWORD_FILE="$password_file"
+        PASSWORD_METHOD="file"; PASSWORD_FILE="$password_file"
         assert_fail "reject password file $password_case" prepare_password_credentials
         cleanup_runtime
     )
@@ -533,7 +616,7 @@ done
 (
     trap - EXIT HUP INT TERM
     root="$TEST_DIR/password-owner"; mkdir -m 0700 "$root"; make_runtime "$root/runtime"
-    password_file="$root/password"; printf 'secret\n' > "$password_file"; chmod 0600 "$password_file"; PASSWORD_METHOD=file; PASSWORD_FILE="$password_file"
+    password_file="$root/password"; printf 'secret\n' > "$password_file"; chmod 0600 "$password_file"; PASSWORD_METHOD="file"; PASSWORD_FILE="$password_file"
     other_uid=65534; [[ "$other_uid" == "$EUID" ]] && other_uid=1
     stat() {
         local last=${!#}
@@ -550,7 +633,7 @@ done
     root="$TEST_DIR/password-toctou"; mkdir -m 0700 "$root"; make_runtime "$root/runtime"
     password_file="$root/password"; replacement="$root/replacement"
     printf 'verified-password\nsecond\n' > "$password_file"; printf 'replaced-password\n' > "$replacement"; chmod 0600 "$password_file" "$replacement"
-    PASSWORD_METHOD=file; PASSWORD_FILE="$password_file"
+    PASSWORD_METHOD="file"; PASSWORD_FILE="$password_file"
     secure_fd_open_hook() {
         if [[ "$1" == password-file ]]; then
             command mv "$2" "$2.opened"
@@ -570,11 +653,11 @@ done
     trap - EXIT HUP INT TERM
     root="$TEST_DIR/password-methods"; mkdir -m 0700 "$root"; make_runtime "$root/runtime"
     export PUSH_TEST_PASSWORD=env-secret
-    PASSWORD_METHOD=env; PASSWORD_ENV_VAR=PUSH_TEST_PASSWORD
+    PASSWORD_METHOD="env"; PASSWORD_ENV_VAR=PUSH_TEST_PASSWORD
     prepare_password_credentials
     assert_eq env-secret "$SSHPASS" "password env method remains supported"
     unset SSHPASS
-    PASSWORD_METHOD=inline; PASSWORD=inline-secret
+    PASSWORD_METHOD="inline"; PASSWORD=inline-secret
     prepare_password_credentials >/dev/null 2>"$root/inline.log"
     assert_eq inline-secret "$SSHPASS" "password inline method remains supported"
     grep -Fq '不推荐' "$root/inline.log" || fail "inline password warning missing"
@@ -675,7 +758,7 @@ done
     trap - EXIT HUP INT TERM
     root="$TEST_DIR/password-gid"; mkdir -m 0700 "$root"; make_runtime "$root/runtime"
     password_file="$root/password"; printf 'secret\n' > "$password_file"; chmod 0600 "$password_file"
-    PASSWORD_METHOD=file; PASSWORD_FILE="$password_file"
+    PASSWORD_METHOD="file"; PASSWORD_FILE="$password_file"
     other_gid=65534; [[ "$other_gid" == "$(id -g)" ]] && other_gid=1
     stat() {
         local last=${!#}
@@ -829,7 +912,7 @@ EOF
     chmod 0700 "$root/bin"/*
     PATH="$root/bin:$PATH"; export PATH CAPTURE_DIR="$root/capture"
     TMPDIR="$root/runtime"; mkdir -m 0700 "$TMPDIR"
-    AUTH_METHOD=password; PASSWORD_METHOD=env; PASSWORD_ENV_VAR=AUTH_TEST_PASSWORD; export AUTH_TEST_PASSWORD=secret
+    AUTH_METHOD=password; PASSWORD_METHOD="env"; PASSWORD_ENV_VAR=AUTH_TEST_PASSWORD; export AUTH_TEST_PASSWORD=secret
     STRICT_HOST_KEY_CHECKING=yes; USER_KNOWN_HOSTS_FILE="$root/known_hosts"; ALLOW_INSECURE_HOST_KEY_STORAGE=false
     CONNECTION_TIMEOUT=10; TOTAL_TIMEOUT=15; SERVERS=("user@example.com")
     initialize_runtime; prepare_ssh_runtime
@@ -1080,8 +1163,27 @@ wait_for_test_process_start() {
 }
 
 cleanup_auth_signal_case() {
-    local name pid start _
+    local state_file="" saved_temp="$TEMP_DIR" state_status=0 name pid start
     trap - EXIT HUP INT TERM
+    state_file=$(find "${root:-}"/runtime -type f -name 'worker-session.*.state' -print -quit 2>/dev/null || true)
+    if [[ -n "$state_file" ]]; then
+        TEMP_DIR=$(dirname -- "$state_file")
+        if read_worker_session_state "$state_file"; then
+            cleanup_worker_session_state_file "$state_file" "$SESSION_WORKER_PID" "$SESSION_WORKER_START" || state_status=$?
+        else
+            state_status=1
+        fi
+        TEMP_DIR=$saved_temp
+    fi
+    for name in timeout sshpass rsync ssh leaf; do
+        pid=${AUTH_READY_PID[$name]:-}; start=${AUTH_READY_START[$name]:-}
+        [[ -n "$pid" && -n "$start" ]] || continue
+        if fixture_identity_same "$pid" "$start"; then
+            dump_fixture_process "$name" "$pid" "$start"
+            : > "$TEST_DIR/retain-fixture-evidence"
+            printf 'FAIL: auth fixture teardown retained %s (state_status=%s)\n' "$name" "$state_status" >&2
+        fi
+    done
     for name in watchdog main unrelated; do
         case "$name" in
             watchdog) pid=$AUTH_CASE_WATCHDOG_PID; start=$AUTH_CASE_WATCHDOG_START ;;
@@ -1089,33 +1191,7 @@ cleanup_auth_signal_case() {
             unrelated) pid=$AUTH_CASE_UNRELATED_PID; start=$AUTH_CASE_UNRELATED_START ;;
         esac
         [[ -n "$pid" && -n "$start" ]] || continue
-        if process_identity_matches "$pid" "$start" && process_is_running "$pid"; then kill -TERM "$pid" 2>/dev/null || true; fi
-    done
-    for name in "${!AUTH_READY_PID[@]}"; do
-        pid=${AUTH_READY_PID[$name]}; start=${AUTH_READY_START[$name]:-}
-        [[ -n "$start" ]] || continue
-        if process_identity_matches "$pid" "$start" && process_is_running "$pid"; then kill -TERM "$pid" 2>/dev/null || true; fi
-    done
-    for _ in {1..40}; do
-        local active=false
-        for name in watchdog main unrelated; do
-            case "$name" in watchdog) pid=$AUTH_CASE_WATCHDOG_PID; start=$AUTH_CASE_WATCHDOG_START ;; main) pid=$AUTH_CASE_MAIN_PID; start=$AUTH_CASE_MAIN_START ;; unrelated) pid=$AUTH_CASE_UNRELATED_PID; start=$AUTH_CASE_UNRELATED_START ;; esac
-            [[ -n "$pid" && -n "$start" ]] || continue
-            process_identity_matches "$pid" "$start" && process_is_running "$pid" && active=true
-        done
-        [[ "$active" == false ]] && break
-        sleep 0.05
-    done
-    for name in watchdog main unrelated; do
-        case "$name" in watchdog) pid=$AUTH_CASE_WATCHDOG_PID; start=$AUTH_CASE_WATCHDOG_START ;; main) pid=$AUTH_CASE_MAIN_PID; start=$AUTH_CASE_MAIN_START ;; unrelated) pid=$AUTH_CASE_UNRELATED_PID; start=$AUTH_CASE_UNRELATED_START ;; esac
-        [[ -n "$pid" && -n "$start" ]] || continue
-        if process_identity_matches "$pid" "$start" && process_is_running "$pid"; then kill -KILL "$pid" 2>/dev/null || true; fi
-        wait "$pid" 2>/dev/null || true
-    done
-    for name in "${!AUTH_READY_PID[@]}"; do
-        pid=${AUTH_READY_PID[$name]}; start=${AUTH_READY_START[$name]:-}
-        [[ -n "$start" ]] || continue
-        if process_identity_matches "$pid" "$start" && process_is_running "$pid"; then kill -KILL "$pid" 2>/dev/null || true; fi
+        if fixture_identity_same "$pid" "$start"; then kill -TERM "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; fi
     done
 }
 
@@ -1166,6 +1242,8 @@ run_auth_process_tree_signal_case() (
     for name in "${!AUTH_READY_PID[@]}"; do
         child_pid=${AUTH_READY_PID[$name]}; child_start=${AUTH_READY_START[$name]}
         if process_identity_matches "$child_pid" "$child_start" && process_is_running "$child_pid"; then
+            dump_fixture_process "$name" "$child_pid" "$child_start"
+            cat "$root/output.log" >&2 2>/dev/null || true
             fail "$mode/$signal_name run $repeat left $name process"
         fi
     done
@@ -1182,7 +1260,7 @@ run_auth_process_tree_signal_case() (
     trap - EXIT HUP INT TERM
 )
 
-for auth_repeat in 1 2 3; do
+for auth_repeat in $(seq 1 "${PUSH_AUTH_SIGNAL_REPEATS:-3}"); do
     for auth_mode in key password; do
         run_auth_process_tree_signal_case "$auth_repeat" "$auth_mode" HUP 129
         run_auth_process_tree_signal_case "$auth_repeat" "$auth_mode" INT 130
@@ -1295,6 +1373,18 @@ EOF
     SERVERS=(good1 good2 good3 good4)
     run_transfer source destination
     assert_eq 2 "$(<"$root/state/max")" "sliding concurrency respects MAX_PARALLEL while keeping window full"
+    [[ "$BATCH_WORKER_FAILED" == false ]] || fail "sliding batch left lifecycle failure flag"
+    if (( ${#ACTIVE_WORKERS[@]} != 0 || ${#ACTIVE_WORKER_STATE_FILES[@]} != 0 ||
+        ${#ACTIVE_WORKER_STATE_STARTS[@]} != 0 || ${#REGISTERING_WORKERS[@]} != 0 ||
+        ${#WORKER_REGISTRATION_READY_FILES[@]} != 0 || ${#WORKER_REGISTRATION_RELEASE_FILES[@]} != 0 ||
+        ${#WORKER_REGISTRATION_STARTS[@]} != 0 || ${#WORKER_REGISTRATION_STAGE_FILES[@]} != 0 )); then
+        declare -p ACTIVE_WORKERS ACTIVE_WORKER_STATE_FILES ACTIVE_WORKER_STATE_STARTS REGISTERING_WORKERS \
+            WORKER_REGISTRATION_READY_FILES WORKER_REGISTRATION_RELEASE_FILES WORKER_REGISTRATION_STARTS \
+            WORKER_REGISTRATION_STAGE_FILES >&2
+        fail "sliding batch left lifecycle maps"
+    fi
+    runtime_has_published_worker_state && fail "sliding batch left worker-session state"
+    runtime_has_worker_registration_state && fail "sliding batch left registration state"
     : > "$SUCCESS_FILE"; : > "$FAILED_FILE"; : > "$root/state/current"; : > "$root/state/max"
     SERVERS=(good1 bad1 good2)
     assert_fail "partial server failure returns nonzero" run_transfer source destination
@@ -1314,7 +1404,7 @@ EOF
 #!/usr/bin/env bash
 trap '' TERM
 printf '%s\n' "$$" > "$PID_DIR/rsync.pid"
-bash -c 'trap "" TERM; printf "%s\n" "$$" > "$PID_DIR/leaf.pid"; while :; do sleep 1; done' &
+bash -c 'trap "" TERM; printf "%s\n" "$$" > "$PID_DIR/leaf.pid"; while :; do kill -STOP "$$"; done' &
 wait "$!"
 EOF
     chmod 0700 "$root/bin/rsync"
@@ -1341,7 +1431,7 @@ EOF
 #!/usr/bin/env bash
 trap '' TERM
 printf '%s\n' "$$" > "$PID_DIR/ssh.pid"
-bash -c 'trap "" TERM; printf "%s\n" "$$" > "$PID_DIR/leaf.pid"; while :; do sleep 1; done' &
+bash -c 'trap "" TERM; printf "%s\n" "$$" > "$PID_DIR/leaf.pid"; while :; do kill -STOP "$$"; done' &
 wait "$!"
 EOF
     chmod 0700 "$root/bin/ssh"
@@ -1680,94 +1770,220 @@ USER_KNOWN_HOSTS_FILE="$root/ssh/known_hosts"
 ALLOW_INSECURE_HOST_KEY_STORAGE="false"
 EOF
     chmod 0600 "$root/config.conf"
+    cat > "$root/bin/record-process" <<'EOF'
+record_process_identity() {
+    local role="$1" pid="$2" stat_line="" stat_rest="" state ppid pgid sid start comm stage identity pid_stage
+    local -a fields=()
+    for _ in {1..100}; do
+        [[ -r "/proc/$pid/stat" ]] && { IFS= read -r stat_line < "/proc/$pid/stat" || true; }
+        [[ -n "$stat_line" ]] && break
+        sleep 0.005
+    done
+    [[ -n "$stat_line" ]] || exit 92
+    comm=${stat_line#*\(}; comm=${comm%%\) *}; stat_rest=${stat_line##*) }
+    read -r -a fields <<< "$stat_rest"; (( ${#fields[@]} >= 20 )) || exit 92
+    state=${fields[0]}; ppid=${fields[1]}; pgid=${fields[2]}; sid=${fields[3]}; start=${fields[19]}
+    identity="$PID_DIR/$role.identity"; stage="$PID_DIR/.$role.$pid.identity.stage"
+    pid_stage="$PID_DIR/.$role.$pid.pid.stage"
+    (umask 077; set -o noclobber; : > "$stage"; : > "$pid_stage") || exit 93
+    printf 'role=%s\npid=%s\nstart=%s\nppid=%s\npgid=%s\nsid=%s\nstate=%s\ncomm=%s\n' \
+        "$role" "$pid" "$start" "$ppid" "$pgid" "$sid" "$state" "$comm" > "$stage"
+    printf '%s\n' "$pid" > "$pid_stage"
+    chmod 0600 "$stage" "$pid_stage"
+    mv -fT "$stage" "$identity"; mv -fT "$pid_stage" "$PID_DIR/$role.pid"
+}
+EOF
     cat > "$root/bin/timeout" <<'EOF'
 #!/usr/bin/env bash
 trap '' HUP INT TERM
-printf '%s\n' "$$" > "$PID_DIR/timeout.pid"
+source "$RECORD_PROCESS_LIB"
+record_process_identity timeout "$$"
 [[ ${1:-} == --kill-after=* ]] && shift
 shift
-"$@" &
-wait "$!"
+"$@" & child=$!
+wait "$child"
 EOF
     cat > "$root/bin/sshpass" <<'EOF'
 #!/usr/bin/env bash
 trap '' HUP INT TERM
-printf '%s\n' "$$" > "$PID_DIR/sshpass.pid"
+source "$RECORD_PROCESS_LIB"
+record_process_identity sshpass "$$"
 [[ ${1:-} == -e ]] && shift
-"$@" &
-wait "$!"
+"$@" & child=$!
+wait "$child"
 EOF
     cat > "$root/bin/rsync" <<'EOF'
 #!/usr/bin/env bash
 trap '' HUP INT TERM
+source "$RECORD_PROCESS_LIB"
 set -m
-printf '%s\n' "$$" > "$PID_DIR/rsync.pid"
-ssh fake-target &
-wait "$!"
+record_process_identity rsync "$$"
+ssh fake-target & child=$!
+wait "$child"
 EOF
     cat > "$root/bin/ssh" <<'EOF'
 #!/usr/bin/env bash
 trap '' HUP INT TERM
-printf '%s\n' "$$" > "$PID_DIR/ssh.pid"
-sleep 300 &
-printf '%s\n' "$!" > "$PID_DIR/leaf.pid"
-wait "$!"
+source "$RECORD_PROCESS_LIB"
+record_process_identity ssh "$$"
+sleep 300 & child=$!
+record_process_identity leaf "$child"
+wait "$child"
 EOF
     chmod 0700 "$root/bin"/*
 }
 
+wait_for_signal_fixture_readiness() {
+    local root="$1" role identity pid_file metadata owner gid mode trusted_gid state_count=0 state_file=""
+    local first_signature="" second_signature="" saved_temp="$TEMP_DIR"
+    for _ in {1..600}; do
+        state_count=$(find "$root/runtime" -type f -name 'worker-session.*.state' | wc -l)
+        ready=true
+        for role in timeout sshpass rsync ssh leaf; do
+            [[ -f "$root/pids/$role.identity" && -f "$root/pids/$role.pid" ]] || ready=false
+        done
+        [[ "$state_count" == 1 && "$ready" == true ]] && break
+        sleep 0.05
+    done
+    [[ "$state_count" == 1 && "$ready" == true ]] || return 1
+    state_file=$(find "$root/runtime" -type f -name 'worker-session.*.state' -print -quit)
+    TEMP_DIR=$(dirname "$state_file")
+    worker_session_state_file_trusted "$state_file" || { TEMP_DIR=$saved_temp; return 1; }
+    read_worker_session_state "$state_file" || { TEMP_DIR=$saved_temp; return 1; }
+    SIGNAL_STATE_FILE=$state_file
+    SIGNAL_WORKER_PID=$SESSION_WORKER_PID; SIGNAL_WORKER_START=$SESSION_WORKER_START
+    SIGNAL_LEADER_PID=$SESSION_LEADER_PID; SIGNAL_LEADER_START=$SESSION_LEADER_START
+    SIGNAL_MANAGED_PGID=$SESSION_PGID; SIGNAL_MANAGED_SID=$SESSION_SID
+    fixture_identity_same "$SIGNAL_WORKER_PID" "$SIGNAL_WORKER_START" || { TEMP_DIR=$saved_temp; return 1; }
+    fixture_identity_same "$SIGNAL_LEADER_PID" "$SIGNAL_LEADER_START" || { TEMP_DIR=$saved_temp; return 1; }
+    [[ "$FIXTURE_PGID" == "$SIGNAL_MANAGED_PGID" && "$FIXTURE_SID" == "$SIGNAL_MANAGED_SID" ]] || { TEMP_DIR=$saved_temp; return 1; }
+    trusted_gid=$(current_gid) || { TEMP_DIR=$saved_temp; return 1; }
+    for role in timeout sshpass rsync ssh leaf; do
+        identity="$root/pids/$role.identity"; pid_file="$root/pids/$role.pid"
+        read_fixture_identity "$identity" || { TEMP_DIR=$saved_temp; return 1; }
+        metadata=$(stat -Lc '%u:%g:%a' -- "$pid_file") || { TEMP_DIR=$saved_temp; return 1; }
+        IFS=: read -r owner gid mode <<< "$metadata"
+        [[ -f "$pid_file" && ! -L "$pid_file" && "$owner" == "$EUID" && "$gid" == "$trusted_gid" && "$mode" == 600 ]] || { TEMP_DIR=$saved_temp; return 1; }
+        [[ "$(wc -l < "$pid_file")" == 1 && "$(<"$pid_file")" == "$FIXTURE_FILE_PID" ]] || { TEMP_DIR=$saved_temp; return 1; }
+        fixture_identity_same "$FIXTURE_FILE_PID" "$FIXTURE_FILE_START" || { TEMP_DIR=$saved_temp; return 1; }
+        [[ "$FIXTURE_SID" == "$SIGNAL_MANAGED_SID" && "$FIXTURE_FILE_SID" == "$SIGNAL_MANAGED_SID" ]] || { TEMP_DIR=$saved_temp; return 1; }
+        if [[ "$role" == timeout ]]; then
+            [[ "$FIXTURE_FILE_PID" == "$SIGNAL_LEADER_PID" && "$FIXTURE_FILE_START" == "$SIGNAL_LEADER_START" &&
+                "$FIXTURE_FILE_PGID" == "$SIGNAL_MANAGED_PGID" ]] || { TEMP_DIR=$saved_temp; return 1; }
+        fi
+    done
+    first_signature="$(stat -Lc '%d:%i:%u:%g:%a:%s' -- "$state_file")|$(sha256sum "$state_file")|$(cat "$root"/pids/*.identity | sha256sum)"
+    sleep 0.06
+    read_worker_session_state "$state_file" || { TEMP_DIR=$saved_temp; return 1; }
+    second_signature="$(stat -Lc '%d:%i:%u:%g:%a:%s' -- "$state_file")|$(sha256sum "$state_file")|$(cat "$root"/pids/*.identity | sha256sum)"
+    TEMP_DIR=$saved_temp
+    [[ "$first_signature" == "$second_signature" ]]
+}
 
-run_process_tree_signal_case() {
+run_process_tree_signal_case() (
     local signal_name="$1" expected_status="$2"
-    local root="$TEST_DIR/process-$signal_name" main_pid rc=0 watchdog unrelated worker_pid timeout_pid ssh_pid managed_sid timeout_pgid
-    write_signal_fixture "$root"
-    mkdir -m 0700 "$root/pids"
-    sleep 60 & unrelated=$!
+    local root="$TEST_DIR/process-$signal_name" main_pid="" main_start="" rc=0 watchdog="" watchdog_start=""
+    local unrelated="" unrelated_start="" role child_pid child_start timeout_pgid ssh_pgid
+    local -a session_pids=()
+    local -A process_pids=() process_starts=() session_starts=() session_ppids=() session_pgids=() session_states=()
+    cleanup_signal_fixture() {
+        local saved_temp="$TEMP_DIR" state_file="" state_status=0 role pid start
+        trap - EXIT HUP INT TERM
+        state_file=$(find "$root/runtime" -type f -name 'worker-session.*.state' -print -quit 2>/dev/null || true)
+        if [[ -n "$state_file" ]]; then
+            TEMP_DIR=$(dirname -- "$state_file")
+            WORKER_SESSION_STATE_FILE=$state_file
+            if read_worker_session_state "$state_file"; then
+                WORKER_TRANSFER_PID=$SESSION_LEADER_PID
+                WORKER_TRANSFER_START=$SESSION_LEADER_START
+                WORKER_TRANSFER_PGID=$SESSION_PGID
+                WORKER_TRANSFER_SID=$SESSION_SID
+                cleanup_worker_session_state_file "$state_file" "$SESSION_WORKER_PID" "$SESSION_WORKER_START" || state_status=$?
+            else
+                state_status=1
+            fi
+            TEMP_DIR=$saved_temp
+        fi
+        # Managed teardown must never KILL parent before child/reap proof.
+        for role in timeout sshpass rsync ssh leaf worker; do
+            pid=${process_pids[$role]:-}; start=${process_starts[$role]:-}
+            [[ -n "$pid" && -n "$start" ]] || continue
+            if fixture_identity_same "$pid" "$start"; then
+                dump_fixture_process "$role" "$pid" "$start"
+                : > "$TEST_DIR/retain-fixture-evidence"
+                printf 'FAIL: managed fixture teardown retained %s (state_status=%s)\n' "$role" "$state_status" >&2
+            fi
+        done
+        if [[ -n "$watchdog" && -n "$watchdog_start" ]] && fixture_identity_same "$watchdog" "$watchdog_start"; then
+            kill -TERM "$watchdog" 2>/dev/null || true; wait "$watchdog" 2>/dev/null || true
+        fi
+        if [[ -n "$unrelated" && -n "$unrelated_start" ]] && fixture_identity_same "$unrelated" "$unrelated_start"; then
+            kill -TERM "$unrelated" 2>/dev/null || true; wait "$unrelated" 2>/dev/null || true
+        fi
+    }
+    trap cleanup_signal_fixture EXIT
+    write_signal_fixture "$root"; mkdir -m 0700 "$root/pids"
+    sleep 60 & unrelated=$!; unrelated_start=$(wait_fixture_start "$unrelated")
     (
         cd "$root"
         exec env --default-signal=HUP,INT,TERM PATH="$root/bin:$PATH" TMPDIR="$root/runtime" PID_DIR="$root/pids" \
-            "$SCRIPT" "$root/source" '/remote/path'
+            RECORD_PROCESS_LIB="$root/bin/record-process" "$SCRIPT" "$root/source" '/remote/path'
     ) > "$root/output.log" 2>&1 &
-    main_pid=$!
-    for _ in $(seq 1 300); do
-        [[ -f "$root/pids/timeout.pid" && -f "$root/pids/sshpass.pid" && -f "$root/pids/rsync.pid" && -f "$root/pids/ssh.pid" && -f "$root/pids/leaf.pid" ]] && break
-        sleep 0.05
+    main_pid=$!; main_start=$(wait_fixture_start "$main_pid")
+    if ! wait_for_signal_fixture_readiness "$root"; then
+        cat "$root/output.log" >&2 || true
+        fail "$signal_name process tree did not reach authoritative session readiness"
+    fi
+    process_pids[worker]=$SIGNAL_WORKER_PID; process_starts[worker]=$SIGNAL_WORKER_START
+    for role in timeout sshpass rsync ssh leaf; do
+        read_fixture_identity "$root/pids/$role.identity" || fail "$signal_name cannot read $role identity"
+        process_pids[$role]=$FIXTURE_FILE_PID; process_starts[$role]=$FIXTURE_FILE_START
+        [[ "$role" == timeout ]] && timeout_pgid=$FIXTURE_FILE_PGID
+        [[ "$role" == ssh ]] && ssh_pgid=$FIXTURE_FILE_PGID
     done
-    [[ -f "$root/pids/leaf.pid" ]] || { cat "$root/output.log"; kill "$main_pid" "$unrelated" 2>/dev/null || true; fail "$signal_name process tree did not start"; }
-    timeout_pid=$(<"$root/pids/timeout.pid")
-    ssh_pid=$(<"$root/pids/ssh.pid")
-    read_process_record "$timeout_pid" || fail "$signal_name cannot parse timeout proc stat"
-    managed_sid="$PROC_SID"; timeout_pgid="$PROC_PGID"
-    read_process_record "$ssh_pid" || fail "$signal_name cannot parse ssh proc stat"
-    assert_eq "$managed_sid" "$PROC_SID" "$signal_name extra SSH PGID remains in managed SID"
-    [[ "$timeout_pgid" != "$PROC_PGID" ]] || fail "$signal_name fixture did not create a second PGID"
+    assert_eq "$SIGNAL_MANAGED_SID" "$(read_fixture_identity "$root/pids/ssh.identity"; printf '%s' "$FIXTURE_FILE_SID")" "$signal_name SSH remains in managed SID"
+    [[ "$timeout_pgid" != "$ssh_pgid" ]] || fail "$signal_name fixture did not create a second PGID"
     pass "$signal_name cleanup fixture contains multiple PGIDs in one SID"
-    worker_pid=$(awk '{print $4}' "/proc/$timeout_pid/stat")
-    (sleep 15; kill -KILL "$main_pid" 2>/dev/null || true) & watchdog=$!
+
+    signal_test_watchdog "$root" "$main_pid" & watchdog=$!; watchdog_start=$(wait_fixture_start "$watchdog")
+    printf 'signal-sent %s main=%s:%s worker=%s:%s sid=%s\n' "$(date +%s%N)" "$main_pid" "$main_start" \
+        "$SIGNAL_WORKER_PID" "$SIGNAL_WORKER_START" "$SIGNAL_MANAGED_SID" > "$root/exit-order.log"
     kill "-$signal_name" "$main_pid"
     wait "$main_pid" || rc=$?
-    kill "$watchdog" 2>/dev/null || true; wait "$watchdog" 2>/dev/null || true
+    printf 'main-reaped %s status=%s\n' "$(date +%s%N)" "$rc" >> "$root/exit-order.log"
+    kill -TERM "$watchdog" 2>/dev/null || true; wait "$watchdog" 2>/dev/null || true
+    [[ ! -e "$root/watchdog-fired" ]] || fail "$signal_name watchdog fired"
+    fixture_identity_same "$watchdog" "$watchdog_start" && fail "$signal_name watchdog identity remains"
     assert_eq "$expected_status" "$rc" "$signal_name returns conventional push signal status"
-    for pid_file in timeout sshpass rsync ssh leaf; do
-        child_pid=$(<"$root/pids/$pid_file.pid")
-        for _ in $(seq 1 100); do
-            process_is_running "$child_pid" || break
-            sleep 0.05
-        done
-        process_is_running "$child_pid" && fail "$signal_name left $pid_file process $child_pid"
+
+    for role in timeout sshpass rsync ssh leaf worker; do
+        child_pid=${process_pids[$role]}; child_start=${process_starts[$role]}
+        if ! wait_fixture_identity_gone "$child_pid" "$child_start"; then
+            dump_fixture_process "$role" "$child_pid" "$child_start"
+            cat "$root/exit-order.log" >&2 || true; cat "$root/output.log" >&2 || true
+            fail "$signal_name left original $role identity $child_pid/$child_start"
+        fi
+        if fixture_current_identity "$child_pid"; then
+            printf 'pid-reuse %s role=%s pid=%s expected=%s actual=%s state=%s\n' "$(date +%s%N)" "$role" "$child_pid" "$child_start" "$FIXTURE_START" "$FIXTURE_STATE" >> "$root/exit-order.log"
+        else
+            printf 'identity-gone %s role=%s pid=%s start=%s\n' "$(date +%s%N)" "$role" "$child_pid" "$child_start" >> "$root/exit-order.log"
+        fi
     done
-    process_is_running "$worker_pid" && fail "$signal_name left worker process $worker_pid"
-    pass "$signal_name terminates worker, timeout, sshpass, rsync, ssh, and leaf processes"
+    collect_owned_session_records "$SIGNAL_MANAGED_SID" session_pids session_starts session_ppids session_pgids session_states || fail "$signal_name cannot verify managed SID"
+    (( ${#session_pids[@]} == 0 )) || { printf 'remaining SID members: %s\n' "${session_pids[*]}" >&2; fail "$signal_name left managed SID member"; }
+    pass "$signal_name terminates and reaps worker, timeout, sshpass, rsync, ssh, and leaf identities"
     [[ -z "$(find "$root/runtime" -mindepth 1 -maxdepth 1 -name 'push-runtime.*' -print -quit)" ]] || fail "$signal_name left runtime directory"
     pass "$signal_name removes runtime directory"
     [[ -f "$root/config.conf" && -f "$root/ssh/known_hosts" ]] || fail "$signal_name deleted config or known_hosts"
     pass "$signal_name preserves config and known_hosts"
-    kill -0 "$unrelated" 2>/dev/null || fail "$signal_name terminated unrelated process"
-    pass "$signal_name preserves unrelated process"
-    kill "$unrelated" 2>/dev/null || true; wait "$unrelated" 2>/dev/null || true
+    fixture_identity_same "$unrelated" "$unrelated_start" || fail "$signal_name terminated or replaced unrelated process"
+    pass "$signal_name preserves unrelated process identity"
+    kill -TERM "$unrelated"; wait "$unrelated" 2>/dev/null || true; unrelated=""; unrelated_start=""
     [[ -z "${SSHPASS:-}" ]] || fail "$signal_name leaked SSHPASS to parent test shell"
     pass "$signal_name leaves no observable SSHPASS in subsequent test process"
-}
+    main_pid=""; main_start=""; watchdog=""; watchdog_start=""
+    trap - EXIT
+)
 
 run_process_tree_signal_case HUP 129
 run_process_tree_signal_case INT 130
@@ -1794,15 +2010,18 @@ chmod 0700 "$TEST_DIR/worker-grace-child.sh"
     (
         cd "$root"
         exec env --default-signal=HUP,INT,TERM PATH="$root/bin:$PATH" TMPDIR="$root/runtime" PID_DIR="$root/pids" \
-            WORKER_GRACE_MARKER="$marker" bash "$TEST_DIR/worker-grace-child.sh" "$SCRIPT" "$root/source" /remote/path
+            RECORD_PROCESS_LIB="$root/bin/record-process" WORKER_GRACE_MARKER="$marker" bash "$TEST_DIR/worker-grace-child.sh" "$SCRIPT" "$root/source" /remote/path
     ) > "$root/output.log" 2>&1 &
     pid=$!
-    for _ in $(seq 1 300); do [[ -f "$root/pids/leaf.pid" ]] && break; sleep 0.05; done
-    [[ -f "$root/pids/leaf.pid" ]] || { cat "$root/output.log"; kill "$pid" 2>/dev/null || true; fail "worker grace fixture did not start"; }
+    if ! wait_for_signal_fixture_readiness "$root"; then
+        cat "$root/output.log" >&2 || true
+        kill "$pid" 2>/dev/null || true
+        fail "worker grace fixture did not reach authoritative session readiness"
+    fi
     kill -TERM "$pid"
     wait "$pid" || rc=$?
     assert_eq 143 "$rc" "main preserves TERM status while waiting for worker cleanup"
-    [[ -e "$marker" ]] || fail "main killed worker before managed-session cleanup hook"
+    [[ -e "$marker" ]] || { cat "$root/output.log" >&2 || true; fail "main killed worker before managed-session cleanup hook"; }
     pass "main TERM grace exceeds worker TERM/KILL/final-verification duration"
 )
 
