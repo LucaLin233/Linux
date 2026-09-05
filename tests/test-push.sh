@@ -7,7 +7,7 @@ readonly ROOT_DIR
 readonly SCRIPT="$ROOT_DIR/tools/push.sh"
 TEST_DIR=$(mktemp -d)
 readonly TEST_DIR
-trap 'rm -rf "$TEST_DIR"' EXIT
+trap '[[ -e "$TEST_DIR/retain-fixture-evidence" ]] || rm -rf "$TEST_DIR"' EXIT
 
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 pass() { printf 'PASS: %s\n' "$*"; }
@@ -1163,8 +1163,27 @@ wait_for_test_process_start() {
 }
 
 cleanup_auth_signal_case() {
-    local name pid start _
+    local state_file="" saved_temp="$TEMP_DIR" state_status=0 name pid start
     trap - EXIT HUP INT TERM
+    state_file=$(find "${root:-}"/runtime -type f -name 'worker-session.*.state' -print -quit 2>/dev/null || true)
+    if [[ -n "$state_file" ]]; then
+        TEMP_DIR=$(dirname -- "$state_file")
+        if read_worker_session_state "$state_file"; then
+            cleanup_worker_session_state_file "$state_file" "$SESSION_WORKER_PID" "$SESSION_WORKER_START" || state_status=$?
+        else
+            state_status=1
+        fi
+        TEMP_DIR=$saved_temp
+    fi
+    for name in timeout sshpass rsync ssh leaf; do
+        pid=${AUTH_READY_PID[$name]:-}; start=${AUTH_READY_START[$name]:-}
+        [[ -n "$pid" && -n "$start" ]] || continue
+        if fixture_identity_same "$pid" "$start"; then
+            dump_fixture_process "$name" "$pid" "$start"
+            : > "$TEST_DIR/retain-fixture-evidence"
+            printf 'FAIL: auth fixture teardown retained %s (state_status=%s)\n' "$name" "$state_status" >&2
+        fi
+    done
     for name in watchdog main unrelated; do
         case "$name" in
             watchdog) pid=$AUTH_CASE_WATCHDOG_PID; start=$AUTH_CASE_WATCHDOG_START ;;
@@ -1172,33 +1191,7 @@ cleanup_auth_signal_case() {
             unrelated) pid=$AUTH_CASE_UNRELATED_PID; start=$AUTH_CASE_UNRELATED_START ;;
         esac
         [[ -n "$pid" && -n "$start" ]] || continue
-        if process_identity_matches "$pid" "$start" && process_is_running "$pid"; then kill -TERM "$pid" 2>/dev/null || true; fi
-    done
-    for name in "${!AUTH_READY_PID[@]}"; do
-        pid=${AUTH_READY_PID[$name]}; start=${AUTH_READY_START[$name]:-}
-        [[ -n "$start" ]] || continue
-        if process_identity_matches "$pid" "$start" && process_is_running "$pid"; then kill -TERM "$pid" 2>/dev/null || true; fi
-    done
-    for _ in {1..40}; do
-        local active=false
-        for name in watchdog main unrelated; do
-            case "$name" in watchdog) pid=$AUTH_CASE_WATCHDOG_PID; start=$AUTH_CASE_WATCHDOG_START ;; main) pid=$AUTH_CASE_MAIN_PID; start=$AUTH_CASE_MAIN_START ;; unrelated) pid=$AUTH_CASE_UNRELATED_PID; start=$AUTH_CASE_UNRELATED_START ;; esac
-            [[ -n "$pid" && -n "$start" ]] || continue
-            process_identity_matches "$pid" "$start" && process_is_running "$pid" && active=true
-        done
-        [[ "$active" == false ]] && break
-        sleep 0.05
-    done
-    for name in watchdog main unrelated; do
-        case "$name" in watchdog) pid=$AUTH_CASE_WATCHDOG_PID; start=$AUTH_CASE_WATCHDOG_START ;; main) pid=$AUTH_CASE_MAIN_PID; start=$AUTH_CASE_MAIN_START ;; unrelated) pid=$AUTH_CASE_UNRELATED_PID; start=$AUTH_CASE_UNRELATED_START ;; esac
-        [[ -n "$pid" && -n "$start" ]] || continue
-        if process_identity_matches "$pid" "$start" && process_is_running "$pid"; then kill -KILL "$pid" 2>/dev/null || true; fi
-        wait "$pid" 2>/dev/null || true
-    done
-    for name in "${!AUTH_READY_PID[@]}"; do
-        pid=${AUTH_READY_PID[$name]}; start=${AUTH_READY_START[$name]:-}
-        [[ -n "$start" ]] || continue
-        if process_identity_matches "$pid" "$start" && process_is_running "$pid"; then kill -KILL "$pid" 2>/dev/null || true; fi
+        if fixture_identity_same "$pid" "$start"; then kill -TERM "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; fi
     done
 }
 
@@ -1267,7 +1260,7 @@ run_auth_process_tree_signal_case() (
     trap - EXIT HUP INT TERM
 )
 
-for auth_repeat in 1 2 3; do
+for auth_repeat in $(seq 1 "${PUSH_AUTH_SIGNAL_REPEATS:-3}"); do
     for auth_mode in key password; do
         run_auth_process_tree_signal_case "$auth_repeat" "$auth_mode" HUP 129
         run_auth_process_tree_signal_case "$auth_repeat" "$auth_mode" INT 130
@@ -1894,18 +1887,39 @@ run_process_tree_signal_case() (
     local -a session_pids=()
     local -A process_pids=() process_starts=() session_starts=() session_ppids=() session_pgids=() session_states=()
     cleanup_signal_fixture() {
-        local cleanup_role cleanup_pid cleanup_start
-        for cleanup_role in worker timeout sshpass rsync ssh leaf; do
-            cleanup_pid=${process_pids[$cleanup_role]:-}; cleanup_start=${process_starts[$cleanup_role]:-}
-            [[ -n "$cleanup_pid" && -n "$cleanup_start" ]] || continue
-            fixture_identity_same "$cleanup_pid" "$cleanup_start" && kill -KILL "$cleanup_pid" 2>/dev/null || true
+        local saved_temp="$TEMP_DIR" state_file="" state_status=0 role pid start
+        trap - EXIT HUP INT TERM
+        state_file=$(find "$root/runtime" -type f -name 'worker-session.*.state' -print -quit 2>/dev/null || true)
+        if [[ -n "$state_file" ]]; then
+            TEMP_DIR=$(dirname -- "$state_file")
+            WORKER_SESSION_STATE_FILE=$state_file
+            if read_worker_session_state "$state_file"; then
+                WORKER_TRANSFER_PID=$SESSION_LEADER_PID
+                WORKER_TRANSFER_START=$SESSION_LEADER_START
+                WORKER_TRANSFER_PGID=$SESSION_PGID
+                WORKER_TRANSFER_SID=$SESSION_SID
+                cleanup_worker_session_state_file "$state_file" "$SESSION_WORKER_PID" "$SESSION_WORKER_START" || state_status=$?
+            else
+                state_status=1
+            fi
+            TEMP_DIR=$saved_temp
+        fi
+        # Managed teardown must never KILL parent before child/reap proof.
+        for role in timeout sshpass rsync ssh leaf worker; do
+            pid=${process_pids[$role]:-}; start=${process_starts[$role]:-}
+            [[ -n "$pid" && -n "$start" ]] || continue
+            if fixture_identity_same "$pid" "$start"; then
+                dump_fixture_process "$role" "$pid" "$start"
+                : > "$TEST_DIR/retain-fixture-evidence"
+                printf 'FAIL: managed fixture teardown retained %s (state_status=%s)\n' "$role" "$state_status" >&2
+            fi
         done
-        [[ -z "$main_pid" || -z "$main_start" ]] || { fixture_identity_same "$main_pid" "$main_start" && kill -KILL "$main_pid" 2>/dev/null || true; }
-        [[ -z "$watchdog" || -z "$watchdog_start" ]] || { fixture_identity_same "$watchdog" "$watchdog_start" && kill -TERM "$watchdog" 2>/dev/null || true; }
-        [[ -z "$unrelated" || -z "$unrelated_start" ]] || { fixture_identity_same "$unrelated" "$unrelated_start" && kill -TERM "$unrelated" 2>/dev/null || true; }
-        [[ -z "$main_pid" ]] || wait "$main_pid" 2>/dev/null || true
-        [[ -z "$watchdog" ]] || wait "$watchdog" 2>/dev/null || true
-        [[ -z "$unrelated" ]] || wait "$unrelated" 2>/dev/null || true
+        if [[ -n "$watchdog" && -n "$watchdog_start" ]] && fixture_identity_same "$watchdog" "$watchdog_start"; then
+            kill -TERM "$watchdog" 2>/dev/null || true; wait "$watchdog" 2>/dev/null || true
+        fi
+        if [[ -n "$unrelated" && -n "$unrelated_start" ]] && fixture_identity_same "$unrelated" "$unrelated_start"; then
+            kill -TERM "$unrelated" 2>/dev/null || true; wait "$unrelated" 2>/dev/null || true
+        fi
     }
     trap cleanup_signal_fixture EXIT
     write_signal_fixture "$root"; mkdir -m 0700 "$root/pids"

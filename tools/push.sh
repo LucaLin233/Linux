@@ -100,6 +100,12 @@ WORKER_REGISTRATION_PENDING_STATUS=0
 BATCH_WORKER_FAILED=false
 BATCH_WORKER_ERROR=false
 MANAGED_CLEANUP_FAILURE_STATUS=125
+MANAGED_SESSION_CLEANUP_KEY=""
+MANAGED_SESSION_CLEANUP_DEADLINE=0
+MANAGED_SESSION_CLEANUP_TICKS=1200
+CLEANUP_NOW=0
+declare -A MANAGED_SESSION_TERM_SENT_AT=()
+declare -A MANAGED_SESSION_SEEN_STARTS=()
 MANAGED_PROCESS_REUSED_STATUS=3
 MANAGED_LEADER_STILL_LIVE_STATUS=4
 MANAGED_LEADER_REAP_PENDING_STATUS=5
@@ -1424,7 +1430,7 @@ terminate_active_workers() {
     # Give a worker that published cleanup_failed time to remain the direct
     # parent while the coordinator terminates its managed session.  The worker
     # then reaps the leader; the state file is removed only after that proof.
-    for _ in {1..100}; do
+    for _ in {1..180}; do
         cleanup_active_failed_worker_sessions || cleanup_failed=true
         prune_active_workers exiting || cleanup_failed=true
         cleanup_active_failed_worker_sessions || cleanup_failed=true
@@ -1594,6 +1600,7 @@ clear_runtime_lifecycle_state() {
     WORKER_SESSION_FD_SIZE=""
     SESSION_FILE_DEV=""
     SESSION_FILE_INODE=""
+    clear_managed_session_cleanup_tracking
 }
 
 cleanup_runtime() {
@@ -2276,82 +2283,120 @@ session_process_identity_matches() {
     [[ "$PROC_UID" == "$EUID" && "$PROC_START" == "$expected_start" && "$PROC_SID" == "$expected_sid" ]]
 }
 
+cleanup_clock() {
+    local uptime whole fraction
+    uptime=$(< /proc/uptime) || return 1
+    whole=${uptime%% *}; fraction=${whole#*.}; whole=${whole%%.*}; fraction="${fraction}00"
+    [[ "$whole" =~ ^[0-9]+$ && "${fraction:0:2}" =~ ^[0-9]+$ ]] || return 1
+    CLEANUP_NOW=$((10#$whole * 100 + 10#${fraction:0:2}))
+}
+
+# 0=gone/PID reuse, 1=orphan or untrusted parent, 2=identity unreadable,
+# 3=pending: same identity remains and caller must rescan the whole tree.
 wait_for_session_process_reap() {
-    local pid="$1" expected_start="$2" expected_sid="$3" _
-    for _ in {1..30}; do
-        session_process_identity_matches "$pid" "$expected_start" "$expected_sid" || return 0
-        sleep 0.01
-    done
-    return 1
+    local pid="$1" expected_start="$2" expected_sid="$3"
+    local expected_parent="${4:-}" expected_parent_start="${5:-}" record_status=0
+    local state parent
+    read_process_record_for_session_scan "$pid" || record_status=$?
+    (( record_status == 2 )) && return 0
+    (( record_status == 0 )) || return 2
+    [[ "$PROC_START" == "$expected_start" ]] || return 0
+    [[ "$PROC_UID" == "$EUID" && "$PROC_SID" == "$expected_sid" ]] || return 2
+    state=$PROC_STATE; parent=$PROC_PPID
+    [[ "$state" == Z ]] || return 3
+    [[ "$parent" != 1 && "$parent" == "$expected_parent" && -n "$expected_parent_start" ]] || return 1
+    read_process_record_for_session_scan "$parent" || return 2
+    [[ "$PROC_UID" == "$EUID" && "$PROC_START" == "$expected_parent_start" &&
+        "$PROC_SID" == "$expected_sid" && "$PROC_STATE" != Z ]] || return 1
+    return 3
+}
+
+clear_managed_session_cleanup_tracking() {
+    MANAGED_SESSION_CLEANUP_KEY=""
+    MANAGED_SESSION_CLEANUP_DEADLINE=0
+    MANAGED_SESSION_TERM_SENT_AT=()
+    MANAGED_SESSION_SEEN_STARTS=()
 }
 
 terminate_owned_session_leaf_first() {
     local expected_sid="$1" leader_pid="$2" leader_start="$3" allow_leader_zombie="$4"
-    local cleanup_pass pid parent pgid state total leaves_for_group
+    local pid parent key status term_at
     local -a pids=() leaves=()
-    local -A starts=() ppids=() pgids=() states=() has_child=() group_total=() group_leaves=() group_signaled=()
+    local -A starts=() ppids=() pgids=() states=() has_child=()
 
-    for ((cleanup_pass=1; cleanup_pass<=16; cleanup_pass++)); do
+    cleanup_clock || return 1
+    [[ "$MANAGED_SESSION_CLEANUP_DEADLINE" =~ ^[0-9]+$ ]] || return 1
+    (( MANAGED_SESSION_CLEANUP_DEADLINE > CLEANUP_NOW )) || return 1
+    while :; do
+        cleanup_clock || return 1
+        (( CLEANUP_NOW < MANAGED_SESSION_CLEANUP_DEADLINE )) || {
+            echo -e "${RED}${ICON_ERROR} 受管 SID $expected_sid cleanup deadline 到达，保留生命周期证据${NC}" >&2
+            return 1
+        }
         collect_owned_session_records "$expected_sid" pids starts ppids pgids states || return 1
         (( ${#pids[@]} > 0 )) || return 0
-        if (( ${#pids[@]} == 1 )) && [[ "$allow_leader_zombie" == true &&
-            "${pids[0]}" == "$leader_pid" && "${starts[$leader_pid]}" == "$leader_start" &&
-            "${states[$leader_pid]}" == Z ]]; then
-            return 0
-        fi
-        has_child=(); group_total=(); group_leaves=(); group_signaled=(); leaves=()
+
+        has_child=(); leaves=()
         for pid in "${pids[@]}"; do
+            key="$expected_sid:$pid"
+            if [[ -n "${MANAGED_SESSION_SEEN_STARTS[$key]:-}" &&
+                "${MANAGED_SESSION_SEEN_STARTS[$key]}" != "${starts[$pid]}" ]]; then
+                echo -e "${RED}${ICON_ERROR} 受管 SID $expected_sid 出现 PID reuse: $pid${NC}" >&2
+                return 1
+            fi
+            MANAGED_SESSION_SEEN_STARTS[$key]=${starts[$pid]}
             parent=${ppids[$pid]}
             [[ -z "${starts[$parent]:-}" ]] || has_child[$parent]=1
-            pgid=${pgids[$pid]}; group_total[$pgid]=$(( ${group_total[$pgid]:-0} + 1 ))
         done
         for pid in "${pids[@]}"; do
-            [[ -z "${has_child[$pid]:-}" ]] || continue
-            leaves+=("$pid"); pgid=${pgids[$pid]}; group_leaves[$pgid]=$(( ${group_leaves[$pgid]:-0} + 1 ))
+            [[ -z "${has_child[$pid]:-}" ]] && leaves+=("$pid")
         done
         (( ${#leaves[@]} > 0 )) || return 1
 
         for pid in "${leaves[@]}"; do
-            session_process_identity_matches "$pid" "${starts[$pid]}" "$expected_sid" || continue
-            [[ "$PROC_STATE" == Z ]] && continue
-            pgid=${pgids[$pid]}; total=${group_total[$pgid]}; leaves_for_group=${group_leaves[$pgid]}
-            if (( total == leaves_for_group )) && [[ -z "${group_signaled[$pgid]:-}" ]]; then
-                kill -CONT -- "-$pgid" 2>/dev/null || true
-                kill -TERM -- "-$pgid" 2>/dev/null || true
-                group_signaled[$pgid]=1
-            elif (( total != leaves_for_group )); then
+            parent=${ppids[$pid]}
+            if [[ "$pid" == "$leader_pid" && "${starts[$pid]}" == "$leader_start" &&
+                "${states[$pid]}" == Z && "$allow_leader_zombie" == true ]]; then
+                [[ "$parent" != 1 ]] || return 1
+                read_process_record_for_session_scan "$parent" || return 1
+                [[ "$PROC_UID" == "$EUID" && "$PROC_STATE" != Z ]] || return 1
+                (( ${#pids[@]} == 1 )) || return 1
+                return 0
+            fi
+
+            status=0
+            if [[ "$pid" == "$leader_pid" && "${starts[$pid]}" == "$leader_start" &&
+                "${states[$pid]}" != Z ]]; then
+                # Leader parent is worker, outside managed SID. It is still a
+                # valid leaf and must be signalled; direct reap proves parent.
+                status=3
+            else
+                wait_for_session_process_reap "$pid" "${starts[$pid]}" "$expected_sid" \
+                    "$parent" "${starts[$parent]:-}" || status=$?
+            fi
+            case "$status" in
+                0) continue ;;
+                1|2)
+                    echo -e "${RED}${ICON_ERROR} 受管 SID $expected_sid leaf 身份/父级不可信: $pid${NC}" >&2
+                    return 1
+                    ;;
+                3) [[ "${states[$pid]}" != Z ]] || continue ;;
+                *) return 1 ;;
+            esac
+
+            cleanup_clock || return 1
+            key="$expected_sid:$pid:${starts[$pid]}"
+            term_at=${MANAGED_SESSION_TERM_SENT_AT[$key]:-}
+            if [[ -z "$term_at" ]]; then
+                MANAGED_SESSION_TERM_SENT_AT[$key]=$((CLEANUP_NOW + 200))
                 kill -CONT "$pid" 2>/dev/null || true
                 kill -TERM "$pid" 2>/dev/null || true
-            fi
-        done
-        if (( cleanup_pass == 1 )); then sleep 2; else sleep 0.2; fi
-
-        for pid in "${leaves[@]}"; do
-            session_process_identity_matches "$pid" "${starts[$pid]}" "$expected_sid" || continue
-            state=$PROC_STATE
-            if [[ "$state" != Z ]]; then
+            elif (( CLEANUP_NOW >= term_at )); then
                 kill -CONT "$pid" 2>/dev/null || true
                 kill -KILL "$pid" 2>/dev/null || true
             fi
-            if ! wait_for_session_process_reap "$pid" "${starts[$pid]}" "$expected_sid"; then
-                if session_process_identity_matches "$pid" "${starts[$pid]}" "$expected_sid" &&
-                    [[ "$allow_leader_zombie" == true && "$pid" == "$leader_pid" && "$PROC_STATE" == Z ]]; then
-                    continue
-                fi
-                echo -e "${RED}${ICON_ERROR} 受管 SID $expected_sid 无法确认叶进程已回收: $pid/${PROC_STATE:-unknown}${NC}" >&2
-                return 1
-            fi
         done
-    done
-
-    collect_owned_session_records "$expected_sid" pids starts ppids pgids states || return 1
-    for pid in "${pids[@]}"; do
-        if [[ "$allow_leader_zombie" == true && "$pid" == "$leader_pid" &&
-            "${starts[$pid]}" == "$leader_start" && "${states[$pid]}" == Z ]]; then
-            continue
-        fi
-        echo -e "${RED}${ICON_ERROR} 受管 SID $expected_sid 清理后仍有 PID: $pid/${states[$pid]}${NC}" >&2
-        return 1
+        sleep 0.02
     done
 }
 
@@ -2468,13 +2513,23 @@ reap_direct_managed_leader() {
 
 terminate_managed_session() {
     local leader_pid="$1" leader_start="$2" expected_pgid="$3" expected_sid="$4"
-    local allow_leader_zombie="${5:-false}" current_sid="" leader_status=0
+    local allow_leader_zombie="${5:-false}" current_sid="" leader_status=0 key=""
 
     [[ "$leader_pid" =~ ^[1-9][0-9]*$ && "$leader_start" =~ ^[1-9][0-9]*$ &&
         "$expected_pgid" =~ ^[1-9][0-9]*$ && "$expected_sid" =~ ^[1-9][0-9]*$ ]] || return 1
     read_process_record "$BASHPID" || return 1
     current_sid=$PROC_SID
     [[ "$expected_sid" != "$current_sid" ]] || return 1
+    key="$expected_sid:$leader_start"
+    cleanup_clock || return 1
+    if [[ "$MANAGED_SESSION_CLEANUP_KEY" != "$key" ]]; then
+        MANAGED_SESSION_CLEANUP_KEY=$key
+        [[ "$MANAGED_SESSION_CLEANUP_TICKS" =~ ^[1-9][0-9]*$ ]] || return 1
+        MANAGED_SESSION_CLEANUP_DEADLINE=$((CLEANUP_NOW + MANAGED_SESSION_CLEANUP_TICKS))
+        MANAGED_SESSION_TERM_SENT_AT=()
+        MANAGED_SESSION_SEEN_STARTS=()
+    fi
+    (( CLEANUP_NOW < MANAGED_SESSION_CLEANUP_DEADLINE )) || return 1
     managed_leader_identity_trusted "$leader_pid" "$leader_start" "$expected_pgid" "$expected_sid" || leader_status=$?
     if (( leader_status == MANAGED_PROCESS_REUSED_STATUS )); then return 0; fi
     if (( leader_status != 0 )); then
@@ -2512,18 +2567,24 @@ publish_worker_cleanup_failure_state() {
 }
 
 wait_for_parent_worker_reap() {
-    local attempt reap_status=0
+    local reap_status=0
     worker_transfer_identity_complete || return 1
-    for attempt in {1..240}; do
+    cleanup_clock || return 1
+    if ! [[ "$MANAGED_SESSION_CLEANUP_DEADLINE" =~ ^[1-9][0-9]*$ ]]; then
+        [[ "$MANAGED_SESSION_CLEANUP_TICKS" =~ ^[1-9][0-9]*$ ]] || return 1
+        MANAGED_SESSION_CLEANUP_DEADLINE=$((CLEANUP_NOW + MANAGED_SESSION_CLEANUP_TICKS))
+    fi
+    while :; do
+        cleanup_clock || return 1
+        (( CLEANUP_NOW < MANAGED_SESSION_CLEANUP_DEADLINE )) || return 1
         reap_status=0
         reap_direct_managed_leader "$WORKER_TRANSFER_PID" "$WORKER_TRANSFER_START" \
             "$WORKER_TRANSFER_PGID" "$WORKER_TRANSFER_SID" || reap_status=$?
         case "$reap_status" in
             0|"$MANAGED_PROCESS_REUSED_STATUS") return 0 ;;
-            *) sleep 0.05 ;;
+            *) sleep 0.02 ;;
         esac
     done
-    return 1
 }
 
 terminate_worker_transfer() {
@@ -2572,6 +2633,7 @@ terminate_worker_transfer() {
     WORKER_TRANSFER_START=""
     WORKER_TRANSFER_CLEANUP_FAILED=false
     WORKER_SESSION_STATE_FILE=""
+    clear_managed_session_cleanup_tracking
     return 0
 }
 

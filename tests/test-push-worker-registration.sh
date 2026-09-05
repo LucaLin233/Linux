@@ -103,6 +103,103 @@ assert_no_registration_residue() {
     (( ${#REGISTERING_WORKERS[@]} == 0 && ${#ACTIVE_WORKERS[@]} == 0 )) || fail "worker arrays remain"
     (( ${#WORKER_REGISTRATION_READY_FILES[@]} == 0 && ${#WORKER_REGISTRATION_RELEASE_FILES[@]} == 0 && ${#WORKER_REGISTRATION_STARTS[@]} == 0 && ${#WORKER_REGISTRATION_STAGE_FILES[@]} == 0 )) || fail "registration arrays remain"
 }
+
+run_delayed_parent_reap_case() (
+    local depth="$1" root leader leader_start leader_pgid leader_sid
+    root="$TEST_DIR/delayed-reap-$depth"
+    local state_file elapsed_start elapsed_end rc=0
+    local -a session_pids=()
+    local -A session_starts=() session_ppids=() session_pgids=() session_states=()
+    setup_fixture "$root"
+    mkfifo "$root/reap-clock"
+    cat > "$root/parent.sh" <<'CHILD'
+#!/usr/bin/env bash
+set -u
+root="$1" depth="$2"
+trap '' HUP INT TERM
+ : > "$root/parent-open"
+if (( depth == 0 )); then
+    sleep 300 & child=$!
+    printf '%s\n' "$child" > "$root/leaf.pid"
+else
+    bash "$root/parent.sh" "$root" "$((depth - 1))" & child=$!
+fi
+kill -STOP "$BASHPID"
+wait "$child" 2>/dev/null || true
+exit 0
+CHILD
+    chmod 0700 "$root/parent.sh"
+    setsid bash "$root/parent.sh" "$root" "$depth" & leader=$!
+    leader_start=$(wait_test_process_start "$leader")
+    for _ in {1..100}; do [[ -e "$root/parent-open" ]] && break; sleep .01; done
+    read_process_record "$leader"; leader_pgid=$PROC_PGID; leader_sid=$PROC_SID
+    [[ "$leader_pgid" == "$leader" && "$leader_sid" == "$leader" ]] || fail "delayed $depth leader identity invalid"
+    WORKER_TRANSFER_PID=$leader; WORKER_TRANSFER_START=$leader_start
+    WORKER_TRANSFER_PGID=$leader_pgid; WORKER_TRANSFER_SID=$leader_sid
+    publish_worker_session_state active; state_file=$WORKER_SESSION_STATE_FILE
+    leaf=$(<"$root/leaf.pid"); leaf_start=$(wait_test_process_start "$leaf")
+    kill -KILL "$leaf" 2>/dev/null || true
+    old_reap_status=1
+    for _ in {1..30}; do
+        session_process_identity_matches "$leaf" "$leaf_start" "$leader_sid" || { old_reap_status=0; break; }
+        sleep 0.01
+    done
+    assert_eq 1 "$old_reap_status" "delayed $depth old 300ms window remains pending"
+    ( sleep 1; kill -CONT -"$leader" 2>/dev/null || true ) & releaser=$!
+    cleanup_clock; elapsed_start=$CLEANUP_NOW
+    terminate_worker_transfer || rc=$?
+    wait "$releaser" 2>/dev/null || true
+    cleanup_clock; elapsed_end=$CLEANUP_NOW
+    assert_eq 0 "$rc" "delayed $depth parent reap succeeds"
+    (( elapsed_end - elapsed_start >= 100 )) || fail "delayed $depth reap did not wait for parent"
+    wait_test_process_identity_gone "$leader" "$leader_start" || fail "delayed $depth left leader"
+    collect_owned_session_records "$leader_sid" session_pids session_starts session_ppids session_pgids session_states
+    assert_eq 0 "${#session_pids[@]}" "delayed $depth managed SID clears"
+    [[ ! -e "$state_file" && "$RUNTIME_CLEANUP_ACTIVE" == false ]] || fail "delayed $depth state cleanup incomplete"
+    cleanup_runtime
+    exec 9>&-
+    pass "delayed parent reap depth $depth preserves leaf-first order"
+)
+run_delayed_parent_reap_case 1
+run_delayed_parent_reap_case 4
+
+(
+    root="$TEST_DIR/reap-deadline"; setup_fixture "$root"
+    cat > "$root/parent.sh" <<'CHILD'
+#!/usr/bin/env bash
+set -u
+root="$1"
+trap '' HUP INT TERM
+sleep 300 & child=$!
+: > "$root/ready"
+while [[ ! -e "$root/release" ]]; do :; done
+wait "$child" 2>/dev/null || true
+exit 0
+CHILD
+    chmod 0700 "$root/parent.sh"
+    setsid bash "$root/parent.sh" "$root" & leader=$!
+    for _ in {1..100}; do [[ -e "$root/ready" ]] && break; sleep .01; done
+    leader_start=$(wait_test_process_start "$leader"); read_process_record "$leader"
+    WORKER_TRANSFER_PID=$leader; WORKER_TRANSFER_START=$leader_start; WORKER_TRANSFER_PGID=$PROC_PGID; WORKER_TRANSFER_SID=$PROC_SID
+    publish_worker_session_state active; state_file=$WORKER_SESSION_STATE_FILE
+    # shellcheck disable=SC2034  # Consumed by sourced push cleanup state machine.
+    MANAGED_SESSION_CLEANUP_TICKS=300
+    rc=0; terminate_worker_transfer || rc=$?
+    (( rc != 0 )) || fail "deadline failure unexpectedly succeeded"
+    [[ -d "$TEMP_DIR" && -f "$state_file" && "$WORKER_TRANSFER_CLEANUP_FAILED" == true ]] || fail "deadline failure discarded evidence"
+    [[ "$(stat -c %a "$TEMP_DIR")" == 700 && "$(stat -c %a "$state_file")" == 600 ]] || fail "deadline evidence trust changed"
+    : > "$root/release"; wait "$leader" 2>/dev/null || true
+    remove_worker_session_state
+    WORKER_TRANSFER_PID=""; WORKER_TRANSFER_START=""; WORKER_TRANSFER_PGID=""; WORKER_TRANSFER_SID=""; WORKER_TRANSFER_CLEANUP_FAILED=false
+    clear_managed_session_cleanup_tracking
+    cleanup_runtime
+    [[ ! -e "$TEMP_DIR" ]] || fail "deadline teardown left runtime"
+    exec 9>&-
+    pass "deadline failure is bounded and preserves then safely clears evidence"
+)
+if [[ "${PUSH_REAP_ONLY:-false}" == true ]]; then
+    exit 0
+fi
 test_watchdog_process() {
     local seconds="$1" marker="$2" target_pid="$3" timer=""
     trap '[[ -z "$timer" ]] || kill "$timer" 2>/dev/null || true; [[ -z "$timer" ]] || wait "$timer" 2>/dev/null || true; exit 0' HUP INT TERM
