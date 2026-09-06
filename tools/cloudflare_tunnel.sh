@@ -4,7 +4,6 @@
 
 # Sourcing exposes no legacy global function API. Internal tests opt in explicitly.
 if [[ "${BASH_SOURCE[0]:-$0}" != "$0" && "${CLOUDFLARED_TEST_INTERNALS:-}" != 1 ]]; then
-    cloudflare_tunnel_source() { :; }
     return 0
 fi
 
@@ -955,7 +954,7 @@ enable_auto_update() {
     info "已启用每日 APT 更新检查；更新时仅重启原本正在运行的 cloudflared 服务。"
 }
 
-disable_auto_update() {
+disable_auto_update_locked() {
     local confirmed="${1:-}" path backup_dir
     require_root
     check_platform
@@ -979,6 +978,17 @@ disable_auto_update() {
     done
     systemctl daemon-reload
     info "APT 自动更新组件已禁用；备份目录: $backup_dir"
+}
+
+disable_auto_update() {
+    init_runtime_config
+    validate_directory_chain "$(dirname -- "$REPOSITORY_LOCK_DIR")" || return 1
+    acquire_repository_lock || return 1
+    if ! prepare_repository_state || ! disable_auto_update_locked "$@"; then
+        release_repository_lock || return 1
+        return 1
+    fi
+    release_repository_lock
 }
 
 show_auto_update_status() {
@@ -1118,45 +1128,35 @@ show_status() {
     show_auto_update_status
 }
 
-remove_managed_repository() {
+remove_managed_repository_locked() {
     init_runtime_config
     local backup_dir
-    validate_directory_chain "$(dirname -- "$REPOSITORY_LOCK_DIR")" || return 1
-    acquire_repository_lock || return 1
-    prepare_repository_state || {
-        release_repository_lock || true
-        return 1
-    }
-    validate_directory_chain "$(dirname -- "$SOURCE_FILE")" || {
-        release_repository_lock || true
-        return 1
-    }
+    validate_existing_repository_file "$KEYRING" || return 1
+    validate_directory_chain "$(dirname -- "$SOURCE_FILE")" || return 1
     if [[ -e "$SOURCE_FILE" || -L "$SOURCE_FILE" ]]; then
-        validate_secure_file "$SOURCE_FILE" 644 || {
-            release_repository_lock || true
-            return 1
-        }
-        validate_existing_source || {
-            release_repository_lock || true
-            return 1
-        }
+        validate_secure_file "$SOURCE_FILE" 644 || return 1
+        validate_existing_source || return 1
     fi
     backup_dir="$STATE_DIR/uninstall-$(date +%Y%m%d_%H%M%S)"
     if [[ -f "$STATE_DIR/repository-managed" && -f "$SOURCE_FILE" ]]; then
-        backup_path "$SOURCE_FILE" "$backup_dir" || {
-            release_repository_lock || true
-            return 1
-        }
-        rm -f -- "$SOURCE_FILE" "$STATE_DIR/repository-managed" || {
-            release_repository_lock || true
-            return 1
-        }
+        backup_path "$SOURCE_FILE" "$backup_dir" || return 1
+        rm -f -- "$SOURCE_FILE" "$STATE_DIR/repository-managed" || return 1
+    fi
+}
+
+remove_managed_repository() {
+    init_runtime_config
+    validate_directory_chain "$(dirname -- "$REPOSITORY_LOCK_DIR")" || return 1
+    acquire_repository_lock || return 1
+    if ! prepare_repository_state || ! remove_managed_repository_locked; then
+        release_repository_lock || return 1
+        return 1
     fi
     release_repository_lock
 }
 
 uninstall_cloudflared() {
-    local confirmed="${1:-}"
+    local confirmed="${1:-}" uninstall_status=0 release_status=0 lock_path
     require_root
     check_platform
     warn "将删除 cloudflared 服务和 APT 包；Tunnel 配置与凭据默认保留。"
@@ -1164,14 +1164,38 @@ uninstall_cloudflared() {
         confirm "继续卸载？" || { info "已取消"; return 0; }
     fi
 
-    disable_auto_update --confirmed
-    if command -v cloudflared >/dev/null 2>&1; then
-        cloudflared service uninstall >/dev/null 2>&1 || true
+    init_runtime_config
+    validate_directory_chain "$(dirname -- "$REPOSITORY_LOCK_DIR")" || return 1
+    lock_path="$REPOSITORY_LOCK_DIR"
+    acquire_repository_lock || return 1
+    if ! prepare_repository_state; then
+        release_repository_lock || return 1
+        return 1
     fi
-    systemctl disable --now cloudflared.service >/dev/null 2>&1 || true
-    DEBIAN_FRONTEND=noninteractive apt-get remove -y cloudflared
-    remove_managed_repository
-    apt-get update
+
+    disable_auto_update_locked --confirmed || uninstall_status=$?
+    if (( uninstall_status == 0 )); then
+        if command -v cloudflared >/dev/null 2>&1; then
+            cloudflared service uninstall >/dev/null 2>&1 || true
+        fi
+        systemctl disable --now cloudflared.service >/dev/null 2>&1 || true
+        DEBIAN_FRONTEND=noninteractive apt-get remove -y cloudflared || uninstall_status=$?
+    fi
+    if (( uninstall_status == 0 )); then
+        remove_managed_repository_locked || uninstall_status=$?
+    fi
+    if (( uninstall_status == 0 )); then
+        apt-get update || uninstall_status=$?
+    fi
+
+    release_repository_lock || release_status=$?
+    if (( uninstall_status != 0 )); then
+        return "$uninstall_status"
+    fi
+    if (( release_status != 0 )); then
+        error "卸载完成，但仓库事务锁释放失败: $lock_path"
+        return "$release_status"
+    fi
     info "卸载完成；/etc/cloudflared 与用户 .cloudflared 目录未删除。"
 }
 
@@ -1216,7 +1240,7 @@ main() {
         upgrade) upgrade_cloudflared ;;
         status) show_status ;;
         enable-auto-update) enable_auto_update ;;
-        disable-auto-update) disable_auto_update ;;
+        disable-auto-update) disable_auto_update "${2:-}" ;;
         migrate-legacy)
             require_root
             check_platform

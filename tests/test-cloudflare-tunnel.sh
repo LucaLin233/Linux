@@ -176,8 +176,71 @@ after=$(find "$CASE_DIR/root" -mindepth 1 -printf '%P %y %m\n' | sort)
     fail "source is not exact official definition"
 pass "source rendering has zero side effects and exact fields"
 
+(
+    new_case
+    source_cwd=$PWD
+    source_before=$(find "$CASE_DIR/root" -mindepth 1 -printf '%P %y %m\n' | sort)
+    cloudflare_tunnel_source() { printf 'sentinel:%s\n' "$*"; }
+    sentinel_before=$(declare -f cloudflare_tunnel_source)
+    trap 'sentinel-trap' HUP
+    set -o noclobber
+    umask 027
+    source "$ROOT_DIR/tools/cloudflare_tunnel.sh"
+    sentinel_after=$(declare -f cloudflare_tunnel_source)
+    [[ "$sentinel_before" == "$sentinel_after" ]] || fail "ordinary source replaced sentinel function"
+    [[ "$(cloudflare_tunnel_source probe)" == sentinel:probe ]] || fail "ordinary source changed sentinel behavior"
+    [[ "$(trap -p HUP)" == *sentinel-trap* ]] || fail "ordinary source changed caller trap"
+    [[ "$-" == *C* ]] || fail "ordinary source changed caller shell options"
+    [[ "$(umask)" == 0027 ]] || fail "ordinary source changed caller umask"
+    [[ "$PWD" == "$source_cwd" ]] || fail "ordinary source changed caller cwd"
+    [[ "${CLOUDFLARED_STATE_DIR+x}" == x ]] || fail "test setup lost state variable"
+    after=$(find "$CASE_DIR/root" -mindepth 1 -printf '%P %y %m\n' | sort)
+    [[ "$source_before" == "$after" ]] || fail "ordinary source changed filesystem"
+)
+pass "ordinary source preserves sentinels, shell state, and filesystem"
+
+new_case
+before=$(find "$CASE_DIR/root" -mindepth 1 -printf '%P %y %m\\n' | sort)
+bash "$ROOT_DIR/tools/cloudflare_tunnel.sh" status >/dev/null 2>&1 || fail "standalone status failed in fake environment"
+after=$(find "$CASE_DIR/root" -mindepth 1 -printf '%P %y %m\\n' | sort)
+[[ "$before" == "$after" ]] || fail "ordinary status created state, lock, or temp files"
+pass "ordinary help/status paths have zero state and lock side effects"
+
+new_case
+mkdir -p "$CLOUDFLARED_REPOSITORY_STATE_DIR"
+chmod 0700 "$CLOUDFLARED_STATE_DIR" "$CLOUDFLARED_REPOSITORY_STATE_DIR"
+printf 'managed\n' > "$CLOUDFLARED_STATE_DIR/repository-managed"
+printf 'deb [signed-by=%s] %s any main\\n' "$CLOUDFLARED_KEYRING" 'https://pkg.cloudflare.com/cloudflare-main.gpg' > "$CLOUDFLARED_SOURCE_FILE"
+printf key > "$CLOUDFLARED_KEYRING"
+chmod 0644 "$CLOUDFLARED_SOURCE_FILE" "$CLOUDFLARED_KEYRING"
+require_root() { :; }
+check_platform() { :; }
+disable_auto_update_locked() { printf 'disable-auto-update\n' >> "$FAKE_LOG"; }
+remove_managed_repository_locked() { printf 'remove-repository\n' >> "$FAKE_LOG"; }
+uninstall_cloudflared --confirmed || fail "uninstall normal path failed"
+[[ ! -d "$CLOUDFLARED_STATE_DIR.lock" ]] || fail "uninstall left repository lock"
+grep -Fxq 'disable-auto-update' "$FAKE_LOG" || fail "uninstall skipped locked auto-update step"
+grep -Fxq 'remove-repository' "$FAKE_LOG" || fail "uninstall skipped locked repository step"
+grep -Fxq 'apt-get:remove -y cloudflared' "$FAKE_LOG" || fail "uninstall skipped package removal"
+pass "uninstall normal path holds and releases repository lock"
+
 new_case
 mkdir -p "$CLOUDFLARED_STATE_DIR.lock"
+mkdir -p "$CLOUDFLARED_AUTO_UPDATE_SCRIPT"
+printf marker > "$CASE_DIR/marker"
+require_root() { :; }
+check_platform() { :; }
+if uninstall_cloudflared --confirmed >/dev/null 2>&1; then fail "uninstall lock competition unexpectedly succeeded"; fi
+[[ -d "$CLOUDFLARED_STATE_DIR.lock" ]] || fail "uninstall lock competition removed lock"
+[[ -d "$CLOUDFLARED_AUTO_UPDATE_SCRIPT" ]] || fail "lock competition touched auto-update path"
+! grep -Eq 'remove|disable|daemon-reload|apt-get:' "$FAKE_LOG" || fail "lock competition performed mutation"
+pass "uninstall lock competition fails before auto-update, systemctl, and APT"
+
+new_case
+mkdir -p "$CLOUDFLARED_STATE_DIR.lock"
+if disable_auto_update --confirmed >/dev/null 2>&1; then fail "disable-auto-update lock competition unexpectedly succeeded"; fi
+[[ -d "$CLOUDFLARED_STATE_DIR.lock" ]] || fail "disable-auto-update removed competing lock"
+pass "auto-update lock competition fails before state mutation"
 chmod 0700 "$CLOUDFLARED_STATE_DIR.lock"
 if configure_repository >/dev/null 2>&1; then fail "lock competition unexpectedly succeeded"; fi
 pass "key/source lock competition"
