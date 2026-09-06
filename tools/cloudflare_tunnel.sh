@@ -2,31 +2,31 @@
 # Cloudflare Tunnel manager for Debian/Ubuntu.
 # Uses Cloudflare's official stable APT repository and service command.
 
-set -euo pipefail
-
-readonly KEYRING="${CLOUDFLARED_KEYRING:-/usr/share/keyrings/cloudflare-main.gpg}"
-readonly SOURCE_FILE="${CLOUDFLARED_SOURCE_FILE:-/etc/apt/sources.list.d/cloudflared.list}"
-readonly STATE_DIR="${CLOUDFLARED_STATE_DIR:-/var/lib/cloudflared-wrapper}"
-readonly KEY_URL="https://pkg.cloudflare.com/cloudflare-main.gpg"
-readonly REPOSITORY="https://pkg.cloudflare.com/cloudflare-main.gpg"
-readonly KEY_FINGERPRINT="CC94B39C77AE7342A68B89628A682D308D4E5E73"
-readonly KEY_UID="CloudFlare Software Packaging 2025 <help@cloudflare.com>"
-readonly REPOSITORY_STATE_DIR="${CLOUDFLARED_REPOSITORY_STATE_DIR:-$STATE_DIR/repository}"
-readonly TRUST_ANCHOR="${CLOUDFLARED_TRUST_ANCHOR:-/}"
-readonly APT_SOURCE_ROOT="${CLOUDFLARED_APT_SOURCE_ROOT:-/etc/apt}"
-readonly LEGACY_BIN="${CLOUDFLARED_LEGACY_BIN:-/usr/local/bin/cloudflared}"
-readonly APT_BIN="${CLOUDFLARED_APT_BIN:-/usr/bin/cloudflared}"
-readonly LEGACY_UPDATER="${CLOUDFLARED_LEGACY_UPDATER:-/usr/local/bin/cloudflared-update}"
-readonly LEGACY_SERVICE="${CLOUDFLARED_LEGACY_SERVICE:-/etc/systemd/system/cloudflared-updater.service}"
-readonly LEGACY_TIMER="${CLOUDFLARED_LEGACY_TIMER:-/etc/systemd/system/cloudflared-updater.timer}"
-readonly AUTO_UPDATE_SCRIPT="${CLOUDFLARED_AUTO_UPDATE_SCRIPT:-/usr/local/libexec/cloudflared-apt-update}"
-readonly AUTO_UPDATE_SERVICE="${CLOUDFLARED_AUTO_UPDATE_SERVICE:-/etc/systemd/system/cloudflared-apt-update.service}"
-readonly AUTO_UPDATE_TIMER="${CLOUDFLARED_AUTO_UPDATE_TIMER:-/etc/systemd/system/cloudflared-apt-update.timer}"
-readonly SERVICE_FILE="${CLOUDFLARED_SERVICE_FILE:-/etc/systemd/system/cloudflared.service}"
-readonly BINARY_UPDATE_SERVICE="${CLOUDFLARED_BINARY_UPDATE_SERVICE:-/etc/systemd/system/cloudflared-update.service}"
-readonly BINARY_UPDATE_TIMER="${CLOUDFLARED_BINARY_UPDATE_TIMER:-/etc/systemd/system/cloudflared-update.timer}"
-
-PRESERVE_AUTO_UPDATE=false
+init_runtime_config() {
+    KEYRING="${CLOUDFLARED_KEYRING:-/usr/share/keyrings/cloudflare-main.gpg}"
+    SOURCE_FILE="${CLOUDFLARED_SOURCE_FILE:-/etc/apt/sources.list.d/cloudflared.list}"
+    STATE_DIR="${CLOUDFLARED_STATE_DIR:-/var/lib/cloudflared-wrapper}"
+    KEY_URL="https://pkg.cloudflare.com/cloudflare-main.gpg"
+    REPOSITORY="https://pkg.cloudflare.com/cloudflare-main.gpg"
+    KEY_FINGERPRINT="CC94B39C77AE7342A68B89628A682D308D4E5E73"
+    KEY_UID="CloudFlare Software Packaging 2025 <help@cloudflare.com>"
+    REPOSITORY_STATE_DIR="${CLOUDFLARED_REPOSITORY_STATE_DIR:-$STATE_DIR/repository}"
+    REPOSITORY_LOCK_DIR="${CLOUDFLARED_REPOSITORY_LOCK_DIR:-$STATE_DIR.lock}"
+    TRUST_ANCHOR="${CLOUDFLARED_TRUST_ANCHOR:-/}"
+    APT_SOURCE_ROOT="${CLOUDFLARED_APT_SOURCE_ROOT:-/etc/apt}"
+    LEGACY_BIN="${CLOUDFLARED_LEGACY_BIN:-/usr/local/bin/cloudflared}"
+    APT_BIN="${CLOUDFLARED_APT_BIN:-/usr/bin/cloudflared}"
+    LEGACY_UPDATER="${CLOUDFLARED_LEGACY_UPDATER:-/usr/local/bin/cloudflared-update}"
+    LEGACY_SERVICE="${CLOUDFLARED_LEGACY_SERVICE:-/etc/systemd/system/cloudflared-updater.service}"
+    LEGACY_TIMER="${CLOUDFLARED_LEGACY_TIMER:-/etc/systemd/system/cloudflared-updater.timer}"
+    AUTO_UPDATE_SCRIPT="${CLOUDFLARED_AUTO_UPDATE_SCRIPT:-/usr/local/libexec/cloudflared-apt-update}"
+    AUTO_UPDATE_SERVICE="${CLOUDFLARED_AUTO_UPDATE_SERVICE:-/etc/systemd/system/cloudflared-apt-update.service}"
+    AUTO_UPDATE_TIMER="${CLOUDFLARED_AUTO_UPDATE_TIMER:-/etc/systemd/system/cloudflared-apt-update.timer}"
+    SERVICE_FILE="${CLOUDFLARED_SERVICE_FILE:-/etc/systemd/system/cloudflared.service}"
+    BINARY_UPDATE_SERVICE="${CLOUDFLARED_BINARY_UPDATE_SERVICE:-/etc/systemd/system/cloudflared-update.service}"
+    BINARY_UPDATE_TIMER="${CLOUDFLARED_BINARY_UPDATE_TIMER:-/etc/systemd/system/cloudflared-update.timer}"
+    PRESERVE_AUTO_UPDATE=false
+}
 
 info() { printf '[INFO] %s\n' "$*"; }
 warn() { printf '[WARN] %s\n' "$*" >&2; }
@@ -62,25 +62,14 @@ backup_path() {
     cp -a "$path" "$backup_dir/$(basename "$path")"
 }
 
-REPOSITORY_TRANSACTION_ACTIVE=false
-REPOSITORY_TRANSACTION_DIR=""
-REPOSITORY_KEY_STAGE=""
-REPOSITORY_SOURCE_STAGE=""
-REPOSITORY_LOCK_DIR=""
-REPOSITORY_GENERATION=""
-REPOSITORY_OLD_KEY=false
-REPOSITORY_OLD_SOURCE=false
-REPOSITORY_OLD_STATE=false
-REPOSITORY_PREVIOUS_HUP_TRAP=""
-REPOSITORY_PREVIOUS_INT_TRAP=""
-REPOSITORY_PREVIOUS_TERM_TRAP=""
-REPOSITORY_PREVIOUS_EXIT_TRAP=""
 
 repository_source_content() {
+    init_runtime_config
     printf 'deb [signed-by=%s] %s any main\n' "$KEYRING" "$REPOSITORY"
 }
 
 repository_legacy_source_content() {
+    init_runtime_config
     cat <<EOF
 # Managed by tools/cloudflare_tunnel.sh
 # Cloudflare stable repository for Debian-based distributions.
@@ -89,6 +78,7 @@ EOF
 }
 
 path_is_beneath_anchor() {
+    init_runtime_config
     local path anchor
     path=$(realpath -ms -- "$1") || return 1
     anchor=$(realpath -ms -- "$TRUST_ANCHOR") || return 1
@@ -96,6 +86,7 @@ path_is_beneath_anchor() {
 }
 
 validate_directory_chain() {
+    init_runtime_config
     local path="$1" current anchor mode owner group
     path_is_beneath_anchor "$path" || { error "路径越过信任根: $path"; return 1; }
     current=$(realpath -ms -- "$path") || return 1
@@ -120,6 +111,7 @@ validate_directory_chain() {
 }
 
 validate_secure_directory() {
+    init_runtime_config
     local path="$1" expected_mode="$2" metadata
     [[ -d "$path" && ! -L "$path" ]] || {
         error "要求非符号链接目录: $path"
@@ -133,6 +125,7 @@ validate_secure_directory() {
 }
 
 validate_secure_file() {
+    init_runtime_config
     local path="$1" expected_mode="$2" metadata
     [[ -f "$path" && ! -L "$path" ]] || {
         error "要求非符号链接普通文件: $path"
@@ -146,12 +139,14 @@ validate_secure_file() {
 }
 
 validate_existing_repository_file() {
+    init_runtime_config
     local path="$1"
     [[ -e "$path" || -L "$path" ]] || return 0
     validate_secure_file "$path" 644
 }
 
 validate_existing_source() {
+    init_runtime_config
     local expected legacy candidate
     [[ -d "$APT_SOURCE_ROOT" && ! -L "$APT_SOURCE_ROOT" ]] || {
         error "APT source 根必须是非符号链接目录: $APT_SOURCE_ROOT"
@@ -169,6 +164,10 @@ validate_existing_source() {
     validate_directory_chain "$APT_SOURCE_ROOT" || return 1
     while IFS= read -r -d '' candidate; do
         [[ "$candidate" == "$SOURCE_FILE" ]] && continue
+        validate_secure_file "$candidate" 644 || {
+            error "额外 APT source 类型或元数据不可信: $candidate"
+            return 1
+        }
         if grep -Eqs 'pkg\.cloudflare\.com/(cloudflare-main\.gpg|cloudflared)([[:space:]/]|$)' -- "$candidate"; then
             error "发现额外或重复 Cloudflare APT source: $candidate"
             return 1
@@ -187,6 +186,7 @@ validate_existing_source() {
 }
 
 validate_repository_state_entries() {
+    init_runtime_config
     local entry base
     shopt -s nullglob
     for entry in "$REPOSITORY_STATE_DIR"/*; do
@@ -223,6 +223,7 @@ validate_repository_state_entries() {
 }
 
 prepare_repository_state() {
+    init_runtime_config
     local state_parent repository_parent
     state_parent=$(dirname -- "$STATE_DIR")
     repository_parent=$(dirname -- "$REPOSITORY_STATE_DIR")
@@ -243,7 +244,8 @@ prepare_repository_state() {
 }
 
 acquire_repository_lock() {
-    REPOSITORY_LOCK_DIR="$REPOSITORY_STATE_DIR/lock"
+    init_runtime_config
+    validate_directory_chain "$(dirname -- "$REPOSITORY_LOCK_DIR")" || return 1
     if ! mkdir -m 0700 -- "$REPOSITORY_LOCK_DIR" 2>/dev/null; then
         error "无法取得 Cloudflare 仓库事务锁: $REPOSITORY_LOCK_DIR"
         return 1
@@ -281,6 +283,7 @@ restore_repository_traps() {
 }
 
 release_repository_lock() {
+    init_runtime_config
     [[ -n "$REPOSITORY_LOCK_DIR" ]] || return 0
     if [[ -d "$REPOSITORY_LOCK_DIR" && ! -L "$REPOSITORY_LOCK_DIR" ]]; then
         rmdir -- "$REPOSITORY_LOCK_DIR" || return 1
@@ -292,18 +295,22 @@ release_repository_lock() {
 }
 
 repository_copy_file() {
+    init_runtime_config
     cp --no-dereference --preserve=mode,ownership,timestamps -- "$1" "$2"
 }
 
 repository_install_file() {
+    init_runtime_config
     install -o 0 -g 0 -m "$1" -- "$2" "$3"
 }
 
 repository_rename() {
+    init_runtime_config
     mv -fT -- "$1" "$2"
 }
 
 repository_download_key() {
+    init_runtime_config
     curl -fsSL --connect-timeout 10 --max-time 60 "$KEY_URL" -o "$1"
 }
 
@@ -312,11 +319,13 @@ repository_transaction_hook() {
 }
 
 repository_key_records() {
+    init_runtime_config
     LC_ALL=C gpg --batch --no-options --no-default-keyring \
         --show-keys --with-colons --with-fingerprint --with-fingerprint -- "$1"
 }
 
 validate_downloaded_key() {
+    init_runtime_config
     local key="$1" expected_mode="${2:-600}" records primary_count fingerprint uid_count uid
     validate_secure_file "$key" "$expected_mode" || return 1
     [[ -s "$key" ]] || { error "Cloudflare 签名密钥为空"; return 1; }
@@ -355,12 +364,14 @@ validate_downloaded_key() {
 }
 
 write_transaction_status() {
+    init_runtime_config
     local text="$1"
     printf '%s\n' "$text" > "$REPOSITORY_TRANSACTION_DIR/status"
     chmod 0600 "$REPOSITORY_TRANSACTION_DIR/status"
 }
 
 backup_repository_generation() {
+    init_runtime_config
     if [[ -e "$KEYRING" || -L "$KEYRING" ]]; then
         repository_copy_file "$KEYRING" "$REPOSITORY_TRANSACTION_DIR/old-key" || return 1
         chmod 0600 "$REPOSITORY_TRANSACTION_DIR/old-key" || return 1
@@ -379,6 +390,7 @@ backup_repository_generation() {
 }
 
 restore_repository_file() {
+    init_runtime_config
     local had_old="$1" backup="$2" target="$3" restore_stage
     if [[ "$had_old" == true ]]; then
         restore_stage=$(mktemp "$(dirname -- "$target")/.cloudflared-rollback.XXXXXX") || return 1
@@ -397,6 +409,7 @@ restore_repository_file() {
 }
 
 archive_failed_transaction() {
+    init_runtime_config
     local failed_dir="$REPOSITORY_STATE_DIR/failure-$REPOSITORY_GENERATION"
     [[ -d "$REPOSITORY_TRANSACTION_DIR" ]] || return 0
     if repository_rename "$REPOSITORY_TRANSACTION_DIR" "$failed_dir"; then
@@ -407,6 +420,7 @@ archive_failed_transaction() {
 }
 
 rollback_repository_transaction() {
+    init_runtime_config
     local reason="$1" rollback_failed=false
     [[ "$REPOSITORY_TRANSACTION_ACTIVE" == true ]] || return 0
     REPOSITORY_TRANSACTION_ACTIVE=false
@@ -436,6 +450,7 @@ rollback_repository_transaction() {
 }
 
 repository_transaction_fail() {
+    init_runtime_config
     local reason="$1"
     error "$reason"
     rollback_repository_transaction "$reason" || true
@@ -443,12 +458,14 @@ repository_transaction_fail() {
 }
 
 repository_signal_handler() {
+    init_runtime_config
     local code="$1" signal="$2"
     rollback_repository_transaction "收到 $signal 信号" || true
     exit "$code"
 }
 
 repository_exit_handler() {
+    init_runtime_config
     local status="$1"
     if [[ "$REPOSITORY_TRANSACTION_ACTIVE" == true ]]; then
         rollback_repository_transaction "进程异常退出，状态 $status" || true
@@ -457,6 +474,7 @@ repository_exit_handler() {
 }
 
 validate_committed_repository() {
+    init_runtime_config
     local expected
     validate_secure_file "$KEYRING" 644 || return 1
     validate_secure_file "$SOURCE_FILE" 644 || return 1
@@ -469,7 +487,21 @@ validate_committed_repository() {
 }
 
 begin_repository_transaction() {
+    init_runtime_config
     local key_parent source_parent downloaded marker_stage key_hash source_hash
+    REPOSITORY_TRANSACTION_ACTIVE=false
+    REPOSITORY_TRANSACTION_DIR=""
+    REPOSITORY_KEY_STAGE=""
+    REPOSITORY_SOURCE_STAGE=""
+    REPOSITORY_LOCK_DIR="${CLOUDFLARED_REPOSITORY_LOCK_DIR:-$STATE_DIR.lock}"
+    REPOSITORY_GENERATION=""
+    REPOSITORY_OLD_KEY=false
+    REPOSITORY_OLD_SOURCE=false
+    REPOSITORY_OLD_STATE=false
+    REPOSITORY_PREVIOUS_HUP_TRAP=""
+    REPOSITORY_PREVIOUS_INT_TRAP=""
+    REPOSITORY_PREVIOUS_TERM_TRAP=""
+    REPOSITORY_PREVIOUS_EXIT_TRAP=""
     command -v curl >/dev/null || { error "缺少 curl；正式仓库提交前不会通过 APT 安装依赖"; return 1; }
     command -v gpg >/dev/null || { error "缺少 gpg；无法校验 OpenPGP 主身份"; return 1; }
     command -v realpath >/dev/null || { error "缺少 realpath"; return 1; }
@@ -478,8 +510,11 @@ begin_repository_transaction() {
     validate_directory_chain "$key_parent" || return 1
     validate_directory_chain "$source_parent" || return 1
     validate_directory_chain "$APT_SOURCE_ROOT" || return 1
-    prepare_repository_state || return 1
     acquire_repository_lock || return 1
+    if ! prepare_repository_state; then
+        release_repository_lock || true
+        return 1
+    fi
 
     REPOSITORY_GENERATION="$(date -u +%Y%m%dT%H%M%SZ)-$$-$RANDOM"
     REPOSITORY_TRANSACTION_DIR="$REPOSITORY_STATE_DIR/transaction-$REPOSITORY_GENERATION"
@@ -584,6 +619,7 @@ begin_repository_transaction() {
 }
 
 finish_repository_transaction() {
+    init_runtime_config
     local history_dir="$REPOSITORY_STATE_DIR/history-$REPOSITORY_GENERATION"
     [[ "$REPOSITORY_TRANSACTION_ACTIVE" == true ]] || return 1
     if ! repository_rename "$REPOSITORY_TRANSACTION_DIR" "$history_dir"; then
@@ -602,11 +638,13 @@ finish_repository_transaction() {
 }
 
 configure_repository() {
+    init_runtime_config
     begin_repository_transaction || return 1
     finish_repository_transaction
 }
 
 run_repository_apt_transaction() {
+    init_runtime_config
     local operation="$1"
     begin_repository_transaction || return 1
     repository_transaction_hook apt-probe
@@ -1075,13 +1113,23 @@ show_status() {
 }
 
 remove_managed_repository() {
+    init_runtime_config
     local backup_dir
+    validate_directory_chain "$(dirname -- "$REPOSITORY_LOCK_DIR")" || return 1
+    acquire_repository_lock || return 1
     backup_dir="$STATE_DIR/uninstall-$(date +%Y%m%d_%H%M%S)"
     if [[ -f "$STATE_DIR/repository-managed" && -f "$SOURCE_FILE" ]] &&
         grep -Fq '# Managed by tools/cloudflare_tunnel.sh' "$SOURCE_FILE"; then
-        backup_path "$SOURCE_FILE" "$backup_dir"
-        rm -f "$SOURCE_FILE" "$STATE_DIR/repository-managed"
+        backup_path "$SOURCE_FILE" "$backup_dir" || {
+            release_repository_lock || true
+            return 1
+        }
+        rm -f "$SOURCE_FILE" "$STATE_DIR/repository-managed" || {
+            release_repository_lock || true
+            return 1
+        }
     fi
+    release_repository_lock
 }
 
 uninstall_cloudflared() {
@@ -1159,5 +1207,7 @@ main() {
 }
 
 if [[ "${BASH_SOURCE[0]:-$0}" == "$0" ]]; then
+    init_runtime_config
+    set -euo pipefail
     main "$@"
 fi

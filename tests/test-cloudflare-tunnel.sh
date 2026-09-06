@@ -129,6 +129,7 @@ new_case() {
         source "$ROOT_DIR/tools/cloudflare_tunnel.sh"
         SCRIPT_SOURCED=1
     fi
+    init_runtime_config
 }
 
 set_old_generation() {
@@ -157,7 +158,7 @@ run_failure_case() {
         fail "$name unexpectedly succeeded"
     fi
     assert_old_generation
-    [[ ! -d "$CLOUDFLARED_REPOSITORY_STATE_DIR/lock" ]] || fail "$name left lock"
+    [[ ! -d "$CLOUDFLARED_STATE_DIR.lock" ]] || fail "$name left lock"
     find "$CLOUDFLARED_REPOSITORY_STATE_DIR" -maxdepth 1 -type d -name 'failure-*' -print -quit | grep -q . ||
         fail "$name did not preserve failure evidence"
     pass "$name"
@@ -175,8 +176,8 @@ after=$(find "$CASE_DIR/root" -mindepth 1 -printf '%P %y %m\n' | sort)
 pass "source rendering has zero side effects and exact fields"
 
 new_case
-mkdir -p "$CLOUDFLARED_REPOSITORY_STATE_DIR/lock"
-chmod 0700 "$CLOUDFLARED_STATE_DIR" "$CLOUDFLARED_REPOSITORY_STATE_DIR" "$CLOUDFLARED_REPOSITORY_STATE_DIR/lock"
+mkdir -p "$CLOUDFLARED_STATE_DIR.lock"
+chmod 0700 "$CLOUDFLARED_STATE_DIR.lock"
 if configure_repository >/dev/null 2>&1; then fail "lock competition unexpectedly succeeded"; fi
 pass "key/source lock competition"
 
@@ -334,7 +335,7 @@ EOF
         set -e
         [[ "$status" == "$expected" ]] || fail "$signal at $phase returned $status, expected $expected"
         assert_old_generation
-        [[ ! -d "$CLOUDFLARED_REPOSITORY_STATE_DIR/lock" ]] || fail "$signal at $phase left lock"
+        [[ ! -d "$CLOUDFLARED_STATE_DIR.lock" ]] || fail "$signal at $phase left lock"
         pass "$signal=$expected rolls back at $phase"
     done
 done
