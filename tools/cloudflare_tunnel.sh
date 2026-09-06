@@ -8,7 +8,12 @@ readonly KEYRING="${CLOUDFLARED_KEYRING:-/usr/share/keyrings/cloudflare-main.gpg
 readonly SOURCE_FILE="${CLOUDFLARED_SOURCE_FILE:-/etc/apt/sources.list.d/cloudflared.list}"
 readonly STATE_DIR="${CLOUDFLARED_STATE_DIR:-/var/lib/cloudflared-wrapper}"
 readonly KEY_URL="https://pkg.cloudflare.com/cloudflare-main.gpg"
-readonly REPOSITORY="https://pkg.cloudflare.com/cloudflared"
+readonly REPOSITORY="https://pkg.cloudflare.com/cloudflare-main.gpg"
+readonly KEY_FINGERPRINT="CC94B39C77AE7342A68B89628A682D308D4E5E73"
+readonly KEY_UID="CloudFlare Software Packaging 2025 <help@cloudflare.com>"
+readonly REPOSITORY_STATE_DIR="${CLOUDFLARED_REPOSITORY_STATE_DIR:-$STATE_DIR/repository}"
+readonly TRUST_ANCHOR="${CLOUDFLARED_TRUST_ANCHOR:-/}"
+readonly APT_SOURCE_ROOT="${CLOUDFLARED_APT_SOURCE_ROOT:-/etc/apt}"
 readonly LEGACY_BIN="${CLOUDFLARED_LEGACY_BIN:-/usr/local/bin/cloudflared}"
 readonly APT_BIN="${CLOUDFLARED_APT_BIN:-/usr/bin/cloudflared}"
 readonly LEGACY_UPDATER="${CLOUDFLARED_LEGACY_UPDATER:-/usr/local/bin/cloudflared-update}"
@@ -57,39 +62,578 @@ backup_path() {
     cp -a "$path" "$backup_dir/$(basename "$path")"
 }
 
-configure_repository() {
-    local key_temp source_temp backup_dir
-    command -v curl >/dev/null || {
-        apt-get update
-        DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl
-    }
+REPOSITORY_TRANSACTION_ACTIVE=false
+REPOSITORY_TRANSACTION_DIR=""
+REPOSITORY_KEY_STAGE=""
+REPOSITORY_SOURCE_STAGE=""
+REPOSITORY_LOCK_DIR=""
+REPOSITORY_GENERATION=""
+REPOSITORY_OLD_KEY=false
+REPOSITORY_OLD_SOURCE=false
+REPOSITORY_OLD_STATE=false
+REPOSITORY_PREVIOUS_HUP_TRAP=""
+REPOSITORY_PREVIOUS_INT_TRAP=""
+REPOSITORY_PREVIOUS_TERM_TRAP=""
+REPOSITORY_PREVIOUS_EXIT_TRAP=""
 
-    install -d -m 0755 "$(dirname "$KEYRING")" "$(dirname "$SOURCE_FILE")"
-    install -d -m 0700 "$STATE_DIR"
-    if [[ -f "$SOURCE_FILE" ]] && ! grep -Fq "$REPOSITORY" "$SOURCE_FILE"; then
-        error "现有软件源文件包含非 Cloudflare 配置，拒绝覆盖: $SOURCE_FILE"
-        return 1
-    fi
-    backup_dir="$STATE_DIR/repository-$(date +%Y%m%d_%H%M%S)"
-    backup_path "$KEYRING" "$backup_dir"
-    backup_path "$SOURCE_FILE" "$backup_dir"
-    key_temp=$(mktemp)
-    source_temp=$(mktemp)
-    trap 'rm -f "$key_temp" "$source_temp"' RETURN
+repository_source_content() {
+    printf 'deb [signed-by=%s] %s any main\n' "$KEYRING" "$REPOSITORY"
+}
 
-    curl -fsSL --connect-timeout 10 --max-time 60 "$KEY_URL" -o "$key_temp"
-    [[ -s "$key_temp" ]] || { error "Cloudflare 签名密钥为空"; return 1; }
-    install -m 0644 "$key_temp" "$KEYRING"
-
-    cat > "$source_temp" <<EOF
+repository_legacy_source_content() {
+    cat <<EOF
 # Managed by tools/cloudflare_tunnel.sh
 # Cloudflare stable repository for Debian-based distributions.
-deb [signed-by=$KEYRING] $REPOSITORY any main
+deb [signed-by=$KEYRING] https://pkg.cloudflare.com/cloudflared any main
 EOF
-    install -m 0644 "$source_temp" "$SOURCE_FILE"
-    : > "$STATE_DIR/repository-managed"
-    trap - RETURN
-    rm -f "$key_temp" "$source_temp"
+}
+
+path_is_beneath_anchor() {
+    local path anchor
+    path=$(realpath -ms -- "$1") || return 1
+    anchor=$(realpath -ms -- "$TRUST_ANCHOR") || return 1
+    [[ "$path" == "$anchor" || "$path" == "$anchor"/* ]]
+}
+
+validate_directory_chain() {
+    local path="$1" current anchor mode owner group
+    path_is_beneath_anchor "$path" || { error "路径越过信任根: $path"; return 1; }
+    current=$(realpath -ms -- "$path") || return 1
+    anchor=$(realpath -ms -- "$TRUST_ANCHOR") || return 1
+    while :; do
+        [[ -d "$current" && ! -L "$current" ]] || {
+            error "目录祖先不是非符号链接目录: $current"
+            return 1
+        }
+        read -r owner group mode < <(stat -Lc '%u %g %a' -- "$current") || return 1
+        [[ "$owner" == 0 && "$group" == 0 ]] || {
+            error "目录祖先 owner/GID 非 0:0: $current"
+            return 1
+        }
+        (( (8#$mode & 0022) == 0 )) || {
+            error "目录祖先可被 group/other 写入: $current ($mode)"
+            return 1
+        }
+        [[ "$current" == "$anchor" ]] && break
+        current=$(dirname -- "$current")
+    done
+}
+
+validate_secure_directory() {
+    local path="$1" expected_mode="$2" metadata
+    [[ -d "$path" && ! -L "$path" ]] || {
+        error "要求非符号链接目录: $path"
+        return 1
+    }
+    metadata=$(stat -Lc '%u:%g:%a' -- "$path") || return 1
+    [[ "$metadata" == "0:0:$expected_mode" ]] || {
+        error "目录元数据错误: $path ($metadata，期望 0:0:$expected_mode)"
+        return 1
+    }
+}
+
+validate_secure_file() {
+    local path="$1" expected_mode="$2" metadata
+    [[ -f "$path" && ! -L "$path" ]] || {
+        error "要求非符号链接普通文件: $path"
+        return 1
+    }
+    metadata=$(stat -Lc '%u:%g:%a' -- "$path") || return 1
+    [[ "$metadata" == "0:0:$expected_mode" ]] || {
+        error "文件元数据错误: $path ($metadata，期望 0:0:$expected_mode)"
+        return 1
+    }
+}
+
+validate_existing_repository_file() {
+    local path="$1"
+    [[ -e "$path" || -L "$path" ]] || return 0
+    validate_secure_file "$path" 644
+}
+
+validate_existing_source() {
+    local expected legacy candidate
+    [[ -d "$APT_SOURCE_ROOT" && ! -L "$APT_SOURCE_ROOT" ]] || {
+        error "APT source 根必须是非符号链接目录: $APT_SOURCE_ROOT"
+        return 1
+    }
+    path_is_beneath_anchor "$APT_SOURCE_ROOT" || {
+        error "APT source 根越过信任根: $APT_SOURCE_ROOT"
+        return 1
+    }
+    path_is_beneath_anchor "$SOURCE_FILE" || return 1
+    [[ "$(realpath -ms -- "$SOURCE_FILE")" == "$(realpath -ms -- "$APT_SOURCE_ROOT")"/* ]] || {
+        error "Cloudflare source 文件不在 APT source 根内"
+        return 1
+    }
+    validate_directory_chain "$APT_SOURCE_ROOT" || return 1
+    while IFS= read -r -d '' candidate; do
+        [[ "$candidate" == "$SOURCE_FILE" ]] && continue
+        if grep -Eqs 'pkg\.cloudflare\.com/(cloudflare-main\.gpg|cloudflared)([[:space:]/]|$)' -- "$candidate"; then
+            error "发现额外或重复 Cloudflare APT source: $candidate"
+            return 1
+        fi
+    done < <(find "$APT_SOURCE_ROOT" -maxdepth 2 \
+        \( -path "$APT_SOURCE_ROOT/sources.list" -o -path "$APT_SOURCE_ROOT/sources.list.d/*.list" -o -path "$APT_SOURCE_ROOT/sources.list.d/*.sources" \) \
+        \( -type f -o -type l \) -print0 2>/dev/null)
+    [[ -e "$SOURCE_FILE" || -L "$SOURCE_FILE" ]] || return 0
+    validate_secure_file "$SOURCE_FILE" 644 || return 1
+    expected=$(repository_source_content)
+    legacy=$(repository_legacy_source_content)
+    if [[ "$(cat -- "$SOURCE_FILE")" != "$expected" && "$(cat -- "$SOURCE_FILE")" != "$legacy" ]]; then
+        error "现有软件源不是精确官方配置或受支持旧配置，拒绝覆盖: $SOURCE_FILE"
+        return 1
+    fi
+}
+
+validate_repository_state_entries() {
+    local entry base
+    shopt -s nullglob
+    for entry in "$REPOSITORY_STATE_DIR"/*; do
+        base=$(basename -- "$entry")
+        case "$base" in
+            current)
+                validate_secure_file "$entry" 600 || return 1
+                ;;
+            history-*|failure-*)
+                validate_secure_directory "$entry" 700 || return 1
+                find "$entry" -mindepth 1 -type l -print -quit | grep -q . && {
+                    error "事务证据目录包含符号链接: $entry"
+                    return 1
+                }
+                while IFS= read -r -d '' evidence; do
+                    validate_secure_file "$evidence" 600 || return 1
+                done < <(find "$entry" -mindepth 1 -maxdepth 1 -type f -print0)
+                find "$entry" -mindepth 1 -maxdepth 1 ! -type f -print -quit | grep -q . && {
+                    error "事务证据目录包含未知类型: $entry"
+                    return 1
+                }
+                ;;
+            lock)
+                error "另一个 Cloudflare 仓库事务正在运行，或存在待人工审查的锁: $entry"
+                return 1
+                ;;
+            *)
+                error "Cloudflare 仓库状态目录包含陌生残留: $entry"
+                return 1
+                ;;
+        esac
+    done
+    shopt -u nullglob
+}
+
+prepare_repository_state() {
+    local state_parent repository_parent
+    state_parent=$(dirname -- "$STATE_DIR")
+    repository_parent=$(dirname -- "$REPOSITORY_STATE_DIR")
+    validate_directory_chain "$state_parent" || return 1
+    if [[ ! -e "$STATE_DIR" && ! -L "$STATE_DIR" ]]; then
+        install -d -o 0 -g 0 -m 0700 -- "$STATE_DIR" || return 1
+    fi
+    validate_secure_directory "$STATE_DIR" 700 || return 1
+    [[ "$repository_parent" == "$STATE_DIR" ]] || {
+        error "仓库状态目录必须直接位于状态目录内"
+        return 1
+    }
+    if [[ ! -e "$REPOSITORY_STATE_DIR" && ! -L "$REPOSITORY_STATE_DIR" ]]; then
+        install -d -o 0 -g 0 -m 0700 -- "$REPOSITORY_STATE_DIR" || return 1
+    fi
+    validate_secure_directory "$REPOSITORY_STATE_DIR" 700 || return 1
+    validate_repository_state_entries
+}
+
+acquire_repository_lock() {
+    REPOSITORY_LOCK_DIR="$REPOSITORY_STATE_DIR/lock"
+    if ! mkdir -m 0700 -- "$REPOSITORY_LOCK_DIR" 2>/dev/null; then
+        error "无法取得 Cloudflare 仓库事务锁: $REPOSITORY_LOCK_DIR"
+        return 1
+    fi
+    if ! validate_secure_directory "$REPOSITORY_LOCK_DIR" 700; then
+        rmdir -- "$REPOSITORY_LOCK_DIR" 2>/dev/null || true
+        return 1
+    fi
+}
+
+save_repository_traps() {
+    REPOSITORY_PREVIOUS_HUP_TRAP=$(trap -p HUP || true)
+    REPOSITORY_PREVIOUS_INT_TRAP=$(trap -p INT || true)
+    REPOSITORY_PREVIOUS_TERM_TRAP=$(trap -p TERM || true)
+    REPOSITORY_PREVIOUS_EXIT_TRAP=$(trap -p EXIT || true)
+    trap 'repository_signal_handler 129 HUP' HUP
+    trap 'repository_signal_handler 130 INT' INT
+    trap 'repository_signal_handler 143 TERM' TERM
+    trap 'repository_exit_handler $?' EXIT
+}
+
+restore_one_trap() {
+    local signal="$1" saved="$2"
+    trap - "$signal"
+    if [[ -n "$saved" ]]; then
+        eval "$saved"
+    fi
+}
+
+restore_repository_traps() {
+    restore_one_trap HUP "$REPOSITORY_PREVIOUS_HUP_TRAP"
+    restore_one_trap INT "$REPOSITORY_PREVIOUS_INT_TRAP"
+    restore_one_trap TERM "$REPOSITORY_PREVIOUS_TERM_TRAP"
+    restore_one_trap EXIT "$REPOSITORY_PREVIOUS_EXIT_TRAP"
+}
+
+release_repository_lock() {
+    [[ -n "$REPOSITORY_LOCK_DIR" ]] || return 0
+    if [[ -d "$REPOSITORY_LOCK_DIR" && ! -L "$REPOSITORY_LOCK_DIR" ]]; then
+        rmdir -- "$REPOSITORY_LOCK_DIR" || return 1
+    elif [[ -e "$REPOSITORY_LOCK_DIR" || -L "$REPOSITORY_LOCK_DIR" ]]; then
+        error "事务锁类型在运行中发生变化: $REPOSITORY_LOCK_DIR"
+        return 1
+    fi
+    REPOSITORY_LOCK_DIR=""
+}
+
+repository_copy_file() {
+    cp --no-dereference --preserve=mode,ownership,timestamps -- "$1" "$2"
+}
+
+repository_install_file() {
+    install -o 0 -g 0 -m "$1" -- "$2" "$3"
+}
+
+repository_rename() {
+    mv -fT -- "$1" "$2"
+}
+
+repository_download_key() {
+    curl -fsSL --connect-timeout 10 --max-time 60 "$KEY_URL" -o "$1"
+}
+
+repository_transaction_hook() {
+    :
+}
+
+repository_key_records() {
+    LC_ALL=C gpg --batch --no-options --no-default-keyring \
+        --show-keys --with-colons --with-fingerprint --with-fingerprint -- "$1"
+}
+
+validate_downloaded_key() {
+    local key="$1" expected_mode="${2:-600}" records primary_count fingerprint uid_count uid
+    validate_secure_file "$key" "$expected_mode" || return 1
+    [[ -s "$key" ]] || { error "Cloudflare 签名密钥为空"; return 1; }
+    if ! records=$(repository_key_records "$key"); then
+        error "gpg 无法解析 Cloudflare 签名密钥"
+        return 1
+    fi
+    primary_count=$(awk -F: '$1 == "pub" {count++} END {print count+0}' <<< "$records")
+    [[ "$primary_count" == 1 ]] || {
+        error "Cloudflare keyring 必须且只能包含一个主公钥"
+        return 1
+    }
+    fingerprint=$(awk -F: '
+        $1 == "pub" {in_primary=1; next}
+        in_primary && $1 == "fpr" {print $10; exit}
+    ' <<< "$records")
+    [[ "$fingerprint" == "$KEY_FINGERPRINT" ]] || {
+        error "Cloudflare 主公钥 fingerprint 不匹配"
+        return 1
+    }
+    uid_count=$(awk -F: '
+        $1 == "pub" {in_primary=1; next}
+        $1 == "sub" {in_primary=0}
+        in_primary && $1 == "uid" {count++}
+        END {print count+0}
+    ' <<< "$records")
+    uid=$(awk -F: '
+        $1 == "pub" {in_primary=1; next}
+        $1 == "sub" {in_primary=0}
+        in_primary && $1 == "uid" {print $10; exit}
+    ' <<< "$records")
+    [[ "$uid_count" == 1 && "$uid" == "$KEY_UID" ]] || {
+        error "Cloudflare 主公钥 UID/主身份不匹配"
+        return 1
+    }
+}
+
+write_transaction_status() {
+    local text="$1"
+    printf '%s\n' "$text" > "$REPOSITORY_TRANSACTION_DIR/status"
+    chmod 0600 "$REPOSITORY_TRANSACTION_DIR/status"
+}
+
+backup_repository_generation() {
+    if [[ -e "$KEYRING" || -L "$KEYRING" ]]; then
+        repository_copy_file "$KEYRING" "$REPOSITORY_TRANSACTION_DIR/old-key" || return 1
+        chmod 0600 "$REPOSITORY_TRANSACTION_DIR/old-key" || return 1
+        REPOSITORY_OLD_KEY=true
+    fi
+    if [[ -e "$SOURCE_FILE" || -L "$SOURCE_FILE" ]]; then
+        repository_copy_file "$SOURCE_FILE" "$REPOSITORY_TRANSACTION_DIR/old-source" || return 1
+        chmod 0600 "$REPOSITORY_TRANSACTION_DIR/old-source" || return 1
+        REPOSITORY_OLD_SOURCE=true
+    fi
+    if [[ -f "$REPOSITORY_STATE_DIR/current" ]]; then
+        repository_copy_file "$REPOSITORY_STATE_DIR/current" "$REPOSITORY_TRANSACTION_DIR/old-current" || return 1
+        chmod 0600 "$REPOSITORY_TRANSACTION_DIR/old-current" || return 1
+        REPOSITORY_OLD_STATE=true
+    fi
+}
+
+restore_repository_file() {
+    local had_old="$1" backup="$2" target="$3" restore_stage
+    if [[ "$had_old" == true ]]; then
+        restore_stage=$(mktemp "$(dirname -- "$target")/.cloudflared-rollback.XXXXXX") || return 1
+        if ! repository_install_file 0644 "$backup" "$restore_stage" ||
+            ! validate_secure_file "$restore_stage" 644 ||
+            ! repository_rename "$restore_stage" "$target"; then
+            rm -f -- "$restore_stage" 2>/dev/null || true
+            return 1
+        fi
+    else
+        if [[ -e "$target" || -L "$target" ]]; then
+            [[ -f "$target" && ! -L "$target" ]] || return 1
+            rm -f -- "$target" || return 1
+        fi
+    fi
+}
+
+archive_failed_transaction() {
+    local failed_dir="$REPOSITORY_STATE_DIR/failure-$REPOSITORY_GENERATION"
+    [[ -d "$REPOSITORY_TRANSACTION_DIR" ]] || return 0
+    if repository_rename "$REPOSITORY_TRANSACTION_DIR" "$failed_dir"; then
+        REPOSITORY_TRANSACTION_DIR="$failed_dir"
+        return 0
+    fi
+    return 1
+}
+
+rollback_repository_transaction() {
+    local reason="$1" rollback_failed=false
+    [[ "$REPOSITORY_TRANSACTION_ACTIVE" == true ]] || return 0
+    REPOSITORY_TRANSACTION_ACTIVE=false
+    trap - HUP INT TERM EXIT
+    printf '%s\n' "$reason" >> "$REPOSITORY_TRANSACTION_DIR/rollback.log" 2>/dev/null || rollback_failed=true
+    chmod 0600 "$REPOSITORY_TRANSACTION_DIR/rollback.log" 2>/dev/null || rollback_failed=true
+    restore_repository_file "$REPOSITORY_OLD_SOURCE" "$REPOSITORY_TRANSACTION_DIR/old-source" "$SOURCE_FILE" || rollback_failed=true
+    restore_repository_file "$REPOSITORY_OLD_KEY" "$REPOSITORY_TRANSACTION_DIR/old-key" "$KEYRING" || rollback_failed=true
+    if [[ "$REPOSITORY_OLD_STATE" == true ]]; then
+        repository_install_file 0600 "$REPOSITORY_TRANSACTION_DIR/old-current" "$REPOSITORY_STATE_DIR/current.rollback" || rollback_failed=true
+        if [[ -f "$REPOSITORY_STATE_DIR/current.rollback" ]]; then
+            repository_rename "$REPOSITORY_STATE_DIR/current.rollback" "$REPOSITORY_STATE_DIR/current" || rollback_failed=true
+        fi
+    else
+        rm -f -- "$REPOSITORY_STATE_DIR/current" 2>/dev/null || rollback_failed=true
+    fi
+    rm -f -- "$REPOSITORY_KEY_STAGE" "$REPOSITORY_SOURCE_STAGE" 2>/dev/null || rollback_failed=true
+    archive_failed_transaction || rollback_failed=true
+    release_repository_lock || rollback_failed=true
+    restore_repository_traps
+    if [[ "$rollback_failed" == true ]]; then
+        error "Cloudflare 仓库事务回滚不完整；失败证据已尽量保留: $REPOSITORY_TRANSACTION_DIR"
+        return 1
+    fi
+    error "Cloudflare 仓库事务失败，旧 key/source 已恢复；证据: $REPOSITORY_TRANSACTION_DIR"
+    return 0
+}
+
+repository_transaction_fail() {
+    local reason="$1"
+    error "$reason"
+    rollback_repository_transaction "$reason" || true
+    return 1
+}
+
+repository_signal_handler() {
+    local code="$1" signal="$2"
+    rollback_repository_transaction "收到 $signal 信号" || true
+    exit "$code"
+}
+
+repository_exit_handler() {
+    local status="$1"
+    if [[ "$REPOSITORY_TRANSACTION_ACTIVE" == true ]]; then
+        rollback_repository_transaction "进程异常退出，状态 $status" || true
+    fi
+    exit "$status"
+}
+
+validate_committed_repository() {
+    local expected
+    validate_secure_file "$KEYRING" 644 || return 1
+    validate_secure_file "$SOURCE_FILE" 644 || return 1
+    expected=$(repository_source_content)
+    [[ "$(cat -- "$SOURCE_FILE")" == "$expected" ]] || {
+        error "正式 source 内容不精确"
+        return 1
+    }
+    validate_downloaded_key "$KEYRING" 644
+}
+
+begin_repository_transaction() {
+    local key_parent source_parent downloaded marker_stage key_hash source_hash
+    command -v curl >/dev/null || { error "缺少 curl；正式仓库提交前不会通过 APT 安装依赖"; return 1; }
+    command -v gpg >/dev/null || { error "缺少 gpg；无法校验 OpenPGP 主身份"; return 1; }
+    command -v realpath >/dev/null || { error "缺少 realpath"; return 1; }
+    key_parent=$(dirname -- "$KEYRING")
+    source_parent=$(dirname -- "$SOURCE_FILE")
+    validate_directory_chain "$key_parent" || return 1
+    validate_directory_chain "$source_parent" || return 1
+    validate_directory_chain "$APT_SOURCE_ROOT" || return 1
+    prepare_repository_state || return 1
+    acquire_repository_lock || return 1
+
+    REPOSITORY_GENERATION="$(date -u +%Y%m%dT%H%M%SZ)-$$-$RANDOM"
+    REPOSITORY_TRANSACTION_DIR="$REPOSITORY_STATE_DIR/transaction-$REPOSITORY_GENERATION"
+    if ! mkdir -m 0700 -- "$REPOSITORY_TRANSACTION_DIR" ||
+        ! validate_secure_directory "$REPOSITORY_TRANSACTION_DIR" 700; then
+        release_repository_lock || true
+        return 1
+    fi
+    REPOSITORY_TRANSACTION_ACTIVE=true
+    save_repository_traps
+
+    validate_existing_repository_file "$KEYRING" || repository_transaction_fail "现有 keyring 类型或元数据不可信"
+    [[ "$REPOSITORY_TRANSACTION_ACTIVE" == true ]] || return 1
+    validate_existing_source || repository_transaction_fail "现有 source 类型、元数据或内容不可信"
+    [[ "$REPOSITORY_TRANSACTION_ACTIVE" == true ]] || return 1
+    backup_repository_generation || repository_transaction_fail "备份旧 key/source 失败"
+    [[ "$REPOSITORY_TRANSACTION_ACTIVE" == true ]] || return 1
+
+    downloaded="$REPOSITORY_TRANSACTION_DIR/downloaded-key"
+    repository_transaction_hook download
+    if ! : > "$downloaded" || ! chmod 0600 "$downloaded" ||
+        ! repository_download_key "$downloaded"; then
+        repository_transaction_fail "Cloudflare key URL 下载失败"
+        return 1
+    fi
+    repository_transaction_hook validate
+    validate_downloaded_key "$downloaded" || {
+        repository_transaction_fail "Cloudflare 下载密钥校验失败"
+        return 1
+    }
+
+    repository_transaction_hook stage
+    REPOSITORY_KEY_STAGE=$(mktemp "$key_parent/.cloudflare-main.gpg.stage.XXXXXX") || {
+        repository_transaction_fail "创建 key stage 失败"
+        return 1
+    }
+    REPOSITORY_SOURCE_STAGE=$(mktemp "$source_parent/.cloudflared.list.stage.XXXXXX") || {
+        repository_transaction_fail "创建 source stage 失败"
+        return 1
+    }
+    if ! repository_install_file 0644 "$downloaded" "$REPOSITORY_KEY_STAGE" ||
+        ! validate_secure_file "$REPOSITORY_KEY_STAGE" 644; then
+        repository_transaction_fail "写入或校验 key stage 失败"
+        return 1
+    fi
+    if ! repository_source_content > "$REPOSITORY_TRANSACTION_DIR/source" ||
+        ! chmod 0600 "$REPOSITORY_TRANSACTION_DIR/source" ||
+        ! repository_install_file 0644 "$REPOSITORY_TRANSACTION_DIR/source" "$REPOSITORY_SOURCE_STAGE" ||
+        ! validate_secure_file "$REPOSITORY_SOURCE_STAGE" 644; then
+        repository_transaction_fail "写入或校验 source stage 失败"
+        return 1
+    fi
+
+    write_transaction_status "generation=$REPOSITORY_GENERATION staged" || {
+        repository_transaction_fail "写入事务状态失败"
+        return 1
+    }
+    repository_transaction_hook key-commit
+    if ! repository_rename "$REPOSITORY_KEY_STAGE" "$KEYRING"; then
+        repository_transaction_fail "提交正式 keyring 失败"
+        return 1
+    fi
+    REPOSITORY_KEY_STAGE=""
+    validate_secure_file "$KEYRING" 644 || {
+        repository_transaction_fail "正式 keyring 提交后校验失败"
+        return 1
+    }
+    repository_transaction_hook source-commit
+    if ! repository_rename "$REPOSITORY_SOURCE_STAGE" "$SOURCE_FILE"; then
+        repository_transaction_fail "提交正式 source 失败"
+        return 1
+    fi
+    REPOSITORY_SOURCE_STAGE=""
+    repository_transaction_hook committed
+    validate_committed_repository || {
+        repository_transaction_fail "正式 key/source 同世代校验失败"
+        return 1
+    }
+
+    key_hash=$(sha256sum -- "$KEYRING" | awk '{print $1}') || {
+        repository_transaction_fail "计算 keyring 世代摘要失败"
+        return 1
+    }
+    source_hash=$(sha256sum -- "$SOURCE_FILE" | awk '{print $1}') || {
+        repository_transaction_fail "计算 source 世代摘要失败"
+        return 1
+    }
+    marker_stage="$REPOSITORY_STATE_DIR/current.stage-$REPOSITORY_GENERATION"
+    if ! printf 'generation=%s\nkey_sha256=%s\nsource_sha256=%s\n' \
+        "$REPOSITORY_GENERATION" "$key_hash" "$source_hash" > "$marker_stage" ||
+        ! chmod 0600 "$marker_stage" ||
+        ! validate_secure_file "$marker_stage" 600 ||
+        ! repository_rename "$marker_stage" "$REPOSITORY_STATE_DIR/current"; then
+        rm -f -- "$marker_stage" 2>/dev/null || true
+        repository_transaction_fail "提交 key/source 世代状态失败"
+        return 1
+    fi
+    write_transaction_status "generation=$REPOSITORY_GENERATION committed" || {
+        repository_transaction_fail "记录事务提交状态失败"
+        return 1
+    }
+}
+
+finish_repository_transaction() {
+    local history_dir="$REPOSITORY_STATE_DIR/history-$REPOSITORY_GENERATION"
+    [[ "$REPOSITORY_TRANSACTION_ACTIVE" == true ]] || return 1
+    if ! repository_rename "$REPOSITORY_TRANSACTION_DIR" "$history_dir"; then
+        repository_transaction_fail "归档成功事务失败"
+        return 1
+    fi
+    REPOSITORY_TRANSACTION_DIR="$history_dir"
+    REPOSITORY_TRANSACTION_ACTIVE=false
+    trap - HUP INT TERM EXIT
+    if ! release_repository_lock; then
+        restore_repository_traps
+        error "仓库提交成功，但事务锁释放失败: $REPOSITORY_LOCK_DIR"
+        return 1
+    fi
+    restore_repository_traps
+}
+
+configure_repository() {
+    begin_repository_transaction || return 1
+    finish_repository_transaction
+}
+
+run_repository_apt_transaction() {
+    local operation="$1"
+    begin_repository_transaction || return 1
+    repository_transaction_hook apt-probe
+    if ! apt-get update; then
+        repository_transaction_fail "Cloudflare APT probe 失败"
+        return 1
+    fi
+    repository_transaction_hook apt-install
+    case "$operation" in
+        install)
+            if ! DEBIAN_FRONTEND=noninteractive apt-get install -y cloudflared; then
+                repository_transaction_fail "cloudflared APT 安装失败"
+                return 1
+            fi
+            ;;
+        upgrade)
+            if ! DEBIAN_FRONTEND=noninteractive apt-get install -y --only-upgrade cloudflared; then
+                repository_transaction_fail "cloudflared APT 升级失败"
+                return 1
+            fi
+            ;;
+        *)
+            repository_transaction_fail "未知 APT 仓库事务: $operation"
+            return 1
+            ;;
+    esac
+    finish_repository_transaction
 }
 
 legacy_updater_is_managed() {
@@ -430,9 +974,7 @@ install_package() {
     validate_migration_inputs
     PRESERVE_AUTO_UPDATE=false
     legacy_auto_update_present && PRESERVE_AUTO_UPDATE=true || true
-    configure_repository
-    apt-get update
-    DEBIAN_FRONTEND=noninteractive apt-get install -y cloudflared
+    run_repository_apt_transaction install
     migrate_legacy_binary
     cleanup_legacy_updater || { error "旧自定义更新组件清理失败"; return 1; }
     cleanup_binary_updater || { error "二进制更新单元清理失败"; return 1; }
@@ -493,9 +1035,7 @@ upgrade_cloudflared() {
     validate_migration_inputs
     PRESERVE_AUTO_UPDATE=false
     legacy_auto_update_present && PRESERVE_AUTO_UPDATE=true || true
-    configure_repository
-    apt-get update
-    DEBIAN_FRONTEND=noninteractive apt-get install -y --only-upgrade cloudflared
+    run_repository_apt_transaction upgrade
     migrate_legacy_binary
     cleanup_legacy_updater || { error "旧自定义更新组件清理失败"; return 1; }
     cleanup_binary_updater || { error "二进制更新单元清理失败"; return 1; }

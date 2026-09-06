@@ -292,9 +292,13 @@ scaling、SACK、DSACK、时间戳和 syncookies，但保留内核或发行版�
 ### Cloudflare Tunnel
 
 [`tools/cloudflare_tunnel.sh`](tools/cloudflare_tunnel.sh) 是 Cloudflare 官方 APT 安装流程的薄包装器，
-只支持 Debian/Ubuntu 与 systemd。它使用官方 stable 软件源和 `cloudflared service install`，
-不再下载裸二进制。安装完成后会询问是否启用受管的 APT systemd timer，默认不启用；也可稍后
-使用独立命令启用。
+只支持 Debian/Ubuntu 与 systemd。它使用 Cloudflare 官方 key/source：
+`deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflare-main.gpg any main`，
+并以 `cloudflared service install` 配置服务，不再下载裸二进制。keyring 会严格校验单一主公钥
+fingerprint `CC94B39C77AE7342A68B89628A682D308D4E5E73` 与 UID
+`CloudFlare Software Packaging 2025 <help@cloudflare.com>`。key/source 同一事务提交；APT probe 或安装
+失败、进程异常退出或收到 HUP/INT/TERM 时恢复旧世代并保留失败证据。安装完成后会询问是否启用
+受管的 APT systemd timer，默认不启用；也可稍后使用独立命令启用。
 
 ```bash
 sudo bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/tools/cloudflare_tunnel.sh) install
