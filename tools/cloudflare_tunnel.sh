@@ -2,6 +2,12 @@
 # Cloudflare Tunnel manager for Debian/Ubuntu.
 # Uses Cloudflare's official stable APT repository and service command.
 
+# Sourcing exposes no legacy global function API. Internal tests opt in explicitly.
+if [[ "${BASH_SOURCE[0]:-$0}" != "$0" && "${CLOUDFLARED_TEST_INTERNALS:-}" != 1 ]]; then
+    cloudflare_tunnel_source() { :; }
+    return 0
+fi
+
 init_runtime_config() {
     KEYRING="${CLOUDFLARED_KEYRING:-/usr/share/keyrings/cloudflare-main.gpg}"
     SOURCE_FILE="${CLOUDFLARED_SOURCE_FILE:-/etc/apt/sources.list.d/cloudflared.list}"
@@ -1117,14 +1123,31 @@ remove_managed_repository() {
     local backup_dir
     validate_directory_chain "$(dirname -- "$REPOSITORY_LOCK_DIR")" || return 1
     acquire_repository_lock || return 1
+    prepare_repository_state || {
+        release_repository_lock || true
+        return 1
+    }
+    validate_directory_chain "$(dirname -- "$SOURCE_FILE")" || {
+        release_repository_lock || true
+        return 1
+    }
+    if [[ -e "$SOURCE_FILE" || -L "$SOURCE_FILE" ]]; then
+        validate_secure_file "$SOURCE_FILE" 644 || {
+            release_repository_lock || true
+            return 1
+        }
+        validate_existing_source || {
+            release_repository_lock || true
+            return 1
+        }
+    fi
     backup_dir="$STATE_DIR/uninstall-$(date +%Y%m%d_%H%M%S)"
-    if [[ -f "$STATE_DIR/repository-managed" && -f "$SOURCE_FILE" ]] &&
-        grep -Fq '# Managed by tools/cloudflare_tunnel.sh' "$SOURCE_FILE"; then
+    if [[ -f "$STATE_DIR/repository-managed" && -f "$SOURCE_FILE" ]]; then
         backup_path "$SOURCE_FILE" "$backup_dir" || {
             release_repository_lock || true
             return 1
         }
-        rm -f "$SOURCE_FILE" "$STATE_DIR/repository-managed" || {
+        rm -f -- "$SOURCE_FILE" "$STATE_DIR/repository-managed" || {
             release_repository_lock || true
             return 1
         }
