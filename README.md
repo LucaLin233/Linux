@@ -78,13 +78,12 @@ bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/linux_
 | ---: | --- | --- | --- |
 | 1 | `system-optimize.sh` | Zram、系统 sysctl、journald、THP、时区和 Chrony | 为 headless VPS 设置 Panic 恢复、日志上限和低干扰 THP 策略；Ubuntu 可能安装内核模块、固件与 CPU 微码 |
 | 2 | `system-customize.sh` | 动态 MOTD、中文 Locale、可选 XanMod | 可能修改 Locale、欢迎信息和内核 |
-| 3 | `network-optimize.sh` | BBR、fq、动态 TCP 缓冲区与 initcwnd | 交互测速默认 Y；上传、下载各 12.5 GB，合计 25 GB |
-| 4 | `zsh-setup.sh` | Zsh、Oh My Zsh、Powerlevel10k 和插件 | 备份后重写 root 的 `.zshrc`，可修改默认 Shell |
-| 5 | `mise-setup.sh` | Mise、Python、Node.js 和依赖迁移 | 配置 Shell 集成及每周 Mise 自动更新 |
-| 6 | `tools-setup.sh` | NextTrace、Speedtest、htop、jq、tree 等 | 可能添加 NextTrace 第三方 APT 源 |
-| 7 | `docker-setup.sh` | Docker Engine、Compose、Buildx、日志轮转 | 添加 Docker 官方 APT 源并管理 Docker 服务 |
-| 8 | `auto-update-setup.sh` | 定时完整升级系统和内核 | 更新后需要重启时会等待 30 秒自动重启 |
-| 9 | `ssh-security.sh` | SSH 端口、Root 登录与认证策略 | 保留当前 `ListenAddress`，完整管理其余主配置；写入前显示 drop-in 冲突并再次确认 |
+| 3 | `zsh-setup.sh` | Zsh、Oh My Zsh、Powerlevel10k 和插件 | 备份后重写 root 的 `.zshrc`，可修改默认 Shell |
+| 4 | `mise-setup.sh` | Mise、Python、Node.js 和依赖迁移 | 配置 Shell 集成及每周 Mise 自动更新 |
+| 5 | `tools-setup.sh` | NextTrace、Speedtest、htop、jq、tree 等 | 可能添加 NextTrace 第三方 APT 源 |
+| 6 | `docker-setup.sh` | Docker Engine、Compose、Buildx、日志轮转 | 添加 Docker 官方 APT 源并管理 Docker 服务 |
+| 7 | `auto-update-setup.sh` | 定时完整升级系统和内核 | 更新后需要重启时会等待 30 秒自动重启 |
+| 8 | `ssh-security.sh` | SSH 端口、Root 登录与认证策略 | 保留当前 `ListenAddress`，完整管理其余主配置；写入前显示 drop-in 冲突并再次确认 |
 
 当前只有 `mise-setup` 声明 `zsh-setup` 为强依赖；其他模块可以单独执行。
 SSH 模块要求系统已安装并运行 `openssh-server`；精简镜像请先执行 `sudo apt install -y openssh-server`。
@@ -144,25 +143,22 @@ sudo bash <(curl -fsSL "$RAW_BASE/system-optimize.sh")
 # 2. 欢迎信息、中文环境和可选 XanMod
 sudo bash <(curl -fsSL "$RAW_BASE/system-customize.sh")
 
-# 3. 网络优化；交互选择是否测速，测速可能产生大量流量
-sudo bash <(curl -fsSL "$RAW_BASE/network-optimize.sh")
-
-# 4. Zsh、Oh My Zsh、Powerlevel10k 和插件
+# 3. Zsh、Oh My Zsh、Powerlevel10k 和插件
 sudo bash <(curl -fsSL "$RAW_BASE/zsh-setup.sh")
 
-# 5. Mise、Python 和 Node.js；请先完成第 4 项
+# 4. Mise、Python 和 Node.js；请先完成第 3 项
 sudo bash <(curl -fsSL "$RAW_BASE/mise-setup.sh")
 
-# 6. NextTrace、Speedtest、htop、jq、tree 等工具
+# 5. NextTrace、Speedtest、htop、jq、tree 等工具
 sudo bash <(curl -fsSL "$RAW_BASE/tools-setup.sh")
 
-# 7. Docker Engine、Compose 和 Buildx
+# 6. Docker Engine、Compose 和 Buildx
 sudo bash <(curl -fsSL "$RAW_BASE/docker-setup.sh")
 
-# 8. 每周系统与内核更新；需要时会自动重启
+# 7. 每周系统与内核更新；需要时会自动重启
 sudo bash <(curl -fsSL "$RAW_BASE/auto-update-setup.sh")
 
-# 9. SSH 安全配置；操作前先确认控制台和云防火墙可用
+# 8. SSH 安全配置；操作前先确认控制台和云防火墙可用
 sudo bash <(curl -fsSL "$RAW_BASE/ssh-security.sh")
 ```
 
@@ -199,70 +195,7 @@ sudo bash <(curl -fsSL "$RAW_BASE/system-customize.sh") help
 文件已经严格安全有效时，无需确认。只有计划确实包含修改时才使用 `[y/N]`，无 TTY 必须显式传入
 `--yes`。`all` 或无参数模式在无 TTY 时仍会完成 MOTD 与 Locale，但只跳过确需修改的 XanMod 步骤。
 
-`network-optimize.sh` 支持自动测速、手动指定参数、查看状态和恢复配置：
-
-```bash
-RAW_BASE="https://raw.githubusercontent.com/LucaLin233/Linux/main/modules"
-# 交互终端无参数运行：回车默认执行公共 iperf3 测速，选择 N 后手填带宽
-sudo bash <(curl -fsSL "$RAW_BASE/network-optimize.sh")
-
-# 非交互自动测速；install 模式可通过 APT 安装缺失的 iperf3 等依赖
-sudo bash <(curl -fsSL "$RAW_BASE/network-optimize.sh") install --auto
-
-# 绕过 7 天缓存强制现场测速；失败时仍可回退到 30 天内同路由缓存
-sudo bash <(curl -fsSL "$RAW_BASE/network-optimize.sh") install --auto --refresh
-
-# 非交互手动提供完整上下行带宽
-bash <(curl -fsSL "$RAW_BASE/network-optimize.sh") \
-  plan --download-mbps 1000 --upload-mbps 500
-
-# 使用明确的带宽和 RTT，避免自动测速
-sudo bash <(curl -fsSL "$RAW_BASE/network-optimize.sh") \
-  install --download-mbps 1000 --upload-mbps 500 --rtt-ms 180
-
-bash <(curl -fsSL "$RAW_BASE/network-optimize.sh") status
-sudo bash <(curl -fsSL "$RAW_BASE/network-optimize.sh") restore
-sudo bash <(curl -fsSL "$RAW_BASE/network-optimize.sh") restore initial
-bash <(curl -fsSL "$RAW_BASE/network-optimize.sh") help
-```
-
-主脚本仍以无参数方式调用网络模块，因此进入该模块后会显示同一交互问题，直接回车走默认 Y。
-无 TTY 时只接受 `--auto`、`--bandwidth-mbps` 或完整的 `--download-mbps` 与
-`--upload-mbps`。自动测速仅使用 IPv4 公共 iperf3，最多选择两个节点，每方向固定
-`P=4`、`t=5` 秒并采用有效较高结果；同方向节点差异超过 30% 时只降低可信度并警告。
-上传、下载预算各为 12.5 GB，总预算 25 GB，按实际出口接口计数并包含同期后台流量。自动测速
-先记录 `1.1.1.1` 对应的默认 IPv4 出口身份，只测试并采纳 ifindex、接口、网关和源地址完全
-一致的公共节点；应用前会再次校验，避免路由切换后写入失真的调优值。
-
-成功测量通过路由复核后写入 v2 缓存，固定绑定 `1.1.1.1` 的 ifindex、接口、网关和源地址；旧版
-缓存会被忽略。7 天内缓存可直接复用；`--auto --refresh` 会绕过它并强制现场测速。现场测速失败
-时，只允许回退到 30 天内且路由身份完全一致的缓存；refresh 回退范围也包含 7 天内缓存。单节点、
-结果分歧、预算停止或缓存回退属于低可信度：只要上下行输入完整且应用验证成功，命令仍返回 0，
-并把来源、时间、节点、可信度和警告写入配置供 `status` 显示。缺少任一方向、应用验证失败或触发
-回滚返回 1。
-
-`initcwnd` 默认为 `auto`：上传带宽不高于 100 Mbps 时保留内核默认，否则在默认路由设置
-`initcwnd/initrwnd=32`；`--enable-initcwnd` 和 `--disable-initcwnd` 可显式覆盖。持久化 hook
-在最终写路由前会再次检查 ownership marker。模块不接管 ECN、forwarding 或 IPv6 RA。
-`verify`、`--probe`、`--yes` 和 `--disable-ecn` 已退休并会被拒绝。
-
-网络模块默认面向同时承载 TCP、UDP 与 Docker 流量的代理节点：连接队列使用
-`somaxconn=65535`、`tcp_max_syn_backlog=16384`。基础内存模型兼容 tcpfit v0.5.6 的 mixed role：
-TCP 与 core socket default 固定为 2 MiB，长流继续依赖 autotuning；core default 同时影响 TCP、
-UDP 和其他未显式设置缓冲区的 socket。`tcp_mem` 的 low/pressure/max 比例值按有效 RAM
-（物理 RAM 与当前轻量 cgroup 根限制的较小值）的 1/16、1/8、1/4 推导；低内存 floor 固定为
-16/32/64 MiB，最终写入 sysctl 时转换为当前内核 page 数，不假设 page size 固定为 4 KiB。
-
-动态 socket 最大值仍按 `2 × BDP + 2 MiB` 计算，并受有效 RAM / 32 限制；RAM cap 最低
-8 MiB、最高 256 MiB，动态最大值另保留 4 MiB 绝对下限。下游继续保留严格应用与验证事务、
-initial/previous 双备份，以及 cgroup 根限制增强。模块启用 TCP receive autotuning、window
-scaling、SACK、DSACK、时间戳和 syncookies，但保留内核或发行版管理的 `netdev_budget` 与
-`netdev_budget_usecs`。`status` 聚焦当前测量记录、BBR/fq、受管缓冲区和 initcwnd 状态，不再
-提供通用系统健康面板。
-
-> `RAW_BASE` 只在当前 Shell 会话有效。上述进程替换语法需要 Bash 或 Zsh；不要改成
-> `curl ... | sudo bash`，否则交互模块可能无法正常读取终端输入。SSH、自动更新、内核和网络
-> 模块具有断连、重启或大量流量风险，执行前请阅读“高风险提醒”。
+Linux 仓库不再内置 `network-optimize` 和 `traffic-shape` 网络调优脚本。
 
 ### 新增模块
 
@@ -328,53 +261,6 @@ APT 包与 `cloudflared update` 混用。若旧环境已有每日自动更新 ti
 APT timer；旧环境未启用自动更新时仍保持关闭并询问是否启用。`uninstall` 删除服务、APT 包及
 本脚本管理的软件源，但保留 Tunnel 配置和凭据。彻底清理须显式运行 `purge`，并在交互终端
 输入 `PURGE` 二次确认。
-
-### 出口流量整形 tcshape
-
-基于 tcpfit `v0.5.6` 选择性移植限速器拐点 Sweep 与 `HTB + fq` Shape。它不会修改基础
-sysctl，适用于存在出口 policer 的特定 VPS，不是通用必选优化。
-
-首次运行：
-
-```bash
-curl -fsSLo /tmp/tcshape.sh https://raw.githubusercontent.com/LucaLin233/Linux/main/tools/traffic-shape.sh && sudo bash /tmp/tcshape.sh
-```
-
-该写法先落盘再执行，兼容 Termius，也避免部分 Bash 进程替换场景中的 `/dev/fd/*` 无法二次读取。
-新版仍会识别 `bash <(curl ...)`：若启动源不可复制，会从官方仓库重新下载并校验后安装；检测到
-旧版遗留的零字节 `/usr/local/sbin/tcshape` 时会自动安全替换，非空且无受管标记的文件仍拒绝覆盖。
-
-随后可使用短命令：
-
-```bash
-sudo tcshape s        # 自动选公共节点并扫描
-sudo tcshape a        # 应用 24 小时内的最近推荐值
-sudo tcshape on 480   # 手动限制为 480 Mbit
-sudo tcshape off      # 关闭并恢复原 qdisc
-sudo tcshape st       # 只读查看状态，不自安装或安装依赖
-sudo tcshape u        # 从 LucaLin233/Linux main 检查更新
-sudo tcshape apply --force  # 明确强制使用超过 24 小时的旧推荐值
-```
-
-tcshape 明确支持 Debian 12+ 与 Ubuntu 22.04+，要求 root、systemd、APT 及内核允许管理
-qdisc。Ubuntu 软件源缺少 `iperf3` 时会提示先启用 `universe`，不会继续半安装。
-
-Sweep 可能消耗大量上传流量，并会临时替换默认出口接口的根 qdisc。单方向上限约 45 GB，
-双向合计上限约 90 GB。未检测到限速器或未找到拐点时，不建议且不能自动应用整形。
-`tcshape a` 默认只接受 24 小时内的成功结果；相同推荐值已完整启用时直接返回，不重建 qdisc。
-超过 24 小时的结果应重新扫描，仅在明确确认线路未变化时使用 `tcshape apply --force`。
-自动扫描上限默认 10 Gbit，可用 `tcshape scan --cap N` 明确调整；可用
-`--loss-threshold PCT` 覆盖默认 `0.1%` 重传率阈值。跨出口接口重新设置时会验证新整形后清理
-旧接口 HTB 并迁移恢复基线，失败则回滚；带自定义参数的 `fq`/`fq_codel` 会被拒绝接管。
-不限速单流低于自动选点或 `--nominal` 参考带宽的 70% 时，会按 tcpfit `v0.5.6` 在同一节点
-补测两次，并按接收带宽选取最高的完整样本。重传率优先使用 iperf3 实际字节数与 MSS 计算。
-
-`tcshape u`/`tcshape update` 会读取 `LucaLin233/Linux` 的 `main` 最新提交，按固定 Commit 下载并
-校验受管标记、版本号和 Bash 语法，再原子替换短命令。上一版本保存在
-`/usr/local/sbin/tcshape.previous`；配置、Sweep 结果和当前 qdisc 不会被修改。已安装 `1.0.3`
-或更早版本的机器需要先按上面的“首次运行”命令升级一次，之后才能使用更新短命令。
-
-详细参数、安全边界和恢复说明见 [`docs/traffic-shape.md`](docs/traffic-shape.md)。
 
 ### 多服务器文件推送
 
@@ -470,28 +356,19 @@ APT 安装失败时请检查 `dpkg --audit` 和 APT 状态。
 
 - [`p10k-config.zsh`](p10k-config.zsh)：供 Zsh 模块使用的 Powerlevel10k 配置；
 - `config.conf`：`push.sh` 生成的本地配置，可能包含敏感信息，不应提交；
-- [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md)：第三方代码来源和许可证。
 
 ## 功能重叠与选择
 
 | 需求 | 推荐脚本 | 避免同时使用 |
 | --- | --- | --- |
-| 新 Debian/Ubuntu VPS 网络基础调优 | `modules/network-optimize.sh` | 其他会覆盖 sysctl 或根 qdisc 的调优脚本 |
-| 特定出口 policer 检测与整形 | `tools/traffic-shape.sh` | tcpfit Shape、CAKE、TBF、其他 HTB |
 | 一键系统定制 | `system-customize.sh` | 重复运行 `setup-motd.sh` |
 | 仅安装 XanMod | `xanmod-install.sh` | 同时让多个脚本反复管理内核源 |
-
-`network-optimize.sh` 与 `traffic-shape.sh` 职责不同，可以配合：前者管理 BBR、缓冲区、默认
-`fq` 和按内核能力启用的 TCP 参数；后者在确实检测到 policer 后才使用 HTB 控制聚合出口速率，
-并保留 fq 叶子 pacing。
 
 ## 高风险提醒
 
 - **SSH**：修改端口或认证前，先放行云安全组/防火墙，并保持当前会话直到新连接验证成功；
 - **自动更新**：系统或内核更新后可能自动重启；
 - **系统优化**：首次写入 journald 限额时会重启 `systemd-journald`，并设置 Kernel Panic 30 秒后重启；
-- **网络测速**：`network-optimize` 和 tcshape 都可能产生大量流量；
-- **qdisc**：不要叠加多个整形工具；tcshape 遇到高级或未知 qdisc 会拒绝覆盖；
 - **内核**：安装新内核前确认磁盘空间、架构和可用的旧内核；
 - **rsync**：默认不删除远端文件；显式启用 `DELETE_EXTRA=true` 后会要求额外确认；
 - **凭据**：不要提交 Token、密码、私钥、`.env` 或 `config.conf`。
@@ -511,10 +388,8 @@ journalctl -p warning -b --no-pager
 根据故障再检查对应服务：
 
 ```bash
-systemctl status ssh docker chrony cron tcshape.service
+systemctl status ssh docker chrony cron
 sshd -t
-tc qdisc show
-sysctl net.ipv4.tcp_congestion_control net.core.default_qdisc
 ```
 
 提交 Issue 时请提供系统版本、执行命令、退出码和已脱敏的完整日志，不要包含 Token、密码、
@@ -522,8 +397,7 @@ sysctl net.ipv4.tcp_congestion_control net.core.default_qdisc
 
 ## 许可证与免责声明
 
-本仓库采用 [MIT License](LICENSE)。第三方移植代码见
-[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md)。
+本仓库采用 [MIT License](LICENSE)。
 
 脚本按“原样”提供，不附带任何担保。发行版、内核、虚拟化、机房网络和软件源存在差异，使用者
 应自行审查、备份、验证并承担操作后果。
