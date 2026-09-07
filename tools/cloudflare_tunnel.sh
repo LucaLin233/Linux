@@ -1128,20 +1128,47 @@ show_status() {
     show_auto_update_status
 }
 
+validate_current_repository_manifest() {
+    init_runtime_config
+    local current="$REPOSITORY_STATE_DIR/current" generation key_hash source_hash expected_key_hash expected_source_hash
+    validate_secure_file "$current" 600 || return 1
+    awk -F= '
+        NF != 2 || ($1 != "generation" && $1 != "key_sha256" && $1 != "source_sha256") || seen[$1]++ {bad=1}
+        END {if (bad || seen["generation"] != 1 || seen["key_sha256"] != 1 || seen["source_sha256"] != 1) exit 1}
+    ' "$current" || return 1
+    generation=$(awk -F= '$1 == "generation" {print $2}' "$current")
+    [[ "$generation" =~ ^[0-9]{8}T[0-9]{6}Z-[0-9]+-[0-9]+$ ]] || return 1
+    key_hash=$(awk -F= '$1 == "key_sha256" {print $2}' "$current")
+    source_hash=$(awk -F= '$1 == "source_sha256" {print $2}' "$current")
+    [[ "$key_hash" =~ ^[[:xdigit:]]{64}$ && "$source_hash" =~ ^[[:xdigit:]]{64}$ ]] || return 1
+    validate_secure_file "$KEYRING" 644 || return 1
+    validate_secure_file "$SOURCE_FILE" 644 || return 1
+    expected_key_hash=$(sha256sum -- "$KEYRING" | awk '{print $1}') || return 1
+    expected_source_hash=$(sha256sum -- "$SOURCE_FILE" | awk '{print $1}') || return 1
+    [[ "$key_hash" == "$expected_key_hash" && "$source_hash" == "$expected_source_hash" ]] || return 1
+    [[ "$(cat -- "$SOURCE_FILE")" == "$(repository_source_content)" ]] || return 1
+}
+
 remove_managed_repository_locked() {
     init_runtime_config
-    local backup_dir
-    validate_existing_repository_file "$KEYRING" || return 1
+    local backup_dir managed=false
     validate_directory_chain "$(dirname -- "$SOURCE_FILE")" || return 1
-    if [[ -e "$SOURCE_FILE" || -L "$SOURCE_FILE" ]]; then
+    if [[ -f "$REPOSITORY_STATE_DIR/current" ]] && validate_current_repository_manifest; then
+        managed=true
+    fi
+    if [[ "$managed" != true && -f "$STATE_DIR/repository-managed" ]] &&
+        validate_secure_file "$STATE_DIR/repository-managed" 600 &&
+        [[ "$(cat -- "$STATE_DIR/repository-managed")" == managed ]]; then
         validate_secure_file "$SOURCE_FILE" 644 || return 1
-        validate_existing_source || return 1
+        [[ "$(cat -- "$SOURCE_FILE")" == "$(repository_legacy_source_content)" ]] || return 1
+        managed=true
     fi
+    [[ "$managed" == true ]] || { error "无法验证 Cloudflare source 管理归属，拒绝删除"; return 1; }
     backup_dir="$STATE_DIR/uninstall-$(date +%Y%m%d_%H%M%S)"
-    if [[ -f "$STATE_DIR/repository-managed" && -f "$SOURCE_FILE" ]]; then
-        backup_path "$SOURCE_FILE" "$backup_dir" || return 1
-        rm -f -- "$SOURCE_FILE" "$STATE_DIR/repository-managed" || return 1
-    fi
+    backup_path "$SOURCE_FILE" "$backup_dir" || return 1
+    rm -f -- "$SOURCE_FILE" "$STATE_DIR/repository-managed" || return 1
+    rm -f -- "$REPOSITORY_STATE_DIR/current" || return 1
+    unset REPOSITORY_STATE_DIR
 }
 
 remove_managed_repository() {
@@ -1155,8 +1182,82 @@ remove_managed_repository() {
     release_repository_lock
 }
 
+uninstall_transaction_hook() {
+    :
+}
+
+uninstall_cleanup() {
+    init_runtime_config
+    local reason="$1" failed=false evidence
+    [[ "${UNINSTALL_TRANSACTION_ACTIVE:-false}" == true ]] || return 0
+    UNINSTALL_TRANSACTION_ACTIVE=false
+    trap - HUP INT TERM EXIT
+    evidence="$REPOSITORY_STATE_DIR/failure-uninstall-${UNINSTALL_GENERATION:-unknown}"
+    mkdir -m 0700 -- "$evidence" 2>/dev/null || failed=true
+    printf '%s\n' "$reason" > "$evidence/rollback.log" 2>/dev/null || failed=true
+    chmod 0600 "$evidence/rollback.log" 2>/dev/null || failed=true
+    if [[ -n "${UNINSTALL_SNAPSHOT_DIR:-}" && -d "$UNINSTALL_SNAPSHOT_DIR" ]]; then
+        for path in "$AUTO_UPDATE_SCRIPT" "$AUTO_UPDATE_SERVICE" "$AUTO_UPDATE_TIMER" "$SOURCE_FILE" "$REPOSITORY_STATE_DIR/current" "$STATE_DIR/repository-managed"; do
+            if [[ -f "$UNINSTALL_SNAPSHOT_DIR/$(basename -- "$path")" ]]; then
+                install -o 0 -g 0 -m "$(stat -c %a "$UNINSTALL_SNAPSHOT_DIR/$(basename -- "$path")")" -- "$UNINSTALL_SNAPSHOT_DIR/$(basename -- "$path")" "$path" || failed=true
+            fi
+        done
+        rm -rf -- "$UNINSTALL_SNAPSHOT_DIR" 2>/dev/null || failed=true
+    fi
+    release_repository_lock || failed=true
+    restore_repository_traps
+    [[ "$failed" == false ]] || { error "卸载事务清理不完整；失败证据: $evidence"; return 1; }
+    error "Cloudflare 卸载事务失败；可恢复文件已恢复；证据: $evidence"
+}
+
+uninstall_signal_handler() {
+    local code="$1" signal="$2"
+    uninstall_cleanup "收到 $signal 信号" || true
+    exit "$code"
+}
+
+uninstall_exit_handler() {
+    local status="$1"
+    if [[ "${UNINSTALL_TRANSACTION_ACTIVE:-false}" == true ]]; then
+        uninstall_cleanup "活动卸载事务异常退出，原状态 $status" || true
+        (( status == 0 )) && status=1
+    fi
+    exit "$status"
+}
+
+begin_uninstall_transaction() {
+    init_runtime_config
+    UNINSTALL_GENERATION="$(date -u +%Y%m%dT%H%M%SZ)-$$-$RANDOM"
+    UNINSTALL_SNAPSHOT_DIR="$REPOSITORY_STATE_DIR/uninstall-$UNINSTALL_GENERATION"
+    mkdir -m 0700 -- "$UNINSTALL_SNAPSHOT_DIR" || return 1
+    for path in "$AUTO_UPDATE_SCRIPT" "$AUTO_UPDATE_SERVICE" "$AUTO_UPDATE_TIMER" "$SOURCE_FILE" "$REPOSITORY_STATE_DIR/current" "$STATE_DIR/repository-managed"; do
+        [[ -e "$path" || -L "$path" ]] || continue
+        validate_secure_file "$path" "$(stat -Lc %a -- "$path")" || return 1
+        repository_copy_file "$path" "$UNINSTALL_SNAPSHOT_DIR/$(basename -- "$path")" || return 1
+    done
+    UNINSTALL_TRANSACTION_ACTIVE=true
+    save_repository_traps
+    trap 'uninstall_signal_handler 129 HUP' HUP
+    trap 'uninstall_signal_handler 130 INT' INT
+    trap 'uninstall_signal_handler 143 TERM' TERM
+    trap 'uninstall_exit_handler $?' EXIT
+}
+
+finish_uninstall_transaction() {
+    local lock_path="$REPOSITORY_LOCK_DIR"
+    UNINSTALL_TRANSACTION_ACTIVE=false
+    trap - HUP INT TERM EXIT
+    rm -rf -- "$UNINSTALL_SNAPSHOT_DIR" || return 1
+    if ! release_repository_lock; then
+        restore_repository_traps
+        error "卸载完成，但仓库事务锁释放失败: $lock_path"
+        return 1
+    fi
+    restore_repository_traps
+}
+
 uninstall_cloudflared() {
-    local confirmed="${1:-}" uninstall_status=0 release_status=0 lock_path
+    local confirmed="${1:-}" uninstall_status=0 irreversible=false
     require_root
     check_platform
     warn "将删除 cloudflared 服务和 APT 包；Tunnel 配置与凭据默认保留。"
@@ -1166,36 +1267,57 @@ uninstall_cloudflared() {
 
     init_runtime_config
     validate_directory_chain "$(dirname -- "$REPOSITORY_LOCK_DIR")" || return 1
-    lock_path="$REPOSITORY_LOCK_DIR"
     acquire_repository_lock || return 1
     if ! prepare_repository_state; then
         release_repository_lock || return 1
         return 1
     fi
+    if [[ -f "$REPOSITORY_STATE_DIR/current" ]]; then
+        validate_current_repository_manifest || {
+            release_repository_lock || return 1
+            return 1
+        }
+    elif [[ ! -f "$STATE_DIR/repository-managed" ]]; then
+        error "无法验证 Cloudflare source 管理归属，拒绝卸载"
+        release_repository_lock || return 1
+        return 1
+    fi
+    begin_uninstall_transaction || {
+        release_repository_lock || return 1
+        return 1
+    }
 
+    uninstall_transaction_hook lock-acquired
+    uninstall_transaction_hook before-disable-auto-update
     disable_auto_update_locked --confirmed || uninstall_status=$?
+    uninstall_transaction_hook after-disable-auto-update
     if (( uninstall_status == 0 )); then
         if command -v cloudflared >/dev/null 2>&1; then
             cloudflared service uninstall >/dev/null 2>&1 || true
         fi
         systemctl disable --now cloudflared.service >/dev/null 2>&1 || true
+        uninstall_transaction_hook before-apt-remove
+        irreversible=true
         DEBIAN_FRONTEND=noninteractive apt-get remove -y cloudflared || uninstall_status=$?
+        uninstall_transaction_hook after-apt-remove
     fi
     if (( uninstall_status == 0 )); then
+        uninstall_transaction_hook before-source-remove
         remove_managed_repository_locked || uninstall_status=$?
+        uninstall_transaction_hook after-source-remove
     fi
     if (( uninstall_status == 0 )); then
+        uninstall_transaction_hook final-apt-update
         apt-get update || uninstall_status=$?
     fi
 
-    release_repository_lock || release_status=$?
     if (( uninstall_status != 0 )); then
+        uninstall_cleanup "卸载步骤失败，状态 $uninstall_status" || true
+        [[ "$irreversible" == true ]] && error "APT 包状态可能已部分改变；未尝试自动重新安装 cloudflared"
         return "$uninstall_status"
     fi
-    if (( release_status != 0 )); then
-        error "卸载完成，但仓库事务锁释放失败: $lock_path"
-        return "$release_status"
-    fi
+    uninstall_transaction_hook before-lock-release
+    finish_uninstall_transaction || return 1
     info "卸载完成；/etc/cloudflared 与用户 .cloudflared 目录未删除。"
 }
 

@@ -329,9 +329,10 @@ cloudflared 时再启用。`upgrade` 可用于立即手动检查、升级并重�
 
 脚本使用 `service install --no-update-service`，并识别、备份和清理旧版裸二进制更新单元，避免
 APT 包与 `cloudflared update` 混用。若旧环境已有每日自动更新 timer，迁移时会自动换成新的
-APT timer；旧环境未启用自动更新时仍保持关闭并询问是否启用。`uninstall` 删除服务、APT 包及
-本脚本管理的软件源，但保留 Tunnel 配置和凭据。彻底清理须显式运行 `purge`，并在交互终端
-输入 `PURGE` 二次确认。
+APT timer；旧环境未启用自动更新时仍保持关闭并询问是否启用。`uninstall` 在同一事务锁内验证
+`current` 清单与 key/source 摘要，备份并删除受管 source，保留 keyring、Tunnel 配置和凭据。
+文件阶段失败会恢复可恢复配置；APT 包删除属于不可逆边界，失败时不会尝试自动重装。
+彻底清理须显式运行 `purge`，并在交互终端输入 `PURGE` 二次确认。
 
 ### 出口流量整形 tcshape
 

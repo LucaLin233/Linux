@@ -206,6 +206,42 @@ after=$(find "$CASE_DIR/root" -mindepth 1 -printf '%P %y %m\\n' | sort)
 [[ "$before" == "$after" ]] || fail "ordinary status created state, lock, or temp files"
 pass "ordinary help/status paths have zero state and lock side effects"
 
+cat > "$TEST_DIR/source-contract.sh" <<EOF
+#!/usr/bin/env bash
+set +e
+set +u
+set +o pipefail
+set -o noclobber
+umask 027
+cd $(printf '%q' "$TEST_DIR")
+unset CLOUDFLARED_TEST_INTERNALS
+trap 'true' HUP
+trap 'true' INT
+trap 'true' TERM
+trap 'true' EXIT
+sentinel=unchanged
+cloudflare_tunnel_source() { printf 'sentinel\\n'; }
+before_options=\$(set +o)
+before_traps=\$(trap -p HUP INT TERM EXIT)
+before_functions=\$(declare -F | sort)
+before_function=\$(declare -f cloudflare_tunnel_source)
+before_files=\$(find . -mindepth 1 -printf '%P %y %m\\n' | sort)
+source $(printf '%q' "$ROOT_DIR/tools/cloudflare_tunnel.sh")
+[[ \$(set +o) == "\$before_options" ]]
+[[ \$(trap -p HUP INT TERM EXIT) == "\$before_traps" ]]
+[[ \$(declare -F | sort) == "\$before_functions" ]]
+[[ \$(declare -f cloudflare_tunnel_source) == "\$before_function" ]]
+[[ \$(cloudflare_tunnel_source) == sentinel ]]
+[[ \$sentinel == unchanged && \$PWD == $(printf '%q' "$TEST_DIR") && \$(umask) == 0027 ]]
+[[ \$(find . -mindepth 1 -printf '%P %y %m\\n' | sort) == "\$before_files" ]]
+EOF
+bash "$TEST_DIR/source-contract.sh" || fail "ordinary source independent subprocess contract failed"
+pass "ordinary source independent subprocess preserves full shell contract"
+
+CLOUDFLARED_TEST_INTERNALS=1 bash -c 'source "$1"; declare -F configure_repository >/dev/null' _ \
+    "$ROOT_DIR/tools/cloudflare_tunnel.sh" || fail "internal source mode unavailable"
+pass "explicit internal source mode exposes test functions"
+
 new_case
 mkdir -p "$CLOUDFLARED_REPOSITORY_STATE_DIR"
 chmod 0700 "$CLOUDFLARED_STATE_DIR" "$CLOUDFLARED_REPOSITORY_STATE_DIR"
@@ -223,6 +259,9 @@ grep -Fxq 'disable-auto-update' "$FAKE_LOG" || fail "uninstall skipped locked au
 grep -Fxq 'remove-repository' "$FAKE_LOG" || fail "uninstall skipped locked repository step"
 grep -Fxq 'apt-get:remove -y cloudflared' "$FAKE_LOG" || fail "uninstall skipped package removal"
 pass "uninstall normal path holds and releases repository lock"
+unset -f disable_auto_update_locked remove_managed_repository_locked
+source "$ROOT_DIR/tools/cloudflare_tunnel.sh"
+init_runtime_config
 
 new_case
 mkdir -p "$CLOUDFLARED_STATE_DIR.lock"
@@ -429,6 +468,92 @@ source_hash=$(sha256sum "$CLOUDFLARED_SOURCE_FILE" | awk '{print $1}')
 grep -Fxq "key_sha256=$key_hash" "$current" || fail "key generation hash mismatch"
 grep -Fxq "source_sha256=$source_hash" "$current" || fail "source generation hash mismatch"
 pass "key/source commit as one recorded generation"
+
+new_case
+set_old_generation
+configure_repository
+validate_current_repository_manifest || fail "trusted current manifest validation failed"
+remove_managed_repository
+init_runtime_config
+assert_absent "$CLOUDFLARED_SOURCE_FILE" "trusted current did not remove managed source"
+[[ -f "$CLOUDFLARED_KEYRING" ]] || fail "managed repository removal deleted keyring"
+[[ ! -f "$CLOUDFLARED_REPOSITORY_STATE_DIR/current" ]] || fail "managed repository removal retained current"
+find "$CLOUDFLARED_STATE_DIR" -maxdepth 1 -type d -name 'uninstall-*' -print -quit | grep -q . ||
+    fail "managed source backup missing"
+[[ ! -d "$CLOUDFLARED_STATE_DIR.lock" ]] || fail "managed repository removal left lock"
+pass "configure then real repository uninstall removes source and preserves keyring"
+
+for signal in HUP INT TERM; do
+    case "$signal" in HUP) expected=129 ;; INT) expected=130 ;; TERM) expected=143 ;; esac
+    for phase in lock-acquired before-disable-auto-update after-disable-auto-update before-apt-remove after-apt-remove before-source-remove after-source-remove final-apt-update before-lock-release; do
+        new_case
+        set_old_generation
+        configure_repository
+        cp "$CLOUDFLARED_SOURCE_FILE" "$CASE_DIR/expected-source"
+        cp "$CLOUDFLARED_REPOSITORY_STATE_DIR/current" "$CASE_DIR/expected-current"
+        set +e
+        CLOUDFLARED_TEST_INTERNALS=1 SIGNAL_PHASE="$phase" SIGNAL_NAME="$signal" \
+            bash -c '
+                source "$1"
+                require_root() { :; }
+                check_platform() { :; }
+                uninstall_transaction_hook() {
+                    [[ "$1" != "$SIGNAL_PHASE" ]] || kill -s "$SIGNAL_NAME" "$BASHPID"
+                }
+                uninstall_cloudflared --confirmed
+            ' _ "$ROOT_DIR/tools/cloudflare_tunnel.sh" >"$CASE_DIR/out" 2>"$CASE_DIR/err"
+        status=$?
+        set -e
+        [[ "$status" == "$expected" ]] || fail "uninstall $signal at $phase returned $status"
+        [[ ! -d "$CLOUDFLARED_STATE_DIR.lock" ]] || fail "uninstall $signal at $phase left lock"
+        assert_same "$CLOUDFLARED_SOURCE_FILE" "$CASE_DIR/expected-source" "uninstall $signal at $phase failed source restore"
+        assert_same "$CLOUDFLARED_REPOSITORY_STATE_DIR/current" "$CASE_DIR/expected-current" "uninstall $signal at $phase failed current restore"
+        acquire_repository_lock || fail "uninstall $signal at $phase lock not reusable"
+        release_repository_lock || fail "uninstall $signal at $phase lock cleanup failed"
+        pass "uninstall $signal=$expected cleans $phase"
+    done
+done
+
+new_case
+set_old_generation
+configure_repository
+uninstall_transaction_hook() { [[ "$1" != after-disable-auto-update ]] || exit 0; }
+set +e
+( uninstall_cloudflared --confirmed ) >"$CASE_DIR/out" 2>"$CASE_DIR/err"
+status=$?
+set -e
+[[ "$status" == 1 ]] || fail "active uninstall exit 0 returned $status"
+[[ ! -d "$CLOUDFLARED_STATE_DIR.lock" ]] || fail "active uninstall exit 0 left lock"
+grep -R -Fq '活动卸载事务异常退出' "$CLOUDFLARED_REPOSITORY_STATE_DIR" || fail "active uninstall exit 0 lacked evidence"
+pass "active uninstall exit 0 returns 1 and cleans transaction"
+
+for manifest_case in missing duplicate unknown generation key-digest source-digest source-content symlink directory fifo owner gid mode; do
+    new_case
+    set_old_generation
+    configure_repository
+    current="$CLOUDFLARED_REPOSITORY_STATE_DIR/current"
+    case "$manifest_case" in
+        missing) sed -i '/^source_sha256=/d' "$current" ;;
+        duplicate) cat "$current" >> "$current.copy"; cat "$current.copy" >> "$current"; rm "$current.copy" ;;
+        unknown) printf 'unknown=value\n' >> "$current" ;;
+        generation) sed -i 's/^generation=.*/generation=invalid/' "$current" ;;
+        key-digest) sed -i 's/^key_sha256=.*/key_sha256=0000000000000000000000000000000000000000000000000000000000000000/' "$current" ;;
+        source-digest) sed -i 's/^source_sha256=.*/source_sha256=0000000000000000000000000000000000000000000000000000000000000000/' "$current" ;;
+        source-content) printf '# tampered\n' >> "$CLOUDFLARED_SOURCE_FILE" ;;
+        symlink) rm "$current"; ln -s "$CASE_DIR/external" "$current"; printf external > "$CASE_DIR/external" ;;
+        directory) rm "$current"; mkdir "$current" ;;
+        fifo) rm "$current"; mkfifo "$current" ;;
+        owner) chown 65534:0 "$current" ;;
+        gid) chown 0:65534 "$current" ;;
+        mode) chmod 0644 "$current" ;;
+    esac
+    if remove_managed_repository >/dev/null 2>&1; then fail "current $manifest_case unexpectedly trusted"; fi
+    [[ -f "$CLOUDFLARED_KEYRING" ]] || fail "current $manifest_case deleted keyring"
+    [[ -e "$CLOUDFLARED_SOURCE_FILE" ]] || fail "current $manifest_case deleted source"
+    [[ ! -e "$CASE_DIR/external" || "$(cat "$CASE_DIR/external")" == external ]] || fail "current symlink target changed"
+    [[ ! -d "$CLOUDFLARED_STATE_DIR.lock" ]] || fail "current $manifest_case left lock"
+    pass "current manifest rejects $manifest_case"
+done
 
 new_case
 set_old_generation
