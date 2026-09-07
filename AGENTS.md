@@ -10,7 +10,9 @@
 - 任务分支必须从最新 `origin/main` 创建。
 - 修改前必须明确目标、范围、风险和验收标准。
 - 只修改任务相关文件；禁止顺手重构、格式化或清理无关内容。
-- 完成本地验证后才能推送。
+- 推送前，生产宿主机仅执行差异检查及改动脚本的 `bash -n`；全量分析和测试由 PR CI 完成。
+- 本机重测试必须使用原生资源限制及权限隔离；无法隔离或超限时停止，不自动提高额度或转宿主机执行。
+- 文档修改不强制本地全套测试，但 PR 仍须通过必需 CI。
 - 禁止使用 `[skip ci]` 或任何等价方式跳过 CI。
 - 禁止 force push，包括 `--force` 和 `--force-with-lease`。
 - PR 必须等待全部 CI 完成并通过；当前基础检查包括 `Ubuntu 24.04 lint and tests` 和 `Debian 13 tests`。
@@ -24,7 +26,7 @@
 1. 获取最新 `main`：拉取远端并确认本地基于最新 `origin/main`。
 2. 从最新 `origin/main` 创建符合命名规则的任务分支。
 3. 实施满足目标的最小改动。
-4. 运行 `bash -n`、ShellCheck 和相关测试；文档或工作流改动也保留仓库基础检查。
+4. 执行差异检查（`git diff --check` 并复核 diff），仅对改动的 Shell 脚本运行 `bash -n`；生产宿主机不运行全量 ShellCheck 或完整测试集。全量分析和测试交由 PR CI；其他本机重测试必须满足上述隔离与资源限制规则。
 5. 优先创建一个逻辑提交；允许临时多提交，最终由 Squash merge 合并为一个提交。
 6. 推送任务分支，禁止直接推送 `main`。
 7. 创建 PR，标题采用 Conventional Commit，正文说明 Summary、Scope、Validation、Risks 和 Rollback。

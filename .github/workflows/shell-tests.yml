@@ -20,9 +20,20 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      - name: Install pinned ShellCheck
+        env:
+          SHELLCHECK_VERSION: v0.10.0
+        run: |
+          curl --fail --silent --show-error --location \
+            "https://github.com/koalaman/shellcheck/releases/download/${SHELLCHECK_VERSION}/shellcheck-${SHELLCHECK_VERSION}.linux.x86_64.tar.xz" \
+            --output "$RUNNER_TEMP/shellcheck.tar.xz"
+          tar -xJf "$RUNNER_TEMP/shellcheck.tar.xz" -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/shellcheck-${SHELLCHECK_VERSION}" >> "$GITHUB_PATH"
+
       - name: Verify test dependencies
         run: |
           command -v shellcheck
+          shellcheck --version
           command -v jq
           command -v ip
           command -v rsync
@@ -32,7 +43,7 @@ jobs:
         run: find . -type f -name '*.sh' -print0 | xargs -0 -n1 bash -n
 
       - name: Run ShellCheck
-        run: shellcheck -x --severity=error linux_setup.sh modules/*.sh tools/*.sh tests/*.sh
+        run: git ls-files -z -- '*.sh' | xargs -0 -r shellcheck -x --severity=error --
 
       - name: Run tests
         run: bash tests/run.sh
