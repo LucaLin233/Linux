@@ -614,10 +614,10 @@ for schema_case in version generation duplicate unknown order state mode uid gid
             uid) sed -i '6s/.*/uid=1/' "$manifest" ;;
             gid) sed -i '7s/.*/gid=1/' "$manifest" ;;
             digest) sed -i '8s/.*/sha256=invalid/' "$manifest" ;;
-            created) sed -i 's/^transaction_created=false$/transaction_created=true/' "$manifest" ;;
+            created) sed -i '0,/^type=regular$/s//type=absent/' "$manifest" ;;
             payload-name) sed -i 's/^snapshot=target-source$/snapshot=target-current/' "$manifest" ;;
             payload-missing) rm -- "$UNINSTALL_SNAPSHOT_DIR/files/target-source" ;;
-            payload-extra) printf extra > "$UNINSTALL_SNAPSHOT_DIR/files/.extra"; chmod 600 "$UNINSTALL_SNAPSHOT_DIR/files/.extra" ;;
+            payload-extra) printf extra > "$UNINSTALL_SNAPSHOT_DIR/files/target-extra"; chmod 600 "$UNINSTALL_SNAPSHOT_DIR/files/target-extra" ;;
             payload-fifo) mkfifo "$UNINSTALL_SNAPSHOT_DIR/files/.fifo" ;;
             payload-symlink) ln -s target-source "$UNINSTALL_SNAPSHOT_DIR/files/.link" ;;
             manifest-fifo) rm -- "$manifest"; mkfifo "$manifest" ;;
