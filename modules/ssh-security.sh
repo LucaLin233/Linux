@@ -123,7 +123,7 @@ get_effective_listen_addresses_from_config() {
             sub(/:[0-9]+$/, "", value)
         }
         print value
-    }' | sort -u)
+    }' | LC_ALL=C sort -u)
     [[ -n "$addresses" ]] || return 1
     printf '%s\n' "$addresses"
 }
