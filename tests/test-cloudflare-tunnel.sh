@@ -105,7 +105,7 @@ new_case() {
         "$CASE_DIR/root/etc/apt/sources.list.d" "$CASE_DIR/root/var" "$CASE_DIR/root/var/lib"
     make_fake_commands "$CASE_DIR/bin"
     export PATH="$CASE_DIR/bin:$ORIGINAL_PATH"
-    export CLOUDFLARED_TRUST_ANCHOR="$CASE_DIR/root"
+    export CLOUDFLARED_TRUST_ANCHOR="$CASE_DIR"
     export CLOUDFLARED_KEYRING="$CASE_DIR/root/usr/share/keyrings/cloudflare-main.gpg"
     export CLOUDFLARED_SOURCE_FILE="$CASE_DIR/root/etc/apt/sources.list.d/cloudflared.list"
     export CLOUDFLARED_APT_SOURCE_ROOT="$CASE_DIR/root/etc/apt"
