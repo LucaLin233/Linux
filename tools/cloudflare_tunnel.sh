@@ -1220,43 +1220,102 @@ uninstall_manifest_field() {
 }
 
 uninstall_manifest_valid() {
-    local manifest="$1" id state mode uid gid sha snapshot count
+    local manifest="$1" id state sha snapshot entry expected_entries=0 actual_entries=0
+    local -a rows=()
+    local offset=2
+    [[ "$manifest" == "$UNINSTALL_SNAPSHOT_DIR/manifest" ]] || return 1
+    uninstall_snapshot_path_valid || return 1
+    validate_directory_chain "$UNINSTALL_SNAPSHOT_DIR/files" || return 1
+    validate_secure_directory "$UNINSTALL_SNAPSHOT_DIR/files" 700 || return 1
     validate_secure_file "$manifest" 600 || return 1
-    [[ "$(wc -l < "$manifest")" == 44 ]] || return 1
-    [[ "$(sed -n '1p' "$manifest")" == version=1 ]] || return 1
-    grep -Eq '^generation=[0-9]{8}T[0-9]{6}Z-[0-9]+-[0-9]+$' "$manifest" || return 1
-    [[ "$(grep -c '^generation=' "$manifest")" == 1 ]] || return 1
-    while read -r id; do
-        count=$(grep -c "^target_id=$id$" "$manifest")
-        [[ "$count" == 1 ]] || return 1
-        state=$(uninstall_manifest_field "$manifest" "$id" state)
-        mode=$(uninstall_manifest_field "$manifest" "$id" mode)
-        uid=$(uninstall_manifest_field "$manifest" "$id" uid)
-        gid=$(uninstall_manifest_field "$manifest" "$id" gid)
-        sha=$(uninstall_manifest_field "$manifest" "$id" sha256)
-        snapshot=$(uninstall_manifest_field "$manifest" "$id" snapshot)
-        [[ "$state" == regular || "$state" == absent ]] || return 1
-        [[ "$mode" == "$(uninstall_target_mode "$id")" ]] || return 1
-        [[ "$uid" == 0 && "$gid" == 0 ]] || return 1
+    mapfile -t rows < "$manifest" || return 1
+    [[ "${#rows[@]}" == 80 ]] || return 1
+    [[ "${rows[0]}" == version=1 && "${rows[1]}" == "generation=$UNINSTALL_GENERATION" ]] || return 1
+    [[ "$UNINSTALL_GENERATION" =~ ^[0-9]{8}T[0-9]{6}Z-[0-9]+-[0-9]+$ ]] || return 1
+    while IFS= read -r id; do
+        [[ "${rows[offset]}" == "target_id=$id" ]] || return 1
+        [[ "${rows[offset+1]}" =~ ^state=(regular|absent)$ ]] || return 1
+        [[ "${rows[offset+2]}" == "mode=$(uninstall_target_mode "$id")" ]] || return 1
+        [[ "${rows[offset+3]}" == uid=0 && "${rows[offset+4]}" == gid=0 ]] || return 1
+        [[ "${rows[offset+5]}" =~ ^sha256=[0-9a-f]{64}$ ]] || return 1
+        [[ "${rows[offset+6]}" == snapshot=none || "${rows[offset+6]}" == "snapshot=target-$id" ]] || return 1
+        [[ "${rows[offset+7]}" == transaction_created=true || "${rows[offset+7]}" == transaction_created=false ]] || return 1
+        [[ "${rows[offset+8]}" =~ ^created_uid=[0-9]+$ && "${rows[offset+9]}" =~ ^created_gid=[0-9]+$ ]] || return 1
+        [[ "${rows[offset+10]}" =~ ^created_dev=[0-9]+$ && "${rows[offset+11]}" =~ ^created_ino=[0-9]+$ ]] || return 1
+        [[ "${rows[offset+12]}" =~ ^created_sha256=[0-9a-f]{64}$ ]] || return 1
+        state=${rows[offset+1]#state=}; sha=${rows[offset+5]#sha256=}; snapshot="target-$id"
+        created=${rows[offset+7]#transaction_created=}
+        [[ "$state" == absent || "$created" == false ]] || return 1
         if [[ "$state" == regular ]]; then
-            [[ "$sha" =~ ^[[:xdigit:]]{64}$ && "$snapshot" == "target-$id" ]] || return 1
+            [[ "${rows[offset+6]}" == "snapshot=$snapshot" ]] || return 1
             validate_secure_file "$UNINSTALL_SNAPSHOT_DIR/files/$snapshot" 600 || return 1
             [[ "$(sha256sum -- "$UNINSTALL_SNAPSHOT_DIR/files/$snapshot" | awk '{print $1}')" == "$sha" ]] || return 1
+            expected_entries=$((expected_entries + 1))
         else
-            [[ "$sha" == 0000000000000000000000000000000000000000000000000000000000000000 && "$snapshot" == none ]] || return 1
+            [[ "${rows[offset+6]}" == snapshot=none && "$sha" == $(printf '0%.0s' {1..64}) ]] || return 1
         fi
+        offset=$((offset + 13))
     done < <(uninstall_snapshot_targets)
-    find "$UNINSTALL_SNAPSHOT_DIR/files" -mindepth 1 -maxdepth 1 -type f -printf '%f\n' | while read -r snapshot; do
-        grep -Fxq "snapshot=$snapshot" "$manifest" || exit 1
-    done
+    while IFS= read -r -d '' entry; do
+        validate_secure_file "$entry" 600 || return 1
+        actual_entries=$((actual_entries + 1))
+    done < <(find "$UNINSTALL_SNAPSHOT_DIR/files" -mindepth 1 -maxdepth 1 -print0)
+    [[ "$actual_entries" == "$expected_entries" ]]
 }
 
 uninstall_snapshot_path_valid() {
+    init_runtime_config
     [[ -n "${UNINSTALL_SNAPSHOT_DIR:-}" && -n "${UNINSTALL_GENERATION:-}" ]] || return 1
     [[ "$UNINSTALL_SNAPSHOT_DIR" == "$REPOSITORY_STATE_DIR/uninstall-$UNINSTALL_GENERATION" ]] || return 1
-    [[ ! -L "$UNINSTALL_SNAPSHOT_DIR" ]] || return 1
-    [[ -d "$UNINSTALL_SNAPSHOT_DIR" ]] || return 1
+    [[ ! -L "$UNINSTALL_SNAPSHOT_DIR" && -d "$UNINSTALL_SNAPSHOT_DIR" ]] || return 1
+    validate_directory_chain "$UNINSTALL_SNAPSHOT_DIR" || return 1
     validate_secure_directory "$UNINSTALL_SNAPSHOT_DIR" 700
+}
+
+uninstall_update_manifest_creation() {
+    local id="$1" path="$2" digest metadata dev ino tmp manifest="$UNINSTALL_SNAPSHOT_DIR/manifest"
+    [[ -f "$path" && ! -L "$path" ]] || return 1
+    [[ "$(uninstall_manifest_field "$manifest" "$id" state)" == absent ]] || return 1
+    validate_secure_file "$path" "$(uninstall_target_mode "$id")" || return 1
+    metadata=$(stat -Lc '%u %g %d %i' -- "$path") || return 1
+    read -r _ _ dev ino <<< "$metadata"
+    digest=$(sha256sum -- "$path" | awk '{print $1}') || return 1
+    tmp=$(mktemp "$UNINSTALL_SNAPSHOT_DIR/manifest.stage.XXXXXX") || return 1
+    awk -F= -v id="$id" -v dev="$dev" -v ino="$ino" -v digest="$digest" '
+      BEGIN {OFS="="}
+      $1=="target_id" {hit=($2==id); print; next}
+      hit && $1=="transaction_created" {$2="true"; print; next}
+      hit && $1=="created_uid" {$2="0"; print; next}
+      hit && $1=="created_gid" {$2="0"; print; next}
+      hit && $1=="created_dev" {$2=dev; print; next}
+      hit && $1=="created_ino" {$2=ino; print; next}
+      hit && $1=="created_sha256" {$2=digest; print; next}
+      {print}
+    ' "$manifest" > "$tmp" || { rm -f -- "$tmp"; return 1; }
+    chmod 0600 "$tmp" && repository_rename "$tmp" "$manifest" || { rm -f -- "$tmp"; return 1; }
+}
+
+uninstall_register_exclusive_creation() {
+    local id="$1" path
+    [[ "${UNINSTALL_TRANSACTION_STATE:-NONE}" == ACTIVE ]] || return 1
+    path=$(uninstall_target_path "$id") || return 1
+    uninstall_update_manifest_creation "$id" "$path"
+}
+
+uninstall_created_identity_valid() {
+    local id="$1" path metadata dev ino digest
+    path=$(uninstall_target_path "$id") || return 1
+    [[ "$(uninstall_manifest_field "$UNINSTALL_SNAPSHOT_DIR/manifest" "$id" transaction_created)" == true ]] || return 1
+    [[ -f "$path" && ! -L "$path" ]] || return 1
+    validate_secure_file "$path" "$(uninstall_target_mode "$id")" || return 1
+    metadata=$(stat -Lc '%u %g %d %i' -- "$path") || return 1
+    read -r _ _ dev ino <<< "$metadata"
+    [[ "$(uninstall_manifest_field "$UNINSTALL_SNAPSHOT_DIR/manifest" "$id" created_uid)" == 0 ]] || return 1
+    [[ "$(uninstall_manifest_field "$UNINSTALL_SNAPSHOT_DIR/manifest" "$id" created_gid)" == 0 ]] || return 1
+    [[ "$dev" == "$(uninstall_manifest_field "$UNINSTALL_SNAPSHOT_DIR/manifest" "$id" created_dev)" ]] || return 1
+    [[ "$ino" == "$(uninstall_manifest_field "$UNINSTALL_SNAPSHOT_DIR/manifest" "$id" created_ino)" ]] || return 1
+    digest=$(sha256sum -- "$path" | awk '{print $1}') || return 1
+    [[ "$digest" == "$(uninstall_manifest_field "$UNINSTALL_SNAPSHOT_DIR/manifest" "$id" created_sha256)" ]]
 }
 
 restore_uninstall_target() {
@@ -1270,39 +1329,59 @@ restore_uninstall_target() {
     validate_directory_chain "$(dirname -- "$path")" || return 1
     stage=$(mktemp "$(dirname -- "$path")/.cloudflared-uninstall-restore.XXXXXX") || return 1
     if ! repository_install_file "$mode" "$payload" "$stage" ||
-        ! validate_secure_file "$stage" "$mode" ||
-        ! repository_rename "$stage" "$path" ||
-        ! validate_secure_file "$path" "$mode"; then
-        rm -f -- "$stage" 2>/dev/null || true
+       ! validate_secure_file "$stage" "$mode" ||
+       ! repository_rename "$stage" "$path" ||
+       ! validate_secure_file "$path" "$mode" ||
+       [[ "$(sha256sum -- "$path" | awk '{print $1}')" != "$sha" ]]; then
+        error "恢复目标失败，保留 stage 证据: $stage"
         return 1
     fi
 }
 
+write_uninstall_journal() {
+    local state="$1" reason="$2" journal="$UNINSTALL_SNAPSHOT_DIR/journal" stage
+    stage=$(mktemp "$UNINSTALL_SNAPSHOT_DIR/journal.stage.XXXXXX") || return 1
+    printf 'version=1\ngeneration=%s\nstate=%s\nreason=%s\n' "$UNINSTALL_GENERATION" "$state" "$reason" > "$stage" || { rm -f -- "$stage"; return 1; }
+    chmod 0600 "$stage" || { rm -f -- "$stage"; return 1; }
+    repository_rename "$stage" "$journal" || { rm -f -- "$stage"; return 1; }
+    validate_secure_file "$journal" 600
+}
+
+archive_uninstall_evidence() {
+    local archive="$1" path
+    [[ ! -e "$archive" && ! -L "$archive" ]] || return 1
+    repository_rename "$UNINSTALL_SNAPSHOT_DIR" "$archive" || return 1
+    chmod 0500 "$archive" || return 1
+    find "$archive" -maxdepth 1 -type d -exec chmod 0500 -- {} + || return 1
+    find "$archive" -maxdepth 1 -type f -exec chmod 0400 -- {} + || return 1
+    path="$archive/files"
+    if [[ -d "$path" ]]; then
+        chmod 0500 "$path" || return 1
+        find "$path" -maxdepth 1 -type f -exec chmod 0400 -- {} + || return 1
+    fi
+    UNINSTALL_SNAPSHOT_DIR="$archive"
+}
+
 uninstall_cleanup() {
     init_runtime_config
-    local reason="$1" failed=false state path target_state mode
+    local reason="$1" failed=false state path target_state
     local evidence="$REPOSITORY_STATE_DIR/failure-uninstall-${UNINSTALL_GENERATION:-unknown}"
     state="${UNINSTALL_TRANSACTION_STATE:-NONE}"
-    if [[ "${UNINSTALL_SNAPSHOT_BUILDING:-false}" == true ]]; then state=BUILDING; fi
-    if [[ "${UNINSTALL_TRANSACTION_ACTIVE:-false}" == true ]]; then state=ACTIVE; fi
+    [[ "${UNINSTALL_SNAPSHOT_BUILDING:-false}" == true ]] && state=BUILDING
+    [[ "${UNINSTALL_TRANSACTION_ACTIVE:-false}" == true ]] && state=ACTIVE
     [[ "$state" == BUILDING || "$state" == ACTIVE ]] || return 0
     if [[ "$state" == ACTIVE ]]; then
         if ! uninstall_snapshot_path_valid || ! uninstall_manifest_valid "$UNINSTALL_SNAPSHOT_DIR/manifest"; then
             failed=true
         else
-            while read -r path; do
+            while IFS= read -r path; do
                 target_state=$(uninstall_manifest_field "$UNINSTALL_SNAPSHOT_DIR/manifest" "$path" state)
-                mode=$(uninstall_manifest_field "$UNINSTALL_SNAPSHOT_DIR/manifest" "$path" mode)
-            if [[ "$target_state" == regular ]]; then
+                if [[ "$target_state" == regular ]]; then
                     restore_uninstall_target "$path" || failed=true
                 elif [[ "$target_state" == absent ]]; then
                     target=$(uninstall_target_path "$path") || { failed=true; continue; }
                     if [[ -e "$target" || -L "$target" ]]; then
-                        if [[ -f "$target" && ! -L "$target" ]]; then
-                            rm -f -- "$target" || failed=true
-                        else
-                            failed=true
-                        fi
+                        uninstall_created_identity_valid "$path" && rm -f -- "$target" || failed=true
                     fi
                 else
                     failed=true
@@ -1313,21 +1392,21 @@ uninstall_cleanup() {
     mkdir -m 0700 -- "$evidence" 2>/dev/null || failed=true
     printf '%s\n' "$reason" > "$evidence/rollback.log" 2>/dev/null || failed=true
     chmod 0600 "$evidence/rollback.log" 2>/dev/null || failed=true
-    if uninstall_snapshot_path_valid; then
-        rm -rf -- "$UNINSTALL_SNAPSHOT_DIR" 2>/dev/null || failed=true
-    else
-        failed=true
+    write_uninstall_journal "$([[ "$failed" == true ]] && printf FAILED || printf ROLLED_BACK)" "$reason" || failed=true
+    # Retain complete snapshot as read-only evidence; never garbage-collect it.
+    if [[ -d "$UNINSTALL_SNAPSHOT_DIR" ]]; then
+        archive_uninstall_evidence "$evidence/snapshot" || failed=true
     fi
     release_repository_lock || failed=true
     restore_repository_traps
     UNINSTALL_SNAPSHOT_BUILDING=false
     UNINSTALL_TRANSACTION_ACTIVE=false
-    UNINSTALL_TRANSACTION_STATE=NONE
+    UNINSTALL_TRANSACTION_STATE=$([[ "$failed" == true ]] && printf FAILED || printf ROLLED_BACK)
     if [[ "$failed" == true ]]; then
-        error "卸载事务清理不完整；失败证据: $evidence；锁路径: ${REPOSITORY_LOCK_DIR:-unknown}"
+        error "卸载事务清理不完整；状态 FAILED/PENDING；证据: $evidence；snapshot: ${UNINSTALL_SNAPSHOT_DIR:-unknown}"
         return 1
     fi
-    error "Cloudflare 卸载事务失败；可恢复文件已处理；证据: $evidence"
+    error "Cloudflare 卸载事务失败；证据: $evidence"
 }
 
 uninstall_signal_handler() {
@@ -1347,64 +1426,49 @@ uninstall_exit_handler() {
 
 begin_uninstall_transaction() {
     init_runtime_config
-    local id path mode sha state
+    local id path mode sha
     UNINSTALL_GENERATION="$(date -u +%Y%m%dT%H%M%SZ)-$$-$RANDOM"
     UNINSTALL_SNAPSHOT_DIR="$REPOSITORY_STATE_DIR/uninstall-$UNINSTALL_GENERATION"
-    UNINSTALL_SNAPSHOT_BUILDING=false
-    UNINSTALL_TRANSACTION_ACTIVE=false
+    UNINSTALL_SNAPSHOT_BUILDING=false; UNINSTALL_TRANSACTION_ACTIVE=false; UNINSTALL_TRANSACTION_STATE=NONE
     validate_directory_chain "$(dirname -- "$UNINSTALL_SNAPSHOT_DIR")" || return 1
-    [[ "$UNINSTALL_SNAPSHOT_DIR" == "$REPOSITORY_STATE_DIR/uninstall-$UNINSTALL_GENERATION" ]] || return 1
     [[ ! -e "$UNINSTALL_SNAPSHOT_DIR" && ! -L "$UNINSTALL_SNAPSHOT_DIR" ]] || return 1
     mkdir -m 0700 -- "$UNINSTALL_SNAPSHOT_DIR" || return 1
-    UNINSTALL_SNAPSHOT_BUILDING=true
-    UNINSTALL_TRANSACTION_STATE=BUILDING
+    UNINSTALL_SNAPSHOT_BUILDING=true; UNINSTALL_TRANSACTION_STATE=BUILDING
     save_repository_traps
-    trap 'uninstall_signal_handler 129 HUP' HUP
-    trap 'uninstall_signal_handler 130 INT' INT
-    trap 'uninstall_signal_handler 143 TERM' TERM
-    trap 'uninstall_exit_handler $?' EXIT
+    trap 'uninstall_signal_handler 129 HUP' HUP; trap 'uninstall_signal_handler 130 INT' INT; trap 'uninstall_signal_handler 143 TERM' TERM; trap 'uninstall_exit_handler $?' EXIT
     uninstall_transaction_hook before-snapshot-create
     mkdir -m 0700 -- "$UNINSTALL_SNAPSHOT_DIR/files" || return 1
-    : > "$UNINSTALL_SNAPSHOT_DIR/manifest" || return 1
-    chmod 0600 "$UNINSTALL_SNAPSHOT_DIR/manifest" || return 1
+    : > "$UNINSTALL_SNAPSHOT_DIR/manifest" || return 1; chmod 0600 "$UNINSTALL_SNAPSHOT_DIR/manifest" || return 1
     printf 'version=1\ngeneration=%s\n' "$UNINSTALL_GENERATION" > "$UNINSTALL_SNAPSHOT_DIR/manifest" || return 1
-    while read -r id; do
-        path=$(uninstall_target_path "$id") || return 1
-        mode=$(uninstall_target_mode "$id") || return 1
+    while IFS= read -r id; do
+        path=$(uninstall_target_path "$id") || return 1; mode=$(uninstall_target_mode "$id") || return 1
         validate_directory_chain "$(dirname -- "$path")" || return 1
         if [[ -e "$path" || -L "$path" ]]; then
             validate_secure_file "$path" "$mode" || return 1
             sha=$(sha256sum -- "$path" | awk '{print $1}') || return 1
-            repository_copy_file "$path" "$UNINSTALL_SNAPSHOT_DIR/files/target-$id" || return 1
-            chmod 0600 "$UNINSTALL_SNAPSHOT_DIR/files/target-$id" || return 1
-            state=regular
-            printf 'target_id=%s\nstate=%s\nmode=%s\nuid=0\ngid=0\nsha256=%s\nsnapshot=target-%s\n' "$id" "$state" "$mode" "$sha" "$id" >> "$UNINSTALL_SNAPSHOT_DIR/manifest" || return 1
+            repository_copy_file "$path" "$UNINSTALL_SNAPSHOT_DIR/files/target-$id" || return 1; chmod 0600 "$UNINSTALL_SNAPSHOT_DIR/files/target-$id" || return 1
+            printf 'target_id=%s\nstate=regular\nmode=%s\nuid=0\ngid=0\nsha256=%s\nsnapshot=target-%s\ntransaction_created=false\ncreated_uid=0\ncreated_gid=0\ncreated_dev=0\ncreated_ino=0\ncreated_sha256=%064d\n' "$id" "$mode" "$sha" "$id" 0 >> "$UNINSTALL_SNAPSHOT_DIR/manifest" || return 1
         else
-            printf 'target_id=%s\nstate=absent\nmode=%s\nuid=0\ngid=0\nsha256=0000000000000000000000000000000000000000000000000000000000000000\nsnapshot=none\n' "$id" "$mode" >> "$UNINSTALL_SNAPSHOT_DIR/manifest" || return 1
+            printf 'target_id=%s\nstate=absent\nmode=%s\nuid=0\ngid=0\nsha256=%064d\nsnapshot=none\ntransaction_created=false\ncreated_uid=0\ncreated_gid=0\ncreated_dev=0\ncreated_ino=0\ncreated_sha256=%064d\n' "$id" "$mode" 0 0 >> "$UNINSTALL_SNAPSHOT_DIR/manifest" || return 1
         fi
     done < <(uninstall_snapshot_targets)
     uninstall_manifest_valid "$UNINSTALL_SNAPSHOT_DIR/manifest" || return 1
-    UNINSTALL_SNAPSHOT_BUILDING=false
-    UNINSTALL_TRANSACTION_ACTIVE=true
-    UNINSTALL_TRANSACTION_STATE=ACTIVE
+    UNINSTALL_SNAPSHOT_BUILDING=false; UNINSTALL_TRANSACTION_ACTIVE=true; UNINSTALL_TRANSACTION_STATE=ACTIVE
+    write_uninstall_journal ACTIVE capture-complete || return 1
     uninstall_transaction_hook after-snapshot-active
 }
 
 finish_uninstall_transaction() {
     local lock_path="$REPOSITORY_LOCK_DIR" failed=false
     uninstall_snapshot_path_valid || failed=true
-    if [[ "$failed" == false ]]; then
-        rm -rf -- "$UNINSTALL_SNAPSHOT_DIR" || failed=true
-    fi
+    uninstall_manifest_valid "$UNINSTALL_SNAPSHOT_DIR/manifest" || failed=true
+    if [[ "$failed" == false ]]; then write_uninstall_journal COMMITTED uninstall-complete || failed=true; fi
+    if [[ "$failed" == false ]]; then archive_uninstall_evidence "$REPOSITORY_STATE_DIR/history-uninstall-$UNINSTALL_GENERATION" || failed=true; fi
     release_repository_lock || failed=true
     restore_repository_traps
-    UNINSTALL_SNAPSHOT_BUILDING=false
-    UNINSTALL_TRANSACTION_ACTIVE=false
-    UNINSTALL_TRANSACTION_STATE=NONE
-    if [[ "$failed" == true ]]; then
-        error "卸载收尾失败；可能残留锁或 snapshot: $lock_path $UNINSTALL_SNAPSHOT_DIR"
-        return 1
-    fi
+    UNINSTALL_SNAPSHOT_BUILDING=false; UNINSTALL_TRANSACTION_ACTIVE=false
+    UNINSTALL_TRANSACTION_STATE=$([[ "$failed" == true ]] && printf FAILED || printf COMMITTED)
+    if [[ "$failed" == true ]]; then error "卸载收尾失败；状态 FAILED/PENDING；锁或证据: $lock_path $UNINSTALL_SNAPSHOT_DIR"; return 1; fi
 }
 
 uninstall_cloudflared() {

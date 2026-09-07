@@ -89,6 +89,11 @@ FAKE
 printf 'systemctl:%s\n' "$*" >> "$FAKE_LOG"
 exit 0
 FAKE
+    cat > "$bin/cloudflared" <<'FAKE'
+#!/usr/bin/env bash
+printf 'cloudflared:%s\n' "$*" >> "$FAKE_LOG"
+exit 0
+FAKE
     chmod 0755 "$bin"/*
 }
 
@@ -185,6 +190,7 @@ pass "source rendering has zero side effects and exact fields"
     trap 'sentinel-trap' HUP
     set -o noclobber
     umask 027
+    unset CLOUDFLARED_TEST_INTERNALS
     source "$ROOT_DIR/tools/cloudflare_tunnel.sh"
     sentinel_after=$(declare -f cloudflare_tunnel_source)
     [[ "$sentinel_before" == "$sentinel_after" ]] || fail "ordinary source replaced sentinel function"
@@ -227,13 +233,13 @@ before_functions=\$(declare -F | sort)
 before_function=\$(declare -f cloudflare_tunnel_source)
 before_files=\$(find . -mindepth 1 -printf '%P %y %m\\n' | sort)
 source $(printf '%q' "$ROOT_DIR/tools/cloudflare_tunnel.sh")
-[[ \$(set +o) == "\$before_options" ]]
-[[ \$(trap -p HUP INT TERM EXIT) == "\$before_traps" ]]
-[[ \$(declare -F | sort) == "\$before_functions" ]]
-[[ \$(declare -f cloudflare_tunnel_source) == "\$before_function" ]]
-[[ \$(cloudflare_tunnel_source) == sentinel ]]
-[[ \$sentinel == unchanged && \$PWD == $(printf '%q' "$TEST_DIR") && \$(umask) == 0027 ]]
-[[ \$(find . -mindepth 1 -printf '%P %y %m\\n' | sort) == "\$before_files" ]]
+[[ \$(set +o) == "\$before_options" ]] || exit 1
+[[ \$(trap -p HUP INT TERM EXIT) == "\$before_traps" ]] || exit 1
+[[ \$(declare -F | sort) == "\$before_functions" ]] || exit 1
+[[ \$(declare -f cloudflare_tunnel_source) == "\$before_function" ]] || exit 1
+[[ \$(cloudflare_tunnel_source) == sentinel ]] || exit 1
+[[ \$sentinel == unchanged && \$PWD == $(printf '%q' "$TEST_DIR") && \$(umask) == 0027 ]] || exit 1
+[[ \$(find . -mindepth 1 -printf '%P %y %m\\n' | sort) == "\$before_files" ]] || exit 1
 EOF
 bash "$TEST_DIR/source-contract.sh" || fail "ordinary source independent subprocess contract failed"
 pass "ordinary source independent subprocess preserves full shell contract"
@@ -243,25 +249,16 @@ CLOUDFLARED_TEST_INTERNALS=1 bash -c 'source "$1"; declare -F configure_reposito
 pass "explicit internal source mode exposes test functions"
 
 new_case
-mkdir -p "$CLOUDFLARED_REPOSITORY_STATE_DIR"
-chmod 0700 "$CLOUDFLARED_STATE_DIR" "$CLOUDFLARED_REPOSITORY_STATE_DIR"
-printf 'managed\n' > "$CLOUDFLARED_STATE_DIR/repository-managed"
-chmod 0600 "$CLOUDFLARED_STATE_DIR/repository-managed"
-printf 'deb [signed-by=%s] %s any main\\n' "$CLOUDFLARED_KEYRING" 'https://pkg.cloudflare.com/cloudflare-main.gpg' > "$CLOUDFLARED_SOURCE_FILE"
-printf key > "$CLOUDFLARED_KEYRING"
-chmod 0644 "$CLOUDFLARED_SOURCE_FILE" "$CLOUDFLARED_KEYRING"
+configure_repository || fail "configure before real uninstall failed"
 require_root() { :; }
 check_platform() { :; }
-disable_auto_update_locked() { printf 'disable-auto-update\n' >> "$FAKE_LOG"; }
-remove_managed_repository_locked() { printf 'remove-repository\n' >> "$FAKE_LOG"; }
 uninstall_cloudflared --confirmed || fail "uninstall normal path failed"
 [[ ! -d "$CLOUDFLARED_STATE_DIR.lock" ]] || fail "uninstall left repository lock"
-grep -Fxq 'disable-auto-update' "$FAKE_LOG" || fail "uninstall skipped locked auto-update step"
-grep -Fxq 'remove-repository' "$FAKE_LOG" || fail "uninstall skipped locked repository step"
 grep -Fxq 'apt-get:remove -y cloudflared' "$FAKE_LOG" || fail "uninstall skipped package removal"
-pass "uninstall normal path holds and releases repository lock"
-unset -f disable_auto_update_locked remove_managed_repository_locked
-source "$ROOT_DIR/tools/cloudflare_tunnel.sh"
+assert_absent "$CLOUDFLARED_SOURCE_FILE" "real uninstall retained source"
+assert_absent "$CLOUDFLARED_REPOSITORY_STATE_DIR/current" "real uninstall retained current"
+[[ -f "$CLOUDFLARED_KEYRING" ]] || fail "real uninstall removed keyring"
+pass "configure then real uninstall preserves keyring and releases lock"
 init_runtime_config
 
 new_case
@@ -595,6 +592,49 @@ assert_absent "$CLOUDFLARED_LEGACY_BIN" "recognized legacy binary was not migrat
 grep -Fq "ExecStart=$CLOUDFLARED_APT_BIN --no-autoupdate --token-file /etc/cloudflared/token" "$CLOUDFLARED_SERVICE_FILE" ||
     fail "legacy service path was not preserved"
 pass "legacy binary and service migration behavior remains"
+
+
+# Each malformed snapshot runs in a separate process: transaction traps and
+# intentional corrupt fixtures must not leak into subsequent cases.
+for schema_case in version generation duplicate unknown order state mode uid gid digest created payload-name payload-missing payload-extra payload-fifo payload-symlink manifest-fifo ancestor; do
+    (
+        new_case
+        configure_repository || fail "schema fixture configure"
+        acquire_repository_lock || fail "schema fixture lock"
+        begin_uninstall_transaction || fail "schema fixture capture"
+        manifest="$UNINSTALL_SNAPSHOT_DIR/manifest"
+        case "$schema_case" in
+            version) sed -i '1d' "$manifest" ;;
+            generation) sed -i '2s/.*/generation=20000101T000000Z-1-1/' "$manifest" ;;
+            duplicate) sed -i '3s/.*/version=1/' "$manifest" ;;
+            unknown) sed -i '10s/.*/path=\/tmp\/forbidden/' "$manifest" ;;
+            order) sed -i '3s/auto_update_script/auto_update_timer/' "$manifest" ;;
+            state) sed -i '4s/.*/state=invalid/' "$manifest" ;;
+            mode) sed -i '5s/.*/mode=777/' "$manifest" ;;
+            uid) sed -i '6s/.*/uid=1/' "$manifest" ;;
+            gid) sed -i '7s/.*/gid=1/' "$manifest" ;;
+            digest) sed -i '8s/.*/sha256=invalid/' "$manifest" ;;
+            created) sed -i 's/^transaction_created=false$/transaction_created=true/' "$manifest" ;;
+            payload-name) sed -i 's/^snapshot=target-source$/snapshot=target-current/' "$manifest" ;;
+            payload-missing) rm -- "$UNINSTALL_SNAPSHOT_DIR/files/target-source" ;;
+            payload-extra) printf extra > "$UNINSTALL_SNAPSHOT_DIR/files/.extra"; chmod 600 "$UNINSTALL_SNAPSHOT_DIR/files/.extra" ;;
+            payload-fifo) mkfifo "$UNINSTALL_SNAPSHOT_DIR/files/.fifo" ;;
+            payload-symlink) ln -s target-source "$UNINSTALL_SNAPSHOT_DIR/files/.link" ;;
+            manifest-fifo) rm -- "$manifest"; mkfifo "$manifest" ;;
+            ancestor) chmod 0777 "$UNINSTALL_SNAPSHOT_DIR/files" ;;
+        esac
+        if uninstall_manifest_valid "$manifest"; then fail "schema accepted $schema_case"; fi
+        # No rollback is appropriate for this read-only parser test.
+        UNINSTALL_TRANSACTION_ACTIVE=false
+        UNINSTALL_SNAPSHOT_BUILDING=false
+        UNINSTALL_TRANSACTION_STATE=NONE
+        restore_repository_traps
+        # Parent alone owns TEST_DIR cleanup; do not run its EXIT trap here.
+        trap - EXIT
+        release_repository_lock || fail "schema fixture release"
+    ) > "$TEST_DIR/schema-$schema_case.log" 2>&1 || fail "schema $schema_case (see $TEST_DIR/schema-$schema_case.log)"
+    pass "uninstall manifest rejects $schema_case"
+done
 
 entrypoint_output=$(bash -c "$(cat "$ROOT_DIR/tools/cloudflare_tunnel.sh")" cloudflare_tunnel.sh help)
 grep -Fq 'cloudflare_tunnel.sh install' <<< "$entrypoint_output" || fail "bash -c entrypoint broken"
