@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-readonly ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-readonly TEMP_DIR=$(mktemp -d)
+ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+readonly ROOT_DIR
+TEMP_DIR=$(mktemp -d)
+readonly TEMP_DIR
 trap 'rm -rf "$TEMP_DIR"' EXIT
 
 # shellcheck source=../modules/ssh-security.sh
@@ -47,6 +49,21 @@ assert_eq $'10.0.0.5\n2001:db8::5' "$(get_effective_listen_addresses)" \
 SSHD_OUTPUT=$'listenaddress 0.0.0.0:22\nlistenaddress [::]:22'
 assert_eq $'0.0.0.0\n::' "$(get_effective_listen_addresses)" \
     "preserve wildcard scope when it was already effective"
+
+run_locale_case() {
+    local locale_name="$1" output
+    if ! locale -a 2>/dev/null | grep -Fqx "$locale_name"; then
+        printf 'SKIP: locale %s is unavailable\n' "$locale_name"
+        return 0
+    fi
+    output=$(LC_ALL="$locale_name" SSHD_OUTPUT=$'listenaddress 0.0.0.0:22\nlistenaddress [::]:22' \
+        bash -c 'source "$1"; get_effective_listen_addresses' _ "$ROOT_DIR/modules/ssh-security.sh") ||
+        fail "locale $locale_name invocation failed"
+    assert_eq $'0.0.0.0\n::' "$output" "stable wildcard ordering under locale $locale_name"
+}
+
+run_locale_case C
+run_locale_case en_US.utf8
 
 CONFIG_FIXTURE="$TEMP_DIR/sshd_config"
 mktemp() {
