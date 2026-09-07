@@ -1283,6 +1283,8 @@ uninstall_cleanup() {
     local reason="$1" failed=false state path target_state mode
     local evidence="$REPOSITORY_STATE_DIR/failure-uninstall-${UNINSTALL_GENERATION:-unknown}"
     state="${UNINSTALL_TRANSACTION_STATE:-NONE}"
+    if [[ "${UNINSTALL_SNAPSHOT_BUILDING:-false}" == true ]]; then state=BUILDING; fi
+    if [[ "${UNINSTALL_TRANSACTION_ACTIVE:-false}" == true ]]; then state=ACTIVE; fi
     [[ "$state" == BUILDING || "$state" == ACTIVE ]] || return 0
     if [[ "$state" == ACTIVE ]]; then
         if ! uninstall_snapshot_path_valid || ! uninstall_manifest_valid "$UNINSTALL_SNAPSHOT_DIR/manifest"; then
@@ -1291,10 +1293,17 @@ uninstall_cleanup() {
             while read -r path; do
                 target_state=$(uninstall_manifest_field "$UNINSTALL_SNAPSHOT_DIR/manifest" "$path" state)
                 mode=$(uninstall_manifest_field "$UNINSTALL_SNAPSHOT_DIR/manifest" "$path" mode)
-                if [[ "$target_state" == regular ]]; then
+            if [[ "$target_state" == regular ]]; then
                     restore_uninstall_target "$path" || failed=true
                 elif [[ "$target_state" == absent ]]; then
-                    :
+                    target=$(uninstall_target_path "$path") || { failed=true; continue; }
+                    if [[ -e "$target" || -L "$target" ]]; then
+                        if [[ -f "$target" && ! -L "$target" ]]; then
+                            rm -f -- "$target" || failed=true
+                        else
+                            failed=true
+                        fi
+                    fi
                 else
                     failed=true
                 fi
@@ -1311,6 +1320,8 @@ uninstall_cleanup() {
     fi
     release_repository_lock || failed=true
     restore_repository_traps
+    UNINSTALL_SNAPSHOT_BUILDING=false
+    UNINSTALL_TRANSACTION_ACTIVE=false
     UNINSTALL_TRANSACTION_STATE=NONE
     if [[ "$failed" == true ]]; then
         error "卸载事务清理不完整；失败证据: $evidence；锁路径: ${REPOSITORY_LOCK_DIR:-unknown}"
@@ -1339,6 +1350,13 @@ begin_uninstall_transaction() {
     local id path mode sha state
     UNINSTALL_GENERATION="$(date -u +%Y%m%dT%H%M%SZ)-$$-$RANDOM"
     UNINSTALL_SNAPSHOT_DIR="$REPOSITORY_STATE_DIR/uninstall-$UNINSTALL_GENERATION"
+    UNINSTALL_SNAPSHOT_BUILDING=false
+    UNINSTALL_TRANSACTION_ACTIVE=false
+    validate_directory_chain "$(dirname -- "$UNINSTALL_SNAPSHOT_DIR")" || return 1
+    [[ "$UNINSTALL_SNAPSHOT_DIR" == "$REPOSITORY_STATE_DIR/uninstall-$UNINSTALL_GENERATION" ]] || return 1
+    [[ ! -e "$UNINSTALL_SNAPSHOT_DIR" && ! -L "$UNINSTALL_SNAPSHOT_DIR" ]] || return 1
+    mkdir -m 0700 -- "$UNINSTALL_SNAPSHOT_DIR" || return 1
+    UNINSTALL_SNAPSHOT_BUILDING=true
     UNINSTALL_TRANSACTION_STATE=BUILDING
     save_repository_traps
     trap 'uninstall_signal_handler 129 HUP' HUP
@@ -1346,10 +1364,6 @@ begin_uninstall_transaction() {
     trap 'uninstall_signal_handler 143 TERM' TERM
     trap 'uninstall_exit_handler $?' EXIT
     uninstall_transaction_hook before-snapshot-create
-    validate_directory_chain "$(dirname -- "$UNINSTALL_SNAPSHOT_DIR")" || return 1
-    [[ "$UNINSTALL_SNAPSHOT_DIR" == "$REPOSITORY_STATE_DIR/uninstall-$UNINSTALL_GENERATION" ]] || return 1
-    [[ ! -e "$UNINSTALL_SNAPSHOT_DIR" && ! -L "$UNINSTALL_SNAPSHOT_DIR" ]] || return 1
-    mkdir -m 0700 -- "$UNINSTALL_SNAPSHOT_DIR" || return 1
     mkdir -m 0700 -- "$UNINSTALL_SNAPSHOT_DIR/files" || return 1
     : > "$UNINSTALL_SNAPSHOT_DIR/manifest" || return 1
     chmod 0600 "$UNINSTALL_SNAPSHOT_DIR/manifest" || return 1
@@ -1370,6 +1384,8 @@ begin_uninstall_transaction() {
         fi
     done < <(uninstall_snapshot_targets)
     uninstall_manifest_valid "$UNINSTALL_SNAPSHOT_DIR/manifest" || return 1
+    UNINSTALL_SNAPSHOT_BUILDING=false
+    UNINSTALL_TRANSACTION_ACTIVE=true
     UNINSTALL_TRANSACTION_STATE=ACTIVE
     uninstall_transaction_hook after-snapshot-active
 }
@@ -1382,6 +1398,8 @@ finish_uninstall_transaction() {
     fi
     release_repository_lock || failed=true
     restore_repository_traps
+    UNINSTALL_SNAPSHOT_BUILDING=false
+    UNINSTALL_TRANSACTION_ACTIVE=false
     UNINSTALL_TRANSACTION_STATE=NONE
     if [[ "$failed" == true ]]; then
         error "卸载收尾失败；可能残留锁或 snapshot: $lock_path $UNINSTALL_SNAPSHOT_DIR"
