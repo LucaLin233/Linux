@@ -19,6 +19,8 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
 
       - name: Install pinned ShellCheck
         env:
@@ -46,6 +48,9 @@ jobs:
         run: git ls-files -z -- '*.sh' | xargs -0 -r shellcheck -x --severity=error --
 
       - name: Run tests
+        env:
+          TEST_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          TEST_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: bash tests/run.sh
 
   debian-13:
@@ -61,9 +66,14 @@ jobs:
             ca-certificates git iproute2 jq openssh-client rsync
 
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
 
       - name: Check Bash syntax
         run: find . -type f -name '*.sh' -print0 | xargs -0 -n1 bash -n
 
       - name: Run tests
+        env:
+          TEST_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          TEST_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: bash tests/run.sh
