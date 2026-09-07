@@ -56,14 +56,23 @@ run_locale_case() {
         printf 'SKIP: locale %s is unavailable\n' "$locale_name"
         return 0
     fi
-    output=$(LC_ALL="$locale_name" SSHD_OUTPUT=$'listenaddress 0.0.0.0:22\nlistenaddress [::]:22' \
-        bash -c 'source "$1"; get_effective_listen_addresses' _ "$ROOT_DIR/modules/ssh-security.sh") ||
+    output=$(LC_ALL="$locale_name" SSHD_OUTPUT=$'listenaddress [::]:22\nlistenaddress 0.0.0.0:22\nlistenaddress [::]:2222\nlistenaddress 0.0.0.0:2222' \
+        bash -c '
+            sshd() { printf "%s\n" "$SSHD_OUTPUT"; }
+            source "$1"
+            get_effective_listen_addresses
+        ' _ "$ROOT_DIR/modules/ssh-security.sh") ||
         fail "locale $locale_name invocation failed"
-    assert_eq $'0.0.0.0\n::' "$output" "stable wildcard ordering under locale $locale_name"
+    assert_eq $'0.0.0.0\n::' "$output" "stable deduplicated wildcard ordering under locale $locale_name"
 }
 
 run_locale_case C
-run_locale_case en_US.utf8
+non_c_locale=$(locale -a 2>/dev/null | grep -Ev '^(C|C\.utf8|POSIX)$' | head -n 1 || true)
+if [[ -n "$non_c_locale" ]]; then
+    run_locale_case "$non_c_locale"
+else
+    printf 'SKIP: no non-C locale is available\n'
+fi
 
 CONFIG_FIXTURE="$TEMP_DIR/sshd_config"
 mktemp() {
