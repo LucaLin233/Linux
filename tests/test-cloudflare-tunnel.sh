@@ -614,7 +614,7 @@ for schema_case in version generation duplicate unknown order state mode uid gid
             uid) sed -i '6s/.*/uid=1/' "$manifest" ;;
             gid) sed -i '7s/.*/gid=1/' "$manifest" ;;
             digest) sed -i '8s/.*/sha256=invalid/' "$manifest" ;;
-            created) sed -i '0,/^type=regular$/s//type=absent/' "$manifest" ;;
+            created) sed -i '0,/^transaction_created=false$/s//transaction_created=invalid/' "$manifest" ;;
             payload-name) sed -i 's/^snapshot=target-source$/snapshot=target-current/' "$manifest" ;;
             payload-missing) rm -- "$UNINSTALL_SNAPSHOT_DIR/files/target-source" ;;
             payload-extra) printf extra > "$UNINSTALL_SNAPSHOT_DIR/files/target-extra"; chmod 600 "$UNINSTALL_SNAPSHOT_DIR/files/target-extra" ;;
@@ -634,6 +634,142 @@ for schema_case in version generation duplicate unknown order state mode uid gid
         release_repository_lock || fail "schema fixture release"
     ) > "$TEST_DIR/schema-$schema_case.log" 2>&1 || fail "schema $schema_case (see $TEST_DIR/schema-$schema_case.log)"
     pass "uninstall manifest rejects $schema_case"
+done
+
+
+for ownership_case in owned foreign inode mode owner gid symlink directory fifo; do
+    (
+        new_case
+        uninstall_transaction_hook() { :; }
+        trap - EXIT
+        configure_repository || fail "ownership configure"
+        acquire_repository_lock || fail "ownership lock"
+        begin_uninstall_transaction || fail "ownership capture"
+        target="$AUTO_UPDATE_SCRIPT"
+        printf 'owned-content\n' > "$CASE_DIR/payload"
+        chmod 0600 "$CASE_DIR/payload"
+        if [[ "$ownership_case" == foreign ]]; then
+            printf foreign > "$target"
+            chmod 0755 "$target"
+        else
+            uninstall_create_absent_target auto_update_script "$CASE_DIR/payload" || fail "exclusive creation"
+            case "$ownership_case" in
+                inode) mv "$target" "$target.original"; cp "$target.original" "$target" ;;
+                mode) chmod 0644 "$target" ;;
+                owner) chown 65534:0 "$target" ;;
+                gid) chown 0:65534 "$target" ;;
+                symlink) rm "$target"; ln -s "$CASE_DIR/payload" "$target" ;;
+                directory) rm "$target"; mkdir "$target" ;;
+                fifo) rm "$target"; mkfifo "$target" ;;
+            esac
+        fi
+        if [[ "$ownership_case" == owned ]]; then
+            uninstall_cleanup ownership-test || fail "owned rollback"
+            assert_absent "$target" "owned file survived"
+        else
+            if uninstall_cleanup ownership-test; then fail "foreign identity accepted"; fi
+            [[ -e "$target" || -L "$target" ]] || fail "foreign object deleted"
+            [[ -f "$UNINSTALL_SNAPSHOT_DIR/manifest" ]] || fail "manifest lost"
+            [[ -f "$UNINSTALL_SNAPSHOT_DIR/files/target-source" ]] || fail "payload lost"
+        fi
+        trap - EXIT
+    ) > "$TEST_DIR/ownership-$ownership_case.log" 2>&1 || { cat "$TEST_DIR/ownership-$ownership_case.log"; fail "ownership $ownership_case"; }
+    pass "absent ownership $ownership_case"
+done
+
+for journal_case in generation duplicate state unknown reason; do
+    (
+        new_case
+        trap - EXIT
+        uninstall_transaction_hook() { :; }
+        configure_repository || fail "journal configure"
+        acquire_repository_lock || fail "journal lock"
+        begin_uninstall_transaction || fail "journal capture"
+        journal="$UNINSTALL_SNAPSHOT_DIR/journal"
+        case "$journal_case" in
+            generation) sed -i '2s/.*/generation=wrong/' "$journal" ;;
+            duplicate) printf 'state=ACTIVE\n' >> "$journal" ;;
+            state) sed -i '3s/.*/state=COMMITTED/' "$journal" ;;
+            unknown) sed -i '1s/.*/unknown=1/' "$journal" ;;
+            reason) sed -i '4s/.*/path=invalid/' "$journal" ;;
+        esac
+        if uninstall_journal_valid "$journal" ACTIVE; then fail "bad journal accepted"; fi
+        UNINSTALL_TRANSACTION_STATE=FAILED
+        UNINSTALL_TRANSACTION_ACTIVE=false
+        UNINSTALL_SNAPSHOT_BUILDING=false
+        restore_repository_traps
+        release_repository_lock || fail "journal release"
+    ) > "$TEST_DIR/journal-$journal_case.log" 2>&1 || fail "journal $journal_case"
+    pass "journal rejects $journal_case"
+done
+
+for finalization_case in journal archive release restore; do
+    (
+        new_case
+        trap - EXIT
+        uninstall_transaction_hook() { :; }
+        configure_repository || fail "finalization configure"
+        acquire_repository_lock || fail "finalization lock"
+        begin_uninstall_transaction || fail "finalization capture"
+        snapshot_before="$UNINSTALL_SNAPSHOT_DIR"
+        case "$finalization_case" in
+            journal|archive)
+                repository_rename() {
+                    if [[ "$finalization_case" == journal && "$2" == */journal ]] ||
+                       [[ "$finalization_case" == archive && "$1" == "$snapshot_before" ]]; then return 1; fi
+                    command mv -fT -- "$1" "$2"
+                }
+                ;;
+            release)
+                # A nonempty lock is an actual rmdir failure, not a core stub.
+                printf retained > "$REPOSITORY_LOCK_DIR/injected"
+                ;;
+            restore)
+                repository_install_file() {
+                    [[ "$2" != */target-source ]] || return 1
+                    command install -o 0 -g 0 -m "$1" -- "$2" "$3"
+                }
+                ;;
+        esac
+        if uninstall_cleanup "injected-$finalization_case"; then fail "finalization failure accepted"; fi
+        [[ "$UNINSTALL_TRANSACTION_STATE" == FAILED ]] || fail "failed guard state"
+        [[ "$UNINSTALL_TRANSACTION_ACTIVE" == false ]] || fail "active guard survived"
+        [[ -f "$UNINSTALL_SNAPSHOT_DIR/manifest" ]] || fail "manifest deleted"
+        [[ -f "$UNINSTALL_SNAPSHOT_DIR/files/target-source" ]] || fail "source payload deleted"
+        [[ -f "$UNINSTALL_SNAPSHOT_DIR/files/target-current" ]] || fail "current payload deleted"
+        cmp "$SOURCE_FILE" "$UNINSTALL_SNAPSHOT_DIR/files/target-source" || fail "source changed"
+        [[ -f "$KEYRING" ]] || fail "keyring deleted"
+        if [[ "$finalization_case" == release ]]; then
+            [[ -d "$CLOUDFLARED_STATE_DIR.lock" ]] || fail "lock evidence missing"
+        fi
+    ) > "$TEST_DIR/finalization-$finalization_case.log" 2>&1 || {
+        cat "$TEST_DIR/finalization-$finalization_case.log"
+        fail "finalization $finalization_case"
+    }
+    pass "finalization $finalization_case failure preserves complete evidence"
+done
+
+for capture_id in auto_update_script auto_update_timer legacy_marker; do
+    (
+        new_case
+        trap - EXIT
+        configure_repository || fail "capture configure"
+        cp "$SOURCE_FILE" "$CASE_DIR/source-before"
+        cp "$KEYRING" "$CASE_DIR/key-before"
+        acquire_repository_lock || fail "capture lock"
+        uninstall_transaction_hook() { [[ "$1" != "capture-$capture_id" ]]; }
+        if begin_uninstall_transaction; then fail "capture fault ignored"; fi
+        [[ "$UNINSTALL_TRANSACTION_STATE" == BUILDING ]] || fail "partial capture activated"
+        if uninstall_cleanup capture-failed; then fail "partial capture reported recovery"; fi
+        cmp "$SOURCE_FILE" "$CASE_DIR/source-before" || fail "partial source changed"
+        cmp "$KEYRING" "$CASE_DIR/key-before" || fail "partial key changed"
+        [[ -f "$UNINSTALL_SNAPSHOT_DIR/journal" ]] || fail "partial journal missing"
+        [[ "$UNINSTALL_TRANSACTION_ACTIVE" == false ]] || fail "partial guard active"
+    ) > "$TEST_DIR/capture-$capture_id.log" 2>&1 || {
+        cat "$TEST_DIR/capture-$capture_id.log"
+        fail "capture $capture_id"
+    }
+    pass "capture failure $capture_id retains partial evidence without restoration"
 done
 
 entrypoint_output=$(bash -c "$(cat "$ROOT_DIR/tools/cloudflare_tunnel.sh")" cloudflare_tunnel.sh help)
