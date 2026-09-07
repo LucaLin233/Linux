@@ -1186,24 +1186,41 @@ uninstall_transaction_hook() {
     :
 }
 
+uninstall_snapshot_targets() {
+    printf '%s\t%s\n' \
+        "$AUTO_UPDATE_SCRIPT" 755 \
+        "$AUTO_UPDATE_SERVICE" 644 \
+        "$AUTO_UPDATE_TIMER" 644 \
+        "$SOURCE_FILE" 644 \
+        "$REPOSITORY_STATE_DIR/current" 600 \
+        "$STATE_DIR/repository-managed" 600
+}
+
 uninstall_cleanup() {
     init_runtime_config
-    local reason="$1" failed=false evidence
-    [[ "${UNINSTALL_TRANSACTION_ACTIVE:-false}" == true ]] || return 0
-    UNINSTALL_TRANSACTION_ACTIVE=false
+    local reason="$1" failed=false evidence path mode state
+    state="${UNINSTALL_TRANSACTION_STATE:-NONE}"
+    [[ "$state" == BUILDING || "$state" == ACTIVE ]] || return 0
+    UNINSTALL_TRANSACTION_STATE=NONE
     trap - HUP INT TERM EXIT
     evidence="$REPOSITORY_STATE_DIR/failure-uninstall-${UNINSTALL_GENERATION:-unknown}"
     mkdir -m 0700 -- "$evidence" 2>/dev/null || failed=true
     printf '%s\n' "$reason" > "$evidence/rollback.log" 2>/dev/null || failed=true
     chmod 0600 "$evidence/rollback.log" 2>/dev/null || failed=true
-    if [[ -n "${UNINSTALL_SNAPSHOT_DIR:-}" && -d "$UNINSTALL_SNAPSHOT_DIR" ]]; then
-        for path in "$AUTO_UPDATE_SCRIPT" "$AUTO_UPDATE_SERVICE" "$AUTO_UPDATE_TIMER" "$SOURCE_FILE" "$REPOSITORY_STATE_DIR/current" "$STATE_DIR/repository-managed"; do
-            if [[ -f "$UNINSTALL_SNAPSHOT_DIR/$(basename -- "$path")" ]]; then
-                install -o 0 -g 0 -m "$(stat -c %a "$UNINSTALL_SNAPSHOT_DIR/$(basename -- "$path")")" -- "$UNINSTALL_SNAPSHOT_DIR/$(basename -- "$path")" "$path" || failed=true
-            fi
-        done
-        rm -rf -- "$UNINSTALL_SNAPSHOT_DIR" 2>/dev/null || failed=true
+    if [[ "$state" == ACTIVE && -f "$UNINSTALL_SNAPSHOT_DIR/manifest" ]]; then
+        while IFS=$'\t' read -r path mode; do
+            case "$mode" in
+                absent)
+                    [[ ! -e "$path" && ! -L "$path" ]] || rm -f -- "$path" || failed=true
+                    ;;
+                600|644|755)
+                    repository_install_file "$mode" "$UNINSTALL_SNAPSHOT_DIR/files/$(printf '%s' "$path" | sha256sum | awk '{print $1}')" "$path" || failed=true
+                    ;;
+                *) failed=true ;;
+            esac
+        done < "$UNINSTALL_SNAPSHOT_DIR/manifest"
     fi
+    rm -rf -- "${UNINSTALL_SNAPSHOT_DIR:-}" 2>/dev/null || failed=true
     release_repository_lock || failed=true
     restore_repository_traps
     [[ "$failed" == false ]] || { error "卸载事务清理不完整；失败证据: $evidence"; return 1; }
@@ -1212,14 +1229,14 @@ uninstall_cleanup() {
 
 uninstall_signal_handler() {
     local code="$1" signal="$2"
-    uninstall_cleanup "收到 $signal 信号" || true
+    uninstall_cleanup "收到 $signal 信号" || code=1
     exit "$code"
 }
 
 uninstall_exit_handler() {
     local status="$1"
-    if [[ "${UNINSTALL_TRANSACTION_ACTIVE:-false}" == true ]]; then
-        uninstall_cleanup "活动卸载事务异常退出，原状态 $status" || true
+    if [[ "${UNINSTALL_TRANSACTION_STATE:-NONE}" == BUILDING || "${UNINSTALL_TRANSACTION_STATE:-NONE}" == ACTIVE ]]; then
+        uninstall_cleanup "活动卸载事务异常退出，原状态 $status" || status=1
         (( status == 0 )) && status=1
     fi
     exit "$status"
@@ -1227,33 +1244,48 @@ uninstall_exit_handler() {
 
 begin_uninstall_transaction() {
     init_runtime_config
+    local path mode digest
     UNINSTALL_GENERATION="$(date -u +%Y%m%dT%H%M%SZ)-$$-$RANDOM"
     UNINSTALL_SNAPSHOT_DIR="$REPOSITORY_STATE_DIR/uninstall-$UNINSTALL_GENERATION"
-    mkdir -m 0700 -- "$UNINSTALL_SNAPSHOT_DIR" || return 1
-    for path in "$AUTO_UPDATE_SCRIPT" "$AUTO_UPDATE_SERVICE" "$AUTO_UPDATE_TIMER" "$SOURCE_FILE" "$REPOSITORY_STATE_DIR/current" "$STATE_DIR/repository-managed"; do
-        [[ -e "$path" || -L "$path" ]] || continue
-        validate_secure_file "$path" "$(stat -Lc %a -- "$path")" || return 1
-        repository_copy_file "$path" "$UNINSTALL_SNAPSHOT_DIR/$(basename -- "$path")" || return 1
-    done
-    UNINSTALL_TRANSACTION_ACTIVE=true
+    UNINSTALL_TRANSACTION_STATE=BUILDING
     save_repository_traps
     trap 'uninstall_signal_handler 129 HUP' HUP
     trap 'uninstall_signal_handler 130 INT' INT
     trap 'uninstall_signal_handler 143 TERM' TERM
     trap 'uninstall_exit_handler $?' EXIT
+    uninstall_transaction_hook before-snapshot-create
+    mkdir -m 0700 -- "$UNINSTALL_SNAPSHOT_DIR" || return 1
+    mkdir -m 0700 -- "$UNINSTALL_SNAPSHOT_DIR/files" || return 1
+    : > "$UNINSTALL_SNAPSHOT_DIR/manifest" || return 1
+    chmod 0600 "$UNINSTALL_SNAPSHOT_DIR/manifest" || return 1
+    while IFS=$'\t' read -r path mode; do
+        if [[ -e "$path" || -L "$path" ]]; then
+            validate_secure_file "$path" "$mode" || return 1
+            digest=$(printf '%s' "$path" | sha256sum | awk '{print $1}') || return 1
+            repository_copy_file "$path" "$UNINSTALL_SNAPSHOT_DIR/files/$digest" || return 1
+            chmod 0600 "$UNINSTALL_SNAPSHOT_DIR/files/$digest" || return 1
+        else
+            mode=absent
+        fi
+        printf '%s\t%s\n' "$path" "$mode" >> "$UNINSTALL_SNAPSHOT_DIR/manifest" || return 1
+    done < <(uninstall_snapshot_targets)
+    validate_secure_file "$UNINSTALL_SNAPSHOT_DIR/manifest" 600 || return 1
+    [[ "$(wc -l < "$UNINSTALL_SNAPSHOT_DIR/manifest")" == 6 ]] || return 1
+    UNINSTALL_TRANSACTION_STATE=ACTIVE
+    uninstall_transaction_hook after-snapshot-active
 }
 
 finish_uninstall_transaction() {
-    local lock_path="$REPOSITORY_LOCK_DIR"
-    UNINSTALL_TRANSACTION_ACTIVE=false
+    local lock_path="$REPOSITORY_LOCK_DIR" failed=false
+    UNINSTALL_TRANSACTION_STATE=NONE
     trap - HUP INT TERM EXIT
-    rm -rf -- "$UNINSTALL_SNAPSHOT_DIR" || return 1
-    if ! release_repository_lock; then
-        restore_repository_traps
-        error "卸载完成，但仓库事务锁释放失败: $lock_path"
+    rm -rf -- "$UNINSTALL_SNAPSHOT_DIR" || failed=true
+    release_repository_lock || failed=true
+    restore_repository_traps
+    if [[ "$failed" == true ]]; then
+        error "卸载收尾失败；可能残留锁或 snapshot: $lock_path $UNINSTALL_SNAPSHOT_DIR"
         return 1
     fi
-    restore_repository_traps
 }
 
 uninstall_cloudflared() {

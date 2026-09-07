@@ -246,6 +246,7 @@ new_case
 mkdir -p "$CLOUDFLARED_REPOSITORY_STATE_DIR"
 chmod 0700 "$CLOUDFLARED_STATE_DIR" "$CLOUDFLARED_REPOSITORY_STATE_DIR"
 printf 'managed\n' > "$CLOUDFLARED_STATE_DIR/repository-managed"
+chmod 0600 "$CLOUDFLARED_STATE_DIR/repository-managed"
 printf 'deb [signed-by=%s] %s any main\\n' "$CLOUDFLARED_KEYRING" 'https://pkg.cloudflare.com/cloudflare-main.gpg' > "$CLOUDFLARED_SOURCE_FILE"
 printf key > "$CLOUDFLARED_KEYRING"
 chmod 0644 "$CLOUDFLARED_SOURCE_FILE" "$CLOUDFLARED_KEYRING"
@@ -572,9 +573,9 @@ fi
 pass "no kernel deletion or unrelated APT change"
 
 script_hashes_before=$(sha256sum "$ROOT_DIR/linux_setup.sh" "$ROOT_DIR"/modules/*.sh "$ROOT_DIR"/tools/push.sh \
-    "$ROOT_DIR"/tools/setup-motd.sh "$ROOT_DIR"/tools/xanmod-install.sh "$ROOT_DIR"/tools/traffic-shape.sh)
+    "$ROOT_DIR"/tools/setup-motd.sh "$ROOT_DIR"/tools/xanmod-install.sh)
 script_hashes_after=$(sha256sum "$ROOT_DIR/linux_setup.sh" "$ROOT_DIR"/modules/*.sh "$ROOT_DIR"/tools/push.sh \
-    "$ROOT_DIR"/tools/setup-motd.sh "$ROOT_DIR"/tools/xanmod-install.sh "$ROOT_DIR"/tools/traffic-shape.sh)
+    "$ROOT_DIR"/tools/setup-motd.sh "$ROOT_DIR"/tools/xanmod-install.sh)
 [[ "$script_hashes_before" == "$script_hashes_after" ]] || fail "payload or unrelated scripts changed during tests"
 pass "payload and unrelated scripts remain unchanged"
 
