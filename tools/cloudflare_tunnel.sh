@@ -1041,7 +1041,7 @@ install_package() {
     validate_migration_inputs
     PRESERVE_AUTO_UPDATE=false
     legacy_auto_update_present && PRESERVE_AUTO_UPDATE=true || true
-    run_repository_apt_transaction install
+    run_repository_apt_transaction install || return $?
     migrate_legacy_binary
     cleanup_legacy_updater || { error "旧自定义更新组件清理失败"; return 1; }
     cleanup_binary_updater || { error "二进制更新单元清理失败"; return 1; }
@@ -1081,8 +1081,8 @@ install_service() {
 install_cloudflared() {
     require_root
     check_platform
-    install_package
-    install_service
+    install_package || return $?
+    install_service || return $?
     info "安装完成。版本由 APT 管理。"
     if [[ "$PRESERVE_AUTO_UPDATE" == true ]]; then
         info "旧版自动更新行为已保留，无需再次确认。"
@@ -1102,7 +1102,7 @@ upgrade_cloudflared() {
     validate_migration_inputs
     PRESERVE_AUTO_UPDATE=false
     legacy_auto_update_present && PRESERVE_AUTO_UPDATE=true || true
-    run_repository_apt_transaction upgrade
+    run_repository_apt_transaction upgrade || return $?
     migrate_legacy_binary
     cleanup_legacy_updater || { error "旧自定义更新组件清理失败"; return 1; }
     cleanup_binary_updater || { error "二进制更新单元清理失败"; return 1; }
@@ -1715,7 +1715,7 @@ main() {
         migrate-legacy)
             require_root
             check_platform
-            install_package
+            install_package || return $?
             ;;
         uninstall) uninstall_cloudflared ;;
         purge) purge_config ;;

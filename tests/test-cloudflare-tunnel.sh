@@ -826,7 +826,7 @@ for interrupted_phase in before-snapshot-create after-snapshot-active after-evid
         # Simulate operator removing only the stale lock; pending must still block.
         rmdir "$CLOUDFLARED_STATE_DIR.lock" || fail "stale lock remove"
         : > "$FAKE_LOG"
-        for operation in configure_repository upgrade_cloudflared uninstall_cloudflared disable_auto_update; do
+        for operation in install_cloudflared upgrade_cloudflared uninstall_cloudflared disable_auto_update; do
             (
                 trap - EXIT
                 "$operation" --confirmed
