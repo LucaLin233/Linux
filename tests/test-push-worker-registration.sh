@@ -85,6 +85,19 @@ printf source-safe
 assert_eq source-safe "$source_result" "source keeps zero runtime side effects"
 # shellcheck source=../tools/push.sh
 source "$SCRIPT"
+(
+    # Inert direct-child job table: no SSH or production services.
+    sleep 10 & snapshot_child=$!
+    cleanup_snapshot_child() { kill -TERM "$snapshot_child" 2>/dev/null || true; wait "$snapshot_child" 2>/dev/null || true; }
+    trap cleanup_snapshot_child EXIT
+    job_is_active "$snapshot_child" || fail "snapshot misses active direct child"
+    if job_is_active 0; then fail "snapshot accepts absent PID"; fi
+    kill -TERM "$snapshot_child"
+    wait "$snapshot_child" 2>/dev/null || true
+    if job_is_active "$snapshot_child"; then fail "snapshot retains reaped child"; fi
+    trap - EXIT
+    pass "job snapshot preserves direct-child matching and reap semantics"
+)
 trap 'rm -rf "$TEST_DIR"' EXIT
 
 setup_fixture() {
