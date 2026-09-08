@@ -87,6 +87,7 @@ path_is_beneath_anchor() {
     local path anchor
     path=$(realpath -ms -- "$1") || return 1
     anchor=$(realpath -ms -- "$TRUST_ANCHOR") || return 1
+    [[ "$anchor" == / ]] && return 0
     [[ "$path" == "$anchor" || "$path" == "$anchor"/* ]]
 }
 
@@ -1318,13 +1319,14 @@ uninstall_create_absent_target() {
     validate_secure_file "$stage" "$mode" || return 1
     digest=$(sha256sum -- "$stage" | awk '{print $1}') || return 1
     identity=$(stat -c '%d:%i' -- "$stage") || return 1
-    # GNU ln -T cannot follow a destination symlink or replace an existing file.
-    ln -T -- "$stage" "$path" || return 1
-    [[ "$(stat -c '%d:%i' -- "$path")" == "$identity" ]] || return 1
+    # Record intent and exact stage identity BEFORE publication. A true manifest
+    # flag permits removal only when the destination matches this identity.
+    uninstall_transaction_hook before-create-marker || return 1
     marker="$UNINSTALL_SNAPSHOT_DIR/created-$id"
     (set -C; umask 077; printf 'state=created\ntarget_id=%s\npath=%s\nuid=0\ngid=0\ndev=%s\nino=%s\nsha256=%s\n' \
         "$id" "$path" "${identity%:*}" "${identity#*:}" "$digest" > "$marker") || return 1
     validate_secure_file "$marker" 600 || return 1
+    uninstall_transaction_hook before-create-manifest-stage || return 1
     manifest_stage=$(mktemp "$UNINSTALL_SNAPSHOT_DIR/manifest.stage.XXXXXX") || return 1
     awk -v id="$id" '
         /^target_id=/ {hit=($0 == "target_id=" id)}
@@ -1332,7 +1334,13 @@ uninstall_create_absent_target() {
         {print}
     ' "$UNINSTALL_SNAPSHOT_DIR/manifest" > "$manifest_stage" || return 1
     chmod 0600 "$manifest_stage" || return 1
+    uninstall_transaction_hook before-create-manifest-rename || return 1
     repository_rename "$manifest_stage" "$UNINSTALL_SNAPSHOT_DIR/manifest" || return 1
+    uninstall_manifest_valid "$UNINSTALL_SNAPSHOT_DIR/manifest" || return 1
+    uninstall_transaction_hook before-create-publish || return 1
+    # No marker/manifest writes are needed after successful exclusive publication.
+    ln -T -- "$stage" "$path" || return 1
+    uninstall_transaction_hook after-create-publish || return 1
     uninstall_created_identity_valid "$id" || return 1
     rm -- "$stage"
 }

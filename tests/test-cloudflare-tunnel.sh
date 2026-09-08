@@ -966,6 +966,55 @@ for target_id in auto_update_script auto_update_service auto_update_timer source
     done
 done
 
+(
+    unset CLOUDFLARED_TRUST_ANCHOR
+    init_runtime_config
+    [[ "$TRUST_ANCHOR" == / ]] || exit 1
+    path_is_beneath_anchor / || exit 1
+    path_is_beneath_anchor /var/lib || exit 1
+    CLOUDFLARED_TRUST_ANCHOR=/var
+    path_is_beneath_anchor /var || exit 1
+    path_is_beneath_anchor /var/lib || exit 1
+    if path_is_beneath_anchor /variable; then exit 1; fi
+    if path_is_beneath_anchor /var/../etc; then exit 1; fi
+    path_is_beneath_anchor /var/lib/../lib || exit 1
+) || fail "pure anchor boundaries"
+pass "pure paths validate default root anchor and normalized non-root boundaries"
+
+for creation_phase in before-create-marker before-create-manifest-stage before-create-manifest-rename before-create-publish after-create-publish; do
+    for creation_fault in failure HUP INT TERM; do
+        (
+            new_case
+            trap - EXIT
+            configure_repository || fail "creation configure"
+            printf payload > "$CASE_DIR/payload"
+            chmod 0600 "$CASE_DIR/payload"
+            rc=0
+            (
+                trap - EXIT
+                acquire_repository_lock || exit 1
+                begin_uninstall_transaction || exit 1
+                uninstall_transaction_hook() {
+                    [[ "$1" == "$creation_phase" ]] || return 0
+                    if [[ "$creation_fault" == failure ]]; then return 1; fi
+                    kill -s "$creation_fault" "$BASHPID"
+                }
+                if uninstall_create_absent_target auto_update_script "$CASE_DIR/payload"; then exit 90; fi
+                uninstall_cleanup creation-failure || :
+                exit 1
+            ) > "$CASE_DIR/creation.log" 2>&1 || rc=$?
+            case "$creation_fault" in failure) expected=1 ;; HUP) expected=129 ;; INT) expected=130 ;; TERM) expected=143 ;; esac
+            [[ "$rc" == "$expected" ]] || fail "creation status $rc"
+            [[ ! -e "$AUTO_UPDATE_SCRIPT" && ! -L "$AUTO_UPDATE_SCRIPT" ]] || fail "owned publication not recovered"
+            [[ ! -d "$CLOUDFLARED_STATE_DIR.lock" ]] || fail "creation lock leaked"
+        ) > "$TEST_DIR/create-$creation_phase-$creation_fault.log" 2>&1 || {
+            cat "$TEST_DIR/create-$creation_phase-$creation_fault.log"
+            fail "creation $creation_phase $creation_fault"
+        }
+        pass "creation $creation_phase $creation_fault preserves ownership across publication"
+    done
+done
+
 entrypoint_output=$(bash -c "$(cat "$ROOT_DIR/tools/cloudflare_tunnel.sh")" cloudflare_tunnel.sh help)
 grep -Fq 'cloudflare_tunnel.sh install' <<< "$entrypoint_output" || fail "bash -c entrypoint broken"
 pass "bash -c entrypoint remains compatible"
