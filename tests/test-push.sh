@@ -1386,12 +1386,29 @@ EOF
     runtime_has_published_worker_state && fail "sliding batch left worker-session state"
     runtime_has_worker_registration_state && fail "sliding batch left registration state"
     : > "$SUCCESS_FILE"; : > "$FAILED_FILE"; : > "$root/state/current"; : > "$root/state/max"
+    diagnose_batch_contract() {
+        printf "DIAG: bash=%s status=%s lifecycle_failed=%s worker_error=%s\n" "$BASH_VERSION" "$1" "$BATCH_WORKER_FAILED" "$BATCH_WORKER_ERROR" >&2
+        declare -p ACTIVE_WORKERS ACTIVE_WORKER_STATE_FILES ACTIVE_WORKER_STATE_STARTS REGISTERING_WORKERS WORKER_REGISTRATION_READY_FILES WORKER_REGISTRATION_RELEASE_FILES WORKER_REGISTRATION_STARTS WORKER_REGISTRATION_STAGE_FILES >&2
+    }
+    assert_transfer_failure_contract() {
+        local label=$1 status=$2
+        if [[ $status != 1 || $BATCH_WORKER_FAILED != false || $BATCH_WORKER_ERROR != false ]]; then
+            diagnose_batch_contract "$status"
+            fail "$label must be ordinary transfer failure, not lifecycle/accounting failure"
+        fi
+        pass "$label preserves ordinary failure status"
+    }
     SERVERS=(good1 bad1 good2)
-    assert_fail "partial server failure returns nonzero" run_transfer source destination
+    partial_status=0
+    run_transfer source destination || partial_status=$?
+    assert_transfer_failure_contract "partial failure" "$partial_status"
+    assert_eq 2 "$(wc -l < "$SUCCESS_FILE")" "partial failure completes both unrelated servers"
     assert_eq 1 "$(wc -l < "$FAILED_FILE")" "partial failure records one failed server"
     : > "$SUCCESS_FILE"; : > "$FAILED_FILE"; : > "$root/state/current"; : > "$root/state/max"
     SERVERS=(bad1 bad2)
-    assert_fail "all server failures return nonzero" run_transfer source destination
+    all_status=0
+    run_transfer source destination || all_status=$?
+    assert_transfer_failure_contract "all failures" "$all_status"
     assert_eq 2 "$(wc -l < "$FAILED_FILE")" "all failures record every server"
     cleanup_runtime
 )
