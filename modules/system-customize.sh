@@ -3000,7 +3000,7 @@ xanmod_allocate_temp_directory() {
     [[ -z "$XANMOD_ALLOCATION_CANDIDATE" && -z "$XANMOD_ALLOCATION_STATE" ]] || return 1
     printf -v "$path_variable" '%s' ""
     printf -v "$building_variable" '%s' false
-    for attempt in {1..64}; do
+    for (( attempt=1; attempt<=64; attempt++ )); do
         token=$(xanmod_random_token) || return 1
         owner_token=$(xanmod_random_token) || return 1
         candidate="$parent/$prefix.$token"
@@ -3068,7 +3068,7 @@ xanmod_allocate_temp_file() {
     [[ -d "$parent" && ! -L "$parent" ]] || return 1
     [[ -z "$XANMOD_ALLOCATION_CANDIDATE" && -z "$XANMOD_ALLOCATION_STATE" ]] || return 1
     printf -v "$path_variable" '%s' ""
-    for attempt in {1..64}; do
+    for (( attempt=1; attempt<=64; attempt++ )); do
         token=$(xanmod_random_token) || return 1
         owner_token=$(xanmod_random_token) || return 1
         candidate="$parent/$prefix.$token$suffix"
