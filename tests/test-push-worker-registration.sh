@@ -100,6 +100,27 @@ source "$SCRIPT"
 )
 trap 'rm -rf "$TEST_DIR"' EXIT
 
+# Deterministic coordinator contract: a live worker can republish after cleanup.
+(
+    root="$TEST_DIR/republish-tracking"; mkdir -m 0700 "$root"
+    state_file="$root/worker.state"; : > "$state_file"
+    ACTIVE_WORKERS=([424242]=12345)
+    ACTIVE_WORKER_STATE_FILES=([424242]="$state_file")
+    ACTIVE_WORKER_STATE_STARTS=([424242]=12345)
+    worker_session_state_maybe_cleanup_failed() { return 0; }
+    cleanup_calls=0
+    cleanup_worker_session_state_file() { cleanup_calls=$((cleanup_calls + 1)); rm -f -- "$1"; }
+    cleanup_active_failed_worker_sessions
+    [[ ${ACTIVE_WORKER_STATE_FILES[424242]:-} == "$state_file" && ${ACTIVE_WORKER_STATE_STARTS[424242]:-} == 12345 ]] || fail "active cleanup lost live publisher tracking"
+    : > "$state_file"
+    ACTIVE_WORKERS=()
+    job_is_active() { return 1; }
+    cleanup_published_worker_sessions
+    assert_eq 2 "$cleanup_calls" "post-reap fallback handles republished state"
+    [[ ! -e $state_file && ${#ACTIVE_WORKER_STATE_FILES[@]} == 0 && ${#ACTIVE_WORKER_STATE_STARTS[@]} == 0 ]] || fail "republished state remains"
+    pass "live publisher tracking survives successful active cleanup"
+)
+
 setup_fixture() {
     local root="$1"
     CURRENT_FIXTURE_ROOT=$root
