@@ -12,7 +12,7 @@ init_runtime_config() {
     SOURCE_FILE="${CLOUDFLARED_SOURCE_FILE:-/etc/apt/sources.list.d/cloudflared.list}"
     STATE_DIR="${CLOUDFLARED_STATE_DIR:-/var/lib/cloudflared-wrapper}"
     KEY_URL="https://pkg.cloudflare.com/cloudflare-main.gpg"
-    REPOSITORY="https://pkg.cloudflare.com/cloudflare-main.gpg"
+    REPOSITORY="https://pkg.cloudflare.com/cloudflared"
     KEY_FINGERPRINT="CC94B39C77AE7342A68B89628A682D308D4E5E73"
     KEY_UID="CloudFlare Software Packaging 2025 <help@cloudflare.com>"
     REPOSITORY_STATE_DIR="${CLOUDFLARED_REPOSITORY_STATE_DIR:-$STATE_DIR/repository}"

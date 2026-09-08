@@ -177,7 +177,7 @@ before=$(find "$CASE_DIR/root" -mindepth 1 -printf '%P %y %m\n' | sort)
 repository_source_content > "$CASE_DIR/source-output"
 after=$(find "$CASE_DIR/root" -mindepth 1 -printf '%P %y %m\n' | sort)
 [[ "$before" == "$after" ]] || fail "source rendering had side effects"
-[[ "$(cat "$CASE_DIR/source-output")" == "deb [signed-by=$CLOUDFLARED_KEYRING] https://pkg.cloudflare.com/cloudflare-main.gpg any main" ]] ||
+[[ "$(cat "$CASE_DIR/source-output")" == "deb [signed-by=$CLOUDFLARED_KEYRING] https://pkg.cloudflare.com/cloudflared any main" ]] ||
     fail "source is not exact official definition"
 pass "source rendering has zero side effects and exact fields"
 
@@ -334,7 +334,7 @@ assert_absent "$CLOUDFLARED_SOURCE_FILE" "duplicate source wrote managed source"
 pass "reject duplicate or extra Cloudflare source before commit"
 
 new_case
-printf 'deb [signed-by=%s trusted=yes] https://pkg.cloudflare.com/cloudflare-main.gpg any main\n' \
+printf 'deb [signed-by=%s trusted=yes] https://pkg.cloudflare.com/cloudflared any main\n' \
     "$CLOUDFLARED_KEYRING" > "$CLOUDFLARED_SOURCE_FILE"
 chmod 0644 "$CLOUDFLARED_SOURCE_FILE"
 if configure_repository >/dev/null 2>&1; then fail "source injection accepted"; fi
@@ -462,7 +462,9 @@ configure_repository
 current="$CLOUDFLARED_REPOSITORY_STATE_DIR/current"
 [[ -f "$current" ]] || fail "generation marker missing"
 key_hash=$(sha256sum "$CLOUDFLARED_KEYRING" | awk '{print $1}')
-source_hash=$(sha256sum "$CLOUDFLARED_SOURCE_FILE" | awk '{print $1}')
+printf 'deb [signed-by=%s] https://pkg.cloudflare.com/cloudflared any main\n' "$CLOUDFLARED_KEYRING" > "$CASE_DIR/independent-source"
+assert_same "$CLOUDFLARED_SOURCE_FILE" "$CASE_DIR/independent-source" "source differs from official literal"
+source_hash=$(sha256sum "$CASE_DIR/independent-source" | awk '{print $1}')
 grep -Fxq "key_sha256=$key_hash" "$current" || fail "key generation hash mismatch"
 grep -Fxq "source_sha256=$source_hash" "$current" || fail "source generation hash mismatch"
 pass "key/source commit as one recorded generation"
@@ -1046,6 +1048,25 @@ for bookkeeping_fault in marker stage rename; do
     }
     pass "actual $bookkeeping_fault failure precedes ln publication"
 done
+
+new_case
+configure_repository || fail "URL configure"
+grep '^curl:' "$FAKE_LOG" | grep -Fq 'https://pkg.cloudflare.com/cloudflare-main.gpg' || fail "key download URL changed"
+printf 'deb [signed-by=%s] https://pkg.cloudflare.com/cloudflared any main\n' "$CLOUDFLARED_KEYRING" > "$CASE_DIR/official-source"
+assert_same "$CLOUDFLARED_SOURCE_FILE" "$CASE_DIR/official-source" "APT repository URL incorrect"
+validate_current_repository_manifest || fail "official current rejected"
+remove_managed_repository || fail "official source removal failed"
+assert_absent "$CLOUDFLARED_SOURCE_FILE" "official source not removed"
+pass "literal key URL and repository source validate current and real removal"
+
+new_case
+printf 'deb [signed-by=%s] https://pkg.cloudflare.com/cloudflare-main.gpg any main\n' "$CLOUDFLARED_KEYRING" > "$CLOUDFLARED_SOURCE_FILE"
+chmod 0644 "$CLOUDFLARED_SOURCE_FILE"
+cp "$CLOUDFLARED_SOURCE_FILE" "$CASE_DIR/wrong-source"
+if configure_repository > "$CASE_DIR/rejected.log" 2>&1; then fail "gpg repository accepted"; fi
+assert_same "$CLOUDFLARED_SOURCE_FILE" "$CASE_DIR/wrong-source" "unowned wrong source overwritten"
+[[ ! -s "$FAKE_LOG" ]] || fail "invalid source triggered external operation"
+pass "gpg repository URL rejected without overwrite or download"
 
 entrypoint_output=$(bash -c "$(cat "$ROOT_DIR/tools/cloudflare_tunnel.sh")" cloudflare_tunnel.sh help)
 grep -Fq 'cloudflare_tunnel.sh install' <<< "$entrypoint_output" || fail "bash -c entrypoint broken"
