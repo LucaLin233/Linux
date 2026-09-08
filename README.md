@@ -268,7 +268,7 @@ cloudflared 时再启用。`upgrade` 可用于立即手动检查、升级并重�
 旧版脚本用户无需先卸载，可直接重新运行 `install`。确认旧二进制、unit 路径和版本均匹配旧版
 受管安装后，脚本会全自动安装 APT 包，把 `cloudflared.service` 从
 `/usr/local/bin/cloudflared` 事务式迁移到 `/usr/bin/cloudflared`，原样保留 Token/config 参数，
-验证服务后再备份并移除旧二进制，无需重新输入 Token。任一验证失败都会恢复旧 unit 和运行状态；
+验证服务后再备份并移除旧二进制，无需重新输入 Token。服务启动验证失败会尝试恢复备份 unit；恢复也可能失败，不能保证运行状态恢复，需人工检查备份与服务状态；
 归属证据不足则保留文件并停止，不盲删。若上一次迁移已完成 APT 安装和 unit 切换，只留下
 `/usr/local/bin/cloudflared -> /usr/bin/cloudflared` 兼容链接，重新运行也会自动识别、备份并收尾。
 `migrate-legacy` 可单独执行相同迁移流程。
@@ -285,6 +285,8 @@ APT 包与 `cloudflared update` 混用。自动处理只接受已核实的完整
 `SIGKILL` 或收尾失败留下 `pending-uninstall-*`、快照/归档及可能的锁。后续 install、upgrade、
 uninstall、disable-auto-update 拒绝继续；应先人工审查错误输出中的状态路径，不要仅删除锁后重试。
 HUP/INT/TERM 分别返回 129/130/143；终态归档开始后的中断不会再次执行配置回滚。
+独立 enable/disable-auto-update 全过程使用仓库同一互斥锁；中断或部分修改失败保留 pending，
+后续仓库操作失败关闭，需人工检查配置组、备份及服务状态，不自动重放。
 彻底清理须显式运行 `purge`，并在交互终端输入 `PURGE` 二次确认。
 
 ### 多服务器文件推送

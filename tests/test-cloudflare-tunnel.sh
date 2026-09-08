@@ -1352,6 +1352,65 @@ for review_fault in timer-enable stage-identity trap-restore; do
     pass "review $review_fault injection reached and failure preserved"
 done
 
+for phase in disable-systemctl disable-backup disable-delete; do
+    for fault in HUP INT TERM zero failure; do
+        (
+            new_case
+            trap - EXIT
+            configure_repository || fail "disable fixture"
+            write_auto_update_files || fail "disable files"
+            rc=0
+            (
+                trap - EXIT
+                updater_transaction_hook() {
+                    [[ "$1" == "$phase" ]] || return 0
+                    case "$fault" in zero) exit 0 ;; failure) return 1 ;; *) kill -s "$fault" "$BASHPID" ;; esac
+                }
+                disable_auto_update --confirmed
+            ) > "$CASE_DIR/disable.log" 2>&1 || rc=$?
+            case "$fault" in HUP) expected=129 ;; INT) expected=130 ;; TERM) expected=143 ;; *) expected=1 ;; esac
+            [[ "$rc" == "$expected" ]] || fail "disable exit $rc"
+            [[ -f "$AUTO_UPDATE_SCRIPT" && -f "$AUTO_UPDATE_SERVICE" && -f "$AUTO_UPDATE_TIMER" ]] || fail "premature file deletion"
+            compgen -G "$REPOSITORY_STATE_DIR/pending-updater-*" >/dev/null || fail "disable pending missing"
+            grep -q '自动更新操作未完成' "$CASE_DIR/disable.log" || fail "disable diagnostic missing"
+            acquire_repository_lock || fail "disable lock retained"
+            release_repository_lock || fail "disable lock release"
+        ) > "$TEST_DIR/disable-$phase-$fault.log" 2>&1 || {
+            cat "$TEST_DIR/disable-$phase-$fault.log"
+            fail "disable $phase $fault"
+        }
+        pass "independent disable $phase $fault preserves pending and exit contract"
+    done
+done
+
+for phase in enable-validate enable-write enable-reload enable-timer disable-systemctl; do
+    (
+        new_case
+        trap - EXIT
+        configure_repository || fail "barrier configure"
+        write_auto_update_files || fail "barrier files"
+        mkfifo "$CASE_DIR/ready" "$CASE_DIR/release"
+        (
+            trap - EXIT
+            dpkg-query() { printf installed; }
+            updater_transaction_hook() {
+                [[ "$1" == "$phase" ]] || return 0
+                printf ready > "$CASE_DIR/ready"
+                read -r _ < "$CASE_DIR/release"
+            }
+            if [[ "$phase" == disable-* ]]; then disable_auto_update --confirmed; else enable_auto_update; fi
+        ) > "$CASE_DIR/holder.log" 2>&1 &
+        holder=$!
+        read -r ready < "$CASE_DIR/ready" || [[ "$ready" == ready ]] || fail "barrier readiness"
+        for contender in enable_auto_update disable_auto_update uninstall_cloudflared; do
+            if ( "$contender" --confirmed ) > "$CASE_DIR/contender.log" 2>&1; then fail "contender bypassed lock"; fi
+        done
+        printf 'release\n' > "$CASE_DIR/release"
+        wait "$holder" || { cat "$CASE_DIR/holder.log"; fail "holder failed"; }
+    ) > "$TEST_DIR/barrier-$phase.log" 2>&1 || { cat "$TEST_DIR/barrier-$phase.log"; fail "barrier $phase"; }
+    pass "real updater barrier $phase excludes all competing mutation entrypoints"
+done
+
 entrypoint_output=$(bash -c "$(cat "$ROOT_DIR/tools/cloudflare_tunnel.sh")" cloudflare_tunnel.sh help)
 grep -Fq 'cloudflare_tunnel.sh install' <<< "$entrypoint_output" || fail "bash -c entrypoint broken"
 pass "bash -c entrypoint remains compatible"

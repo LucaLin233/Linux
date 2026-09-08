@@ -784,6 +784,7 @@ finish_repository_transaction() {
     fi
     REPOSITORY_TRANSACTION_DIR="$history_dir"
     REPOSITORY_TRANSACTION_ACTIVE=false
+    if [[ "${1:-}" == --keep-lock ]]; then return 0; fi
     trap - HUP INT TERM EXIT
     if ! release_repository_lock; then
         restore_repository_traps
@@ -1080,7 +1081,46 @@ auto_update_file_is_managed() {
     [[ "$actual" == "$expected" ]]
 }
 
-enable_auto_update() {
+updater_transaction_hook() { :; }
+
+updater_abort() {
+    local status="$1"
+    [[ "${UPDATER_ACTIVE:-false}" == true ]] || return "$status"
+    UPDATER_ACTIVE=false
+    release_repository_lock || error "自动更新锁释放失败: $REPOSITORY_OWNED_LOCK"
+    restore_repository_traps || error "自动更新 traps 恢复失败"
+    error "自动更新操作未完成；不自动恢复服务状态，请人工检查文件、备份与 pending: ${UPDATER_PENDING:-unknown}"
+    (( status == 0 )) && status=1
+    return "$status"
+}
+
+updater_guard() {
+    UPDATER_ACTIVE=true
+    trap 'updater_abort 129; exit 129' HUP
+    trap 'updater_abort 130; exit 130' INT
+    trap 'updater_abort 143; exit 143' TERM
+    trap 'status=$?; updater_abort "$status"; exit $?' EXIT
+}
+
+updater_start_pending() {
+    UPDATER_PENDING="$REPOSITORY_STATE_DIR/pending-updater-$(date -u +%Y%m%dT%H%M%SZ)-$$-$RANDOM"
+    (set -C; umask 077; printf 'updater operation pending\n' > "$UPDATER_PENDING")
+}
+
+updater_finish() {
+    # A failed lock release must leave durable evidence. Remove pending while
+    # locked, recreate on release failure; competing entrypoints still see lock.
+    validate_secure_file "$UPDATER_PENDING" 600 && rm -- "$UPDATER_PENDING" || { updater_abort 1; return 1; }
+    if ! release_repository_lock; then
+        (umask 077; printf 'lock release failed\n' > "$UPDATER_PENDING") || true
+        updater_abort 1
+        return 1
+    fi
+    UPDATER_ACTIVE=false
+    restore_repository_traps || return 1
+}
+
+enable_auto_update_locked() {
     local path backup_dir
     require_root
     check_platform || return $?
@@ -1088,11 +1128,11 @@ enable_auto_update() {
         error "请先安装 cloudflared APT 包"
         return 1
     }
-    configure_repository || return $?
     command -v flock >/dev/null || {
-        apt-get update
-        DEBIAN_FRONTEND=noninteractive apt-get install -y util-linux
+        apt-get update || return $?
+        DEBIAN_FRONTEND=noninteractive apt-get install -y util-linux || return $?
     }
+    updater_transaction_hook enable-validate || return $?
     for path in "$AUTO_UPDATE_SCRIPT" "$AUTO_UPDATE_SERVICE" "$AUTO_UPDATE_TIMER"; do
         [[ -e "$path" || -L "$path" ]] || continue
         auto_update_file_is_managed "$path" || {
@@ -1104,10 +1144,26 @@ enable_auto_update() {
     for path in "$AUTO_UPDATE_SCRIPT" "$AUTO_UPDATE_SERVICE" "$AUTO_UPDATE_TIMER"; do
         backup_path "$path" "$backup_dir" || return $?
     done
+    updater_transaction_hook enable-write || return $?
     write_auto_update_files || return $?
+    updater_transaction_hook enable-reload || return $?
     systemctl daemon-reload || return $?
+    updater_transaction_hook enable-timer || return $?
     systemctl enable --now cloudflared-apt-update.timer || return $?
     info "已启用每日 APT 更新检查；更新时仅重启原本正在运行的 cloudflared 服务。"
+}
+
+enable_auto_update() {
+    init_runtime_config
+    require_root
+    check_platform || return $?
+    begin_repository_transaction || return 1
+    # Archive repository changes without releasing the shared lock or traps.
+    finish_repository_transaction --keep-lock || return 1
+    updater_guard
+    updater_start_pending || { updater_abort 1; return 1; }
+    enable_auto_update_locked || { local status=$?; updater_abort "$status"; return "$status"; }
+    updater_finish
 }
 
 disable_auto_update_locked() {
@@ -1125,13 +1181,16 @@ disable_auto_update_locked() {
         confirm "禁用并删除 cloudflared APT 自动更新组件？" || { info "已取消"; return 0; }
     fi
     backup_dir="$STATE_DIR/auto-update-$(date +%Y%m%d_%H%M%S)"
+    updater_transaction_hook disable-systemctl || return $?
     systemctl disable --now cloudflared-apt-update.timer >/dev/null 2>&1 || true
     systemctl stop cloudflared-apt-update.service >/dev/null 2>&1 || true
     for path in "$AUTO_UPDATE_SCRIPT" "$AUTO_UPDATE_SERVICE" "$AUTO_UPDATE_TIMER"; do
         [[ -e "$path" || -L "$path" ]] || continue
         if [[ "${UNINSTALL_TRANSACTION_STATE:-NONE}" != ACTIVE ]]; then
+            updater_transaction_hook disable-backup || return $?
             backup_path "$path" "$backup_dir" || return 1
         fi
+        updater_transaction_hook disable-delete || return $?
         rm -f "$path" || return 1
     done
     systemctl daemon-reload || return $?
@@ -1140,13 +1199,14 @@ disable_auto_update_locked() {
 
 disable_auto_update() {
     init_runtime_config
-    validate_directory_chain "$(dirname -- "$REPOSITORY_LOCK_DIR")" || return 1
     acquire_repository_lock || return 1
-    if ! prepare_repository_state || ! disable_auto_update_locked "$@"; then
-        release_repository_lock || return 1
-        return 1
-    fi
-    release_repository_lock
+    save_repository_traps
+    updater_guard
+    UPDATER_PENDING=""
+    prepare_repository_state || { updater_abort 1; return 1; }
+    updater_start_pending || { updater_abort 1; return 1; }
+    disable_auto_update_locked "$@" || { local status=$?; updater_abort "$status"; return "$status"; }
+    updater_finish
 }
 
 show_auto_update_status() {
