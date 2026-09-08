@@ -7,7 +7,7 @@ cleanup() { rm -rf -- "$root"; }
 trap cleanup EXIT
 command -v timeout >/dev/null
 printf "DIAG: parser controls bash=%s\n" "$BASH_VERSION"
-cat > "$root/child.sh" <<CHILD
+cat > "$root/child.sh" <<\CHILD
 #!/usr/bin/env bash
 set -euo pipefail
 handler() { exit 129; }
@@ -25,7 +25,7 @@ esac
 # Reaching this point means no HUP was handled; never count it as success.
 exit 91
 CHILD
-cat > "$root/controller.sh" <<CONTROL
+cat > "$root/controller.sh" <<\CONTROL
 #!/usr/bin/env bash
 set -euo pipefail
 root=$1 mode=$2 round=$3 delay=$4
