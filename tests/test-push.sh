@@ -1390,32 +1390,7 @@ EOF
         printf "DIAG: bash=%s status=%s lifecycle_failed=%s worker_error=%s\n" "$BASH_VERSION" "$1" "$BATCH_WORKER_FAILED" "$BATCH_WORKER_ERROR" >&2
         declare -p ACTIVE_WORKERS ACTIVE_WORKER_STATE_FILES ACTIVE_WORKER_STATE_STARTS REGISTERING_WORKERS WORKER_REGISTRATION_READY_FILES WORKER_REGISTRATION_RELEASE_FILES WORKER_REGISTRATION_STARTS WORKER_REGISTRATION_STAGE_FILES >&2
     }
-    # Test-local wrappers preserve return values and only log failing boundaries.
-    # No argument values, environment dumps, credentials, or global xtrace.
-    for diagnostic_function in launch_worker prune_active_workers wait_for_worker_slot wait_for_all_workers cleanup_active_failed_worker_sessions; do
-        eval "$(declare -f "$diagnostic_function" | sed "1s/$diagnostic_function/diagnostic_original_$diagnostic_function/")"
-    done
-    diagnostic_boundary() {
-        local name=$1 status=0
-        shift
-        "diagnostic_original_$name" "$@" || status=$?
-        if (( status != 0 )); then
-            printf "DIAG: boundary=%s pid=%s status=%s\n" "$name" "$BASHPID" "$status" >&2
-            diagnose_batch_contract "$status"
-        fi
-        return "$status"
-    }
-    launch_worker() { diagnostic_boundary launch_worker "$@"; }
-    prune_active_workers() { diagnostic_boundary prune_active_workers "$@"; }
-    wait_for_worker_slot() { diagnostic_boundary wait_for_worker_slot "$@"; }
-    wait_for_all_workers() { diagnostic_boundary wait_for_all_workers "$@"; }
-    cleanup_active_failed_worker_sessions() { diagnostic_boundary cleanup_active_failed_worker_sessions "$@"; }
-    eval "$(declare -f stop_batch_after_lifecycle_failure | sed "1s/stop_batch_after_lifecycle_failure/diagnostic_original_stop_batch_after_lifecycle_failure/")"
-    stop_batch_after_lifecycle_failure() {
-        printf "DIAG: barrier observed before lifecycle teardown\n" >&2
-        diagnose_batch_contract "$MANAGED_CLEANUP_FAILURE_STATUS"
-        diagnostic_original_stop_batch_after_lifecycle_failure
-    }
+    # Keep production call stacks intact; diagnose only after return.
     assert_transfer_failure_contract() {
         local label=$1 status=$2
         if [[ $status != 1 || $BATCH_WORKER_FAILED != false || $BATCH_WORKER_ERROR != false ]]; then
