@@ -275,6 +275,12 @@ APT 包与 `cloudflared update` 混用。若旧环境已有每日自动更新 ti
 APT timer；旧环境未启用自动更新时仍保持关闭并询问是否启用。`uninstall` 在同一事务锁内验证
 `current` 清单与 key/source 摘要，备份并删除受管 source，保留 keyring、Tunnel 配置和凭据。
 文件阶段失败会恢复可恢复配置；APT 包删除属于不可逆边界，失败时不会尝试自动重装。
+卸载快照固定包含六个受管目标，完整捕获后才进入 ACTIVE。恢复失败保留原 manifest、payload
+和 journal，不覆盖失败证据。成功卸载或完整恢复后，终态 journal 与快照在锁内归档，目录
+权限为 `0500`、文件为 `0400`；不自动清理历史证据。只删除身份仍匹配的本事务临时文件。
+`SIGKILL` 或收尾失败留下 `pending-uninstall-*`、快照/归档及可能的锁。后续 install、upgrade、
+uninstall、disable-auto-update 拒绝继续；应先人工审查错误输出中的状态路径，不要仅删除锁后重试。
+HUP/INT/TERM 分别返回 129/130/143；终态归档开始后的中断不会再次执行配置回滚。
 彻底清理须显式运行 `purge`，并在交互终端输入 `PURGE` 二次确认。
 
 ### 多服务器文件推送

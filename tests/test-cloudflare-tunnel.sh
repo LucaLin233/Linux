@@ -483,7 +483,7 @@ pass "configure then real repository uninstall removes source and preserves keyr
 
 for signal in HUP INT TERM; do
     case "$signal" in HUP) expected=129 ;; INT) expected=130 ;; TERM) expected=143 ;; esac
-    for phase in lock-acquired before-disable-auto-update after-disable-auto-update before-apt-remove after-apt-remove before-source-remove after-source-remove final-apt-update before-lock-release; do
+    for phase in before-snapshot-create capture-auto_update_script capture-auto_update_timer capture-legacy_marker lock-acquired before-disable-auto-update after-disable-auto-update before-apt-remove after-apt-remove before-source-remove after-source-remove final-apt-update before-lock-release; do
         new_case
         set_old_generation
         configure_repository
@@ -932,6 +932,38 @@ for restore_id in auto_update_script auto_update_service auto_update_timer sourc
         fail "restore failure $restore_id"
     }
     pass "restore failure $restore_id continues remaining five targets and preserves original evidence"
+done
+
+for target_id in auto_update_script auto_update_service auto_update_timer source current legacy_marker; do
+    for bad_metadata in mode owner gid symlink directory fifo; do
+        (
+            new_case
+            trap - EXIT
+            configure_repository || fail "metadata configure"
+            mkdir -p "$(dirname "$AUTO_UPDATE_SCRIPT")" "$(dirname "$AUTO_UPDATE_SERVICE")"
+            write_auto_update_files || fail "metadata auto update"
+            printf managed > "$STATE_DIR/repository-managed"
+            chmod 0600 "$STATE_DIR/repository-managed"
+            target=$(uninstall_target_path "$target_id")
+            case "$bad_metadata" in
+                mode) chmod 0666 "$target" ;;
+                owner) chown 1:0 "$target" ;;
+                gid) chown 0:1 "$target" ;;
+                symlink) mv "$target" "$target.external"; ln -s "$target.external" "$target" ;;
+                directory) rm "$target"; mkdir "$target" ;;
+                fifo) rm "$target"; mkfifo "$target" ;;
+            esac
+            acquire_repository_lock || fail "metadata lock"
+            if begin_uninstall_transaction; then fail "bad target captured"; fi
+            uninstall_cleanup bad-metadata >/dev/null 2>&1 || :
+            [[ -e "$target" || -L "$target" ]] || fail "untrusted target deleted"
+            [[ "$UNINSTALL_TRANSACTION_STATE" == FAILED ]] || fail "capture failure state lost"
+        ) > "$TEST_DIR/meta-$target_id-$bad_metadata.log" 2>&1 || {
+            cat "$TEST_DIR/meta-$target_id-$bad_metadata.log"
+            fail "metadata $target_id $bad_metadata"
+        }
+        pass "capture rejects $target_id $bad_metadata without deleting target"
+    done
 done
 
 entrypoint_output=$(bash -c "$(cat "$ROOT_DIR/tools/cloudflare_tunnel.sh")" cloudflare_tunnel.sh help)
