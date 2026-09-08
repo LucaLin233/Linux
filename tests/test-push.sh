@@ -1424,6 +1424,12 @@ EOF
         fi
         pass "$label preserves ordinary failure status"
     }
+    # Fixed probes: stop on first failure, never reset lifecycle barriers.
+    batch_probe_deadline=$((SECONDS + 90))
+    for batch_probe in 1 2 3 4 5 6 7 8; do
+    (( SECONDS < batch_probe_deadline )) || fail "batch probe budget exhausted"
+    printf "DIAG: consecutive failure batch round=%s/8\n" "$batch_probe"
+    : > "$SUCCESS_FILE"; : > "$FAILED_FILE"; : > "$root/state/current"; : > "$root/state/max"
     SERVERS=(good1 bad1 good2)
     partial_status=0
     run_transfer source destination || partial_status=$?
@@ -1436,6 +1442,7 @@ EOF
     run_transfer source destination || all_status=$?
     assert_transfer_failure_contract "all failures" "$all_status"
     assert_eq 2 "$(wc -l < "$FAILED_FILE")" "all failures record every server"
+    done
     cleanup_runtime
 )
 
