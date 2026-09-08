@@ -42,6 +42,7 @@ TOTAL_START_TIME=0
 
 SELECTED_MODULES=()
 
+declare -A MODULE_PREPARATION_ERROR
 declare -A MODULE_STATUS
 declare -A MODULE_EXEC_TIME
 
@@ -684,6 +685,7 @@ resolve_dependencies() {
         visit_state["$current_module"]="visiting"
 
         for dependency in ${MODULE_DEPS[$current_module]:-}; do
+            [[ -n "${MODULES[$dependency]:-}" ]] || continue
             collect_dependencies "$dependency" || return 1
         done
 
@@ -862,35 +864,24 @@ register_module() {
     MODULE_FILES["$module"]="$module_file"
 }
 
-remove_module_registration() {
-    local module="$1"
-
-    unset 'MODULES[$module]'
-    unset 'MODULE_DEPS[$module]'
-    unset 'MODULE_ORDER_VALUE[$module]'
-    unset 'MODULE_FILES[$module]'
-}
-
 validate_module_dependencies() {
-    local changed=true
-    local module
-    local dependency
-
-    # 重复检查，确保依赖于已被剔除模块的模块也会被剔除。
-    while [[ "$changed" == "true" ]]; do
-        changed=false
-
-        for module in "${!MODULES[@]}"; do
-            for dependency in ${MODULE_DEPS[$module]:-}; do
-                if [[ -z "${MODULES[$dependency]:-}" ]]; then
-                    log "模块依赖不存在，已跳过：$module -> $dependency" "error"
-                    remove_module_registration "$module"
-                    changed=true
-                    break
-                fi
-            done
+    local module dependency
+    for module in "${!MODULES[@]}"; do
+        for dependency in ${MODULE_DEPS[$module]:-}; do
+            if [[ -z "${MODULES[$dependency]:-}" ]]; then
+                MODULE_PREPARATION_ERROR["$module"]="依赖不存在或已禁用：$dependency"
+                log "$module：${MODULE_PREPARATION_ERROR[$module]}" "warn"
+            fi
         done
     done
+}
+
+register_unavailable_module() {
+    local module="$1" reason="$2"
+    MODULES["$module"]="$module（准备失败）"
+    MODULE_ORDER_VALUE["$module"]=900
+    MODULE_DEPS["$module"]=""
+    MODULE_PREPARATION_ERROR["$module"]="$reason"
 }
 
 build_module_order() {
@@ -965,7 +956,8 @@ discover_and_prepare_modules() {
         module_file="$TEMP_DIR/$file_name"
 
         if ! download_module "$module"; then
-            log "模块下载失败，已跳过：$module" "error"
+            register_unavailable_module "$module" "下载或完整性验证失败"
+            log "模块准备失败，选择后将计入失败：$module" "error"
             continue
         fi
 
@@ -976,6 +968,7 @@ discover_and_prepare_modules() {
         fi
 
         if (( register_result != 2 )); then
+            register_unavailable_module "$module" "语法或元数据验证失败"
             rm -f "$module_file"
         fi
     done
@@ -1240,6 +1233,35 @@ self_update() {
 # 模块执行
 # =============================================================================
 
+execute_selected_module() {
+    local module="$1" dependency
+    case "${MODULE_STATUS[$module]:-}" in
+        success|degraded) return 0 ;;
+        failed) return 1 ;;
+        running)
+            MODULE_STATUS["$module"]=failed
+            log "模块循环依赖：$module" "error"
+            return 1 ;;
+    esac
+    if [[ -n "${MODULE_PREPARATION_ERROR[$module]:-}" ]]; then
+        MODULE_STATUS["$module"]=failed
+        log "模块 $module 准备失败：${MODULE_PREPARATION_ERROR[$module]}" "error"
+        return 1
+    fi
+    MODULE_STATUS["$module"]=running
+    for dependency in ${MODULE_DEPS[$module]:-}; do
+        # An explicitly omitted dependency retains the existing user-confirmed
+        # external-dependency contract; only selected modules are scheduled here.
+        module_is_selected "$dependency" || continue
+        if ! execute_selected_module "$dependency"; then
+            MODULE_STATUS["$module"]=failed
+            log "模块 $module 被依赖失败阻塞：$dependency" "error"
+            return 1
+        fi
+    done
+    execute_module "$module"
+}
+
 execute_module() {
     local module="$1"
     local module_file="${MODULE_FILES[$module]:-}"
@@ -1248,8 +1270,8 @@ execute_module() {
     local duration
     local result
 
-    if [[ ! -f "$module_file" ]]; then
-        log "模块文件不存在：$module" "error"
+    if ! validate_bash_script "$module_file"; then
+        log "模块文件缺失或执行前语法验证失败：$module" "error"
         MODULE_STATUS["$module"]="failed"
         return 1
     fi
@@ -1745,7 +1767,7 @@ main() {
         echo
         echo "[$current/$total] ${MODULES[$module]}"
 
-        if ! execute_module "$module"; then
+        if ! execute_selected_module "$module"; then
             log "模块失败，但继续执行后续模块：$module" "warn"
         fi
     done

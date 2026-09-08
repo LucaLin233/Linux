@@ -255,3 +255,82 @@ grep -Fq 'Linux/${repository_ref}/p10k-config.zsh' "$ROOT_DIR/modules/zsh-setup.
 pass "pin repository module resource"
 
 printf 'All linux_setup integrity tests passed.\n'
+
+# Project 4: preparation failures count only when selected; dependencies run first.
+(
+    MODULES=(); MODULE_DEPS=(); MODULE_FILES=(); MODULE_ORDER_VALUE=()
+    MODULE_STATUS=(); MODULE_PREPARATION_ERROR=()
+    register_unavailable_module unavailable 'download or validation failed'
+    [[ -n ${MODULES[unavailable]} && -z ${MODULE_STATUS[unavailable]:-} ]]
+    SELECTED_MODULES=(unavailable)
+    assert_fail 'selected preparation failure returns nonzero' execute_selected_module unavailable
+    assert_fail 'selected preparation failure reaches final status' finish_deployment
+    MODULE_STATUS=(); SELECTED_MODULES=(ok)
+    export MODULE_CAPTURE="$TEST_DIR/module-order"
+    : > "$MODULE_CAPTURE"
+    for module in ok dependency dependent transitive degraded; do
+        MODULES[$module]=$module
+        MODULE_FILES[$module]="$TEST_DIR/status-$module.sh"
+        printf '#!/usr/bin/env bash\nprintf "%%s\\n" "%s" >> "$MODULE_CAPTURE"\nexit 0\n' "$module" > "${MODULE_FILES[$module]}"
+    done
+    assert_ok 'unselected preparation failure does not taint success' execute_selected_module ok
+    assert_ok 'unselected preparation failure stays nonfatal' finish_deployment
+    MODULE_STATUS=(); : > "$MODULE_CAPTURE"
+    printf '#!/usr/bin/env bash\nexit 9\n' > "${MODULE_FILES[dependency]}"
+    MODULE_DEPS[dependent]=dependency; MODULE_DEPS[transitive]=dependent
+    SELECTED_MODULES=(transitive dependent dependency ok)
+    for module in "${SELECTED_MODULES[@]}"; do execute_selected_module "$module" || true; done
+    [[ ${MODULE_STATUS[dependency]} == failed && ${MODULE_STATUS[dependent]} == failed && ${MODULE_STATUS[transitive]} == failed ]]
+    assert_file_order=$(cat "$MODULE_CAPTURE")
+    assert_eq ok "$assert_file_order" 'dependency failure blocks transitive consumers but not unrelated module'
+    assert_fail 'dependency failures reach final status' finish_deployment
+    MODULE_STATUS=(); : > "$MODULE_CAPTURE"
+    printf '#!/usr/bin/env bash\nprintf "dependency\\n" >> "$MODULE_CAPTURE"\nexit 0\n' > "${MODULE_FILES[dependency]}"
+    for module in "${SELECTED_MODULES[@]}"; do execute_selected_module "$module" || true; done
+    assert_eq $'dependency\ndependent\ntransitive\nok' "$(cat "$MODULE_CAPTURE")" 'dependency order overrides numeric selection and avoids duplicate execution'
+    MODULE_STATUS=(); SELECTED_MODULES=(degraded)
+    printf '#!/usr/bin/env bash\nexit 2\n' > "${MODULE_FILES[degraded]}"
+    assert_ok 'valid degraded status remains nonfatal' execute_selected_module degraded
+    assert_ok 'degraded final status remains zero' finish_deployment
+    MODULE_STATUS=(); SELECTED_MODULES=(ok)
+    printf '#!/usr/bin/env bash\nif then\n' > "${MODULE_FILES[ok]}"
+    assert_fail 'syntax failure cannot masquerade as degraded exit 2' execute_selected_module ok
+    assert_eq failed "${MODULE_STATUS[ok]}" 'invalid syntax recorded as failed'
+    MODULE_STATUS=(); MODULES[disabled]=''; MODULE_DEPS[dependent]=disabled
+    validate_module_dependencies
+    SELECTED_MODULES=(dependent)
+    assert_fail 'unavailable dependency fails selected consumer' execute_selected_module dependent
+)
+
+# Real discovery with inert curl/download boundaries: no production network.
+(
+    TEMP_DIR="$TEST_DIR/discovery-status"; mkdir "$TEMP_DIR"
+    MODULES=(); MODULE_DEPS=(); MODULE_FILES=(); MODULE_ORDER_VALUE=()
+    MODULE_STATUS=(); MODULE_PREPARATION_ERROR=()
+    curl() {
+        local output=''
+        while (( $# )); do
+            if [[ $1 == -o ]]; then output=$2; shift; fi
+            shift
+        done
+        printf '[{"type":"file","name":"broken.sh"},{"type":"file","name":"disabled.sh"},{"type":"file","name":"valid.sh"},{"type":"file","name":"badsyntax.sh"}]' > "$output"
+    }
+    download_module() {
+        [[ $1 != broken ]] || return 1
+        case $1 in
+            disabled) printf '#!/usr/bin/env bash\n# linux-setup:enabled=false\nexit 0\n' > "$TEMP_DIR/$1.sh" ;;
+            badsyntax) printf '#!/usr/bin/env bash\nif then\n' > "$TEMP_DIR/$1.sh" ;;
+            *) printf '#!/usr/bin/env bash\nexit 0\n' > "$TEMP_DIR/$1.sh" ;;
+        esac
+    }
+    assert_ok 'discovery retains failed candidates and valid modules' discover_and_prepare_modules
+    [[ -n ${MODULES[broken]:-} && -n ${MODULES[badsyntax]:-} && -z ${MODULES[disabled]:-} ]]
+    SELECTED_MODULES=(valid)
+    assert_ok 'valid-only selection ignores failed and disabled discoveries' execute_selected_module valid
+    assert_ok 'valid-only deployment succeeds' finish_deployment
+    SELECTED_MODULES=(broken badsyntax valid)
+    for module in "${SELECTED_MODULES[@]}"; do execute_selected_module "$module" || true; done
+    [[ ${MODULE_STATUS[broken]} == failed && ${MODULE_STATUS[badsyntax]} == failed && ${MODULE_STATUS[valid]} == success ]]
+    assert_fail 'selected discovery failures produce nonzero deployment' finish_deployment
+)
+printf 'All module failure-status tests passed.\n'
