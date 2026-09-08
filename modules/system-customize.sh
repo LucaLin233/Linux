@@ -2165,7 +2165,7 @@ get_locale_config_file() {
     local major_version=""
 
     if [[ -r /etc/os-release ]]; then
-        # shellcheck disable=SC1091
+        # shellcheck disable=SC1091  # /etc/os-release is provided by the target OS, not this repository.
         . /etc/os-release
         os_id="${ID:-}"
         version_id="${VERSION_ID:-}"
@@ -2280,7 +2280,7 @@ authorize_xanmod_install() {
 }
 get_os_codename() {
     if [[ -r "$XANMOD_OS_RELEASE" ]]; then
-        # shellcheck disable=SC1090
+        # shellcheck disable=SC1090  # Runtime OS-release path; test mode substitutes an isolated fixture.
         . "$XANMOD_OS_RELEASE"
         if [[ -n "${VERSION_CODENAME:-}" ]]; then
             echo "$VERSION_CODENAME"
@@ -4291,7 +4291,7 @@ restore_xanmod_saved_trap() {
 
     trap - "$signal_name"
     if [[ -n "$trap_definition" ]]; then
-        # shellcheck disable=SC2294
+        # shellcheck disable=SC2294  # Restore shell-quoted code captured by trap -p; eval is intentional.
         eval "$trap_definition"
     fi
 }
