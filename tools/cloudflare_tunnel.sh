@@ -535,6 +535,12 @@ begin_repository_transaction() {
         return 1
     fi
 
+    # Reject untrusted input before activating rollback: no old-generation
+    # snapshot exists yet, so rollback must not treat existing files as absent.
+    if ! validate_existing_repository_file "$KEYRING" || ! validate_existing_source; then
+        release_repository_lock || return 1
+        return 1
+    fi
     REPOSITORY_GENERATION="$(date -u +%Y%m%dT%H%M%SZ)-$$-$RANDOM"
     REPOSITORY_TRANSACTION_DIR="$REPOSITORY_STATE_DIR/transaction-$REPOSITORY_GENERATION"
     if ! mkdir -m 0700 -- "$REPOSITORY_TRANSACTION_DIR" ||
