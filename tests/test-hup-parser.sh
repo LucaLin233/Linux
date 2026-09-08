@@ -19,7 +19,14 @@ end=$((SECONDS + 2))
 case "$mode" in
     plain) while (( SECONDS < end )); do :; done ;;
     command) while (( SECONDS < end )); do value=$(printf x); [[ $value == x ]]; done ;;
-    pipeline) while (( SECONDS < end )); do jobs -pr | grep -Fx -- 1 > /dev/null || :; done ;;
+    pipeline)
+        while (( SECONDS < end )); do
+            probe_status=0
+            jobs -pr | grep -Fx -- 1 > /dev/null || probe_status=$?
+            # No fixture job has PID 1: only grep no-match is expected.
+            [[ $probe_status == 1 ]] || exit 93
+        done
+        ;;
     snapshot) while (( SECONDS < end )); do active_jobs=$(jobs -pr); while IFS= read -r value; do :; done <<< "$active_jobs"; done ;;
     process) while (( SECONDS < end )); do while IFS= read -r value; do :; done < <(jobs -pr); done ;;
     *) exit 90 ;;
