@@ -10,10 +10,10 @@ printf "DIAG: parser controls bash=%s\n" "$BASH_VERSION"
 cat > "$root/child.sh" <<\CHILD
 #!/usr/bin/env bash
 set -euo pipefail
-handler() { exit 129; }
-trap handler HUP
+handler() { : > "$ready.handled"; exit 129; }
 mode=$1
 ready=$2
+trap handler HUP
 : > "$ready"
 end=$((SECONDS + 2))
 case "$mode" in
@@ -30,7 +30,7 @@ cat > "$root/controller.sh" <<\CONTROL
 set -euo pipefail
 root=$1 mode=$2 round=$3 delay=$4
 ready="$root/ready-$mode-$round"
-# Direct child remains unreaped until wait; its PID cannot be reused meanwhile.
+# Signal only the short-lived direct fixture child after its readiness marker.
 env --default-signal=HUP,INT,TERM bash "$root/child.sh" "$mode" "$ready" &
 child=$!
 end=$((SECONDS + 2))
@@ -44,7 +44,7 @@ kill -HUP "$child"
 status=0
 wait "$child" || status=$?
 printf "DIAG: mode=%s round=%s delay=%s exit=%s\n" "$mode" "$round" "$delay" "$status"
-[[ $status == 129 ]]
+[[ $status == 129 && -f $ready.handled ]]
 CONTROL
 # 3 modes x 6 cases, at most 5 seconds per case (including forced teardown).
 # Do not retry failures. Delay varies delivery, not a claim of exact parser timing.
