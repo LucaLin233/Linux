@@ -237,9 +237,14 @@ Linux 仓库不再内置 `network-optimize` 和 `traffic-shape` 网络调优脚�
 ### Cloudflare Tunnel
 
 [`tools/cloudflare_tunnel.sh`](tools/cloudflare_tunnel.sh) 是 Cloudflare 官方 APT 安装流程的薄包装器，
-只支持 Debian/Ubuntu 与 systemd。它使用官方 stable 软件源和 `cloudflared service install`，
-不再下载裸二进制。安装完成后会询问是否启用受管的 APT systemd timer，默认不启用；也可稍后
-使用独立命令启用。
+只支持 Debian/Ubuntu 与 systemd。密钥下载地址为 `https://pkg.cloudflare.com/cloudflare-main.gpg`；
+按照 [官方推荐配置](https://pkg.cloudflare.com/index.html)，APT source 为：
+`deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared any main`，
+并以 `cloudflared service install` 配置服务，不再下载裸二进制。keyring 会严格校验单一主公钥
+fingerprint `CC94B39C77AE7342A68B89628A682D308D4E5E73` 与 UID
+`CloudFlare Software Packaging 2025 <help@cloudflare.com>`。key/source 同一事务提交；APT probe 或安装
+失败、进程异常退出或收到 HUP/INT/TERM 时恢复旧世代并保留失败证据。安装完成后会询问是否启用
+受管的 APT systemd timer，默认不启用；也可稍后使用独立命令启用。
 
 ```bash
 sudo bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/tools/cloudflare_tunnel.sh) install
@@ -263,16 +268,26 @@ cloudflared 时再启用。`upgrade` 可用于立即手动检查、升级并重�
 旧版脚本用户无需先卸载，可直接重新运行 `install`。确认旧二进制、unit 路径和版本均匹配旧版
 受管安装后，脚本会全自动安装 APT 包，把 `cloudflared.service` 从
 `/usr/local/bin/cloudflared` 事务式迁移到 `/usr/bin/cloudflared`，原样保留 Token/config 参数，
-验证服务后再备份并移除旧二进制，无需重新输入 Token。任一验证失败都会恢复旧 unit 和运行状态；
+验证服务后再备份并移除旧二进制，无需重新输入 Token。服务启动验证失败会尝试恢复备份 unit；恢复也可能失败，不能保证运行状态恢复，需人工检查备份与服务状态；
 归属证据不足则保留文件并停止，不盲删。若上一次迁移已完成 APT 安装和 unit 切换，只留下
 `/usr/local/bin/cloudflared -> /usr/bin/cloudflared` 兼容链接，重新运行也会自动识别、备份并收尾。
 `migrate-legacy` 可单独执行相同迁移流程。
 
 脚本使用 `service install --no-update-service`，并识别、备份和清理旧版裸二进制更新单元，避免
-APT 包与 `cloudflared update` 混用。若旧环境已有每日自动更新 timer，迁移时会自动换成新的
-APT timer；旧环境未启用自动更新时仍保持关闭并询问是否启用。`uninstall` 删除服务、APT 包及
-本脚本管理的软件源，但保留 Tunnel 配置和凭据。彻底清理须显式运行 `purge`，并在交互终端
-输入 `PURGE` 二次确认。
+APT 包与 `cloudflared update` 混用。自动处理只接受已核实的完整 APT updater 模板（脚本、service、timer），
+并校验类型、权限与目录信任链；更早的裸二进制 updater 或手改模板保留并停止，需人工处理。
+当前 main 原样生成的 APT timer 已启用时保持启用；原本关闭时仍保持关闭，安装流程可询问是否启用。`uninstall` 在同一事务锁内验证
+`current` 清单与 key/source 摘要，备份并删除受管 source，保留 keyring、Tunnel 配置和凭据。
+文件阶段失败会恢复可恢复配置；APT 包删除属于不可逆边界，失败时不会尝试自动重装。
+卸载快照固定包含六个受管目标，完整捕获后才进入 ACTIVE。恢复失败保留原 manifest、payload
+和 journal，不覆盖失败证据。成功卸载或完整恢复后，终态 journal 与快照在锁内归档，目录
+权限为 `0500`、文件为 `0400`；不自动清理历史证据。只删除身份仍匹配的本事务临时文件。
+`SIGKILL` 或收尾失败留下 `pending-uninstall-*`、快照/归档及可能的锁。后续 install、upgrade、
+uninstall、disable-auto-update 拒绝继续；应先人工审查错误输出中的状态路径，不要仅删除锁后重试。
+HUP/INT/TERM 分别返回 129/130/143；终态归档开始后的中断不会再次执行配置回滚。
+独立 enable/disable-auto-update 全过程使用仓库同一互斥锁；中断或部分修改失败保留 pending，
+后续仓库操作失败关闭，需人工检查配置组、备份及服务状态，不自动重放。
+彻底清理须显式运行 `purge`，并在交互终端输入 `PURGE` 二次确认。
 
 ### 多服务器文件推送
 
