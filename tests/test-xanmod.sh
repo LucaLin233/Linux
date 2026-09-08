@@ -79,6 +79,39 @@ trap 'rm -rf "$TEST_DIR"' EXIT
     assert_fail "complete third line rejected" xanmod_pending_allocation_owned
     printf "%s\n%s\n\n" fixture-token "$identity" > "$proof"
     assert_fail "empty third line rejected" xanmod_pending_allocation_owned
+
+    # Reproduce the old EOF mistake with inert text, not an old production script.
+    legacy_accepts_tail() {
+        local token identity extra_line
+        {
+            IFS= read -r token || return 1
+            IFS= read -r identity || return 1
+            if IFS= read -r extra_line; then return 1; fi
+        } < "$proof"
+        [[ "$token" == fixture-token && "$identity" =~ ^[0-9]+:[0-9]+$ ]]
+    }
+    printf "%s\n%s\ntail" fixture-token "$identity" > "$proof"
+    assert_ok "old parser incorrectly accepts unterminated tail" legacy_accepts_tail
+    assert_fail "fixed parser rejects same counterexample" xanmod_pending_allocation_proof_trusted
+
+    # Exercise the real cleanup dispatcher; the deletion primitive is a spy.
+    cleanup_calls=0
+    xanmod_cleanup_created_allocation() { cleanup_calls=$((cleanup_calls + 1)); return 0; }
+    for candidate_exists in yes no; do
+        XANMOD_ALLOCATION_CANDIDATE="$proof_root/candidate"
+        XANMOD_ALLOCATION_KIND=file
+        XANMOD_ALLOCATION_OWNER_TOKEN=fixture-token
+        XANMOD_ALLOCATION_EXPECTED_MODE=600
+        XANMOD_ALLOCATION_STATE=pending
+        XANMOD_ALLOCATION_PROOF_OWNED=false
+        if [[ "$candidate_exists" == no ]]; then command rm -- "$XANMOD_ALLOCATION_CANDIDATE"; fi
+        assert_ok "untrusted cleanup safely clears pending state" cleanup_xanmod_pending_allocation
+        assert_eq 0 "$cleanup_calls" "malformed proof never authorizes deletion"
+        [[ -f "$proof" ]] || fail "untrusted proof was removed"
+        if [[ "$candidate_exists" == yes ]]; then
+            [[ -f "$proof_root/candidate" ]] || fail "untrusted candidate was removed"
+        fi
+    done
 )
 
 OTHER_UID=65534; [[ "$OTHER_UID" == "$XANMOD_TRUSTED_UID" ]] && OTHER_UID=0
