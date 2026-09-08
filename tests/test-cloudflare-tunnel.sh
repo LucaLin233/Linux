@@ -1171,6 +1171,58 @@ for build_case in absent archive-failure; do
     pass "repository building $build_case preserves objects traps and evidence"
 done
 
+for restore_object in key source current; do
+    for restore_fault in partial wrong-content wrong-mode rename post-content post-mode; do
+        (
+            new_case
+            trap - EXIT
+            configure_repository || fail "restore fixture"
+            begin_repository_transaction || fail "restore transaction"
+            snapshot=$REPOSITORY_TRANSACTION_DIR
+            printf historical > "$REPOSITORY_STATE_DIR/current.rollback"
+            cp "$REPOSITORY_STATE_DIR/current.rollback" "$CASE_DIR/historical"
+            case "$restore_object" in key) target=$KEYRING ;; source) target=$SOURCE_FILE ;; current) target=$REPOSITORY_STATE_DIR/current ;; esac
+            cp "$target" "$CASE_DIR/pre-restore"
+            : > "$CASE_DIR/attempts"
+            repository_install_file() {
+                printf '%s\n' "$2" >> "$CASE_DIR/attempts"
+                if [[ "$2" == "$snapshot/old-$restore_object" ]]; then
+                    case "$restore_fault" in
+                        partial) printf partial > "$3"; return 1 ;;
+                        wrong-content) command install -o 0 -g 0 -m "$1" "$2" "$3"; printf wrong > "$3"; return 0 ;;
+                        wrong-mode) command install -o 0 -g 0 -m 0777 "$2" "$3"; return 0 ;;
+                    esac
+                fi
+                command install -o 0 -g 0 -m "$1" "$2" "$3"
+            }
+            repository_rename() {
+                if [[ "$2" == "$target" && "$1" == */.cloudflared-rollback.* ]]; then
+                    [[ "$restore_fault" != rename ]] || return 1
+                    command mv -fT -- "$1" "$2" || return 1
+                    case "$restore_fault" in post-content) printf corrupt > "$2" ;; post-mode) chmod 0777 "$2" ;; esac
+                    return 0
+                fi
+                command mv -fT -- "$1" "$2"
+            }
+            if rollback_repository_transaction injected > "$CASE_DIR/restore.log" 2>&1; then fail "restore fault accepted"; fi
+            for item in key source current; do
+                [[ -f "$REPOSITORY_TRANSACTION_DIR/old-$item" ]] || fail "backup lost $item"
+                grep -Fxq "$snapshot/old-$item" "$CASE_DIR/attempts" || fail "restore skipped $item"
+            done
+            case "$restore_fault" in partial|wrong-content|wrong-mode|rename) cmp "$target" "$CASE_DIR/pre-restore" || fail "invalid stage published" ;; esac
+            cmp "$REPOSITORY_STATE_DIR/current.rollback" "$CASE_DIR/historical" || fail "historical rollback touched"
+            if grep -q '旧 key/source 已恢复' "$CASE_DIR/restore.log"; then fail "false recovery success"; fi
+            grep -q '回滚不完整' "$CASE_DIR/restore.log" || fail "missing failure diagnosis"
+            acquire_repository_lock || fail "restore lock retained"
+            release_repository_lock || fail "restore lock release"
+        ) > "$TEST_DIR/publish-$restore_object-$restore_fault.log" 2>&1 || {
+            cat "$TEST_DIR/publish-$restore_object-$restore_fault.log"
+            fail "restore publish $restore_object $restore_fault"
+        }
+        pass "repository restore $restore_object $restore_fault rejects corruption and retains all backups"
+    done
+done
+
 entrypoint_output=$(bash -c "$(cat "$ROOT_DIR/tools/cloudflare_tunnel.sh")" cloudflare_tunnel.sh help)
 grep -Fq 'cloudflare_tunnel.sh install' <<< "$entrypoint_output" || fail "bash -c entrypoint broken"
 pass "bash -c entrypoint remains compatible"

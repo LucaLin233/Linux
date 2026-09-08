@@ -431,13 +431,26 @@ backup_repository_generation() {
 
 restore_repository_file() {
     init_runtime_config
-    local had_old="$1" backup="$2" target="$3" restore_stage
+    local had_old="$1" backup="$2" target="$3" mode="${4:-644}" restore_stage identity
+    validate_directory_chain "$(dirname -- "$target")" || return 1
     if [[ "$had_old" == true ]]; then
+        validate_secure_file "$backup" 600 || return 1
         restore_stage=$(mktemp "$(dirname -- "$target")/.cloudflared-rollback.XXXXXX") || return 1
-        if ! repository_install_file 0644 "$backup" "$restore_stage" ||
-            ! validate_secure_file "$restore_stage" 644 ||
-            ! repository_rename "$restore_stage" "$target"; then
-            rm -f -- "$restore_stage" 2>/dev/null || true
+        identity=$(stat -c '%d:%i' -- "$restore_stage") || return 1
+        if ! repository_install_file "$mode" "$backup" "$restore_stage" ||
+            ! validate_secure_file "$restore_stage" "$mode" ||
+            ! cmp -s -- "$backup" "$restore_stage" ||
+            ! repository_rename "$restore_stage" "$target" ||
+            ! validate_secure_file "$target" "$mode" ||
+            ! cmp -s -- "$backup" "$target"; then
+            error "仓库恢复验证失败: target=$target backup=$backup stage=$restore_stage"
+            if [[ -e "$restore_stage" || -L "$restore_stage" ]]; then
+                if [[ -f "$restore_stage" && ! -L "$restore_stage" && "$(stat -c '%u:%g:%d:%i' -- "$restore_stage")" == "0:0:$identity" ]]; then
+                    rm -- "$restore_stage" || error "无法清理本事务 stage: $restore_stage"
+                else
+                    error "stage 身份改变，保留人工处理: $restore_stage"
+                fi
+            fi
             return 1
         fi
     else
@@ -445,7 +458,30 @@ restore_repository_file() {
             [[ -f "$target" && ! -L "$target" ]] || return 1
             rm -f -- "$target" || return 1
         fi
+        [[ ! -e "$target" && ! -L "$target" ]] || return 1
     fi
+}
+
+validate_restored_repository_group() {
+    local flag target backup mode name failed=0
+    for flag in KEY SOURCE STATE; do
+        case "$flag" in
+            KEY) target=$KEYRING; backup=old-key; mode=644 ;;
+            SOURCE) target=$SOURCE_FILE; backup=old-source; mode=644 ;;
+            STATE) target=$REPOSITORY_STATE_DIR/current; backup=old-current; mode=600 ;;
+        esac
+        name="REPOSITORY_OLD_$flag"
+        validate_directory_chain "$(dirname -- "$target")" || failed=1
+        if [[ "${!name}" == true ]]; then
+            validate_secure_file "$REPOSITORY_TRANSACTION_DIR/$backup" 600 || failed=1
+            validate_secure_file "$target" "$mode" || failed=1
+            cmp -s -- "$target" "$REPOSITORY_TRANSACTION_DIR/$backup" || failed=1
+        else
+            [[ ! -e "$target" && ! -L "$target" ]] || failed=1
+        fi
+    done
+    (( failed == 0 )) || error "仓库恢复最终三文件组验证失败: $REPOSITORY_TRANSACTION_DIR"
+    return "$failed"
 }
 
 archive_failed_transaction() {
@@ -472,14 +508,8 @@ rollback_repository_transaction() {
     if [[ "${REPOSITORY_SNAPSHOT_READY:-false}" == true ]]; then
     restore_repository_file "$REPOSITORY_OLD_SOURCE" "$REPOSITORY_TRANSACTION_DIR/old-source" "$SOURCE_FILE" || rollback_failed=true
     restore_repository_file "$REPOSITORY_OLD_KEY" "$REPOSITORY_TRANSACTION_DIR/old-key" "$KEYRING" || rollback_failed=true
-    if [[ "$REPOSITORY_OLD_STATE" == true ]]; then
-        repository_install_file 0600 "$REPOSITORY_TRANSACTION_DIR/old-current" "$REPOSITORY_STATE_DIR/current.rollback" || rollback_failed=true
-        if [[ -f "$REPOSITORY_STATE_DIR/current.rollback" ]]; then
-            repository_rename "$REPOSITORY_STATE_DIR/current.rollback" "$REPOSITORY_STATE_DIR/current" || rollback_failed=true
-        fi
-    else
-        rm -f -- "$REPOSITORY_STATE_DIR/current" 2>/dev/null || rollback_failed=true
-    fi
+    restore_repository_file "$REPOSITORY_OLD_STATE" "$REPOSITORY_TRANSACTION_DIR/old-current" "$REPOSITORY_STATE_DIR/current" 600 || rollback_failed=true
+    validate_restored_repository_group || rollback_failed=true
     fi
     rm -f -- "$REPOSITORY_KEY_STAGE" "$REPOSITORY_SOURCE_STAGE" 2>/dev/null || rollback_failed=true
     archive_failed_transaction || rollback_failed=true
