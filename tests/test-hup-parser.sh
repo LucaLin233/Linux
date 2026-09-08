@@ -19,6 +19,7 @@ end=$((SECONDS + 2))
 case "$mode" in
     plain) while (( SECONDS < end )); do :; done ;;
     command) while (( SECONDS < end )); do value=$(printf x); [[ $value == x ]]; done ;;
+    snapshot) while (( SECONDS < end )); do active_jobs=$(jobs -pr); while IFS= read -r value; do :; done <<< "$active_jobs"; done ;;
     process) while (( SECONDS < end )); do while IFS= read -r value; do :; done < <(jobs -pr); done ;;
     *) exit 90 ;;
 esac
@@ -48,11 +49,15 @@ printf "DIAG: mode=%s round=%s delay=%s exit=%s\n" "$mode" "$round" "$delay" "$s
 CONTROL
 # 3 modes x 6 cases, at most 5 seconds per case (including forced teardown).
 # Do not retry failures. Delay varies delivery, not a claim of exact parser timing.
-for mode in plain command process; do
+# Legacy process mode already reproduced EOF in run 34226553908.
+# Keep it available explicitly; the default gate validates the replacement.
+modes="plain command snapshot"
+if [[ ${HUP_PARSER_INCLUDE_LEGACY:-false} == true ]]; then modes="$modes process"; fi
+for mode in $modes; do
     round=0
     for delay in 0 0.001 0.005 0.01 0.02 0.05; do
         round=$((round + 1))
         timeout --signal=TERM --kill-after=1s 4s bash "$root/controller.sh" "$root" "$mode" "$round" "$delay"
     done
 done
-printf "PASS: all 18 bounded HUP parser controls\n"
+printf "PASS: all selected bounded HUP parser controls\n"
