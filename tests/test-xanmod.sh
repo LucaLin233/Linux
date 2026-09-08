@@ -53,6 +53,34 @@ make_layout "$TEST_DIR/tool"
 # shellcheck source=../tools/xanmod-install.sh
 source "$TOOL"
 trap 'rm -rf "$TEST_DIR"' EXIT
+# Proof parser fixtures: no APT, services or production paths.
+(
+    proof_root="$TEST_DIR/proof-tail"
+    mkdir -m 0700 "$proof_root"
+    XANMOD_ALLOCATION_CANDIDATE="$proof_root/candidate"
+    XANMOD_ALLOCATION_KIND=file
+    XANMOD_ALLOCATION_OWNER_TOKEN=fixture-token
+    XANMOD_ALLOCATION_EXPECTED_MODE=600
+    touch "$XANMOD_ALLOCATION_CANDIDATE"
+    chmod 600 "$XANMOD_ALLOCATION_CANDIDATE"
+    proof="$proof_root/proof"
+    xanmod_allocation_proof_path() { printf "%s\n" "$proof"; }
+    identity=$(stat -c "%d:%i" "$XANMOD_ALLOCATION_CANDIDATE")
+    printf "%s\n%s\n" fixture-token "$identity" > "$proof"
+    chmod 600 "$proof"
+    assert_ok "exact two-line proof accepted" xanmod_pending_allocation_owned
+    for tail in unterminated "$identity"; do
+        printf "%s\n%s\n%s" fixture-token "$identity" "$tail" > "$proof"
+        assert_fail "unterminated proof tail rejected" xanmod_pending_allocation_proof_trusted
+        assert_fail "malformed proof cannot establish ownership" xanmod_pending_allocation_owned
+        [[ -f "$XANMOD_ALLOCATION_CANDIDATE" ]] || fail "candidate unexpectedly removed"
+    done
+    printf "%s\n%s\nextra\n" fixture-token "$identity" > "$proof"
+    assert_fail "complete third line rejected" xanmod_pending_allocation_owned
+    printf "%s\n%s\n\n" fixture-token "$identity" > "$proof"
+    assert_fail "empty third line rejected" xanmod_pending_allocation_owned
+)
+
 OTHER_UID=65534; [[ "$OTHER_UID" == "$XANMOD_TRUSTED_UID" ]] && OTHER_UID=0
 OTHER_GID=65534; [[ "$OTHER_GID" == "$XANMOD_TRUSTED_GID" ]] && OTHER_GID=0
 
