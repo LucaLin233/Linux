@@ -1913,7 +1913,7 @@ XANMOD_STAGED_SOURCE=""
 XANMOD_CANDIDATE_SOURCE=""
 XANMOD_ARMORED_KEY_TEMP=""
 XANMOD_ACTIVE_APT_LISTS_DIR=""
-XANMOD_ACTIVE_APT_LISTS_BUILDING=false
+printf -v XANMOD_ACTIVE_APT_LISTS_BUILDING "%s" false
 XANMOD_ALLOCATION_CANDIDATE=""
 XANMOD_ALLOCATION_KIND=""
 XANMOD_ALLOCATION_OWNER_TOKEN=""
@@ -1951,7 +1951,7 @@ XANMOD_BACKUP_SNAPSHOT_BUILDING=false
 XANMOD_BACKUP_SNAPSHOT_REMOVED=false
 XANMOD_BACKUP_GROUP_SNAPSHOT_DIR=""
 XANMOD_BACKUP_STAGE_DIR=""
-XANMOD_BACKUP_STAGE_BUILDING=false
+printf -v XANMOD_BACKUP_STAGE_BUILDING "%s" false
 XANMOD_BACKUP_TRANSACTION_ID=""
 XANMOD_CONFIGURATION_PREVIOUSLY_MANAGED=false
 XANMOD_BACKUP_SNAPSHOT_PATHS=()
@@ -3122,13 +3122,13 @@ xanmod_allocate_temp_file() {
 
 cleanup_xanmod_active_apt_lists() {
     if [[ -z "$XANMOD_ACTIVE_APT_LISTS_DIR" ]]; then
-        XANMOD_ACTIVE_APT_LISTS_BUILDING=false
+        printf -v XANMOD_ACTIVE_APT_LISTS_BUILDING "%s" false
         return 0
     fi
     if [[ ! -e "$XANMOD_ACTIVE_APT_LISTS_DIR" && ! -L "$XANMOD_ACTIVE_APT_LISTS_DIR" ]] ||
         remove_xanmod_temp_directory "$XANMOD_ACTIVE_APT_LISTS_DIR" "临时 APT lists"; then
         XANMOD_ACTIVE_APT_LISTS_DIR=""
-        XANMOD_ACTIVE_APT_LISTS_BUILDING=false
+        printf -v XANMOD_ACTIVE_APT_LISTS_BUILDING "%s" false
         return 0
     fi
     return 1
@@ -3141,7 +3141,7 @@ xanmod_source_is_usable() {
 
     xanmod_allocate_temp_directory XANMOD_ACTIVE_APT_LISTS_DIR \
         XANMOD_ACTIVE_APT_LISTS_BUILDING "$temp_parent" xanmod-apt-lists 0755 || return 1
-    XANMOD_ACTIVE_APT_LISTS_BUILDING=false
+    printf -v XANMOD_ACTIVE_APT_LISTS_BUILDING "%s" false
     if ! install -d -m 0755 "$XANMOD_ACTIVE_APT_LISTS_DIR/partial"; then
         cleanup_xanmod_active_apt_lists || true
         return 1
@@ -3957,14 +3957,14 @@ commit_xanmod_backup_group() {
 
 cleanup_xanmod_backup_stage() {
     if [[ -z "$XANMOD_BACKUP_STAGE_DIR" ]]; then
-        XANMOD_BACKUP_STAGE_BUILDING=false
+        printf -v XANMOD_BACKUP_STAGE_BUILDING "%s" false
         return 0
     fi
     if ! remove_xanmod_temp_directory "$XANMOD_BACKUP_STAGE_DIR" "XanMod backup stage"; then
         return 1
     fi
     XANMOD_BACKUP_STAGE_DIR=""
-    XANMOD_BACKUP_STAGE_BUILDING=false
+    printf -v XANMOD_BACKUP_STAGE_BUILDING "%s" false
 }
 
 restore_xanmod_backup_group_snapshot() {
@@ -4065,7 +4065,7 @@ prepare_persistent_xanmod_backups() {
         restore_xanmod_backup_group_snapshot || true
         return 1
     fi
-    XANMOD_BACKUP_STAGE_BUILDING=false
+    printf -v XANMOD_BACKUP_STAGE_BUILDING "%s" false
 
     if xanmod_configuration_looks_previously_managed; then
         XANMOD_CONFIGURATION_PREVIOUSLY_MANAGED=true
