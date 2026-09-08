@@ -55,13 +55,14 @@ wait "$child" || status=$?
 printf "DIAG: mode=%s round=%s delay=%s exit=%s\n" "$mode" "$round" "$delay" "$status"
 [[ $status == 129 && -f $ready.handled ]]
 CONTROL
-# 3 modes x 6 cases, at most 5 seconds per case (including forced teardown).
+# Default: 2 modes x 6 cases; legacy adds 3 modes, each case bounded to 5 seconds.
 # Do not retry failures. Delay varies delivery, not a claim of exact parser timing.
 # Process mode failed in 34226553908; snapshot failed in 34245125939.
-# Keep both failed implementations as explicit diagnostic controls.
-# Keep it available explicitly; the default gate validates the replacement.
-modes="plain command pipeline"
-if [[ ${HUP_PARSER_INCLUDE_LEGACY:-false} == true ]]; then modes="$modes process snapshot"; fi
+# Plain command substitution also failed in main run 34251584749 (Debian, delay=0).
+# Retain all three failing substitutions as opt-in diagnostics, not passing controls.
+# The default gate still requires the handler marker and exit 129 for plain/pipeline.
+modes="plain pipeline"
+if [[ ${HUP_PARSER_INCLUDE_LEGACY:-false} == true ]]; then modes="$modes command process snapshot"; fi
 for mode in $modes; do
     round=0
     for delay in 0 0.001 0.005 0.01 0.02 0.05; do
