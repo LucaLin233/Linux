@@ -1415,7 +1415,8 @@ uninstall_journal_valid() {
     mapfile -t rows < "$journal" || return 1
     [[ "${#rows[@]}" == 4 ]] || return 1
     [[ "${rows[0]}" == version=1 && "${rows[1]}" == "generation=$UNINSTALL_GENERATION" ]] || return 1
-    [[ "${rows[2]}" == "state=$expected" && "${rows[3]}" == reason=* ]]
+    case "$expected" in BUILDING|ACTIVE|FAILED|COMMITTED|ROLLED_BACK) ;; *) return 1 ;; esac
+    [[ "${rows[2]}" == "state=$expected" && "${rows[3]}" == reason=* && "${rows[3]}" != *$'\r'* ]]
 }
 
 write_uninstall_journal() {
@@ -1488,22 +1489,24 @@ archive_uninstall_evidence() {
 }
 
 uninstall_targets_group_valid() {
-    local id path state sha
+    local id path state sha failed=0
     uninstall_snapshot_path_valid || return 1
     uninstall_manifest_valid "$UNINSTALL_SNAPSHOT_DIR/manifest" || return 1
     while IFS= read -r id; do
-        path=$(uninstall_target_path "$id") || return 1
+        path=$(uninstall_target_path "$id") || { failed=1; continue; }
         state=$(uninstall_manifest_field "$UNINSTALL_SNAPSHOT_DIR/manifest" "$id" state)
         if [[ "$state" == regular ]]; then
             sha=$(uninstall_manifest_field "$UNINSTALL_SNAPSHOT_DIR/manifest" "$id" sha256)
-            validate_secure_file "$path" "$(uninstall_target_mode "$id")" || return 1
-            [[ "$(sha256sum -- "$path" | awk '{print $1}')" == "$sha" ]] || return 1
+            validate_directory_chain "$(dirname -- "$path")" || failed=1
+            validate_secure_file "$path" "$(uninstall_target_mode "$id")" || failed=1
+            [[ "$(sha256sum -- "$path" | awk '{print $1}')" == "$sha" ]] || failed=1
         elif [[ "$state" == absent ]]; then
-            [[ ! -e "$path" && ! -L "$path" ]] || return 1
+            [[ ! -e "$path" && ! -L "$path" ]] || failed=1
         else
-            return 1
+            failed=1
         fi
     done < <(uninstall_snapshot_targets)
+    return "$failed"
 }
 
 uninstall_cleanup() {
