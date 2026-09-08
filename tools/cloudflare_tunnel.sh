@@ -391,21 +391,26 @@ write_transaction_status() {
 
 backup_repository_generation() {
     init_runtime_config
-    if [[ -e "$KEYRING" || -L "$KEYRING" ]]; then
-        repository_copy_file "$KEYRING" "$REPOSITORY_TRANSACTION_DIR/old-key" || return 1
-        chmod 0600 "$REPOSITORY_TRANSACTION_DIR/old-key" || return 1
-        REPOSITORY_OLD_KEY=true
-    fi
-    if [[ -e "$SOURCE_FILE" || -L "$SOURCE_FILE" ]]; then
-        repository_copy_file "$SOURCE_FILE" "$REPOSITORY_TRANSACTION_DIR/old-source" || return 1
-        chmod 0600 "$REPOSITORY_TRANSACTION_DIR/old-source" || return 1
-        REPOSITORY_OLD_SOURCE=true
-    fi
-    if [[ -f "$REPOSITORY_STATE_DIR/current" ]]; then
-        repository_copy_file "$REPOSITORY_STATE_DIR/current" "$REPOSITORY_TRANSACTION_DIR/old-current" || return 1
-        chmod 0600 "$REPOSITORY_TRANSACTION_DIR/old-current" || return 1
-        REPOSITORY_OLD_STATE=true
-    fi
+    local target backup flag mode before
+    for flag in KEY SOURCE STATE; do
+        case "$flag" in
+            KEY) target=$KEYRING; backup=old-key; mode=644 ;;
+            SOURCE) target=$SOURCE_FILE; backup=old-source; mode=644 ;;
+            STATE) target=$REPOSITORY_STATE_DIR/current; backup=old-current; mode=600 ;;
+        esac
+        if [[ -e "$target" || -L "$target" ]]; then
+            validate_secure_file "$target" "$mode" || return 1
+            before=$(sha256sum -- "$target" | awk '{print $1}') || return 1
+            repository_copy_file "$target" "$REPOSITORY_TRANSACTION_DIR/$backup" || return 1
+            chmod 0600 "$REPOSITORY_TRANSACTION_DIR/$backup" || return 1
+            validate_secure_file "$REPOSITORY_TRANSACTION_DIR/$backup" 600 || return 1
+            [[ "$(sha256sum -- "$REPOSITORY_TRANSACTION_DIR/$backup" | awk '{print $1}')" == "$before" ]] || return 1
+            validate_secure_file "$target" "$mode" || return 1
+            [[ "$(sha256sum -- "$target" | awk '{print $1}')" == "$before" ]] || return 1
+            printf -v "REPOSITORY_OLD_$flag" true
+        fi
+    done
+    REPOSITORY_SNAPSHOT_READY=true
 }
 
 restore_repository_file() {
@@ -444,8 +449,11 @@ rollback_repository_transaction() {
     [[ "$REPOSITORY_TRANSACTION_ACTIVE" == true ]] || return 0
     REPOSITORY_TRANSACTION_ACTIVE=false
     trap - HUP INT TERM EXIT
-    printf '%s\n' "$reason" >> "$REPOSITORY_TRANSACTION_DIR/rollback.log" 2>/dev/null || rollback_failed=true
-    chmod 0600 "$REPOSITORY_TRANSACTION_DIR/rollback.log" 2>/dev/null || rollback_failed=true
+    if [[ -n "$REPOSITORY_TRANSACTION_DIR" && -d "$REPOSITORY_TRANSACTION_DIR" ]]; then
+        printf '%s\n' "$reason" >> "$REPOSITORY_TRANSACTION_DIR/rollback.log" 2>/dev/null || rollback_failed=true
+        chmod 0600 "$REPOSITORY_TRANSACTION_DIR/rollback.log" 2>/dev/null || rollback_failed=true
+    fi
+    if [[ "${REPOSITORY_SNAPSHOT_READY:-false}" == true ]]; then
     restore_repository_file "$REPOSITORY_OLD_SOURCE" "$REPOSITORY_TRANSACTION_DIR/old-source" "$SOURCE_FILE" || rollback_failed=true
     restore_repository_file "$REPOSITORY_OLD_KEY" "$REPOSITORY_TRANSACTION_DIR/old-key" "$KEYRING" || rollback_failed=true
     if [[ "$REPOSITORY_OLD_STATE" == true ]]; then
@@ -456,6 +464,7 @@ rollback_repository_transaction() {
     else
         rm -f -- "$REPOSITORY_STATE_DIR/current" 2>/dev/null || rollback_failed=true
     fi
+    fi
     rm -f -- "$REPOSITORY_KEY_STAGE" "$REPOSITORY_SOURCE_STAGE" 2>/dev/null || rollback_failed=true
     archive_failed_transaction || rollback_failed=true
     release_repository_lock || rollback_failed=true
@@ -464,7 +473,11 @@ rollback_repository_transaction() {
         error "Cloudflare 仓库事务回滚不完整；失败证据已尽量保留: $REPOSITORY_TRANSACTION_DIR"
         return 1
     fi
-    error "Cloudflare 仓库事务失败，旧 key/source 已恢复；证据: $REPOSITORY_TRANSACTION_DIR"
+    if [[ "${REPOSITORY_SNAPSHOT_READY:-false}" == true ]]; then
+        error "Cloudflare 仓库事务失败，旧 key/source 已恢复；证据: $REPOSITORY_TRANSACTION_DIR"
+    else
+        error "Cloudflare 快照构建失败；未恢复或删除正式文件；证据: $REPOSITORY_TRANSACTION_DIR"
+    fi
     return 0
 }
 
@@ -488,6 +501,7 @@ repository_exit_handler() {
     local status="$1"
     if [[ "$REPOSITORY_TRANSACTION_ACTIVE" == true ]]; then
         rollback_repository_transaction "进程异常退出，状态 $status" || true
+        (( status == 0 )) && status=1
     fi
     exit "$status"
 }
@@ -509,6 +523,7 @@ begin_repository_transaction() {
     init_runtime_config
     local key_parent source_parent downloaded marker_stage key_hash source_hash
     REPOSITORY_TRANSACTION_ACTIVE=false
+    REPOSITORY_SNAPSHOT_READY=false
     REPOSITORY_TRANSACTION_DIR=""
     REPOSITORY_KEY_STAGE=""
     REPOSITORY_SOURCE_STAGE=""
@@ -530,26 +545,26 @@ begin_repository_transaction() {
     validate_directory_chain "$source_parent" || return 1
     validate_directory_chain "$APT_SOURCE_ROOT" || return 1
     acquire_repository_lock || return 1
+    REPOSITORY_TRANSACTION_ACTIVE=true
+    save_repository_traps
     if ! prepare_repository_state; then
-        release_repository_lock || true
+        repository_transaction_fail "准备仓库状态失败"
         return 1
     fi
 
     # Reject untrusted input before activating rollback: no old-generation
     # snapshot exists yet, so rollback must not treat existing files as absent.
     if ! validate_existing_repository_file "$KEYRING" || ! validate_existing_source; then
-        release_repository_lock || return 1
+        repository_transaction_fail "现有仓库输入不可信"
         return 1
     fi
     REPOSITORY_GENERATION="$(date -u +%Y%m%dT%H%M%SZ)-$$-$RANDOM"
     REPOSITORY_TRANSACTION_DIR="$REPOSITORY_STATE_DIR/transaction-$REPOSITORY_GENERATION"
     if ! mkdir -m 0700 -- "$REPOSITORY_TRANSACTION_DIR" ||
         ! validate_secure_directory "$REPOSITORY_TRANSACTION_DIR" 700; then
-        release_repository_lock || true
+        repository_transaction_fail "创建快照目录失败"
         return 1
     fi
-    REPOSITORY_TRANSACTION_ACTIVE=true
-    save_repository_traps
 
     validate_existing_repository_file "$KEYRING" || repository_transaction_fail "现有 keyring 类型或元数据不可信"
     [[ "$REPOSITORY_TRANSACTION_ACTIVE" == true ]] || return 1

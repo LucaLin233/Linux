@@ -1068,6 +1068,72 @@ assert_same "$CLOUDFLARED_SOURCE_FILE" "$CASE_DIR/wrong-source" "unowned wrong s
 [[ ! -s "$FAKE_LOG" ]] || fail "invalid source triggered external operation"
 pass "gpg repository URL rejected without overwrite or download"
 
+for capture_file in old-key old-source old-current; do
+    for capture_fault in copy partial chmod HUP INT TERM exit0; do
+        (
+            new_case
+            trap - EXIT
+            configure_repository || fail "capture fixture"
+            for object in "$KEYRING" "$SOURCE_FILE" "$REPOSITORY_STATE_DIR/current"; do
+                cp -p "$object" "$CASE_DIR/$(basename "$object").before"
+            done
+            : > "$FAKE_LOG"
+            rc=0
+            (
+                trap - EXIT
+                repository_copy_file() {
+                    if [[ "$2" == */"$capture_file" ]]; then
+                        case "$capture_fault" in
+                            copy) return 1 ;;
+                            partial) printf partial > "$2"; return 1 ;;
+                            HUP|INT|TERM) kill -s "$capture_fault" "$BASHPID" ;;
+                            exit0) exit 0 ;;
+                        esac
+                    fi
+                    command cp -- "$1" "$2"
+                }
+                chmod() {
+                    if [[ "$capture_fault" == chmod && "$2" == */"$capture_file" ]]; then return 1; fi
+                    command chmod "$@"
+                }
+                configure_repository
+            ) > "$CASE_DIR/capture.log" 2>&1 || rc=$?
+            case "$capture_fault" in HUP) expected=129 ;; INT) expected=130 ;; TERM) expected=143 ;; *) expected=1 ;; esac
+            [[ "$rc" == "$expected" ]] || fail "capture status $rc"
+            for object in "$KEYRING" "$SOURCE_FILE" "$REPOSITORY_STATE_DIR/current"; do
+                cmp "$object" "$CASE_DIR/$(basename "$object").before" || fail "capture modified formal bytes"
+                [[ "$(stat -c '%u:%g:%a' "$object")" == "$(stat -c '%u:%g:%a' "$CASE_DIR/$(basename "$object").before")" ]] || fail "capture modified metadata"
+            done
+            [[ ! -s "$FAKE_LOG" ]] || fail "capture downloaded or called APT"
+            grep -q '未恢复或删除正式文件' "$CASE_DIR/capture.log" || fail "capture diagnostic missing"
+            acquire_repository_lock || fail "capture lock retained"
+            release_repository_lock || fail "capture lock release"
+        ) > "$TEST_DIR/capture-boundary-$capture_file-$capture_fault.log" 2>&1 || {
+            cat "$TEST_DIR/capture-boundary-$capture_file-$capture_fault.log"
+            fail "capture boundary $capture_file $capture_fault"
+        }
+        pass "repository capture $capture_file $capture_fault preserves formal bytes and metadata"
+    done
+done
+
+(
+    new_case
+    trap - EXIT
+    set_old_generation
+    rc=0
+    (
+        trap - EXIT
+        begin_repository_transaction || exit 1
+        exit 0
+    ) > "$CASE_DIR/active-exit.log" 2>&1 || rc=$?
+    [[ "$rc" == 1 ]] || fail "active exit zero accepted"
+    assert_old_generation
+    [[ ! -e "$REPOSITORY_STATE_DIR/current" ]] || fail "absent current restored incorrectly"
+    acquire_repository_lock || fail "active exit lock retained"
+    release_repository_lock || fail "active exit release"
+) || fail "active exit zero"
+pass "complete repository transaction exit zero returns nonzero and restores absent current"
+
 entrypoint_output=$(bash -c "$(cat "$ROOT_DIR/tools/cloudflare_tunnel.sh")" cloudflare_tunnel.sh help)
 grep -Fq 'cloudflare_tunnel.sh install' <<< "$entrypoint_output" || fail "bash -c entrypoint broken"
 pass "bash -c entrypoint remains compatible"
