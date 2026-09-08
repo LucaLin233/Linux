@@ -89,12 +89,9 @@ setup_fixture() {
     CURRENT_FIXTURE_ROOT=$root
     mkdir -m 0700 "$root" "$root/runtime" "$root/capture"
     TMPDIR="$root/runtime"; initialize_runtime
-    # shellcheck disable=SC2034
     MAX_PARALLEL=2
-    # shellcheck disable=SC2034
     MAX_RETRIES=1
     BATCH_WORKER_FAILED=false
-    # shellcheck disable=SC2034
     BATCH_WORKER_ERROR=false
 }
 assert_no_registration_residue() {
@@ -182,7 +179,6 @@ CHILD
     leader_start=$(wait_test_process_start "$leader"); read_process_record "$leader"
     WORKER_TRANSFER_PID=$leader; WORKER_TRANSFER_START=$leader_start; WORKER_TRANSFER_PGID=$PROC_PGID; WORKER_TRANSFER_SID=$PROC_SID
     publish_worker_session_state active; state_file=$WORKER_SESSION_STATE_FILE
-    # shellcheck disable=SC2034  # Consumed by sourced push cleanup state machine.
     MANAGED_SESSION_CLEANUP_TICKS=300
     rc=0; terminate_worker_transfer || rc=$?
     (( rc != 0 )) || fail "deadline failure unexpectedly succeeded"
@@ -258,7 +254,6 @@ run_with_watchdog root-cause 20 root_cause_regression_case
 
 run_ready_failure_case() (
     kind="$1"; root="$TEST_DIR/ready-$kind"; setup_fixture "$root"
-    # shellcheck disable=SC2034
     WORKER_REGISTRATION_TIMEOUT_TICKS=10
     push_to_server() { : > "$root/capture/transfer"; return 0; }
     case "$kind" in
@@ -348,9 +343,7 @@ prune_identity_failure_case repeated
     root="$TEST_DIR/prune-cleanup-failure"; setup_fixture "$root"
     sleep 300 & worker=$!; read_process_record "$worker"; start=$PROC_START
     ACTIVE_WORKERS[$worker]=$start
-    # shellcheck disable=SC2034
     ACTIVE_WORKER_STATE_FILES[$worker]="$TEMP_DIR/worker-session.$worker.state"
-    # shellcheck disable=SC2034
     ACTIVE_WORKER_STATE_STARTS[$worker]=$start
     eval "$(declare -f process_identity_matches | sed '1s/process_identity_matches/original_process_identity_matches/')"
     eval "$(declare -f read_process_record_for_session_scan | sed '1s/read_process_record_for_session_scan/original_read_process_record_for_session_scan/')"
@@ -373,9 +366,7 @@ prune_identity_failure_case repeated
     root="$TEST_DIR/prune-exited"; setup_fixture "$root"
     sleep 0.1 & worker=$!; read_process_record "$worker"; start=$PROC_START
     ACTIVE_WORKERS[$worker]=$start
-    # shellcheck disable=SC2034
     ACTIVE_WORKER_STATE_FILES[$worker]="$TEMP_DIR/worker-session.$worker.state"
-    # shellcheck disable=SC2034
     ACTIVE_WORKER_STATE_STARTS[$worker]=$start
     sleep 0.2; prune_active_workers
     assert_eq 0 "${#ACTIVE_WORKERS[@]}" "exited worker is normally reaped"
@@ -541,7 +532,6 @@ pass "failed managed-session reap remains bounded for 20 deterministic runs"
     TEMP_DIR=$(dirname "$state_file")
     ACTIVE_WORKERS=(); ACTIVE_WORKER_STATE_FILES=(); ACTIVE_WORKER_STATE_STARTS=()
     BATCH_WORKER_FAILED=false
-    # shellcheck disable=SC2034  # Consumed by sourced worker accounting.
     BATCH_WORKER_ERROR=false
     MAX_PARALLEL=1
     ACTIVE_WORKERS[$worker]=$worker_start
@@ -577,7 +567,6 @@ pass "failed managed-session reap remains bounded for 20 deterministic runs"
 (
     trap - EXIT HUP INT TERM
     leader=424242; leader_start=777777; wait_called=false; after_wait=false
-    # shellcheck disable=SC2034  # Test double fills caller arrays through namerefs.
     collect_owned_session_records() {
         local -n pids_ref="$2" starts_ref="$3" ppids_ref="$4" pgids_ref="$5" states_ref="$6"
         pids_ref=(); starts_ref=(); ppids_ref=(); pgids_ref=(); states_ref=()
@@ -680,13 +669,11 @@ run_preserved_cleanup_retry_case() (
     local run="$1" root runtime runtime_dev runtime_inode credential leader leader_start leader_pgid leader_sid state_file
     local owner watchdog rc=0 metadata="" state_status=0
     local -a session_pids=()
-    # shellcheck disable=SC2034  # Filled through collect_owned_session_records namerefs.
     local -A session_starts=() session_ppids=() session_pgids=() session_states=()
     root="$TEST_DIR/runtime-evidence-retry-$run"; setup_fixture "$root"
     runtime=$TEMP_DIR; runtime_dev=$TEMP_DIR_DEV; runtime_inode=$TEMP_DIR_INODE
     credential="$runtime/private-key"
     printf 'fixture-credential-do-not-print\n' > "$credential"; chmod 0600 "$credential"
-    # shellcheck disable=SC2034  # Consumed by sourced runtime cleanup.
     RUNTIME_KEY_FILE=$credential
 
     setsid bash -c 'trap "" HUP INT TERM; kill -STOP "$BASHPID"; while :; do :; done' & leader=$!
@@ -912,7 +899,6 @@ run_runtime_retention_signal_case() (
     local signal_name="$1" expected="$2" root leader="" leader_start="" leader_pgid="" leader_sid="" target="" target_pid="" target_start=""
     local runtime runtime_dev runtime_inode state_file credential watchdog="" rc=0 line key value state_status=0 reap_status=0
     local -a session_pids=()
-    # shellcheck disable=SC2034  # Filled through collect_owned_session_records namerefs.
     local -A session_starts=() session_ppids=() session_pgids=() session_states=()
     cleanup_runtime_retention_signal_fixture() {
         if [[ -n "$target" ]]; then kill -KILL "$target" 2>/dev/null || true; wait "$target" 2>/dev/null || true; fi
@@ -1135,7 +1121,6 @@ done
 
 run_parallel_fallback_iteration() (
     run="$1"; root="$TEST_DIR/session-parallel-$run"; setup_fixture "$root"
-    # shellcheck disable=SC2034  # consumed by sourced run_server_batch
     MAX_PARALLEL=2
     push_to_server() {
         local server="$1" lock_fd
@@ -1143,13 +1128,9 @@ run_parallel_fallback_iteration() (
         printf '%s\n' "$server" >> "$root/capture/calls"; : > "$root/capture/ready.$server"
         flock -u "$lock_fd"; exec {lock_fd}>&-
         while [[ ! -e "$root/capture/release" ]]; do sleep 0.01; done
-        # shellcheck disable=SC2034  # consumed by sourced state publisher
         WORKER_TRANSFER_PID=$BASHPID
-        # shellcheck disable=SC2034  # consumed by sourced state publisher
         WORKER_TRANSFER_START=11
-        # shellcheck disable=SC2034  # consumed by sourced state publisher
         WORKER_TRANSFER_PGID=$BASHPID
-        # shellcheck disable=SC2034  # consumed by sourced state publisher
         WORKER_TRANSFER_SID=$BASHPID
         publish_worker_session_state cleanup_failed
         return "$MANAGED_CLEANUP_FAILURE_STATUS"
@@ -1336,7 +1317,6 @@ run_live_cleanup_failure_signal_case() (
     }
     trap cleanup_live_failure_fixture EXIT
     local -a session_pids=()
-    # shellcheck disable=SC2034  # Filled by collect_owned_session_records namerefs.
     local -A session_starts=() session_ppids=() session_pgids=() session_states=()
     root="$TEST_DIR/live-cleanup-failure-$signal_name"; CURRENT_FIXTURE_ROOT=$root
     write_active_grace_fixture "$root"
@@ -1422,7 +1402,6 @@ run_state_publication_signal_case() (
     local state="$1" phase="$2" signal_name="$3" expected="$4" mode root main_pid="" main_start="" worker_pid="" worker_start="" leader_pid="" leader_start="" managed_sid=""
     local watchdog="" watchdog_start="" unrelated="" unrelated_start="" rc=0 line key value marker state_file hook_stage
     local -a session_pids=()
-    # shellcheck disable=SC2034  # Filled by collect_owned_session_records namerefs.
     local -A session_starts=() session_ppids=() session_pgids=() session_states=()
     cleanup_publication_fixture() {
         [[ -z "$worker_pid" || -z "$worker_start" ]] || { test_process_identity_exists "$worker_pid" "$worker_start" && kill -KILL "$worker_pid" 2>/dev/null || true; }
