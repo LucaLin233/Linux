@@ -941,10 +941,13 @@ process_identity_matches() {
 }
 
 job_is_active() {
-    local expected="$1" pid
+    local expected="$1" pid active_jobs
+    # Bash 5.2 can report a trap parser EOF when HUP interrupts process substitution.
+    # Snapshot the inherited job table without process substitution or word splitting.
+    active_jobs=$(jobs -pr) || return 1
     while IFS= read -r pid; do
         [[ "$pid" == "$expected" ]] && return 0
-    done < <(jobs -pr)
+    done <<< "$active_jobs"
     return 1
 }
 
