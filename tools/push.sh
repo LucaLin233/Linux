@@ -941,11 +941,11 @@ process_identity_matches() {
 }
 
 job_is_active() {
-    local expected="$1" pid
-    while IFS= read -r pid; do
-        [[ "$pid" == "$expected" ]] && return 0
-    done < <(jobs -pr)
-    return 1
+    local expected="$1"
+    [[ "$expected" =~ ^[1-9][0-9]*$ ]] || return 1
+    # Both process and command substitution reproduced HUP parser EOF on Bash 5.2.
+    # Drain the entire jobs stream: grep -q could close early and cause SIGPIPE.
+    jobs -pr | grep -Fx -- "$expected" > /dev/null
 }
 
 worker_registration_begin_critical() {
@@ -1306,8 +1306,9 @@ cleanup_active_failed_worker_sessions() {
         cleanup_worker_session_state_file "$file" "$worker_pid" "$worker_start" true || status=$?
         case "$status" in
             0)
-                unset 'ACTIVE_WORKER_STATE_FILES[$worker_pid]'
-                unset 'ACTIVE_WORKER_STATE_STARTS[$worker_pid]'
+                # The accepted worker may publish again until it has been reaped.
+                # Keep its identity/path for the final post-reap cleanup pass.
+                :
                 ;;
             "$WORKER_SESSION_STATE_TRANSIENT_STATUS"|"$WORKER_SESSION_STATE_NOT_READY_STATUS"|"$MANAGED_LEADER_REAP_PENDING_STATUS")
                 ;;

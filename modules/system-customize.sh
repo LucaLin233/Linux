@@ -1913,7 +1913,6 @@ XANMOD_STAGED_SOURCE=""
 XANMOD_CANDIDATE_SOURCE=""
 XANMOD_ARMORED_KEY_TEMP=""
 XANMOD_ACTIVE_APT_LISTS_DIR=""
-XANMOD_ACTIVE_APT_LISTS_BUILDING=false
 XANMOD_ALLOCATION_CANDIDATE=""
 XANMOD_ALLOCATION_KIND=""
 XANMOD_ALLOCATION_OWNER_TOKEN=""
@@ -1951,7 +1950,6 @@ XANMOD_BACKUP_SNAPSHOT_BUILDING=false
 XANMOD_BACKUP_SNAPSHOT_REMOVED=false
 XANMOD_BACKUP_GROUP_SNAPSHOT_DIR=""
 XANMOD_BACKUP_STAGE_DIR=""
-XANMOD_BACKUP_STAGE_BUILDING=false
 XANMOD_BACKUP_TRANSACTION_ID=""
 XANMOD_CONFIGURATION_PREVIOUSLY_MANAGED=false
 XANMOD_BACKUP_SNAPSHOT_PATHS=()
@@ -2167,7 +2165,7 @@ get_locale_config_file() {
     local major_version=""
 
     if [[ -r /etc/os-release ]]; then
-        # shellcheck disable=SC1091
+        # shellcheck disable=SC1091  # /etc/os-release is provided by the target OS, not this repository.
         . /etc/os-release
         os_id="${ID:-}"
         version_id="${VERSION_ID:-}"
@@ -2282,7 +2280,7 @@ authorize_xanmod_install() {
 }
 get_os_codename() {
     if [[ -r "$XANMOD_OS_RELEASE" ]]; then
-        # shellcheck disable=SC1090
+        # shellcheck disable=SC1090  # Runtime OS-release path; test mode substitutes an isolated fixture.
         . "$XANMOD_OS_RELEASE"
         if [[ -n "${VERSION_CODENAME:-}" ]]; then
             echo "$VERSION_CODENAME"
@@ -2825,7 +2823,8 @@ xanmod_pending_allocation_proof_trusted() {
     {
         IFS= read -r proof_token || return 1
         IFS= read -r proof_identity || return 1
-        if IFS= read -r extra_line; then
+        # read returns failure at EOF even after consuming an unterminated tail.
+        if IFS= read -r extra_line || [[ -n "$extra_line" ]]; then
             return 1
         fi
     } < "$proof_path"
@@ -2999,8 +2998,11 @@ xanmod_allocate_temp_directory() {
     [[ -d "$parent" && ! -L "$parent" ]] || return 1
     [[ -z "$XANMOD_ALLOCATION_CANDIDATE" && -z "$XANMOD_ALLOCATION_STATE" ]] || return 1
     printf -v "$path_variable" '%s' ""
-    printf -v "$building_variable" '%s' false
-    for attempt in {1..64}; do
+    # Callers without a building-state consumer omit this optional output.
+    if [[ -n "$building_variable" ]]; then
+        printf -v "$building_variable" "%s" false
+    fi
+    for (( attempt=1; attempt<=64; attempt++ )); do
         token=$(xanmod_random_token) || return 1
         owner_token=$(xanmod_random_token) || return 1
         candidate="$parent/$prefix.$token"
@@ -3068,7 +3070,7 @@ xanmod_allocate_temp_file() {
     [[ -d "$parent" && ! -L "$parent" ]] || return 1
     [[ -z "$XANMOD_ALLOCATION_CANDIDATE" && -z "$XANMOD_ALLOCATION_STATE" ]] || return 1
     printf -v "$path_variable" '%s' ""
-    for attempt in {1..64}; do
+    for (( attempt=1; attempt<=64; attempt++ )); do
         token=$(xanmod_random_token) || return 1
         owner_token=$(xanmod_random_token) || return 1
         candidate="$parent/$prefix.$token$suffix"
@@ -3122,13 +3124,11 @@ xanmod_allocate_temp_file() {
 
 cleanup_xanmod_active_apt_lists() {
     if [[ -z "$XANMOD_ACTIVE_APT_LISTS_DIR" ]]; then
-        XANMOD_ACTIVE_APT_LISTS_BUILDING=false
         return 0
     fi
     if [[ ! -e "$XANMOD_ACTIVE_APT_LISTS_DIR" && ! -L "$XANMOD_ACTIVE_APT_LISTS_DIR" ]] ||
         remove_xanmod_temp_directory "$XANMOD_ACTIVE_APT_LISTS_DIR" "临时 APT lists"; then
         XANMOD_ACTIVE_APT_LISTS_DIR=""
-        XANMOD_ACTIVE_APT_LISTS_BUILDING=false
         return 0
     fi
     return 1
@@ -3140,8 +3140,7 @@ xanmod_source_is_usable() {
     local temp_parent="${TMPDIR:-/tmp}"
 
     xanmod_allocate_temp_directory XANMOD_ACTIVE_APT_LISTS_DIR \
-        XANMOD_ACTIVE_APT_LISTS_BUILDING "$temp_parent" xanmod-apt-lists 0755 || return 1
-    XANMOD_ACTIVE_APT_LISTS_BUILDING=false
+        "" "$temp_parent" xanmod-apt-lists 0755 || return 1
     if ! install -d -m 0755 "$XANMOD_ACTIVE_APT_LISTS_DIR/partial"; then
         cleanup_xanmod_active_apt_lists || true
         return 1
@@ -3957,14 +3956,12 @@ commit_xanmod_backup_group() {
 
 cleanup_xanmod_backup_stage() {
     if [[ -z "$XANMOD_BACKUP_STAGE_DIR" ]]; then
-        XANMOD_BACKUP_STAGE_BUILDING=false
         return 0
     fi
     if ! remove_xanmod_temp_directory "$XANMOD_BACKUP_STAGE_DIR" "XanMod backup stage"; then
         return 1
     fi
     XANMOD_BACKUP_STAGE_DIR=""
-    XANMOD_BACKUP_STAGE_BUILDING=false
 }
 
 restore_xanmod_backup_group_snapshot() {
@@ -4061,11 +4058,10 @@ prepare_persistent_xanmod_backups() {
     create_xanmod_backup_group_snapshot || return 1
     XANMOD_BACKUP_TRANSACTION_ID=$(basename "$XANMOD_BACKUP_GROUP_SNAPSHOT_DIR")
     if ! xanmod_allocate_temp_directory XANMOD_BACKUP_STAGE_DIR \
-        XANMOD_BACKUP_STAGE_BUILDING "$XANMOD_BACKUP_STATE_DIR" .xanmod-backup-stage 0700; then
+        "" "$XANMOD_BACKUP_STATE_DIR" .xanmod-backup-stage 0700; then
         restore_xanmod_backup_group_snapshot || true
         return 1
     fi
-    XANMOD_BACKUP_STAGE_BUILDING=false
 
     if xanmod_configuration_looks_previously_managed; then
         XANMOD_CONFIGURATION_PREVIOUSLY_MANAGED=true
@@ -4295,7 +4291,7 @@ restore_xanmod_saved_trap() {
 
     trap - "$signal_name"
     if [[ -n "$trap_definition" ]]; then
-        # shellcheck disable=SC2294
+        # shellcheck disable=SC2294  # Restore shell-quoted code captured by trap -p; eval is intentional.
         eval "$trap_definition"
     fi
 }
