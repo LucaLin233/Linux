@@ -724,7 +724,8 @@ xanmod_pending_allocation_proof_trusted() {
     {
         IFS= read -r proof_token || return 1
         IFS= read -r proof_identity || return 1
-        if IFS= read -r extra_line; then
+        # read returns failure at EOF even after consuming an unterminated tail.
+        if IFS= read -r extra_line || [[ -n "$extra_line" ]]; then
             return 1
         fi
     } < "$proof_path"
