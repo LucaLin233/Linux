@@ -208,7 +208,7 @@ pre_check() {
     local version_id
     local major_version
 
-    # shellcheck disable=SC1091
+    # shellcheck disable=SC1091  # /etc/os-release is provided by the target OS, not this repository.
     . /etc/os-release
     os_id="${ID:-}"
     version_id="${VERSION_ID:-}"

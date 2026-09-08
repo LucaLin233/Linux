@@ -333,7 +333,7 @@ get_ubuntu_kernel_meta_package() {
 
     kernel_version=$(uname -r)
     if [[ -r /etc/os-release ]]; then
-        # shellcheck disable=SC1091
+        # shellcheck disable=SC1091  # /etc/os-release is provided by the target OS, not this repository.
         . /etc/os-release
         version_id="${VERSION_ID:-}"
     fi
@@ -400,7 +400,7 @@ ensure_zram_kernel_module() {
 
     kernel_version=$(uname -r)
     if [[ -r /etc/os-release ]]; then
-        # shellcheck disable=SC1091
+        # shellcheck disable=SC1091  # /etc/os-release is provided by the target OS, not this repository.
         . /etc/os-release
         os_id="${ID:-}"
     fi
