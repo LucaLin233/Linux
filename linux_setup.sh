@@ -1184,6 +1184,7 @@ exec_prepared_script() {
     log "正在使用固定 Commit 重新启动主脚本：${commit:0:7}" "success"
     shopt -q execfail && execfail_was_set=true
     shopt -s execfail
+    # shellcheck disable=SC2093  # execfail returns only on exec failure; close the pinned FD and propagate status.
     exec env RUN_COMMIT="$commit" bash "/proc/self/fd/$script_fd"
     status=$?
     exec {script_fd}<&-
