@@ -200,7 +200,15 @@ validate_repository_state_entries() {
             current)
                 validate_secure_file "$entry" 600 || return 1
                 ;;
-            history-uninstall-*|history-*|failure-*)
+            history-uninstall-*)
+                validate_uninstall_archive "$entry" "${base#history-uninstall-}" || return 1
+                ;;
+            failure-uninstall-*)
+                validate_secure_directory "$entry" 700 || return 1
+                validate_secure_file "$entry/rollback.log" 600 || return 1
+                validate_uninstall_archive "$entry/snapshot" "${base#failure-uninstall-}" || return 1
+                ;;
+            history-*|failure-*)
                 validate_secure_directory "$entry" 700 || return 1
                 while IFS= read -r -d '' evidence; do
                     validate_secure_directory "$evidence" 700 || return 1
@@ -1231,8 +1239,8 @@ uninstall_manifest_valid() {
     [[ "$manifest" == "$UNINSTALL_SNAPSHOT_DIR/manifest" ]] || return 1
     uninstall_snapshot_path_valid || return 1
     validate_directory_chain "$UNINSTALL_SNAPSHOT_DIR/files" || return 1
-    validate_secure_directory "$UNINSTALL_SNAPSHOT_DIR/files" 700 || return 1
-    validate_secure_file "$manifest" 600 || return 1
+    validate_secure_directory "$UNINSTALL_SNAPSHOT_DIR/files" "${UNINSTALL_EVIDENCE_DIR_MODE:-700}" || return 1
+    validate_secure_file "$manifest" "${UNINSTALL_EVIDENCE_FILE_MODE:-600}" || return 1
     mapfile -t rows < "$manifest" || return 1
     [[ "${#rows[@]}" == 50 ]] || return 1
     [[ "${rows[0]}" == version=1 && "${rows[1]}" == "generation=$UNINSTALL_GENERATION" ]] || return 1
@@ -1253,20 +1261,20 @@ uninstall_manifest_valid() {
         if [[ "$state" == regular ]]; then
             [[ "$created" == false ]] || return 1
             [[ "$snapshot" == target-$id && "$sha" != $(printf '0%.0s' {1..64}) ]] || return 1
-            validate_secure_file "$UNINSTALL_SNAPSHOT_DIR/files/$snapshot" 600 || return 1
+            validate_secure_file "$UNINSTALL_SNAPSHOT_DIR/files/$snapshot" "${UNINSTALL_EVIDENCE_FILE_MODE:-600}" || return 1
             [[ "$(sha256sum -- "$UNINSTALL_SNAPSHOT_DIR/files/$snapshot" | awk '{print $1}')" == "$sha" ]] || return 1
             expected_entries=$((expected_entries + 1))
         else
             [[ "$snapshot" == none && "$sha" == $(printf '0%.0s' {1..64}) ]] || return 1
         fi
         if [[ "$created" == true ]]; then
-            validate_secure_file "$UNINSTALL_SNAPSHOT_DIR/created-$id" 600 || return 1
+            validate_secure_file "$UNINSTALL_SNAPSHOT_DIR/created-$id" "${UNINSTALL_EVIDENCE_FILE_MODE:-600}" || return 1
         fi
         offset=$((offset + 8))
     done < <(uninstall_snapshot_targets)
     while IFS= read -r -d '' entry; do
         [[ -f "$entry" && ! -L "$entry" ]] || return 1
-        validate_secure_file "$entry" 600 || return 1
+        validate_secure_file "$entry" "${UNINSTALL_EVIDENCE_FILE_MODE:-600}" || return 1
         [[ "$(basename -- "$entry")" == target-* ]] || return 1
         actual_entries=$((actual_entries + 1))
     done < <(find "$UNINSTALL_SNAPSHOT_DIR/files" -mindepth 1 -maxdepth 1 -print0)
@@ -1282,7 +1290,7 @@ uninstall_snapshot_path_valid() {
     esac
     [[ ! -L "$UNINSTALL_SNAPSHOT_DIR" && -d "$UNINSTALL_SNAPSHOT_DIR" ]] || return 1
     validate_directory_chain "$UNINSTALL_SNAPSHOT_DIR" || return 1
-    validate_secure_directory "$UNINSTALL_SNAPSHOT_DIR" 700
+    validate_secure_directory "$UNINSTALL_SNAPSHOT_DIR" "${UNINSTALL_EVIDENCE_DIR_MODE:-700}"
 }
 
 # Create rather than retrospectively claim an object. Hard-link publication
@@ -1361,7 +1369,7 @@ restore_uninstall_target() {
 uninstall_journal_valid() {
     local journal="$1" expected="$2"
     local -a rows=()
-    validate_secure_file "$journal" 600 || return 1
+    validate_secure_file "$journal" "${UNINSTALL_EVIDENCE_FILE_MODE:-600}" || return 1
     mapfile -t rows < "$journal" || return 1
     [[ "${#rows[@]}" == 4 ]] || return 1
     [[ "${rows[0]}" == version=1 && "${rows[1]}" == "generation=$UNINSTALL_GENERATION" ]] || return 1
@@ -1379,6 +1387,37 @@ write_uninstall_journal() {
     uninstall_journal_valid "$stage" "$state" || return 1
     repository_rename "$stage" "$journal" || return 1
     uninstall_journal_valid "$journal" "$state"
+}
+
+validate_uninstall_archive() (
+    local UNINSTALL_SNAPSHOT_DIR="$1" UNINSTALL_GENERATION="$2"
+    local UNINSTALL_EVIDENCE_DIR_MODE=500 UNINSTALL_EVIDENCE_FILE_MODE=400
+    local terminal entry name
+    uninstall_manifest_valid "$UNINSTALL_SNAPSHOT_DIR/manifest" || return 1
+    terminal=$(sed -n '3s/^state=//p' "$UNINSTALL_SNAPSHOT_DIR/journal") || return 1
+    case "$terminal" in COMMITTED|ROLLED_BACK) ;; *) return 1 ;; esac
+    uninstall_journal_valid "$UNINSTALL_SNAPSHOT_DIR/journal" "$terminal" || return 1
+    while IFS= read -r -d '' entry; do
+        name=${entry##*/}
+        case "$name" in
+            files|manifest|journal) ;;
+            created-*)
+                [[ "$(uninstall_manifest_field "$UNINSTALL_SNAPSHOT_DIR/manifest" "${name#created-}" transaction_created)" == true ]] || return 1
+                validate_secure_file "$entry" 400 || return 1 ;;
+            *) return 1 ;;
+        esac
+    done < <(find "$UNINSTALL_SNAPSHOT_DIR" -mindepth 1 -maxdepth 1 -print0)
+)
+
+seal_uninstall_archive() {
+    local entry
+    # No recursive chmod on unvalidated objects and no automatic evidence GC.
+    while IFS= read -r -d '' entry; do
+        validate_secure_file "$entry" 600 || return 1
+        chmod 0400 -- "$entry" || return 1
+    done < <(find "$UNINSTALL_SNAPSHOT_DIR" -type f -print0)
+    chmod 0500 -- "$UNINSTALL_SNAPSHOT_DIR/files" "$UNINSTALL_SNAPSHOT_DIR" || return 1
+    validate_uninstall_archive "$UNINSTALL_SNAPSHOT_DIR" "$UNINSTALL_GENERATION"
 }
 
 archive_uninstall_evidence() {
@@ -1400,6 +1439,8 @@ archive_uninstall_evidence() {
     # Revalidate all bytes after publication, not just directory metadata.
     uninstall_manifest_valid "$archive/manifest" || return 1
     uninstall_journal_valid "$archive/journal" "$terminal" || return 1
+    seal_uninstall_archive || return 1
+    uninstall_transaction_hook after-evidence-seal
 }
 
 uninstall_targets_group_valid() {
@@ -1467,6 +1508,12 @@ uninstall_cleanup() {
     if [[ "$failed" == false && "$snapshot_valid" == true && -d "$UNINSTALL_SNAPSHOT_DIR" ]]; then
         archive_uninstall_evidence "$evidence/snapshot" || failed=true
     fi
+    if [[ "$failed" == false ]]; then
+        uninstall_transaction_hook before-pending-clear || failed=true
+        if [[ "$failed" == false ]]; then
+            validate_secure_file "$UNINSTALL_PENDING" 600 && rm -- "$UNINSTALL_PENDING" || failed=true
+        fi
+    fi
     release_repository_lock || failed=true
     restore_repository_traps || failed=true
     UNINSTALL_SNAPSHOT_BUILDING=false
@@ -1502,6 +1549,8 @@ begin_uninstall_transaction() {
     UNINSTALL_SNAPSHOT_BUILDING=false; UNINSTALL_TRANSACTION_ACTIVE=false; UNINSTALL_TRANSACTION_STATE=NONE
     validate_directory_chain "$(dirname -- "$UNINSTALL_SNAPSHOT_DIR")" || return 1
     [[ ! -e "$UNINSTALL_SNAPSHOT_DIR" && ! -L "$UNINSTALL_SNAPSHOT_DIR" ]] || return 1
+    UNINSTALL_PENDING="$REPOSITORY_STATE_DIR/pending-uninstall-$UNINSTALL_GENERATION"
+    (set -C; umask 077; printf 'generation=%s\n' "$UNINSTALL_GENERATION" > "$UNINSTALL_PENDING") || return 1
     mkdir -m 0700 -- "$UNINSTALL_SNAPSHOT_DIR" || return 1
     UNINSTALL_SNAPSHOT_BUILDING=true; UNINSTALL_TRANSACTION_STATE=BUILDING
     save_repository_traps
@@ -1542,6 +1591,12 @@ finish_uninstall_transaction() {
     done < <(uninstall_snapshot_targets)
     if [[ "$failed" == false ]]; then write_uninstall_journal COMMITTED uninstall-complete || failed=true; fi
     if [[ "$failed" == false ]]; then archive_uninstall_evidence "$REPOSITORY_STATE_DIR/history-uninstall-$UNINSTALL_GENERATION" || failed=true; fi
+    if [[ "$failed" == false ]]; then
+        uninstall_transaction_hook before-pending-clear || failed=true
+        if [[ "$failed" == false ]]; then
+            validate_secure_file "$UNINSTALL_PENDING" 600 && rm -- "$UNINSTALL_PENDING" || failed=true
+        fi
+    fi
     release_repository_lock || failed=true
     restore_repository_traps || failed=true
     UNINSTALL_SNAPSHOT_BUILDING=false; UNINSTALL_TRANSACTION_ACTIVE=false

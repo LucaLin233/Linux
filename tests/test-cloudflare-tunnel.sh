@@ -804,6 +804,44 @@ for archive_case in intact payload journal; do
     pass "post-rename archive verification $archive_case"
 done
 
+for interrupted_phase in before-snapshot-create after-snapshot-active after-evidence-rename after-evidence-seal before-pending-clear; do
+    (
+        new_case
+        trap - EXIT
+        configure_repository || fail "kill configure"
+        cp "$SOURCE_FILE" "$CASE_DIR/source-before"
+        (
+            trap - EXIT
+            acquire_repository_lock || exit 1
+            uninstall_transaction_hook() {
+                if [[ "$1" == "$interrupted_phase" ]]; then kill -KILL "$BASHPID"; fi
+            }
+            begin_uninstall_transaction || exit 1
+            uninstall_cleanup kill-test
+        ) > "$CASE_DIR/killed.log" 2>&1 &
+        child=$!
+        rc=0
+        wait "$child" || rc=$?
+        [[ "$rc" == 137 ]] || fail "SIGKILL did not reach $interrupted_phase"
+        # Simulate operator removing only the stale lock; pending must still block.
+        rmdir "$CLOUDFLARED_STATE_DIR.lock" || fail "stale lock remove"
+        : > "$FAKE_LOG"
+        for operation in configure_repository upgrade_cloudflared uninstall_cloudflared disable_auto_update; do
+            (
+                trap - EXIT
+                "$operation" --confirmed
+            ) > "$CASE_DIR/retry-$operation.log" 2>&1 && fail "pending allowed $operation"
+        done
+        [[ ! -s "$FAKE_LOG" ]] || fail "pending executed external command"
+        cmp "$SOURCE_FILE" "$CASE_DIR/source-before" || fail "pending changed source"
+        compgen -G "$CLOUDFLARED_STATE_DIR/repository/pending-uninstall-*" >/dev/null || fail "pending evidence missing"
+    ) > "$TEST_DIR/kill-$interrupted_phase.log" 2>&1 || {
+        cat "$TEST_DIR/kill-$interrupted_phase.log"
+        fail "SIGKILL $interrupted_phase"
+    }
+    pass "SIGKILL $interrupted_phase fails closed in independent entrypoints"
+done
+
 entrypoint_output=$(bash -c "$(cat "$ROOT_DIR/tools/cloudflare_tunnel.sh")" cloudflare_tunnel.sh help)
 grep -Fq 'cloudflare_tunnel.sh install' <<< "$entrypoint_output" || fail "bash -c entrypoint broken"
 pass "bash -c entrypoint remains compatible"
