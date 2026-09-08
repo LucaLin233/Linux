@@ -30,7 +30,6 @@ init_runtime_config() {
     SERVICE_FILE="${CLOUDFLARED_SERVICE_FILE:-/etc/systemd/system/cloudflared.service}"
     BINARY_UPDATE_SERVICE="${CLOUDFLARED_BINARY_UPDATE_SERVICE:-/etc/systemd/system/cloudflared-update.service}"
     BINARY_UPDATE_TIMER="${CLOUDFLARED_BINARY_UPDATE_TIMER:-/etc/systemd/system/cloudflared-update.timer}"
-    PRESERVE_AUTO_UPDATE=false
 }
 
 info() { printf '[INFO] %s\n' "$*"; }
@@ -63,7 +62,7 @@ confirm() {
 backup_path() {
     local path="$1" backup_dir="$2"
     [[ -e "$path" || -L "$path" ]] || return 0
-    install -d -m 0700 "$backup_dir"
+    install -d -m 0700 "$backup_dir" || return $?
     cp -a "$path" "$backup_dir/$(basename "$path")"
 }
 
@@ -210,6 +209,10 @@ validate_repository_state_entries() {
                 validate_uninstall_archive "$entry/snapshot" "${base#failure-uninstall-}" || return 1
                 ;;
             history-*|failure-*)
+                if [[ -e "$entry/pending" || -L "$entry/pending" ]]; then
+                    error "仓库恢复未完成，需人工处理: $entry"
+                    return 1
+                fi
                 validate_secure_directory "$entry" 700 || return 1
                 while IFS= read -r -d '' evidence; do
                     validate_secure_directory "$evidence" 700 || return 1
@@ -267,6 +270,8 @@ acquire_repository_lock() {
         error "无法取得 Cloudflare 仓库事务锁: $REPOSITORY_LOCK_DIR"
         return 1
     fi
+    REPOSITORY_OWNED_LOCK="$REPOSITORY_LOCK_DIR"
+    REPOSITORY_LOCK_IDENTITY=$(stat -c '%d:%i' -- "$REPOSITORY_LOCK_DIR") || return 1
     if ! validate_secure_directory "$REPOSITORY_LOCK_DIR" 700; then
         rmdir -- "$REPOSITORY_LOCK_DIR" 2>/dev/null || true
         return 1
@@ -303,7 +308,13 @@ restore_repository_traps() {
 
 release_repository_lock() {
     init_runtime_config
-    [[ -n "$REPOSITORY_LOCK_DIR" ]] || return 0
+    [[ -n "${REPOSITORY_OWNED_LOCK:-}" ]] || return 0
+    [[ "$REPOSITORY_LOCK_DIR" == "$REPOSITORY_OWNED_LOCK" &&
+       ! -L "$REPOSITORY_LOCK_DIR" && -d "$REPOSITORY_LOCK_DIR" &&
+       "$(stat -c '%d:%i' -- "$REPOSITORY_LOCK_DIR")" == "$REPOSITORY_LOCK_IDENTITY" ]] || {
+        error "锁身份改变，拒绝释放: $REPOSITORY_OWNED_LOCK"
+        return 1
+    }
     if [[ -d "$REPOSITORY_LOCK_DIR" && ! -L "$REPOSITORY_LOCK_DIR" ]]; then
         rmdir -- "$REPOSITORY_LOCK_DIR" || return 1
     elif [[ -e "$REPOSITORY_LOCK_DIR" || -L "$REPOSITORY_LOCK_DIR" ]]; then
@@ -311,6 +322,8 @@ release_repository_lock() {
         return 1
     fi
     REPOSITORY_LOCK_DIR=""
+    REPOSITORY_OWNED_LOCK=""
+    REPOSITORY_LOCK_IDENTITY=""
 }
 
 repository_copy_file() {
@@ -429,6 +442,26 @@ backup_repository_generation() {
     REPOSITORY_SNAPSHOT_READY=true
 }
 
+repository_publish_file() {
+    local stage="$1" target="$2" mode="$3"
+    validate_secure_file "$stage" "$mode" || return 1
+    REPOSITORY_PUBLISHED_IDENTITIES["$target"]=$(stat -c '%d:%i' -- "$stage") || return 1
+    REPOSITORY_PUBLISHED_HASHES["$target"]=$(sha256sum -- "$stage" | awk '{print $1}') || return 1
+    repository_rename "$stage" "$target"
+}
+
+repository_remove_owned() {
+    local target="$1" mode="$2"
+    validate_secure_file "$target" "$mode" || return 1
+    [[ -n "${REPOSITORY_PUBLISHED_IDENTITIES[$target]:-}" &&
+       "$(stat -c '%d:%i' -- "$target")" == "${REPOSITORY_PUBLISHED_IDENTITIES[$target]}" &&
+       "$(sha256sum -- "$target" | awk '{print $1}')" == "${REPOSITORY_PUBLISHED_HASHES[$target]}" ]] || {
+        error "无法证明 absent 目标属于本事务，保留: $target"
+        return 1
+    }
+    rm -- "$target"
+}
+
 restore_repository_file() {
     init_runtime_config
     local had_old="$1" backup="$2" target="$3" mode="${4:-644}" restore_stage identity
@@ -455,8 +488,7 @@ restore_repository_file() {
         fi
     else
         if [[ -e "$target" || -L "$target" ]]; then
-            [[ -f "$target" && ! -L "$target" ]] || return 1
-            rm -f -- "$target" || return 1
+            repository_remove_owned "$target" "$mode" || return 1
         fi
         [[ ! -e "$target" && ! -L "$target" ]] || return 1
     fi
@@ -512,9 +544,12 @@ rollback_repository_transaction() {
     validate_restored_repository_group || rollback_failed=true
     fi
     rm -f -- "$REPOSITORY_KEY_STAGE" "$REPOSITORY_SOURCE_STAGE" 2>/dev/null || rollback_failed=true
+    if [[ "$rollback_failed" == true && -d "$REPOSITORY_TRANSACTION_DIR" ]]; then
+        (umask 077; printf 'rollback incomplete\n' > "$REPOSITORY_TRANSACTION_DIR/pending") || true
+    fi
     archive_failed_transaction || rollback_failed=true
     release_repository_lock || rollback_failed=true
-    restore_repository_traps
+    restore_repository_traps || rollback_failed=true
     if [[ "$rollback_failed" == true ]]; then
         error "Cloudflare 仓库事务回滚不完整；失败证据已尽量保留: $REPOSITORY_TRANSACTION_DIR"
         return 1
@@ -570,6 +605,8 @@ begin_repository_transaction() {
     local key_parent source_parent downloaded marker_stage key_hash source_hash
     REPOSITORY_TRANSACTION_ACTIVE=false
     REPOSITORY_SNAPSHOT_READY=false
+    unset REPOSITORY_PUBLISHED_IDENTITIES REPOSITORY_PUBLISHED_HASHES
+    declare -gA REPOSITORY_PUBLISHED_IDENTITIES=() REPOSITORY_PUBLISHED_HASHES=()
     REPOSITORY_TRANSACTION_DIR=""
     REPOSITORY_KEY_STAGE=""
     REPOSITORY_SOURCE_STAGE=""
@@ -642,14 +679,16 @@ begin_repository_transaction() {
         return 1
     }
     if ! repository_install_file 0644 "$downloaded" "$REPOSITORY_KEY_STAGE" ||
-        ! validate_secure_file "$REPOSITORY_KEY_STAGE" 644; then
+        ! validate_secure_file "$REPOSITORY_KEY_STAGE" 644 ||
+        ! cmp -s -- "$downloaded" "$REPOSITORY_KEY_STAGE"; then
         repository_transaction_fail "写入或校验 key stage 失败"
         return 1
     fi
     if ! repository_source_content > "$REPOSITORY_TRANSACTION_DIR/source" ||
         ! chmod 0600 "$REPOSITORY_TRANSACTION_DIR/source" ||
         ! repository_install_file 0644 "$REPOSITORY_TRANSACTION_DIR/source" "$REPOSITORY_SOURCE_STAGE" ||
-        ! validate_secure_file "$REPOSITORY_SOURCE_STAGE" 644; then
+        ! validate_secure_file "$REPOSITORY_SOURCE_STAGE" 644 ||
+        ! cmp -s -- "$REPOSITORY_TRANSACTION_DIR/source" "$REPOSITORY_SOURCE_STAGE"; then
         repository_transaction_fail "写入或校验 source stage 失败"
         return 1
     fi
@@ -659,7 +698,7 @@ begin_repository_transaction() {
         return 1
     }
     repository_transaction_hook key-commit
-    if ! repository_rename "$REPOSITORY_KEY_STAGE" "$KEYRING"; then
+    if ! repository_publish_file "$REPOSITORY_KEY_STAGE" "$KEYRING" 644; then
         repository_transaction_fail "提交正式 keyring 失败"
         return 1
     fi
@@ -669,7 +708,7 @@ begin_repository_transaction() {
         return 1
     }
     repository_transaction_hook source-commit
-    if ! repository_rename "$REPOSITORY_SOURCE_STAGE" "$SOURCE_FILE"; then
+    if ! repository_publish_file "$REPOSITORY_SOURCE_STAGE" "$SOURCE_FILE" 644; then
         repository_transaction_fail "提交正式 source 失败"
         return 1
     fi
@@ -688,12 +727,16 @@ begin_repository_transaction() {
         repository_transaction_fail "计算 source 世代摘要失败"
         return 1
     }
-    marker_stage="$REPOSITORY_STATE_DIR/current.stage-$REPOSITORY_GENERATION"
+    marker_stage=$(mktemp "$REPOSITORY_STATE_DIR/current.stage.XXXXXX") || {
+        repository_transaction_fail "创建 current stage 失败"
+        return 1
+    }
     if ! printf 'generation=%s\nkey_sha256=%s\nsource_sha256=%s\n' \
         "$REPOSITORY_GENERATION" "$key_hash" "$source_hash" > "$marker_stage" ||
         ! chmod 0600 "$marker_stage" ||
         ! validate_secure_file "$marker_stage" 600 ||
-        ! repository_rename "$marker_stage" "$REPOSITORY_STATE_DIR/current"; then
+        ! repository_publish_file "$marker_stage" "$REPOSITORY_STATE_DIR/current" 600 ||
+        ! validate_current_repository_manifest; then
         rm -f -- "$marker_stage" 2>/dev/null || true
         repository_transaction_fail "提交 key/source 世代状态失败"
         return 1
@@ -761,13 +804,8 @@ run_repository_apt_transaction() {
 }
 
 legacy_updater_is_managed() {
-    local path="$1"
-    case "$path" in
-        "$LEGACY_UPDATER") grep -Fq 'cloudflared 自动更新脚本 (由安装脚本生成)' "$path" ;;
-        "$LEGACY_SERVICE") grep -Fq 'Description=Cloudflared Auto Updater' "$path" && grep -Fq "ExecStart=$LEGACY_UPDATER" "$path" ;;
-        "$LEGACY_TIMER") grep -Fq 'Description=Cloudflared Auto Updater Timer' "$path" ;;
-        *) return 1 ;;
-    esac
+    error "历史 updater 缺少已核实完整模板，保留并需人工处理: $1"
+    return 1
 }
 
 cleanup_legacy_updater() {
@@ -776,7 +814,7 @@ cleanup_legacy_updater() {
     local -a paths=("$LEGACY_UPDATER" "$LEGACY_SERVICE" "$LEGACY_TIMER")
 
     for path in "${paths[@]}"; do
-        [[ -e "$path" ]] || continue
+        [[ -e "$path" || -L "$path" ]] || continue
         if ! legacy_updater_is_managed "$path"; then
             warn "发现无法确认归属的旧文件，保留: $path"
             return 1
@@ -786,38 +824,28 @@ cleanup_legacy_updater() {
     systemctl disable --now cloudflared-updater.timer >/dev/null 2>&1 || true
     systemctl stop cloudflared-updater.service >/dev/null 2>&1 || true
     for path in "${paths[@]}"; do
-        [[ -e "$path" ]] || continue
+        [[ -e "$path" || -L "$path" ]] || continue
         if [[ "${UNINSTALL_TRANSACTION_STATE:-NONE}" != ACTIVE ]]; then
             backup_path "$path" "$backup_dir" || return 1
         fi
         rm -f "$path" || return 1
     done
-    systemctl daemon-reload
+    systemctl daemon-reload || return $?
     for path in "${paths[@]}"; do
         [[ ! -e "$path" ]] || return 1
     done
 }
 
 binary_updater_is_managed() {
-    local path="$1"
-    case "$path" in
-        "$BINARY_UPDATE_SERVICE")
-            grep -Fq 'Description=Update cloudflared' "$path" &&
-                grep -Fq ' update; code=$?' "$path"
-            ;;
-        "$BINARY_UPDATE_TIMER")
-            grep -Fq 'Description=Update cloudflared' "$path" &&
-                grep -Fq 'OnCalendar=daily' "$path"
-            ;;
-        *) return 1 ;;
-    esac
+    error "历史 updater 缺少已核实完整模板，保留并需人工处理: $1"
+    return 1
 }
 
 cleanup_binary_updater() {
     local path backup_dir
     local -a paths=("$BINARY_UPDATE_SERVICE" "$BINARY_UPDATE_TIMER")
     for path in "${paths[@]}"; do
-        [[ -e "$path" ]] || continue
+        [[ -e "$path" || -L "$path" ]] || continue
         binary_updater_is_managed "$path" || {
             warn "发现无法确认归属的 cloudflared 二进制更新单元，保留: $path"
             return 1
@@ -827,19 +855,23 @@ cleanup_binary_updater() {
     systemctl disable --now cloudflared-update.timer >/dev/null 2>&1 || true
     systemctl stop cloudflared-update.service >/dev/null 2>&1 || true
     for path in "${paths[@]}"; do
-        [[ -e "$path" ]] || continue
+        [[ -e "$path" || -L "$path" ]] || continue
         if [[ "${UNINSTALL_TRANSACTION_STATE:-NONE}" != ACTIVE ]]; then
             backup_path "$path" "$backup_dir" || return 1
         fi
         rm -f "$path" || return 1
     done
-    systemctl daemon-reload
+    systemctl daemon-reload || return $?
     for path in "${paths[@]}"; do
         [[ ! -e "$path" ]] || return 1
     done
 }
 
 legacy_auto_update_present() {
+    if [[ -f "$AUTO_UPDATE_TIMER" ]] && auto_update_file_is_managed "$AUTO_UPDATE_TIMER" &&
+        systemctl is-enabled --quiet cloudflared-apt-update.timer 2>/dev/null; then
+        return 0
+    fi
     if [[ -f "$LEGACY_TIMER" ]] && legacy_updater_is_managed "$LEGACY_TIMER" &&
         { systemctl is-enabled --quiet cloudflared-updater.timer 2>/dev/null ||
           systemctl is-active --quiet cloudflared-updater.timer 2>/dev/null; }; then
@@ -887,7 +919,7 @@ migrate_legacy_service_path() {
 
     local backup_dir service_temp was_active=false
     backup_dir="$STATE_DIR/legacy-service-$(date +%Y%m%d_%H%M%S)"
-    backup_path "$SERVICE_FILE" "$backup_dir"
+    backup_path "$SERVICE_FILE" "$backup_dir" || return $?
     service_temp=$(mktemp)
     sed "s#^ExecStart=$LEGACY_BIN #ExecStart=$APT_BIN #" "$SERVICE_FILE" > "$service_temp"
     grep -Fq "ExecStart=$APT_BIN " "$service_temp" || {
@@ -896,13 +928,13 @@ migrate_legacy_service_path() {
         return 1
     }
     systemctl is-active --quiet cloudflared.service && was_active=true || true
-    install -m 0644 "$service_temp" "$SERVICE_FILE"
+    install -m 0644 "$service_temp" "$SERVICE_FILE" || { rm -f "$service_temp"; return 1; }
     rm -f "$service_temp"
-    systemctl daemon-reload
+    systemctl daemon-reload || return $?
     if [[ "$was_active" == true ]]; then
         if ! systemctl restart cloudflared.service || ! systemctl is-active --quiet cloudflared.service; then
             cp -a "$backup_dir/$(basename "$SERVICE_FILE")" "$SERVICE_FILE"
-            systemctl daemon-reload
+            systemctl daemon-reload || return $?
             systemctl restart cloudflared.service >/dev/null 2>&1 || true
             error "新 APT 二进制启动失败，已恢复旧服务路径"
             return 1
@@ -924,11 +956,11 @@ migrate_legacy_binary() {
     fi
 
     info "检测到可安全迁移的旧版 cloudflared 安装"
-    migrate_legacy_service_path
+    migrate_legacy_service_path || return $?
 
     local backup_dir
     backup_dir="$STATE_DIR/legacy-$(date +%Y%m%d_%H%M%S)"
-    backup_path "$LEGACY_BIN" "$backup_dir"
+    backup_path "$LEGACY_BIN" "$backup_dir" || return $?
     rm -f "$LEGACY_BIN"
     info "旧二进制已自动备份并移除: $backup_dir"
 }
@@ -1006,24 +1038,36 @@ EOF
 }
 
 auto_update_file_is_managed() {
-    grep -Fq '# Managed by tools/cloudflare_tunnel.sh' "$1"
+    local path="$1" expected actual mode
+    case "$path" in
+        "$AUTO_UPDATE_SCRIPT") mode=755; expected=29927fb2755a5ce8e43eee305ef2a1833fd87f1ef342f51442c34ff47c4a066e ;;
+        "$AUTO_UPDATE_TIMER") mode=644; expected=5aebba15b5de91d6182e3bc662a6cbb0481eff451926fd4703a7a4e16661b827 ;;
+        "$AUTO_UPDATE_SERVICE")
+            mode=644
+            expected=$(printf '# Managed by tools/cloudflare_tunnel.sh\n[Unit]\nDescription=Check and install cloudflared APT updates\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=oneshot\nExecStart=%s\n' "$AUTO_UPDATE_SCRIPT" | sha256sum | awk '{print $1}') ;;
+        *) return 1 ;;
+    esac
+    validate_directory_chain "$(dirname -- "$path")" || return 1
+    validate_secure_file "$path" "$mode" || return 1
+    actual=$(sha256sum -- "$path" | awk '{print $1}') || return 1
+    [[ "$actual" == "$expected" ]]
 }
 
 enable_auto_update() {
     local path backup_dir
     require_root
-    check_platform
+    check_platform || return $?
     dpkg-query -W -f='${db:Status-Status}' cloudflared 2>/dev/null | grep -qx installed || {
         error "请先安装 cloudflared APT 包"
         return 1
     }
-    configure_repository
+    configure_repository || return $?
     command -v flock >/dev/null || {
         apt-get update
         DEBIAN_FRONTEND=noninteractive apt-get install -y util-linux
     }
     for path in "$AUTO_UPDATE_SCRIPT" "$AUTO_UPDATE_SERVICE" "$AUTO_UPDATE_TIMER"; do
-        [[ -e "$path" ]] || continue
+        [[ -e "$path" || -L "$path" ]] || continue
         auto_update_file_is_managed "$path" || {
             error "现有自动更新文件不受本脚本管理，拒绝覆盖: $path"
             return 1
@@ -1031,20 +1075,20 @@ enable_auto_update() {
     done
     backup_dir="$STATE_DIR/auto-update-previous-$(date +%Y%m%d_%H%M%S)"
     for path in "$AUTO_UPDATE_SCRIPT" "$AUTO_UPDATE_SERVICE" "$AUTO_UPDATE_TIMER"; do
-        backup_path "$path" "$backup_dir"
+        backup_path "$path" "$backup_dir" || return $?
     done
-    write_auto_update_files
-    systemctl daemon-reload
-    systemctl enable --now cloudflared-apt-update.timer
+    write_auto_update_files || return $?
+    systemctl daemon-reload || return $?
+    systemctl enable --now cloudflared-apt-update.timer || return $?
     info "已启用每日 APT 更新检查；更新时仅重启原本正在运行的 cloudflared 服务。"
 }
 
 disable_auto_update_locked() {
     local confirmed="${1:-}" path backup_dir
     require_root
-    check_platform
+    check_platform || return $?
     for path in "$AUTO_UPDATE_SCRIPT" "$AUTO_UPDATE_SERVICE" "$AUTO_UPDATE_TIMER"; do
-        [[ -e "$path" ]] || continue
+        [[ -e "$path" || -L "$path" ]] || continue
         auto_update_file_is_managed "$path" || {
             error "自动更新文件不受本脚本管理，拒绝删除: $path"
             return 1
@@ -1057,13 +1101,13 @@ disable_auto_update_locked() {
     systemctl disable --now cloudflared-apt-update.timer >/dev/null 2>&1 || true
     systemctl stop cloudflared-apt-update.service >/dev/null 2>&1 || true
     for path in "$AUTO_UPDATE_SCRIPT" "$AUTO_UPDATE_SERVICE" "$AUTO_UPDATE_TIMER"; do
-        [[ -e "$path" ]] || continue
+        [[ -e "$path" || -L "$path" ]] || continue
         if [[ "${UNINSTALL_TRANSACTION_STATE:-NONE}" != ACTIVE ]]; then
             backup_path "$path" "$backup_dir" || return 1
         fi
         rm -f "$path" || return 1
     done
-    systemctl daemon-reload
+    systemctl daemon-reload || return $?
     info "APT 自动更新组件已禁用；备份目录: $backup_dir"
 }
 
@@ -1096,14 +1140,14 @@ validate_migration_inputs() {
         return 1
     fi
     for path in "$LEGACY_UPDATER" "$LEGACY_SERVICE" "$LEGACY_TIMER"; do
-        [[ -e "$path" ]] || continue
+        [[ -e "$path" || -L "$path" ]] || continue
         legacy_updater_is_managed "$path" || {
             error "旧更新文件归属不明，拒绝自动迁移: $path"
             return 1
         }
     done
     for path in "$BINARY_UPDATE_SERVICE" "$BINARY_UPDATE_TIMER"; do
-        [[ -e "$path" ]] || continue
+        [[ -e "$path" || -L "$path" ]] || continue
         binary_updater_is_managed "$path" || {
             error "二进制更新单元归属不明，拒绝自动迁移: $path"
             return 1
@@ -1112,15 +1156,16 @@ validate_migration_inputs() {
 }
 
 install_package() {
-    validate_migration_inputs
     PRESERVE_AUTO_UPDATE=false
+    init_runtime_config
+    validate_migration_inputs || return $?
     legacy_auto_update_present && PRESERVE_AUTO_UPDATE=true || true
     run_repository_apt_transaction install || return $?
-    migrate_legacy_binary
+    migrate_legacy_binary || return $?
     cleanup_legacy_updater || { error "旧自定义更新组件清理失败"; return 1; }
     cleanup_binary_updater || { error "二进制更新单元清理失败"; return 1; }
     if [[ "$PRESERVE_AUTO_UPDATE" == true ]]; then
-        enable_auto_update
+        enable_auto_update || return $?
         info "检测到旧版每日更新配置，已自动迁移为 APT timer。"
     fi
 
@@ -1154,7 +1199,7 @@ install_service() {
 
 install_cloudflared() {
     require_root
-    check_platform
+    check_platform || return $?
     install_package || return $?
     install_service || return $?
     info "安装完成。版本由 APT 管理。"
@@ -1163,7 +1208,7 @@ install_cloudflared() {
     else
         warn "自动更新安装新版时会重启正在运行的 cloudflared，单实例 Tunnel 会短暂中断。"
         if confirm "是否启用每日 APT 更新检测与安装？"; then
-            enable_auto_update
+            enable_auto_update || return $?
         else
             info "自动更新未启用；稍后可运行: sudo $(basename "$0") enable-auto-update"
         fi
@@ -1171,17 +1216,19 @@ install_cloudflared() {
 }
 
 upgrade_cloudflared() {
+    PRESERVE_AUTO_UPDATE=false
+    init_runtime_config
     require_root
-    check_platform
-    validate_migration_inputs
+    check_platform || return $?
+    validate_migration_inputs || return $?
     PRESERVE_AUTO_UPDATE=false
     legacy_auto_update_present && PRESERVE_AUTO_UPDATE=true || true
     run_repository_apt_transaction upgrade || return $?
-    migrate_legacy_binary
+    migrate_legacy_binary || return $?
     cleanup_legacy_updater || { error "旧自定义更新组件清理失败"; return 1; }
     cleanup_binary_updater || { error "二进制更新单元清理失败"; return 1; }
     if [[ "$PRESERVE_AUTO_UPDATE" == true ]]; then
-        enable_auto_update
+        enable_auto_update || return $?
         info "检测到旧版每日更新配置，已自动迁移为 APT timer。"
     fi
     if systemctl cat cloudflared.service >/dev/null 2>&1; then
@@ -1236,9 +1283,9 @@ validate_current_repository_manifest() {
     [[ "$(cat -- "$SOURCE_FILE")" == "$(repository_source_content)" ]] || return 1
 }
 
-remove_managed_repository_locked() {
+validate_managed_repository_ownership() {
     init_runtime_config
-    local backup_dir managed=false
+    local managed=false
     validate_directory_chain "$(dirname -- "$SOURCE_FILE")" || return 1
     if [[ -f "$REPOSITORY_STATE_DIR/current" ]] && validate_current_repository_manifest; then
         managed=true
@@ -1251,6 +1298,11 @@ remove_managed_repository_locked() {
         managed=true
     fi
     [[ "$managed" == true ]] || { error "无法验证 Cloudflare source 管理归属，拒绝删除"; return 1; }
+}
+
+remove_managed_repository_locked() {
+    local backup_dir
+    validate_managed_repository_ownership || return 1
     backup_dir="$STATE_DIR/uninstall-$(date +%Y%m%d_%H%M%S)"
     if [[ "${UNINSTALL_TRANSACTION_STATE:-NONE}" != ACTIVE ]]; then
         backup_path "$SOURCE_FILE" "$backup_dir" || return 1
@@ -1744,7 +1796,7 @@ finish_uninstall_transaction() {
 uninstall_cloudflared() {
     local confirmed="${1:-}" uninstall_status=0 irreversible=false
     require_root
-    check_platform
+    check_platform || return $?
     warn "将删除 cloudflared 服务和 APT 包；Tunnel 配置与凭据默认保留。"
     if [[ "$confirmed" != --confirmed ]]; then
         confirm "继续卸载？" || { info "已取消"; return 0; }
@@ -1767,6 +1819,10 @@ uninstall_cloudflared() {
         release_repository_lock || return 1
         return 1
     fi
+    validate_managed_repository_ownership || {
+        release_repository_lock || return 1
+        return 1
+    }
     begin_uninstall_transaction || {
         uninstall_cleanup "snapshot capture failed" || true
         release_repository_lock || return 1
@@ -1809,13 +1865,13 @@ uninstall_cloudflared() {
 
 purge_config() {
     require_root
-    check_platform
+    check_platform || return $?
     warn "此操作会永久删除 /etc/cloudflared、/root/.cloudflared 和当前用户配置。"
     [[ -t 0 ]] || { error "彻底清理必须在交互终端执行"; return 1; }
     local answer
     read -r -p "请输入 PURGE 确认: " answer
     [[ "$answer" == PURGE ]] || { info "已取消"; return 0; }
-    uninstall_cloudflared --confirmed
+    uninstall_cloudflared --confirmed || return $?
     rm -rf /etc/cloudflared /root/.cloudflared
     if [[ "${HOME:-/root}" != /root ]]; then
         rm -rf "$HOME/.cloudflared"
@@ -1851,7 +1907,7 @@ main() {
         disable-auto-update) disable_auto_update "${2:-}" ;;
         migrate-legacy)
             require_root
-            check_platform
+            check_platform || return $?
             install_package || return $?
             ;;
         uninstall) uninstall_cloudflared ;;

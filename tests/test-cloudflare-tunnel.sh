@@ -1223,6 +1223,93 @@ for restore_object in key source current; do
     done
 done
 
+for operation in install_cloudflared upgrade_cloudflared; do
+    (
+        new_case
+        trap - EXIT
+        cp "$CASE_DIR/bin/cloudflared" "$APT_BIN"
+        dpkg-query() { [[ "$*" == *'db:Status-Status'* ]] && { printf installed; return 0; }; return 1; }
+        timer_enabled=true
+        systemctl() {
+            printf 'systemctl:%s\n' "$*" >> "$FAKE_LOG"
+            if [[ "$1" == is-enabled || "$1" == is-active ]]; then [[ "$timer_enabled" == true ]]; else return 0; fi
+        }
+        write_auto_update_files || fail "timer fixture"
+        auto_update_file_is_managed "$AUTO_UPDATE_SCRIPT" || fail "main script template rejected"
+        auto_update_file_is_managed "$AUTO_UPDATE_SERVICE" || fail "main service template rejected"
+        auto_update_file_is_managed "$AUTO_UPDATE_TIMER" || fail "main timer template rejected"
+        "$operation" || fail "enabled operation"
+        [[ "$PRESERVE_AUTO_UPDATE" == true ]] || fail "strategy reset by init"
+        grep -Fxq 'systemctl:enable --now cloudflared-apt-update.timer' "$FAKE_LOG" || fail "timer not enabled"
+        timer_enabled=false
+        : > "$FAKE_LOG"
+        "$operation" || fail "disabled operation"
+        [[ "$PRESERVE_AUTO_UPDATE" == false ]] || fail "strategy leaked between operations"
+        if grep -Fxq 'systemctl:enable --now cloudflared-apt-update.timer' "$FAKE_LOG"; then fail "disabled timer enabled"; fi
+        timer_enabled=true
+        export FAKE_APT_UPDATE_FAIL=1
+        : > "$FAKE_LOG"
+        if "$operation"; then fail "repository failure ignored"; fi
+        if grep -Eq 'systemctl:(disable|stop|enable|daemon-reload)' "$FAKE_LOG"; then fail "repository failure continued lifecycle"; fi
+    ) > "$TEST_DIR/policy-$operation.log" 2>&1 || {
+        cat "$TEST_DIR/policy-$operation.log"
+        fail "policy $operation"
+    }
+    pass "policy $operation preserves enabled main timer without cross-operation leakage"
+done
+
+(
+    new_case
+    trap - EXIT
+    write_auto_update_files || fail "template fixture"
+    printf '# changed\n' >> "$AUTO_UPDATE_TIMER"
+    if auto_update_file_is_managed "$AUTO_UPDATE_TIMER"; then fail "partial marker trusted"; fi
+    cp "$AUTO_UPDATE_TIMER" "$CASE_DIR/foreign-timer"
+    if disable_auto_update --confirmed; then fail "unknown timer deleted"; fi
+    cmp "$AUTO_UPDATE_TIMER" "$CASE_DIR/foreign-timer" || fail "unknown timer changed"
+) || fail "strict main template"
+pass "main updater templates reject extra content without deleting unknown files"
+
+(
+    new_case
+    trap - EXIT
+    begin_repository_transaction || fail "absent transaction"
+    mv "$SOURCE_FILE" "$CASE_DIR/owned-source"
+    printf foreign > "$SOURCE_FILE"; chmod 0644 "$SOURCE_FILE"
+    if rollback_repository_transaction foreign; then fail "foreign absent accepted"; fi
+    [[ "$(cat "$SOURCE_FILE")" == foreign ]] || fail "foreign absent deleted"
+    [[ -f "$REPOSITORY_TRANSACTION_DIR/pending" ]] || fail "rollback pending missing"
+    : > "$FAKE_LOG"
+    if configure_repository; then fail "pending allowed restart"; fi
+    [[ ! -s "$FAKE_LOG" ]] || fail "pending performed external work"
+) || fail "absent ownership"
+pass "repository absent foreign object survives rollback and blocks restart"
+
+(
+    new_case
+    trap - EXIT
+    acquire_repository_lock || fail "lock fixture"
+    release_repository_lock || fail "first release"
+    mkdir "$CLOUDFLARED_STATE_DIR.lock"
+    release_repository_lock || fail "idempotent release"
+    [[ -d "$CLOUDFLARED_STATE_DIR.lock" ]] || fail "released another operation lock"
+) || fail "lock identity"
+pass "repeated lock release preserves next operation lock"
+
+(
+    new_case
+    trap - EXIT
+    set_old_generation
+    mkdir -p "$STATE_DIR"
+    chmod 0700 "$STATE_DIR"
+    printf unknown > "$STATE_DIR/repository-managed"
+    chmod 0600 "$STATE_DIR/repository-managed"
+    : > "$FAKE_LOG"
+    if uninstall_cloudflared --confirmed; then fail "bad legacy marker accepted"; fi
+    [[ ! -s "$FAKE_LOG" ]] || fail "legacy ownership checked after destructive operations"
+) || fail "legacy preflight"
+pass "legacy uninstall rejects unknown ownership before systemctl or APT"
+
 entrypoint_output=$(bash -c "$(cat "$ROOT_DIR/tools/cloudflare_tunnel.sh")" cloudflare_tunnel.sh help)
 grep -Fq 'cloudflare_tunnel.sh install' <<< "$entrypoint_output" || fail "bash -c entrypoint broken"
 pass "bash -c entrypoint remains compatible"
