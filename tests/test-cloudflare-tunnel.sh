@@ -1411,6 +1411,39 @@ for phase in enable-validate enable-write enable-reload enable-timer disable-sys
     pass "real updater barrier $phase excludes all competing mutation entrypoints"
 done
 
+for fault in backup delete release; do
+    (
+        new_case
+        trap - EXIT
+        configure_repository || fail "file fault fixture"
+        write_auto_update_files || fail "file fault files"
+        hit=false
+        cp() {
+            if [[ "$fault" == backup && "$*" == *auto-update-* ]]; then hit=true; return 1; fi
+            command cp "$@"
+        }
+        rm() {
+            if [[ "$fault" == delete && "$*" == *"$AUTO_UPDATE_SERVICE"* ]]; then hit=true; return 1; fi
+            command rm "$@"
+        }
+        rmdir() {
+            if [[ "$fault" == release ]]; then hit=true; return 1; fi
+            command rmdir "$@"
+        }
+        before=$(trap -p HUP INT TERM EXIT)
+        if disable_auto_update --confirmed > "$CASE_DIR/error.log" 2>&1; then fail "disable file fault accepted"; fi
+        [[ "$hit" == true ]] || fail "file fault not hit"
+        [[ "$(trap -p HUP INT TERM EXIT)" == "$before" ]] || fail "disable traps not restored"
+        compgen -G "$REPOSITORY_STATE_DIR/pending-updater-*" >/dev/null || fail "file fault pending missing"
+        case "$fault" in
+            backup) [[ -f "$AUTO_UPDATE_SCRIPT" && -f "$AUTO_UPDATE_SERVICE" && -f "$AUTO_UPDATE_TIMER" ]] || fail "backup failure deleted files" ;;
+            delete) [[ ! -e "$AUTO_UPDATE_SCRIPT" && -f "$AUTO_UPDATE_SERVICE" && -f "$AUTO_UPDATE_TIMER" ]] || fail "partial deletion group wrong" ;;
+            release) [[ -d "$CLOUDFLARED_STATE_DIR.lock" ]] || fail "failed release lost lock" ;;
+        esac
+    ) > "$TEST_DIR/disable-file-$fault.log" 2>&1 || { cat "$TEST_DIR/disable-file-$fault.log"; fail "disable file $fault"; }
+    pass "independent disable actual $fault failure retains group evidence and traps"
+done
+
 entrypoint_output=$(bash -c "$(cat "$ROOT_DIR/tools/cloudflare_tunnel.sh")" cloudflare_tunnel.sh help)
 grep -Fq 'cloudflare_tunnel.sh install' <<< "$entrypoint_output" || fail "bash -c entrypoint broken"
 pass "bash -c entrypoint remains compatible"
