@@ -410,6 +410,22 @@ backup_repository_generation() {
             printf -v "REPOSITORY_OLD_$flag" true
         fi
     done
+    # Recheck the complete group after the last copy before authorizing rollback.
+    for flag in KEY SOURCE STATE; do
+        case "$flag" in
+            KEY) target=$KEYRING; backup=old-key; mode=644 ;;
+            SOURCE) target=$SOURCE_FILE; backup=old-source; mode=644 ;;
+            STATE) target=$REPOSITORY_STATE_DIR/current; backup=old-current; mode=600 ;;
+        esac
+        local flag_name="REPOSITORY_OLD_$flag"
+        if [[ "${!flag_name}" == true ]]; then
+            validate_secure_file "$target" "$mode" || return 1
+            validate_secure_file "$REPOSITORY_TRANSACTION_DIR/$backup" 600 || return 1
+            cmp -s -- "$target" "$REPOSITORY_TRANSACTION_DIR/$backup" || return 1
+        else
+            [[ ! -e "$target" && ! -L "$target" ]] || return 1
+        fi
+    done
     REPOSITORY_SNAPSHOT_READY=true
 }
 

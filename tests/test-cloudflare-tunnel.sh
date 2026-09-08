@@ -1134,6 +1134,43 @@ done
 ) || fail "active exit zero"
 pass "complete repository transaction exit zero returns nonzero and restores absent current"
 
+for build_case in absent archive-failure; do
+    (
+        new_case
+        trap - EXIT
+        if [[ "$build_case" == archive-failure ]]; then set_old_generation; fi
+        trap ':' HUP
+        before_traps=$(trap -p HUP INT TERM EXIT)
+        repository_copy_file() { printf partial > "$2"; return 1; }
+        if [[ "$build_case" == absent ]]; then
+            # No formal object exists; fail before any download via snapshot wrapper.
+            chmod() {
+                [[ "$2" != */transaction-* ]] || return 1
+                command chmod "$@"
+            }
+            repository_transaction_hook() { exit 0; }
+            rc=0
+            (begin_repository_transaction) > "$CASE_DIR/absent.log" 2>&1 || rc=$?
+            [[ "$rc" != 0 ]] || fail "absent abnormal exit accepted"
+            [[ ! -e "$KEYRING" && ! -e "$SOURCE_FILE" && ! -e "$REPOSITORY_STATE_DIR/current" ]] || fail "absent formal object created"
+        else
+            repository_rename() { return 1; }
+            if configure_repository > "$CASE_DIR/build.log" 2>&1; then fail "failed capture accepted"; fi
+            assert_old_generation
+            [[ -f "$REPOSITORY_TRANSACTION_DIR/old-key" ]] || fail "partial evidence lost"
+            [[ -f "$REPOSITORY_TRANSACTION_DIR/rollback.log" ]] || fail "failure diagnostic lost"
+            grep -q '回滚不完整' "$CASE_DIR/build.log" || fail "cleanup error not reported"
+        fi
+        [[ "$(trap -p HUP INT TERM EXIT)" == "$before_traps" ]] || fail "build traps changed"
+        acquire_repository_lock || fail "build cleanup lock retained"
+        release_repository_lock || fail "build cleanup lock release"
+    ) > "$TEST_DIR/build-$build_case.log" 2>&1 || {
+        cat "$TEST_DIR/build-$build_case.log"
+        fail "build $build_case"
+    }
+    pass "repository building $build_case preserves objects traps and evidence"
+done
+
 entrypoint_output=$(bash -c "$(cat "$ROOT_DIR/tools/cloudflare_tunnel.sh")" cloudflare_tunnel.sh help)
 grep -Fq 'cloudflare_tunnel.sh install' <<< "$entrypoint_output" || fail "bash -c entrypoint broken"
 pass "bash -c entrypoint remains compatible"
