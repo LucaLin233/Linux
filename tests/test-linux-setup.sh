@@ -334,3 +334,40 @@ printf 'All linux_setup integrity tests passed.\n'
     assert_fail 'selected discovery failures produce nonzero deployment' finish_deployment
 )
 printf 'All module failure-status tests passed.\n'
+
+# Exercise the real main scheduler and final exit, stubbing only system/network/UI.
+for scenario in mixed valid; do
+    main_root="$TEST_DIR/main-status-$scenario"; mkdir "$main_root"
+    rc=0
+    env ROOT_DIR="$ROOT_DIR" MAIN_ROOT="$main_root" SCENARIO="$scenario" \
+        timeout --signal=TERM --kill-after=1s 10s bash -c '
+        source "$ROOT_DIR/linux_setup.sh"
+        init_logging() { :; }; create_temp_dir() { TEMP_DIR=""; }
+        self_update() { :; }; pre_check() { :; }; clear() { :; }
+        migrate_legacy_apt_source_backups() { :; }; install_dependencies() { :; }
+        system_update() { :; }; fix_hosts_file() { :; }
+        discover_and_prepare_modules() {
+            register_unavailable_module broken "download failed"
+            MODULES[consumer]=consumer; MODULE_DEPS[consumer]=broken; MODULE_ORDER_VALUE[consumer]=1
+            MODULES[good]=good; MODULE_ORDER_VALUE[good]=2
+            MODULE_FILES[good]="$MAIN_ROOT/good.sh"
+            printf "#!/usr/bin/env bash\nprintf good > \"%s/executed\"\n" "$MAIN_ROOT" > "${MODULE_FILES[good]}"
+            build_module_order
+        }
+        select_deployment_mode() {
+            if [[ "$SCENARIO" == mixed ]]; then SELECTED_MODULES=(consumer good); else SELECTED_MODULES=(good); fi
+        }
+        generate_summary() { declare -p MODULE_STATUS > "$MAIN_ROOT/status"; }
+        show_recommendations() { :; }
+        main <<< $'\''y\ny\n'\''
+        ' > "$main_root/output" 2>&1 || rc=$?
+    expected=0; [[ $scenario != mixed ]] || expected=1
+    assert_eq "$expected" "$rc" "real main $scenario returns exact deployment status"
+    [[ -f "$main_root/executed" ]]
+    if [[ $scenario == mixed ]]; then
+        grep -Fq '[consumer]="failed"' "$main_root/status"
+        grep -Fq '[broken]="failed"' "$main_root/status"
+    else
+        ! grep -Fq '[broken]=' "$main_root/status"
+    fi
+done
