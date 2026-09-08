@@ -1314,6 +1314,44 @@ pass "repeated lock release preserves next operation lock"
 ) || fail "legacy preflight"
 pass "legacy uninstall rejects unknown ownership before systemctl or APT"
 
+for review_fault in timer-enable stage-identity trap-restore; do
+    (
+        new_case
+        trap - EXIT
+        case "$review_fault" in
+            timer-enable)
+                dpkg-query() { printf installed; }
+                systemctl() {
+                    printf '%s\n' "$*" >> "$FAKE_LOG"
+                    [[ "$*" != 'enable --now cloudflared-apt-update.timer' ]]
+                }
+                if enable_auto_update > "$CASE_DIR/error.log" 2>&1; then fail "timer enable failure hidden"; fi
+                grep -Fxq 'enable --now cloudflared-apt-update.timer' "$FAKE_LOG" || fail "timer injection not hit"
+                ;;
+            stage-identity)
+                begin_repository_transaction || fail "stage fixture"
+                stage=$(mktemp "$CASE_DIR/.stage.XXXXXX")
+                repository_track_stage "$stage" || fail "track stage"
+                mv "$stage" "$stage.owned"
+                printf foreign > "$stage"
+                if rollback_repository_transaction injected; then fail "foreign stage ignored"; fi
+                [[ "$(cat "$stage")" == foreign ]] || fail "foreign stage deleted"
+                ;;
+            trap-restore)
+                begin_repository_transaction || fail "trap fixture"
+                restore_one_trap() { printf '%s\n' "$1" >> "$CASE_DIR/trap-attempts"; return 1; }
+                if rollback_repository_transaction injected; then fail "trap failure hidden"; fi
+                [[ "$(wc -l < "$CASE_DIR/trap-attempts")" == 4 ]] || fail "trap attempts skipped"
+                [[ -f "$REPOSITORY_TRANSACTION_DIR/pending" ]] || fail "trap failure pending missing"
+                ;;
+        esac
+    ) > "$TEST_DIR/review-$review_fault.log" 2>&1 || {
+        cat "$TEST_DIR/review-$review_fault.log"
+        fail "review $review_fault"
+    }
+    pass "review $review_fault injection reached and failure preserved"
+done
+
 entrypoint_output=$(bash -c "$(cat "$ROOT_DIR/tools/cloudflare_tunnel.sh")" cloudflare_tunnel.sh help)
 grep -Fq 'cloudflare_tunnel.sh install' <<< "$entrypoint_output" || fail "bash -c entrypoint broken"
 pass "bash -c entrypoint remains compatible"

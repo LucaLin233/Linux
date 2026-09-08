@@ -274,8 +274,9 @@ cloudflared 时再启用。`upgrade` 可用于立即手动检查、升级并重�
 `migrate-legacy` 可单独执行相同迁移流程。
 
 脚本使用 `service install --no-update-service`，并识别、备份和清理旧版裸二进制更新单元，避免
-APT 包与 `cloudflared update` 混用。若旧环境已有每日自动更新 timer，迁移时会自动换成新的
-APT timer；旧环境未启用自动更新时仍保持关闭并询问是否启用。`uninstall` 在同一事务锁内验证
+APT 包与 `cloudflared update` 混用。自动处理只接受已核实的完整 APT updater 模板（脚本、service、timer），
+并校验类型、权限与目录信任链；更早的裸二进制 updater 或手改模板保留并停止，需人工处理。
+当前 main 原样生成的 APT timer 已启用时保持启用；原本关闭时仍保持关闭，安装流程可询问是否启用。`uninstall` 在同一事务锁内验证
 `current` 清单与 key/source 摘要，备份并删除受管 source，保留 keyring、Tunnel 配置和凭据。
 文件阶段失败会恢复可恢复配置；APT 包删除属于不可逆边界，失败时不会尝试自动重装。
 卸载快照固定包含六个受管目标，完整捕获后才进入 ACTIVE。恢复失败保留原 manifest、payload
