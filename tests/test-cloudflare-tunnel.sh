@@ -1444,6 +1444,99 @@ for fault in backup delete release; do
     pass "independent disable actual $fault failure retains group evidence and traps"
 done
 
+# Separate shells load the implementation independently; only file/FIFO state is shared.
+(
+    new_case
+    trap - EXIT
+    configure_repository || fail "uninstall barrier configure"
+    write_auto_update_files || fail "uninstall barrier updater"
+    mkfifo "$CASE_DIR/uninstall-ready" "$CASE_DIR/uninstall-release"
+    bash -c '
+        source "$1"
+        check_platform() { :; }
+        uninstall_transaction_hook() {
+            [[ "$1" == after-snapshot-active ]] || return 0
+            printf "%s\n" "$UNINSTALL_SNAPSHOT_DIR" > "$CASE_DIR/snapshot-path"
+            printf "ready\n" > "$CASE_DIR/uninstall-ready"
+            read -r _ < "$CASE_DIR/uninstall-release"
+        }
+        uninstall_cloudflared --confirmed
+    ' _ "$ROOT_DIR/tools/cloudflare_tunnel.sh" > "$CASE_DIR/holder.log" 2>&1 &
+    holder=$!
+    # Timeout bounds a broken readiness handshake; no scheduling sleeps.
+    timeout 30 bash -c 'read -r ready < "$CASE_DIR/uninstall-ready"; [[ "$ready" == ready ]]' || fail "uninstall never reached active snapshot"
+    snapshot=$(cat "$CASE_DIR/snapshot-path")
+    [[ -f "$snapshot/manifest" ]] || fail "snapshot not ready"
+    lock_before=$(stat -c '%d:%i:%u:%g:%a' "$CLOUDFLARED_STATE_DIR.lock")
+    find "$REPOSITORY_STATE_DIR" -type f -exec sha256sum {} + | sort > "$CASE_DIR/state-before"
+    sha256sum "$AUTO_UPDATE_SCRIPT" "$AUTO_UPDATE_SERVICE" "$AUTO_UPDATE_TIMER" > "$CASE_DIR/updater-before"
+    for contender in enable_auto_update disable_auto_update; do
+        : > "$CASE_DIR/contender-external.log"
+        rc=0
+        FAKE_LOG="$CASE_DIR/contender-external.log" bash -c '
+            source "$1"
+            check_platform() { :; }
+            "$2" --confirmed
+        ' _ "$ROOT_DIR/tools/cloudflare_tunnel.sh" "$contender" > "$CASE_DIR/contender.log" 2>&1 || rc=$?
+        [[ "$rc" != 0 ]] || fail "contender entered uninstall lock"
+        grep -q '无法取得 Cloudflare 仓库事务锁' "$CASE_DIR/contender.log" || fail "competition not reached"
+        [[ ! -s "$CASE_DIR/contender-external.log" ]] || fail "contender executed external command"
+        [[ "$(stat -c '%d:%i:%u:%g:%a' "$CLOUDFLARED_STATE_DIR.lock")" == "$lock_before" ]] || fail "holder lock changed"
+        find "$REPOSITORY_STATE_DIR" -type f -exec sha256sum {} + | sort > "$CASE_DIR/state-after"
+        cmp "$CASE_DIR/state-before" "$CASE_DIR/state-after" || fail "snapshot or pending changed"
+        sha256sum -c "$CASE_DIR/updater-before" >/dev/null || fail "contender changed updater"
+    done
+    printf 'release\n' > "$CASE_DIR/uninstall-release"
+    wait "$holder" || { cat "$CASE_DIR/holder.log"; fail "uninstall holder failed"; }
+    [[ ! -e "$SOURCE_FILE" && ! -e "$AUTO_UPDATE_TIMER" ]] || fail "uninstall did not complete"
+    [[ ! -d "$CLOUDFLARED_STATE_DIR.lock" ]] || fail "uninstall retained lock"
+) > "$TEST_DIR/uninstall-holder.log" 2>&1 || { cat "$TEST_DIR/uninstall-holder.log"; fail "uninstall holder barrier"; }
+pass "independent uninstall holder excludes enable and disable without changing snapshot pending or lock"
+
+for dependency_fault in update install; do
+    (
+        new_case
+        trap - EXIT
+        write_auto_update_files || fail "dependency updater fixture"
+        sha256sum "$AUTO_UPDATE_SCRIPT" "$AUTO_UPDATE_SERVICE" "$AUTO_UPDATE_TIMER" > "$CASE_DIR/updater-before"
+        command() {
+            if [[ "$*" == '-v flock' ]]; then
+                printf 'flock-missing\n' >> "$CASE_DIR/dependency-hits"
+                return 1
+            fi
+            builtin command "$@"
+        }
+        dpkg-query() { printf installed; }
+        apt-get() {
+            printf 'apt-get:%s\n' "$*" >> "$FAKE_LOG"
+            if [[ "$1" == update && "$dependency_fault" == update ]]; then return 41; fi
+            if [[ "$*" == 'install -y util-linux' ]]; then return 42; fi
+            return 0
+        }
+        trap ':' HUP
+        before_traps=$(trap -p HUP INT TERM EXIT)
+        rc=0
+        enable_auto_update > "$CASE_DIR/dependency.log" 2>&1 || rc=$?
+        case "$dependency_fault" in update) expected=41 ;; install) expected=42 ;; esac
+        [[ "$rc" == "$expected" ]] || fail "dependency status $rc"
+        grep -Fxq flock-missing "$CASE_DIR/dependency-hits" || fail "flock branch not reached"
+        grep -Fxq apt-get:update "$FAKE_LOG" || fail "dependency update not reached"
+        if [[ "$dependency_fault" == update ]]; then
+            if grep -q 'apt-get:install' "$FAKE_LOG"; then fail "install continued after update failure"; fi
+        else
+            grep -Fxq 'apt-get:install -y util-linux' "$FAKE_LOG" || fail "util install not reached"
+        fi
+        if grep -Eq 'systemctl:.*(reload|enable)' "$FAKE_LOG"; then fail "dependency failure continued timer work"; fi
+        sha256sum -c "$CASE_DIR/updater-before" >/dev/null || fail "dependency failure changed updater"
+        validate_current_repository_manifest || fail "prior repository configuration not recorded"
+        compgen -G "$REPOSITORY_STATE_DIR/pending-updater-*" >/dev/null || fail "dependency pending missing"
+        [[ ! -d "$CLOUDFLARED_STATE_DIR.lock" ]] || fail "dependency lock retained"
+        [[ "$(trap -p HUP INT TERM EXIT)" == "$before_traps" ]] || fail "dependency traps changed"
+        grep -q '自动更新操作未完成' "$CASE_DIR/dependency.log" || fail "dependency diagnostic missing"
+    ) > "$TEST_DIR/dependency-$dependency_fault.log" 2>&1 || { cat "$TEST_DIR/dependency-$dependency_fault.log"; fail "dependency $dependency_fault"; }
+    pass "missing flock $dependency_fault failure stops updater after recorded repository commit"
+done
+
 entrypoint_output=$(bash -c "$(cat "$ROOT_DIR/tools/cloudflare_tunnel.sh")" cloudflare_tunnel.sh help)
 grep -Fq 'cloudflare_tunnel.sh install' <<< "$entrypoint_output" || fail "bash -c entrypoint broken"
 pass "bash -c entrypoint remains compatible"
