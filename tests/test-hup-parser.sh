@@ -19,6 +19,14 @@ end=$((SECONDS + 2))
 case "$mode" in
     plain) while (( SECONDS < end )); do :; done ;;
     command) while (( SECONDS < end )); do value=$(printf x); [[ $value == x ]]; done ;;
+    pipeline)
+        while (( SECONDS < end )); do
+            probe_status=0
+            jobs -pr | grep -Fx -- 1 > /dev/null || probe_status=$?
+            # No fixture job has PID 1: only grep no-match is expected.
+            [[ $probe_status == 1 ]] || exit 93
+        done
+        ;;
     snapshot) while (( SECONDS < end )); do active_jobs=$(jobs -pr); while IFS= read -r value; do :; done <<< "$active_jobs"; done ;;
     process) while (( SECONDS < end )); do while IFS= read -r value; do :; done < <(jobs -pr); done ;;
     *) exit 90 ;;
@@ -49,10 +57,11 @@ printf "DIAG: mode=%s round=%s delay=%s exit=%s\n" "$mode" "$round" "$delay" "$s
 CONTROL
 # 3 modes x 6 cases, at most 5 seconds per case (including forced teardown).
 # Do not retry failures. Delay varies delivery, not a claim of exact parser timing.
-# Legacy process mode already reproduced EOF in run 34226553908.
+# Process mode failed in 34226553908; snapshot failed in 34245125939.
+# Keep both failed implementations as explicit diagnostic controls.
 # Keep it available explicitly; the default gate validates the replacement.
-modes="plain command snapshot"
-if [[ ${HUP_PARSER_INCLUDE_LEGACY:-false} == true ]]; then modes="$modes process"; fi
+modes="plain command pipeline"
+if [[ ${HUP_PARSER_INCLUDE_LEGACY:-false} == true ]]; then modes="$modes process snapshot"; fi
 for mode in $modes; do
     round=0
     for delay in 0 0.001 0.005 0.01 0.02 0.05; do
