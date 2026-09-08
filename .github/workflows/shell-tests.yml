@@ -21,6 +21,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Install pinned ShellCheck
         env:
@@ -40,6 +41,15 @@ jobs:
           command -v ip
           command -v rsync
           command -v ssh
+
+      - name: Verify checkout and real Git selection
+        shell: bash
+        run: |
+          # Checkout uses a temporary HOME; trust only this job's workspace.
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          test "$(git rev-parse --show-toplevel)" = "$GITHUB_WORKSPACE"
+          git rev-parse --verify HEAD
+          bash tests/test-selection-git.sh
 
       - name: Check Bash syntax
         run: find . -type f -name '*.sh' -print0 | xargs -0 -n1 bash -n
@@ -68,6 +78,16 @@ jobs:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify checkout and real Git selection
+        shell: bash
+        run: |
+          # Checkout uses a temporary HOME; trust only this job's workspace.
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          test "$(git rev-parse --show-toplevel)" = "$GITHUB_WORKSPACE"
+          git rev-parse --verify HEAD
+          bash tests/test-selection-git.sh
 
       - name: Check Bash syntax
         run: find . -type f -name '*.sh' -print0 | xargs -0 -n1 bash -n
