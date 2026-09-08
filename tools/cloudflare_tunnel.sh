@@ -719,7 +719,9 @@ cleanup_legacy_updater() {
     systemctl stop cloudflared-updater.service >/dev/null 2>&1 || true
     for path in "${paths[@]}"; do
         [[ -e "$path" ]] || continue
-        backup_path "$path" "$backup_dir" || return 1
+        if [[ "${UNINSTALL_TRANSACTION_STATE:-NONE}" != ACTIVE ]]; then
+            backup_path "$path" "$backup_dir" || return 1
+        fi
         rm -f "$path" || return 1
     done
     systemctl daemon-reload
@@ -758,7 +760,9 @@ cleanup_binary_updater() {
     systemctl stop cloudflared-update.service >/dev/null 2>&1 || true
     for path in "${paths[@]}"; do
         [[ -e "$path" ]] || continue
-        backup_path "$path" "$backup_dir" || return 1
+        if [[ "${UNINSTALL_TRANSACTION_STATE:-NONE}" != ACTIVE ]]; then
+            backup_path "$path" "$backup_dir" || return 1
+        fi
         rm -f "$path" || return 1
     done
     systemctl daemon-reload
@@ -986,7 +990,9 @@ disable_auto_update_locked() {
     systemctl stop cloudflared-apt-update.service >/dev/null 2>&1 || true
     for path in "$AUTO_UPDATE_SCRIPT" "$AUTO_UPDATE_SERVICE" "$AUTO_UPDATE_TIMER"; do
         [[ -e "$path" ]] || continue
-        backup_path "$path" "$backup_dir" || return 1
+        if [[ "${UNINSTALL_TRANSACTION_STATE:-NONE}" != ACTIVE ]]; then
+            backup_path "$path" "$backup_dir" || return 1
+        fi
         rm -f "$path" || return 1
     done
     systemctl daemon-reload
@@ -1178,10 +1184,11 @@ remove_managed_repository_locked() {
     fi
     [[ "$managed" == true ]] || { error "无法验证 Cloudflare source 管理归属，拒绝删除"; return 1; }
     backup_dir="$STATE_DIR/uninstall-$(date +%Y%m%d_%H%M%S)"
-    backup_path "$SOURCE_FILE" "$backup_dir" || return 1
+    if [[ "${UNINSTALL_TRANSACTION_STATE:-NONE}" != ACTIVE ]]; then
+        backup_path "$SOURCE_FILE" "$backup_dir" || return 1
+    fi
     rm -f -- "$SOURCE_FILE" "$STATE_DIR/repository-managed" || return 1
     rm -f -- "$REPOSITORY_STATE_DIR/current" || return 1
-    unset REPOSITORY_STATE_DIR
 }
 
 remove_managed_repository() {
@@ -1306,6 +1313,7 @@ uninstall_create_absent_target() {
     validate_directory_chain "$(dirname -- "$path")" || return 1
     validate_secure_file "$payload" 600 || return 1
     stage=$(mktemp "$(dirname -- "$path")/.cloudflared-create.XXXXXX") || return 1
+    uninstall_register_stage "$stage" || return 1
     repository_install_file "$mode" "$payload" "$stage" || return 1
     validate_secure_file "$stage" "$mode" || return 1
     digest=$(sha256sum -- "$stage" | awk '{print $1}') || return 1
@@ -1345,6 +1353,31 @@ uninstall_created_identity_valid() {
     [[ "$digest" == "$(sed -n '8p' "$marker" | cut -d= -f2)" ]]
 }
 
+uninstall_register_stage() {
+    local stage="$1"
+    validate_directory_chain "$(dirname -- "$stage")" || return 1
+    [[ -f "$stage" && ! -L "$stage" ]] || return 1
+    UNINSTALL_STAGES+=("$stage")
+    UNINSTALL_STAGE_IDENTITIES+=("$(stat -c '%d:%i' -- "$stage")")
+}
+
+uninstall_cleanup_stages() {
+    local i stage failed=0
+    for i in "${!UNINSTALL_STAGES[@]}"; do
+        stage=${UNINSTALL_STAGES[i]}
+        [[ -e "$stage" || -L "$stage" ]] || continue
+        if validate_directory_chain "$(dirname -- "$stage")" &&
+           [[ -f "$stage" && ! -L "$stage" && "$(stat -c '%d:%i' -- "$stage")" == "${UNINSTALL_STAGE_IDENTITIES[i]}" ]] &&
+           [[ "$(stat -c '%u:%g' -- "$stage")" == 0:0 ]]; then
+            rm -- "$stage" || failed=1
+        else
+            error "stage 身份变化，保留人工处理: $stage"
+            failed=1
+        fi
+    done
+    return "$failed"
+}
+
 restore_uninstall_target() {
     local id="$1" path mode payload sha stage
     path=$(uninstall_target_path "$id") || return 1
@@ -1355,6 +1388,7 @@ restore_uninstall_target() {
     [[ "$(sha256sum -- "$payload" | awk '{print $1}')" == "$sha" ]] || return 1
     validate_directory_chain "$(dirname -- "$path")" || return 1
     stage=$(mktemp "$(dirname -- "$path")/.cloudflared-uninstall-restore.XXXXXX") || return 1
+    uninstall_register_stage "$stage" || return 1
     if ! repository_install_file "$mode" "$payload" "$stage" ||
        ! validate_secure_file "$stage" "$mode" ||
        [[ "$(sha256sum -- "$stage" | awk '{print $1}')" != "$sha" ]] ||
@@ -1500,14 +1534,19 @@ uninstall_cleanup() {
             uninstall_targets_group_valid || failed=true
         fi
     fi
-    mkdir -m 0700 -- "$evidence" 2>/dev/null || failed=true
-    printf '%s\n' "$reason" > "$evidence/rollback.log" 2>/dev/null || failed=true
-    chmod 0600 "$evidence/rollback.log" 2>/dev/null || failed=true
-    write_uninstall_journal "$([[ "$failed" == true ]] && printf FAILED || printf ROLLED_BACK)" "$reason" || failed=true
+    if mkdir -m 0700 -- "$evidence" 2>/dev/null && validate_secure_directory "$evidence" 700; then
+        (set -C; umask 077; printf '%s\n' "$reason" > "$evidence/rollback.log") || failed=true
+    else
+        failed=true
+    fi
+    if [[ "$failed" == false ]]; then
+        write_uninstall_journal ROLLED_BACK "$reason" || failed=true
+    fi
     # Retain complete snapshot as read-only evidence; never garbage-collect it.
     if [[ "$failed" == false && "$snapshot_valid" == true && -d "$UNINSTALL_SNAPSHOT_DIR" ]]; then
         archive_uninstall_evidence "$evidence/snapshot" || failed=true
     fi
+    if [[ "$failed" == false ]]; then uninstall_cleanup_stages || failed=true; fi
     if [[ "$failed" == false ]]; then
         uninstall_transaction_hook before-pending-clear || failed=true
         if [[ "$failed" == false ]]; then
@@ -1544,6 +1583,7 @@ uninstall_exit_handler() {
 begin_uninstall_transaction() {
     init_runtime_config
     local id path mode sha
+    UNINSTALL_STAGES=(); UNINSTALL_STAGE_IDENTITIES=()
     UNINSTALL_GENERATION="$(date -u +%Y%m%dT%H%M%SZ)-$$-$RANDOM"
     UNINSTALL_SNAPSHOT_DIR="$REPOSITORY_STATE_DIR/uninstall-$UNINSTALL_GENERATION"
     UNINSTALL_SNAPSHOT_BUILDING=false; UNINSTALL_TRANSACTION_ACTIVE=false; UNINSTALL_TRANSACTION_STATE=NONE
@@ -1591,6 +1631,7 @@ finish_uninstall_transaction() {
     done < <(uninstall_snapshot_targets)
     if [[ "$failed" == false ]]; then write_uninstall_journal COMMITTED uninstall-complete || failed=true; fi
     if [[ "$failed" == false ]]; then archive_uninstall_evidence "$REPOSITORY_STATE_DIR/history-uninstall-$UNINSTALL_GENERATION" || failed=true; fi
+    if [[ "$failed" == false ]]; then uninstall_cleanup_stages || failed=true; fi
     if [[ "$failed" == false ]]; then
         uninstall_transaction_hook before-pending-clear || failed=true
         if [[ "$failed" == false ]]; then

@@ -842,6 +842,37 @@ for interrupted_phase in before-snapshot-create after-snapshot-active after-evid
     pass "SIGKILL $interrupted_phase fails closed in independent entrypoints"
 done
 
+for stage_case in owned foreign; do
+    (
+        new_case
+        trap - EXIT
+        configure_repository || fail "stage configure"
+        acquire_repository_lock || fail "stage lock"
+        begin_uninstall_transaction || fail "stage capture"
+        stage=$(mktemp "$CASE_DIR/root/.cloudflared-create.XXXXXX")
+        uninstall_register_stage "$stage" || fail "stage register"
+        if [[ "$stage_case" == foreign ]]; then
+            mv "$stage" "$stage.original"
+            printf foreign > "$stage"
+        fi
+        rc=0
+        uninstall_cleanup stage-test || rc=$?
+        if [[ "$stage_case" == owned ]]; then
+            [[ "$rc" == 0 && ! -e "$stage" ]] || fail "owned stage not cleaned"
+            [[ "$(stat -c %a "$UNINSTALL_SNAPSHOT_DIR")" == 500 ]] || fail "archive writable"
+            [[ "$(stat -c %a "$UNINSTALL_SNAPSHOT_DIR/manifest")" == 400 ]] || fail "manifest writable"
+            validate_uninstall_archive "$UNINSTALL_SNAPSHOT_DIR" "$UNINSTALL_GENERATION" || fail "sealed archive invalid"
+        else
+            [[ "$rc" != 0 && "$(cat "$stage")" == foreign ]] || fail "foreign stage removed"
+            [[ -f "$UNINSTALL_PENDING" ]] || fail "stage failure lost pending"
+        fi
+    ) > "$TEST_DIR/stage-$stage_case.log" 2>&1 || {
+        cat "$TEST_DIR/stage-$stage_case.log"
+        fail "stage $stage_case"
+    }
+    pass "stage cleanup verifies $stage_case identity"
+done
+
 entrypoint_output=$(bash -c "$(cat "$ROOT_DIR/tools/cloudflare_tunnel.sh")" cloudflare_tunnel.sh help)
 grep -Fq 'cloudflare_tunnel.sh install' <<< "$entrypoint_output" || fail "bash -c entrypoint broken"
 pass "bash -c entrypoint remains compatible"
