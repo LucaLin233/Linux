@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# Safe runtime identity only: no environment dump, credentials, or xtrace.
+printf "DIAG: bash=%s kernel=%s\n" "$BASH_VERSION" "$(uname -r)"
+dpkg-query -W bash libc6 2>/dev/null || true
 
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 readonly ROOT_DIR
@@ -1453,6 +1456,8 @@ run_state_publication_signal_case() (
     [[ "$worker_pid" =~ ^[1-9][0-9]*$ && "$worker_start" =~ ^[1-9][0-9]*$ && "$managed_sid" =~ ^[1-9][0-9]*$ ]] || fail "$state/$phase/$signal_name marker identity malformed"
     wait_test_process_identity_present "$worker_pid" "$worker_start" || { cat "$marker" >&2; fail "$state/$phase/$signal_name worker identity missing at hook"; }
     test_watchdog_process 30 "$root/watchdog-timeout" "$main_pid" & watchdog=$!; watchdog_start=$(wait_test_process_start "$watchdog")
+    printf "DIAG: publication state=%s phase=%s signal=%s main=%s/%s worker=%s/%s sid=%s\n" \
+        "$state" "$phase" "$signal_name" "$main_pid" "$main_start" "$worker_pid" "$worker_start" "$managed_sid"
     kill "-$signal_name" "$main_pid"; wait "$main_pid" || rc=$?
     kill -TERM "$watchdog" 2>/dev/null || true; wait "$watchdog" 2>/dev/null || true
     [[ ! -e "$root/watchdog-timeout" ]] || fail "$state/$phase/$signal_name watchdog fired"
@@ -1490,6 +1495,15 @@ for publication_state in $publication_states; do
 done
 
 (
+    # Three bounded extra probes; preserve original matrix and stop at first failure.
+    for diagnostic_round in 1 2 3; do
+        TEST_DIR="$TEST_DIR/hup-probe-$diagnostic_round"
+        mkdir -m 0700 "$TEST_DIR"
+        cp "${TEST_DIR%/hup-probe-*}/state-publication-child.sh" "$TEST_DIR/state-publication-child.sh"
+        printf "DIAG: extra HUP probe=%s/3\n" "$diagnostic_round"
+        run_state_publication_signal_case cleanup_failed after-rename HUP 129
+        TEST_DIR=${TEST_DIR%/hup-probe-*}
+    done
     root="$TEST_DIR/normal-parallel"; setup_fixture "$root"
     : > "$root/capture/current"; : > "$root/capture/max"
     push_to_server() {
