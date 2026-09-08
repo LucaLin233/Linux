@@ -60,8 +60,8 @@ jobs:
           # All tracked Bash scripts outside tests are production by default.
           # Check both groups even when production lint fails.
           status=0
-          git ls-files -z -- *.sh :!:tests/** | xargs -0 -r shellcheck -x --severity=warning -- || status=1
-          git ls-files -z -- tests/**/*.sh | xargs -0 -r shellcheck -x --severity=error -- || status=1
+          git ls-files -z -- "*.sh" ":!:tests/**" | xargs -0 -r shellcheck -x --severity=warning -- || status=1
+          git ls-files -z -- "tests/*.sh" | xargs -0 -r shellcheck -x --severity=error -- || status=1
           exit "$status"
 
       - name: Run tests
