@@ -13,8 +13,8 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  ubuntu:
-    name: Ubuntu 24.04 lint and tests
+  lint:
+    name: ShellCheck
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
@@ -37,19 +37,6 @@ jobs:
         run: |
           command -v shellcheck
           shellcheck --version
-          command -v jq
-          command -v ip
-          command -v rsync
-          command -v ssh
-
-      - name: Verify checkout and real Git selection
-        shell: bash
-        run: |
-          # Checkout uses a temporary HOME; trust only this job's workspace.
-          git config --global --add safe.directory "$GITHUB_WORKSPACE"
-          test "$(git rev-parse --show-toplevel)" = "$GITHUB_WORKSPACE"
-          git rev-parse --verify HEAD
-          bash tests/test-selection-git.sh
 
       - name: Check Bash syntax
         run: find . -type f -name '*.sh' -print0 | xargs -0 -n1 bash -n
@@ -64,17 +51,51 @@ jobs:
           git ls-files -z -- "tests/*.sh" | xargs -0 -r shellcheck -x --severity=error -- || status=1
           exit "$status"
 
+  ubuntu-tests:
+    name: Ubuntu 24.04 / ${{ matrix.shard }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [motd, push, other]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify test dependencies
+        run: |
+          command -v jq
+          command -v ip
+          command -v rsync
+          command -v ssh
+
+      - name: Verify checkout and real Git selection
+        shell: bash
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          test "$(git rev-parse --show-toplevel)" = "$GITHUB_WORKSPACE"
+          git rev-parse --verify HEAD
+          bash tests/test-selection-git.sh
+
       - name: Run tests
         env:
           TEST_BASE_SHA: ${{ github.event.pull_request.base.sha }}
           TEST_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        run: bash tests/run.sh
+          TEST_SHARD: ${{ matrix.shard }}
+        run: bash tests/run.sh "$TEST_SHARD"
 
-  debian-13:
-    name: Debian 13 tests
+  debian-tests:
+    name: Debian 13 / ${{ matrix.shard }}
     runs-on: ubuntu-24.04
     container: debian:13-slim
     timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [motd, push, other]
     steps:
       - name: Install test dependencies
         run: |
@@ -103,4 +124,31 @@ jobs:
         env:
           TEST_BASE_SHA: ${{ github.event.pull_request.base.sha }}
           TEST_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        run: bash tests/run.sh
+          TEST_SHARD: ${{ matrix.shard }}
+        run: bash tests/run.sh "$TEST_SHARD"
+
+  # Preserve existing required-check names; skipped/cancelled dependencies fail closed.
+  ubuntu:
+    name: Ubuntu 24.04 lint and tests
+    if: ${{ always() }}
+    needs: [lint, ubuntu-tests]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    steps:
+      - name: Require lint and every Ubuntu shard
+        env:
+          LINT_RESULT: ${{ needs.lint.result }}
+          TEST_RESULT: ${{ needs.ubuntu-tests.result }}
+        run: test "$LINT_RESULT" = success && test "$TEST_RESULT" = success
+
+  debian-13:
+    name: Debian 13 tests
+    if: ${{ always() }}
+    needs: [debian-tests]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    steps:
+      - name: Require every Debian shard
+        env:
+          TEST_RESULT: ${{ needs.debian-tests.result }}
+        run: test "$TEST_RESULT" = success

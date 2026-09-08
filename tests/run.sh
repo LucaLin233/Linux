@@ -3,6 +3,17 @@ set -euo pipefail
 
 readonly ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 
+# Positional, not exported: nested selection fixtures must still run all suites.
+shard=${1:-all}
+if (( $# > 1 )); then
+    printf 'Usage: tests/run.sh [all|motd|push|other]\n' >&2
+    exit 2
+fi
+case "$shard" in
+    all|motd|push|other) ;;
+    *) printf 'Invalid test shard: %s\n' "$shard" >&2; exit 2 ;;
+esac
+
 declare -A selected=()
 full=true
 if [[ -n "${TEST_BASE_SHA:-}" && -n "${TEST_HEAD_SHA:-}" ]]; then
@@ -38,6 +49,15 @@ for test_file in "$ROOT_DIR"/tests/test-*.sh; do
         continue
     fi
     test_name=$(basename "$test_file")
+    case "$test_name" in
+        test-motd.sh) suite_shard=motd ;;
+        test-push.sh|test-push-worker-registration.sh) suite_shard=push ;;
+        *) suite_shard=other ;;
+    esac
+    if [[ "$shard" != all && "$shard" != "$suite_shard" ]]; then
+        printf 'SKIP: %s (assigned to %s shard)\n' "$test_name" "$suite_shard"
+        continue
+    fi
     printf '\n==> %s\n' "$test_name"
     started=$SECONDS
     # Keep the child shell standalone: an if/|| wrapper can change errexit behavior.
