@@ -36,6 +36,7 @@ readonly CACHE_MARKER_NAME=".linux-setup-managed-cache-v1"
 readonly LINE="============================================================"
 
 TEMP_DIR=""
+TEMP_DIR_IDENTITY=""
 PREPARED_SCRIPT=""
 TOTAL_START_TIME=0
 
@@ -153,15 +154,35 @@ backup_initial_and_previous() {
     atomic_copy_file "$file" "$previous"
 }
 
+temp_directory_trusted() {
+    local identity
+    [[ -n "$TEMP_DIR" && -n "$TEMP_DIR_IDENTITY" && -d "$TEMP_DIR" && ! -L "$TEMP_DIR" ]] || return 1
+    identity=$(stat -c '%d:%i:%u:%a' -- "$TEMP_DIR" 2>/dev/null) || return 1
+    [[ "$identity" == "$TEMP_DIR_IDENTITY" && "$identity" == *":$EUID:700" ]]
+}
+
+remove_owned_temp_directory() {
+    [[ -n "$TEMP_DIR" ]] || return 0
+    temp_directory_trusted || {
+        log "临时目录身份不可验证，拒绝删除：$TEMP_DIR" "error"
+        return 1
+    }
+    # /tmp is sticky; mode 0700 excludes other users from the owned directory.
+    # Never authorize recursive removal from a caller-supplied path alone.
+    rm -rf -- "$TEMP_DIR" || return 1
+    [[ ! -e "$TEMP_DIR" && ! -L "$TEMP_DIR" ]] || return 1
+    TEMP_DIR=""
+    TEMP_DIR_IDENTITY=""
+}
+
 cleanup() {
     local exit_code=$?
 
-    if [[ -n "$TEMP_DIR" && -d "$TEMP_DIR" ]]; then
+    if [[ -n "$TEMP_DIR" ]]; then
         if (( exit_code == 0 )); then
-            rm -rf "$TEMP_DIR" 2>/dev/null || true
+            remove_owned_temp_directory || exit_code=1
         else
             log "脚本异常退出，临时文件保留在：$TEMP_DIR" "error"
-            log "调试完成后可手动删除：rm -rf $TEMP_DIR" "warn"
             log "详细日志：$LOG_FILE" "error"
         fi
     fi
@@ -186,7 +207,9 @@ create_temp_dir() {
         exit 1
     fi
 
-    chmod 700 "$TEMP_DIR"
+    chmod 700 "$TEMP_DIR" || return 1
+    TEMP_DIR_IDENTITY=$(stat -c '%d:%i:%u:%a' -- "$TEMP_DIR") || return 1
+    temp_directory_trusted
 }
 
 # =============================================================================
@@ -1129,12 +1152,43 @@ prepare_main_script() {
 }
 
 exec_prepared_script() {
-    local commit="$1"
+    local commit="$1" script_fd identity fd_identity status=0 execfail_was_set=false
 
     is_valid_commit "$commit" || return 1
+    temp_directory_trusted || return 1
     validate_bash_script "$PREPARED_SCRIPT" || return 1
+    if [[ "$PREPARED_SCRIPT" == "$CACHE_DIR/linux_setup_${commit}.sh" ]]; then
+        validate_cached_script "$PREPARED_SCRIPT" "$commit" || return 1
+    else
+        [[ "$PREPARED_SCRIPT" == "$TEMP_DIR/"* ]] || return 1
+        file_owner_and_mode_are_safe "$PREPARED_SCRIPT" || return 1
+    fi
+    identity=$(stat -Lc '%d:%i:%u:%a:%s' -- "$PREPARED_SCRIPT") || return 1
+    exec {script_fd}<"$PREPARED_SCRIPT" || return 1
+    fd_identity=$(stat -Lc '%d:%i:%u:%a:%s' -- "/proc/self/fd/$script_fd") || {
+        exec {script_fd}<&-; return 1;
+    }
+    if [[ "$identity" != "$fd_identity" || -L "$PREPARED_SCRIPT" ]] ||
+        [[ "$(stat -Lc '%d:%i:%u:%a:%s' -- "$PREPARED_SCRIPT")" != "$identity" ]]; then
+        exec {script_fd}<&-
+        return 1
+    fi
+    # Pin the validated inode before removing the old runtime. The descriptor
+    # survives exec, including when the fallback script pathname is unlinked.
+    # The replacement gets only its script FD, never ownership of an old path.
+    if ! remove_owned_temp_directory; then
+        exec {script_fd}<&-
+        log "无法清理旧临时目录，拒绝重新启动" "error"
+        return 1
+    fi
     log "正在使用固定 Commit 重新启动主脚本：${commit:0:7}" "success"
-    exec env RUN_COMMIT="$commit" bash "$PREPARED_SCRIPT"
+    shopt -q execfail && execfail_was_set=true
+    shopt -s execfail
+    exec env RUN_COMMIT="$commit" bash "/proc/self/fd/$script_fd"
+    status=$?
+    exec {script_fd}<&-
+    [[ "$execfail_was_set" == true ]] || shopt -u execfail
+    return "$status"
 }
 
 self_update() {
@@ -1165,6 +1219,7 @@ self_update() {
     if [[ -z "$RUN_COMMIT" ]]; then
         log "当前主脚本无法证明版本一致性，必须切换到固定 Commit" "warn"
         exec_prepared_script "$latest_commit"
+        return $?
     fi
 
     echo
@@ -1606,11 +1661,11 @@ main() {
     fi
 
     init_logging
-    create_temp_dir
-
     trap cleanup EXIT
+    trap 'exit 129' HUP
     trap 'exit 130' INT
     trap 'exit 143' TERM
+    create_temp_dir || return 1
 
     TOTAL_START_TIME=$(date +%s)
 
