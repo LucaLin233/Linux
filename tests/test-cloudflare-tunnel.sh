@@ -772,6 +772,38 @@ for capture_id in auto_update_script auto_update_timer legacy_marker; do
     pass "capture failure $capture_id retains partial evidence without restoration"
 done
 
+for archive_case in intact payload journal; do
+    (
+        new_case
+        trap - EXIT
+        uninstall_transaction_hook() { :; }
+        configure_repository || fail "archive configure"
+        acquire_repository_lock || fail "archive lock"
+        begin_uninstall_transaction || fail "archive capture"
+        uninstall_transaction_hook() {
+            [[ "$1" == after-evidence-rename ]] || return 0
+            case "$archive_case" in
+                payload) printf corrupt >> "$UNINSTALL_SNAPSHOT_DIR/files/target-source" ;;
+                journal) printf 'unknown=1\n' >> "$UNINSTALL_SNAPSHOT_DIR/journal" ;;
+            esac
+            return 0
+        }
+        rc=0
+        uninstall_cleanup archive-verification || rc=$?
+        if [[ "$archive_case" == intact ]]; then
+            [[ "$rc" == 0 && "$UNINSTALL_TRANSACTION_STATE" == ROLLED_BACK ]] || fail "valid archive rejected"
+        else
+            [[ "$rc" != 0 && "$UNINSTALL_TRANSACTION_STATE" == FAILED ]] || fail "corrupt archive accepted"
+        fi
+        [[ -f "$UNINSTALL_SNAPSHOT_DIR/manifest" && -f "$UNINSTALL_SNAPSHOT_DIR/journal" ]] || fail "archive evidence lost"
+        [[ -f "$UNINSTALL_SNAPSHOT_DIR/files/target-current" ]] || fail "archive payload lost"
+    ) > "$TEST_DIR/archive-$archive_case.log" 2>&1 || {
+        cat "$TEST_DIR/archive-$archive_case.log"
+        fail "archive $archive_case"
+    }
+    pass "post-rename archive verification $archive_case"
+done
+
 entrypoint_output=$(bash -c "$(cat "$ROOT_DIR/tools/cloudflare_tunnel.sh")" cloudflare_tunnel.sh help)
 grep -Fq 'cloudflare_tunnel.sh install' <<< "$entrypoint_output" || fail "bash -c entrypoint broken"
 pass "bash -c entrypoint remains compatible"

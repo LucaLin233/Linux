@@ -284,10 +284,12 @@ restore_one_trap() {
 }
 
 restore_repository_traps() {
-    restore_one_trap HUP "$REPOSITORY_PREVIOUS_HUP_TRAP"
-    restore_one_trap INT "$REPOSITORY_PREVIOUS_INT_TRAP"
-    restore_one_trap TERM "$REPOSITORY_PREVIOUS_TERM_TRAP"
-    restore_one_trap EXIT "$REPOSITORY_PREVIOUS_EXIT_TRAP"
+    local failed=0
+    restore_one_trap HUP "$REPOSITORY_PREVIOUS_HUP_TRAP" || failed=1
+    restore_one_trap INT "$REPOSITORY_PREVIOUS_INT_TRAP" || failed=1
+    restore_one_trap TERM "$REPOSITORY_PREVIOUS_TERM_TRAP" || failed=1
+    restore_one_trap EXIT "$REPOSITORY_PREVIOUS_EXIT_TRAP" || failed=1
+    return "$failed"
 }
 
 release_repository_lock() {
@@ -1274,7 +1276,10 @@ uninstall_manifest_valid() {
 uninstall_snapshot_path_valid() {
     init_runtime_config
     [[ -n "${UNINSTALL_SNAPSHOT_DIR:-}" && -n "${UNINSTALL_GENERATION:-}" ]] || return 1
-    [[ "$UNINSTALL_SNAPSHOT_DIR" == "$REPOSITORY_STATE_DIR/uninstall-$UNINSTALL_GENERATION" ]] || return 1
+    case "$UNINSTALL_SNAPSHOT_DIR" in
+        "$REPOSITORY_STATE_DIR/uninstall-$UNINSTALL_GENERATION"|        "$REPOSITORY_STATE_DIR/history-uninstall-$UNINSTALL_GENERATION"|        "$REPOSITORY_STATE_DIR/failure-uninstall-$UNINSTALL_GENERATION/snapshot") ;;
+        *) return 1 ;;
+    esac
     [[ ! -L "$UNINSTALL_SNAPSHOT_DIR" && -d "$UNINSTALL_SNAPSHOT_DIR" ]] || return 1
     validate_directory_chain "$UNINSTALL_SNAPSHOT_DIR" || return 1
     validate_secure_directory "$UNINSTALL_SNAPSHOT_DIR" 700
@@ -1391,7 +1396,10 @@ archive_uninstall_evidence() {
     validate_secure_directory "$archive" 700 || return 1
     validate_secure_directory "$archive/files" 700 || return 1
     validate_secure_file "$archive/manifest" 600 || return 1
-    UNINSTALL_SNAPSHOT_DIR="$archive"
+    uninstall_transaction_hook after-evidence-rename || return 1
+    # Revalidate all bytes after publication, not just directory metadata.
+    uninstall_manifest_valid "$archive/manifest" || return 1
+    uninstall_journal_valid "$archive/journal" "$terminal" || return 1
 }
 
 uninstall_targets_group_valid() {
@@ -1460,7 +1468,7 @@ uninstall_cleanup() {
         archive_uninstall_evidence "$evidence/snapshot" || failed=true
     fi
     release_repository_lock || failed=true
-    restore_repository_traps
+    restore_repository_traps || failed=true
     UNINSTALL_SNAPSHOT_BUILDING=false
     UNINSTALL_TRANSACTION_ACTIVE=false
     UNINSTALL_TRANSACTION_STATE=$([[ "$failed" == true ]] && printf FAILED || printf ROLLED_BACK)
@@ -1535,7 +1543,7 @@ finish_uninstall_transaction() {
     if [[ "$failed" == false ]]; then write_uninstall_journal COMMITTED uninstall-complete || failed=true; fi
     if [[ "$failed" == false ]]; then archive_uninstall_evidence "$REPOSITORY_STATE_DIR/history-uninstall-$UNINSTALL_GENERATION" || failed=true; fi
     release_repository_lock || failed=true
-    restore_repository_traps
+    restore_repository_traps || failed=true
     UNINSTALL_SNAPSHOT_BUILDING=false; UNINSTALL_TRANSACTION_ACTIVE=false
     UNINSTALL_TRANSACTION_STATE=$([[ "$failed" == true ]] && printf FAILED || printf COMMITTED)
     if [[ "$failed" == true ]]; then error "卸载收尾失败；状态 FAILED/PENDING；锁或证据: $lock_path $UNINSTALL_SNAPSHOT_DIR"; return 1; fi
