@@ -1463,6 +1463,8 @@ archive_uninstall_evidence() {
     terminal=$(sed -n '3s/^state=//p' "$UNINSTALL_SNAPSHOT_DIR/journal") || return 1
     case "$terminal" in COMMITTED|ROLLED_BACK) ;; *) return 1 ;; esac
     uninstall_journal_valid "$UNINSTALL_SNAPSHOT_DIR/journal" "$terminal" || return 1
+    UNINSTALL_TRANSACTION_ACTIVE=false
+    UNINSTALL_TRANSACTION_STATE=FINALIZING
     repository_rename "$UNINSTALL_SNAPSHOT_DIR" "$archive" || return 1
     # Record the new evidence path immediately, even if post-rename validation fails.
     UNINSTALL_SNAPSHOT_DIR="$archive"
@@ -1503,6 +1505,14 @@ uninstall_cleanup() {
     state="${UNINSTALL_TRANSACTION_STATE:-NONE}"
     [[ "${UNINSTALL_SNAPSHOT_BUILDING:-false}" == true ]] && state=BUILDING
     [[ "${UNINSTALL_TRANSACTION_ACTIVE:-false}" == true ]] && state=ACTIVE
+    if [[ "$state" == FINALIZING ]]; then
+        # Never replay rollback after terminal evidence publication has begun.
+        release_repository_lock || true
+        restore_repository_traps || true
+        UNINSTALL_TRANSACTION_STATE=FAILED
+        error "终态收尾中断；保留 pending、journal 与归档: $UNINSTALL_PENDING $UNINSTALL_SNAPSHOT_DIR"
+        return 1
+    fi
     [[ "$state" == BUILDING || "$state" == ACTIVE ]] || return 0
     if [[ "$state" == BUILDING ]]; then
         # Partial capture never enters restoration or claims ROLLED_BACK.
@@ -1573,7 +1583,7 @@ uninstall_signal_handler() {
 
 uninstall_exit_handler() {
     local status="$1"
-    if [[ "${UNINSTALL_TRANSACTION_STATE:-NONE}" == BUILDING || "${UNINSTALL_TRANSACTION_STATE:-NONE}" == ACTIVE ]]; then
+    if [[ "${UNINSTALL_TRANSACTION_STATE:-NONE}" == BUILDING || "${UNINSTALL_TRANSACTION_STATE:-NONE}" == ACTIVE || "${UNINSTALL_TRANSACTION_STATE:-NONE}" == FINALIZING ]]; then
         uninstall_cleanup "活动卸载事务异常退出，原状态 $status" || true
         (( status == 0 )) && status=1
     fi
@@ -1590,11 +1600,11 @@ begin_uninstall_transaction() {
     validate_directory_chain "$(dirname -- "$UNINSTALL_SNAPSHOT_DIR")" || return 1
     [[ ! -e "$UNINSTALL_SNAPSHOT_DIR" && ! -L "$UNINSTALL_SNAPSHOT_DIR" ]] || return 1
     UNINSTALL_PENDING="$REPOSITORY_STATE_DIR/pending-uninstall-$UNINSTALL_GENERATION"
+    save_repository_traps
+    UNINSTALL_SNAPSHOT_BUILDING=true; UNINSTALL_TRANSACTION_STATE=BUILDING
+    trap 'uninstall_signal_handler 129 HUP' HUP; trap 'uninstall_signal_handler 130 INT' INT; trap 'uninstall_signal_handler 143 TERM' TERM; trap 'uninstall_exit_handler $?' EXIT
     (set -C; umask 077; printf 'generation=%s\n' "$UNINSTALL_GENERATION" > "$UNINSTALL_PENDING") || return 1
     mkdir -m 0700 -- "$UNINSTALL_SNAPSHOT_DIR" || return 1
-    UNINSTALL_SNAPSHOT_BUILDING=true; UNINSTALL_TRANSACTION_STATE=BUILDING
-    save_repository_traps
-    trap 'uninstall_signal_handler 129 HUP' HUP; trap 'uninstall_signal_handler 130 INT' INT; trap 'uninstall_signal_handler 143 TERM' TERM; trap 'uninstall_exit_handler $?' EXIT
     write_uninstall_journal BUILDING capture-start || return 1
     uninstall_transaction_hook before-snapshot-create || return 1
     mkdir -m 0700 -- "$UNINSTALL_SNAPSHOT_DIR/files" || return 1

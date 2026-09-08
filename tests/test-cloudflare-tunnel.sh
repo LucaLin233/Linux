@@ -873,6 +873,33 @@ for stage_case in owned foreign; do
     pass "stage cleanup verifies $stage_case identity"
 done
 
+for terminal_signal in HUP INT TERM; do
+    case "$terminal_signal" in HUP) expected=129 ;; INT) expected=130 ;; TERM) expected=143 ;; esac
+    (
+        new_case
+        trap - EXIT
+        configure_repository || fail "terminal signal configure"
+        rc=0
+        (
+            trap - EXIT
+            acquire_repository_lock || exit 1
+            uninstall_transaction_hook() {
+                if [[ "$1" == after-evidence-seal ]]; then kill -s "$terminal_signal" "$BASHPID"; fi
+            }
+            begin_uninstall_transaction || exit 1
+            uninstall_cleanup terminal-signal
+        ) > "$CASE_DIR/signal.log" 2>&1 || rc=$?
+        [[ "$rc" == "$expected" ]] || fail "terminal signal status $rc"
+        [[ ! -d "$CLOUDFLARED_STATE_DIR.lock" ]] || fail "terminal signal lock retained"
+        compgen -G "$CLOUDFLARED_STATE_DIR/repository/pending-uninstall-*" >/dev/null || fail "terminal signal pending missing"
+        [[ -f "$SOURCE_FILE" ]] || fail "terminal signal source lost"
+    ) > "$TEST_DIR/terminal-$terminal_signal.log" 2>&1 || {
+        cat "$TEST_DIR/terminal-$terminal_signal.log"
+        fail "terminal signal $terminal_signal"
+    }
+    pass "terminal $terminal_signal=$expected retains evidence without repeated rollback"
+done
+
 entrypoint_output=$(bash -c "$(cat "$ROOT_DIR/tools/cloudflare_tunnel.sh")" cloudflare_tunnel.sh help)
 grep -Fq 'cloudflare_tunnel.sh install' <<< "$entrypoint_output" || fail "bash -c entrypoint broken"
 pass "bash -c entrypoint remains compatible"
