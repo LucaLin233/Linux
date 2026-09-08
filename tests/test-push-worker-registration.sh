@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# Safe runtime identity only: no environment dump, credentials, or xtrace.
+printf "DIAG: bash=%s kernel=%s\n" "$BASH_VERSION" "$(uname -r)"
+dpkg-query -W bash libc6 2>/dev/null || true
 
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 readonly ROOT_DIR
@@ -82,6 +85,19 @@ printf source-safe
 assert_eq source-safe "$source_result" "source keeps zero runtime side effects"
 # shellcheck source=../tools/push.sh
 source "$SCRIPT"
+(
+    # Inert direct-child job table: no SSH or production services.
+    sleep 10 & snapshot_child=$!
+    cleanup_snapshot_child() { kill -TERM "$snapshot_child" 2>/dev/null || true; wait "$snapshot_child" 2>/dev/null || true; }
+    trap cleanup_snapshot_child EXIT
+    job_is_active "$snapshot_child" || fail "snapshot misses active direct child"
+    if job_is_active 0; then fail "snapshot accepts absent PID"; fi
+    kill -TERM "$snapshot_child"
+    wait "$snapshot_child" 2>/dev/null || true
+    if job_is_active "$snapshot_child"; then fail "snapshot retains reaped child"; fi
+    trap - EXIT
+    pass "job snapshot preserves direct-child matching and reap semantics"
+)
 trap 'rm -rf "$TEST_DIR"' EXIT
 
 setup_fixture() {
@@ -1435,7 +1451,7 @@ run_state_publication_signal_case() (
     }
     trap cleanup_publication_fixture EXIT
     mode=active; [[ "$state" == cleanup_failed ]] && mode=cleanup
-    root="$TEST_DIR/state-publish-$state-$phase-$signal_name"; CURRENT_FIXTURE_ROOT=$root
+    root="$TEST_DIR/state-publish-$state-$phase-$signal_name${5:-}"; CURRENT_FIXTURE_ROOT=$root
     write_active_grace_fixture "$root"
     mkdir -m 0700 "$root/capture"
     marker="$root/capture/publish-marker"
@@ -1453,6 +1469,8 @@ run_state_publication_signal_case() (
     [[ "$worker_pid" =~ ^[1-9][0-9]*$ && "$worker_start" =~ ^[1-9][0-9]*$ && "$managed_sid" =~ ^[1-9][0-9]*$ ]] || fail "$state/$phase/$signal_name marker identity malformed"
     wait_test_process_identity_present "$worker_pid" "$worker_start" || { cat "$marker" >&2; fail "$state/$phase/$signal_name worker identity missing at hook"; }
     test_watchdog_process 30 "$root/watchdog-timeout" "$main_pid" & watchdog=$!; watchdog_start=$(wait_test_process_start "$watchdog")
+    printf "DIAG: publication state=%s phase=%s signal=%s main=%s/%s worker=%s/%s sid=%s\n" \
+        "$state" "$phase" "$signal_name" "$main_pid" "$main_start" "$worker_pid" "$worker_start" "$managed_sid"
     kill "-$signal_name" "$main_pid"; wait "$main_pid" || rc=$?
     kill -TERM "$watchdog" 2>/dev/null || true; wait "$watchdog" 2>/dev/null || true
     [[ ! -e "$root/watchdog-timeout" ]] || fail "$state/$phase/$signal_name watchdog fired"
@@ -1490,6 +1508,11 @@ for publication_state in $publication_states; do
 done
 
 (
+    # Three bounded extra probes; preserve original matrix and stop at first failure.
+    for diagnostic_round in 1 2 3; do
+        printf "DIAG: extra HUP probe=%s/3\n" "$diagnostic_round"
+        run_state_publication_signal_case cleanup_failed after-rename HUP 129 "-probe-$diagnostic_round"
+    done
     root="$TEST_DIR/normal-parallel"; setup_fixture "$root"
     : > "$root/capture/current"; : > "$root/capture/max"
     push_to_server() {
