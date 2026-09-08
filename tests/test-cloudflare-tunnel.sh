@@ -1015,6 +1015,38 @@ for creation_phase in before-create-marker before-create-manifest-stage before-c
     done
 done
 
+for bookkeeping_fault in marker stage rename; do
+    (
+        new_case
+        trap - EXIT
+        configure_repository || fail "bookkeeping configure"
+        printf payload > "$CASE_DIR/payload"; chmod 0600 "$CASE_DIR/payload"
+        acquire_repository_lock || fail "bookkeeping lock"
+        begin_uninstall_transaction || fail "bookkeeping capture"
+        uninstall_transaction_hook() {
+            if [[ "$bookkeeping_fault" == marker && "$1" == before-create-marker ]]; then
+                mkdir "$UNINSTALL_SNAPSHOT_DIR/created-auto_update_script"
+            fi
+            return 0
+        }
+        mktemp() {
+            if [[ "$bookkeeping_fault" == stage && "$1" == */manifest.stage.* ]]; then return 1; fi
+            command mktemp "$@"
+        }
+        repository_rename() {
+            if [[ "$bookkeeping_fault" == rename && "$1" == */manifest.stage.* ]]; then return 1; fi
+            command mv -fT -- "$1" "$2"
+        }
+        if uninstall_create_absent_target auto_update_script "$CASE_DIR/payload"; then fail "bookkeeping fault ignored"; fi
+        [[ ! -e "$AUTO_UPDATE_SCRIPT" ]] || fail "published before durable bookkeeping"
+        uninstall_cleanup bookkeeping-failure || :
+    ) > "$TEST_DIR/bookkeeping-$bookkeeping_fault.log" 2>&1 || {
+        cat "$TEST_DIR/bookkeeping-$bookkeeping_fault.log"
+        fail "bookkeeping $bookkeeping_fault"
+    }
+    pass "actual $bookkeeping_fault failure precedes ln publication"
+done
+
 entrypoint_output=$(bash -c "$(cat "$ROOT_DIR/tools/cloudflare_tunnel.sh")" cloudflare_tunnel.sh help)
 grep -Fq 'cloudflare_tunnel.sh install' <<< "$entrypoint_output" || fail "bash -c entrypoint broken"
 pass "bash -c entrypoint remains compatible"
