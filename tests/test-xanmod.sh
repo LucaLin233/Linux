@@ -94,7 +94,9 @@ trap 'rm -rf "$TEST_DIR"' EXIT
     assert_ok "old parser incorrectly accepts unterminated tail" legacy_accepts_tail
     assert_fail "fixed parser rejects same counterexample" xanmod_pending_allocation_proof_trusted
 
-    # Exercise the real cleanup dispatcher; the deletion primitive is a spy.
+    # Only candidate state without prior ownership is covered here.
+    # Residue/previously-owned resources use a separate existing cleanup contract.
+    # Exercise the real dispatcher; the deletion primitive is a spy.
     cleanup_calls=0
     xanmod_cleanup_created_allocation() { cleanup_calls=$((cleanup_calls + 1)); return 0; }
     for candidate_exists in yes no; do
@@ -102,11 +104,17 @@ trap 'rm -rf "$TEST_DIR"' EXIT
         XANMOD_ALLOCATION_KIND=file
         XANMOD_ALLOCATION_OWNER_TOKEN=fixture-token
         XANMOD_ALLOCATION_EXPECTED_MODE=600
-        XANMOD_ALLOCATION_STATE=pending
+        XANMOD_ALLOCATION_STATE=candidate
         XANMOD_ALLOCATION_PROOF_OWNED=false
         if [[ "$candidate_exists" == no ]]; then command rm -- "$XANMOD_ALLOCATION_CANDIDATE"; fi
-        assert_ok "untrusted cleanup safely clears pending state" cleanup_xanmod_pending_allocation
-        assert_eq 0 "$cleanup_calls" "malformed proof never authorizes deletion"
+        assert_ok "unowned candidate cleanup returns safely" cleanup_xanmod_pending_allocation
+        assert_eq "" "$XANMOD_ALLOCATION_CANDIDATE" "candidate path cleared"
+        assert_eq "" "$XANMOD_ALLOCATION_KIND" "allocation kind cleared"
+        assert_eq "" "$XANMOD_ALLOCATION_OWNER_TOKEN" "owner token cleared"
+        assert_eq "" "$XANMOD_ALLOCATION_EXPECTED_MODE" "expected mode cleared"
+        assert_eq "" "$XANMOD_ALLOCATION_STATE" "allocation state cleared"
+        assert_eq false "$XANMOD_ALLOCATION_PROOF_OWNED" "proof ownership remains false"
+        assert_eq 0 "$cleanup_calls" "malformed proof does not authorize deletion of unowned candidate"
         [[ -f "$proof" ]] || fail "untrusted proof was removed"
         if [[ "$candidate_exists" == yes ]]; then
             [[ -f "$proof_root/candidate" ]] || fail "untrusted candidate was removed"
