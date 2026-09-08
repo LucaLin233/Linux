@@ -1438,7 +1438,7 @@ run_state_publication_signal_case() (
     }
     trap cleanup_publication_fixture EXIT
     mode=active; [[ "$state" == cleanup_failed ]] && mode=cleanup
-    root="$TEST_DIR/state-publish-$state-$phase-$signal_name"; CURRENT_FIXTURE_ROOT=$root
+    root="$TEST_DIR/state-publish-$state-$phase-$signal_name${5:-}"; CURRENT_FIXTURE_ROOT=$root
     write_active_grace_fixture "$root"
     mkdir -m 0700 "$root/capture"
     marker="$root/capture/publish-marker"
@@ -1497,12 +1497,8 @@ done
 (
     # Three bounded extra probes; preserve original matrix and stop at first failure.
     for diagnostic_round in 1 2 3; do
-        TEST_DIR="$TEST_DIR/hup-probe-$diagnostic_round"
-        mkdir -m 0700 "$TEST_DIR"
-        cp "${TEST_DIR%/hup-probe-*}/state-publication-child.sh" "$TEST_DIR/state-publication-child.sh"
         printf "DIAG: extra HUP probe=%s/3\n" "$diagnostic_round"
-        run_state_publication_signal_case cleanup_failed after-rename HUP 129
-        TEST_DIR=${TEST_DIR%/hup-probe-*}
+        run_state_publication_signal_case cleanup_failed after-rename HUP 129 "-probe-$diagnostic_round"
     done
     root="$TEST_DIR/normal-parallel"; setup_fixture "$root"
     : > "$root/capture/current"; : > "$root/capture/max"
