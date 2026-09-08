@@ -18,7 +18,8 @@ if [[ -n "${TEST_BASE_SHA:-}" && -n "${TEST_HEAD_SHA:-}" ]]; then
                 tools/push.sh) selected[test-push.sh]=1; selected[test-push-worker-registration.sh]=1 ;;
                 tools/cloudflare_tunnel.sh) selected[test-cloudflare-tunnel.sh]=1 ;;
                 modules/ssh-security.sh) selected[test-ssh-security.sh]=1 ;;
-                linux_setup.sh|modules/zsh-setup.sh|p10k-config.zsh) selected[test-linux-setup.sh]=1 ;;
+                linux_setup.sh) selected[test-linux-setup.sh]=1; selected[test-setup-exec.sh]=1 ;;
+                modules/zsh-setup.sh|p10k-config.zsh) selected[test-linux-setup.sh]=1 ;;
                 tests/test-*.sh)
                     if [[ -f "$ROOT_DIR/$path" ]]; then selected["${path##*/}"]=1; else full=true; fi ;;
                 README.md|LICENSE) ;;

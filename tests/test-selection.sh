@@ -6,7 +6,7 @@ trap 'rm -rf "$TEMP_DIR"' EXIT
 mkdir -p "$TEMP_DIR/tests" "$TEMP_DIR/bin"
 cp "$ROOT_DIR/tests/run.sh" "$TEMP_DIR/tests/run.sh"
 # Only stub suites run here; never invoke production scripts or the real suite.
-for name in cloudflare-tunnel linux-setup motd push-worker-registration push ssh-security xanmod; do
+for name in cloudflare-tunnel linux-setup motd push-worker-registration push setup-exec ssh-security xanmod; do
     printf '#!/usr/bin/env bash\nset -euo pipefail\nprintf "%%s\\n" "%s" >> "$CAPTURE"\n' "test-$name.sh" > "$TEMP_DIR/tests/test-$name.sh"
 done
 cat > "$TEMP_DIR/bin/git" <<'STUB'
@@ -21,7 +21,7 @@ export PATH="$TEMP_DIR/bin:$PATH"
 export CAPTURE="$TEMP_DIR/capture" CHANGES="$TEMP_DIR/changes"
 export GITHUB_STEP_SUMMARY="$TEMP_DIR/summary"
 export TEST_BASE_SHA=base TEST_HEAD_SHA=head DIFF_FAIL=0
-all=$(printf 'test-%s.sh\n' cloudflare-tunnel linux-setup motd push-worker-registration push ssh-security xanmod)
+all=$(printf 'test-%s.sh\n' cloudflare-tunnel linux-setup motd push-worker-registration push setup-exec ssh-security xanmod)
 check() {
     local expected=$1 actual
     shift
@@ -36,7 +36,8 @@ check $'test-motd.sh\ntest-xanmod.sh' modules/system-customize.sh
 check $'test-push-worker-registration.sh\ntest-push.sh' tools/push.sh
 check test-cloudflare-tunnel.sh tools/cloudflare_tunnel.sh
 check test-ssh-security.sh modules/ssh-security.sh
-check test-linux-setup.sh modules/zsh-setup.sh p10k-config.zsh linux_setup.sh
+check test-linux-setup.sh modules/zsh-setup.sh p10k-config.zsh
+check $'test-linux-setup.sh\ntest-setup-exec.sh' linux_setup.sh
 check test-xanmod.sh tools/xanmod-install.sh
 check $'test-motd.sh\ntest-ssh-security.sh' tools/setup-motd.sh modules/ssh-security.sh
 check test-motd.sh tests/test-motd.sh
