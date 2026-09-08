@@ -1342,7 +1342,12 @@ uninstall_created_identity_valid() {
     path=$(uninstall_target_path "$id") || return 1
     marker="$UNINSTALL_SNAPSHOT_DIR/created-$id"
     validate_secure_file "$marker" 600 || return 1
-    [[ "$(sed -n '1p' "$marker")" == state=created && "$(sed -n '2p' "$marker")" == "target_id=$id" && "$(sed -n '3p' "$marker")" == "path=$path" ]] || return 1
+    local -a marker_rows=()
+    mapfile -t marker_rows < "$marker" || return 1
+    [[ "${#marker_rows[@]}" == 8 ]] || return 1
+    [[ "${marker_rows[0]}" == state=created && "${marker_rows[1]}" == "target_id=$id" && "${marker_rows[2]}" == "path=$path" ]] || return 1
+    [[ "${marker_rows[3]}" == uid=0 && "${marker_rows[4]}" == gid=0 ]] || return 1
+    [[ "${marker_rows[5]}" =~ ^dev=[0-9]+$ && "${marker_rows[6]}" =~ ^ino=[0-9]+$ && "${marker_rows[7]}" =~ ^sha256=[0-9a-f]{64}$ ]] || return 1
     [[ -f "$path" && ! -L "$path" ]] || return 1
     validate_secure_file "$path" "$(uninstall_target_mode "$id")" || return 1
     metadata=$(stat -Lc '%u %g %d %i' -- "$path") || return 1
@@ -1387,6 +1392,9 @@ restore_uninstall_target() {
     validate_secure_file "$payload" 600 || return 1
     [[ "$(sha256sum -- "$payload" | awk '{print $1}')" == "$sha" ]] || return 1
     validate_directory_chain "$(dirname -- "$path")" || return 1
+    if [[ -e "$path" || -L "$path" ]]; then
+        validate_secure_file "$path" "$mode" || return 1
+    fi
     stage=$(mktemp "$(dirname -- "$path")/.cloudflared-uninstall-restore.XXXXXX") || return 1
     uninstall_register_stage "$stage" || return 1
     if ! repository_install_file "$mode" "$payload" "$stage" ||

@@ -900,6 +900,40 @@ for terminal_signal in HUP INT TERM; do
     pass "terminal $terminal_signal=$expected retains evidence without repeated rollback"
 done
 
+for restore_id in auto_update_script auto_update_service auto_update_timer source current legacy_marker; do
+    (
+        new_case
+        trap - EXIT
+        configure_repository || fail "six target configure"
+        mkdir -p "$(dirname "$AUTO_UPDATE_SCRIPT")" "$(dirname "$AUTO_UPDATE_SERVICE")"
+        write_auto_update_files || fail "six target auto update"
+        printf managed > "$STATE_DIR/repository-managed"
+        chmod 0600 "$STATE_DIR/repository-managed"
+        acquire_repository_lock || fail "six target lock"
+        begin_uninstall_transaction || fail "six target capture"
+        snapshot=$UNINSTALL_SNAPSHOT_DIR
+        while IFS= read -r id; do rm -- "$(uninstall_target_path "$id")"; done < <(uninstall_snapshot_targets)
+        repository_install_file() {
+            [[ "$2" != "$snapshot/files/target-$restore_id" ]] || return 1
+            command install -o 0 -g 0 -m "$1" -- "$2" "$3"
+        }
+        if uninstall_cleanup six-target-failure; then fail "restore fault accepted"; fi
+        while IFS= read -r id; do
+            [[ -f "$snapshot/files/target-$id" ]] || fail "snapshot payload lost $id"
+            if [[ "$id" != "$restore_id" ]]; then
+                cmp "$(uninstall_target_path "$id")" "$snapshot/files/target-$id" || fail "restore skipped $id"
+                validate_secure_file "$(uninstall_target_path "$id")" "$(uninstall_target_mode "$id")" || fail "restore metadata $id"
+            fi
+        done < <(uninstall_snapshot_targets)
+        [[ -f "$UNINSTALL_PENDING" ]] || fail "restore pending lost"
+        uninstall_journal_valid "$snapshot/journal" ACTIVE || fail "failure overwrote original journal"
+    ) > "$TEST_DIR/restore-$restore_id.log" 2>&1 || {
+        cat "$TEST_DIR/restore-$restore_id.log"
+        fail "restore failure $restore_id"
+    }
+    pass "restore failure $restore_id continues remaining five targets and preserves original evidence"
+done
+
 entrypoint_output=$(bash -c "$(cat "$ROOT_DIR/tools/cloudflare_tunnel.sh")" cloudflare_tunnel.sh help)
 grep -Fq 'cloudflare_tunnel.sh install' <<< "$entrypoint_output" || fail "bash -c entrypoint broken"
 pass "bash -c entrypoint remains compatible"
