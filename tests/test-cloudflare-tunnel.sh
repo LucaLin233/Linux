@@ -1232,7 +1232,11 @@ for operation in install_cloudflared upgrade_cloudflared; do
         timer_enabled=true
         systemctl() {
             printf 'systemctl:%s\n' "$*" >> "$FAKE_LOG"
-            if [[ "$1" == is-enabled || "$1" == is-active ]]; then [[ "$timer_enabled" == true ]]; else return 0; fi
+            if [[ "$*" == *cloudflared-apt-update.timer* && ( "$1" == is-enabled || "$1" == is-active ) ]]; then
+                [[ "$timer_enabled" == true ]]
+            else
+                return 0
+            fi
         }
         write_auto_update_files || fail "timer fixture"
         auto_update_file_is_managed "$AUTO_UPDATE_SCRIPT" || fail "main script template rejected"

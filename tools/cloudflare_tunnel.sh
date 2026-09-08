@@ -442,6 +442,26 @@ backup_repository_generation() {
     REPOSITORY_SNAPSHOT_READY=true
 }
 
+repository_track_stage() {
+    local path="$1"
+    REPOSITORY_STAGE_IDS["$path"]=$(stat -c '%d:%i' -- "$path") || return 1
+}
+
+repository_cleanup_stages() {
+    local path failed=0
+    for path in "${!REPOSITORY_STAGE_IDS[@]}"; do
+        [[ -e "$path" || -L "$path" ]] || continue
+        if validate_directory_chain "$(dirname -- "$path")" &&
+           [[ -f "$path" && ! -L "$path" && "$(stat -c '%u:%g:%d:%i' -- "$path")" == "0:0:${REPOSITORY_STAGE_IDS[$path]}" ]]; then
+            rm -- "$path" || failed=1
+        else
+            error "仓库 stage 身份改变，保留: $path"
+            failed=1
+        fi
+    done
+    return "$failed"
+}
+
 repository_publish_file() {
     local stage="$1" target="$2" mode="$3"
     validate_secure_file "$stage" "$mode" || return 1
@@ -543,7 +563,7 @@ rollback_repository_transaction() {
     restore_repository_file "$REPOSITORY_OLD_STATE" "$REPOSITORY_TRANSACTION_DIR/old-current" "$REPOSITORY_STATE_DIR/current" 600 || rollback_failed=true
     validate_restored_repository_group || rollback_failed=true
     fi
-    rm -f -- "$REPOSITORY_KEY_STAGE" "$REPOSITORY_SOURCE_STAGE" 2>/dev/null || rollback_failed=true
+    repository_cleanup_stages || rollback_failed=true
     if [[ "$rollback_failed" == true && -d "$REPOSITORY_TRANSACTION_DIR" ]]; then
         (umask 077; printf 'rollback incomplete\n' > "$REPOSITORY_TRANSACTION_DIR/pending") || true
     fi
@@ -551,6 +571,9 @@ rollback_repository_transaction() {
     release_repository_lock || rollback_failed=true
     restore_repository_traps || rollback_failed=true
     if [[ "$rollback_failed" == true ]]; then
+        if [[ -d "$REPOSITORY_TRANSACTION_DIR" ]]; then
+            (umask 077; printf 'rollback incomplete\n' > "$REPOSITORY_TRANSACTION_DIR/pending") || true
+        fi
         error "Cloudflare 仓库事务回滚不完整；失败证据已尽量保留: $REPOSITORY_TRANSACTION_DIR"
         return 1
     fi
@@ -607,6 +630,8 @@ begin_repository_transaction() {
     REPOSITORY_SNAPSHOT_READY=false
     unset REPOSITORY_PUBLISHED_IDENTITIES REPOSITORY_PUBLISHED_HASHES
     declare -gA REPOSITORY_PUBLISHED_IDENTITIES=() REPOSITORY_PUBLISHED_HASHES=()
+    unset REPOSITORY_STAGE_IDS
+    declare -gA REPOSITORY_STAGE_IDS=()
     REPOSITORY_TRANSACTION_DIR=""
     REPOSITORY_KEY_STAGE=""
     REPOSITORY_SOURCE_STAGE=""
@@ -674,10 +699,12 @@ begin_repository_transaction() {
         repository_transaction_fail "创建 key stage 失败"
         return 1
     }
+    repository_track_stage "$REPOSITORY_KEY_STAGE" || { repository_transaction_fail "记录 key stage 失败"; return 1; }
     REPOSITORY_SOURCE_STAGE=$(mktemp "$source_parent/.cloudflared.list.stage.XXXXXX") || {
         repository_transaction_fail "创建 source stage 失败"
         return 1
     }
+    repository_track_stage "$REPOSITORY_SOURCE_STAGE" || { repository_transaction_fail "记录 source stage 失败"; return 1; }
     if ! repository_install_file 0644 "$downloaded" "$REPOSITORY_KEY_STAGE" ||
         ! validate_secure_file "$REPOSITORY_KEY_STAGE" 644 ||
         ! cmp -s -- "$downloaded" "$REPOSITORY_KEY_STAGE"; then
@@ -731,13 +758,13 @@ begin_repository_transaction() {
         repository_transaction_fail "创建 current stage 失败"
         return 1
     }
+    repository_track_stage "$marker_stage" || { repository_transaction_fail "记录 current stage 失败"; return 1; }
     if ! printf 'generation=%s\nkey_sha256=%s\nsource_sha256=%s\n' \
         "$REPOSITORY_GENERATION" "$key_hash" "$source_hash" > "$marker_stage" ||
         ! chmod 0600 "$marker_stage" ||
         ! validate_secure_file "$marker_stage" 600 ||
         ! repository_publish_file "$marker_stage" "$REPOSITORY_STATE_DIR/current" 600 ||
         ! validate_current_repository_manifest; then
-        rm -f -- "$marker_stage" 2>/dev/null || true
         repository_transaction_fail "提交 key/source 世代状态失败"
         return 1
     fi
@@ -966,9 +993,9 @@ migrate_legacy_binary() {
 }
 
 write_auto_update_files() {
-    install -d -m 0755 "$(dirname "$AUTO_UPDATE_SCRIPT")" "$(dirname "$AUTO_UPDATE_SERVICE")"
+    install -d -m 0755 "$(dirname "$AUTO_UPDATE_SCRIPT")" "$(dirname "$AUTO_UPDATE_SERVICE")" || return $?
 
-    cat > "$AUTO_UPDATE_SCRIPT" <<'UPDATER'
+    cat > "$AUTO_UPDATE_SCRIPT" <<'UPDATER' || return $?
 #!/usr/bin/env bash
 # Managed by tools/cloudflare_tunnel.sh
 set -euo pipefail
@@ -1007,9 +1034,9 @@ if [[ "$was_active" == true ]]; then
 fi
 /usr/bin/cloudflared version
 UPDATER
-    chmod 0755 "$AUTO_UPDATE_SCRIPT"
+    chmod 0755 "$AUTO_UPDATE_SCRIPT" || return $?
 
-    cat > "$AUTO_UPDATE_SERVICE" <<EOF
+    cat > "$AUTO_UPDATE_SERVICE" <<EOF || return $?
 # Managed by tools/cloudflare_tunnel.sh
 [Unit]
 Description=Check and install cloudflared APT updates
@@ -1021,7 +1048,7 @@ Type=oneshot
 ExecStart=$AUTO_UPDATE_SCRIPT
 EOF
 
-    cat > "$AUTO_UPDATE_TIMER" <<'EOF'
+    cat > "$AUTO_UPDATE_TIMER" <<'EOF' || return $?
 # Managed by tools/cloudflare_tunnel.sh
 [Unit]
 Description=Daily cloudflared APT update check
