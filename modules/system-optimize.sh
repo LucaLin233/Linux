@@ -458,6 +458,15 @@ get_zram_size() {
     ' /proc/swaps
 }
 
+get_zram_priority() {
+    awk '
+        $1 == "/dev/zram0" {
+            print $5
+            exit
+        }
+    ' /proc/swaps
+}
+
 is_zram_active() {
     systemctl is-active --quiet systemd-zram-setup@zram0.service &&
         [[ -b /dev/zram0 ]] &&
@@ -843,24 +852,19 @@ setup_zswap() {
 get_optimal_zram_config() {
     local mem_mb="$1"
     local zram_size
-    local swappiness
 
-    # 小内存优先避免 OOM；大内存则减少不必要的压缩和换页。
+    # 纯 zram 部署：各档位统一 swappiness=100，优先使用压缩内存而不是磁盘 swap。
     if (( mem_mb <= 512 )); then
         zram_size="ram * 2"
-        swappiness=60
     elif (( mem_mb <= 1024 )); then
         zram_size="ram * 1.5"
-        swappiness=60
     elif (( mem_mb <= 4096 )); then
         zram_size="ram"
-        swappiness=40
     else
-        zram_size="ram / 2"
-        swappiness=20
+        zram_size="min(ram / 2, 8192)"
     fi
 
-    echo "${zram_size},${swappiness}"
+    echo "${zram_size},100"
 }
 
 write_zram_config() {
@@ -872,6 +876,7 @@ write_zram_config() {
 [zram0]
 zram-size = ${zram_size}
 compression-algorithm = zstd
+swap-priority = 100
 EOF
     then
         log "写入 Zram 配置失败：$ZRAM_CONFIG" "error"
@@ -1241,8 +1246,13 @@ setup_zram() {
     fi
 
     config=$(get_optimal_zram_config "$mem_mb")
+    # 表达式自身含逗号（min(ram / 2, 8192)），必须从最后一个逗号切分。
     zram_size="${config%,*}"
-    swappiness="${config#*,}"
+    swappiness="${config##*,}"
+    if [[ ! "$swappiness" =~ ^[0-9]+$ ]]; then
+        log "无法解析 Zram swappiness：$config" "error"
+        return 1
+    fi
 
     echo "检测到内存: ${mem_mb}MB"
     echo "目标 Zram: ${zram_size}，swappiness=${swappiness}"
@@ -1451,6 +1461,19 @@ EOF
     fi
 }
 
+thp_mode_supported() {
+    local path="$1"
+    local mode="$2"
+
+    awk -v mode="$mode" '{
+        for (i = 1; i <= NF; i++) {
+            token = $i
+            gsub(/[\[\]]/, "", token)
+            if (token == mode) { found = 1 }
+        }
+    } END { exit !found }' "$path"
+}
+
 get_active_thp_mode() {
     local path="$1"
     awk '{
@@ -1488,8 +1511,13 @@ setup_thp_policy() {
         case "$defrag_mode" in always|defer|defer+madvise|madvise|never) ;; *) return 1 ;; esac
         defrag_target="$defrag_mode"
         case "$defrag_mode" in
-            always|defer) defrag_target="defer+madvise" ;;
+            always) defrag_target="defer+madvise" ;;
         esac
+        if [[ "$defrag_target" != "$defrag_mode" ]] &&
+            ! thp_mode_supported "$defrag_path" "$defrag_target"; then
+            log "内核不支持 THP defrag 模式 $defrag_target，跳过写入" "warn"
+            return 1
+        fi
     fi
 
     if ! printf '%s\n' "$enabled_mode" > "$STATE_DIR/thp-enabled.previous-runtime"; then

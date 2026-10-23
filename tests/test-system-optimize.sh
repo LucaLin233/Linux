@@ -520,7 +520,7 @@ unset status
 MEM_MB=$(awk '/^MemTotal:/ {print int($2 / 1024)}' /proc/meminfo)
 TARGET_CONFIG=$(get_optimal_zram_config "$MEM_MB")
 TARGET_SIZE="${TARGET_CONFIG%,*}"
-TARGET_SWAPPINESS="${TARGET_CONFIG#*,}"
+TARGET_SWAPPINESS="${TARGET_CONFIG##*,}"
 
 # 这些函数在模块里已有定义，必须在 source 之后覆盖才能生效。
 install_zram_generator() {
@@ -834,5 +834,167 @@ if (( EUID == 0 )); then
 else
     printf 'SKIP: main aggregation needs root (EUID=%s)\n' "$EUID"
 fi
+
+
+# ---------------------------------------------------------------- PR 2: zram sizing table
+
+assert_eq "ram * 2,100" "$(get_optimal_zram_config 512)" "512 MiB keeps 2x sizing"
+assert_eq "ram * 1.5,100" "$(get_optimal_zram_config 513)" "513 MiB moves to 1.5x sizing"
+assert_eq "ram * 1.5,100" "$(get_optimal_zram_config 1024)" "1024 MiB stays at 1.5x sizing"
+assert_eq "ram,100" "$(get_optimal_zram_config 1025)" "1025 MiB moves to 1x sizing"
+assert_eq "ram,100" "$(get_optimal_zram_config 4096)" "4096 MiB stays at 1x sizing"
+assert_eq "min(ram / 2, 8192),100" "$(get_optimal_zram_config 4097)" "4097 MiB caps at half of RAM"
+assert_eq "min(ram / 2, 8192),100" "$(get_optimal_zram_config 16384)" "16384 MiB caps at half of RAM"
+assert_eq "min(ram / 2, 8192),100" "$(get_optimal_zram_config 32768)" "32768 MiB keeps the 8 GiB ceiling"
+
+comma_config=$(get_optimal_zram_config 8192)
+assert_eq "min(ram / 2, 8192)" "${comma_config%,*}" "size expression is cut at the last comma"
+assert_eq "100" "${comma_config##*,}" "swappiness is cut after the last comma"
+
+# ---------------------------------------------------------------- PR 2: rendered policy
+
+reset_sandbox
+assert_ok "write zram config with swap policy" write_zram_config "ram" 100
+assert_eq "100" "$(get_zram_config_value swap-priority)" "generator config renders swap-priority=100"
+assert_eq "zstd" "$(get_zram_config_value compression-algorithm)" "generator config keeps zstd"
+assert_eq "100" "$(get_zram_sysctl_value vm.swappiness)" "sysctl renders swappiness=100"
+assert_eq "0" "$(get_zram_sysctl_value vm.page-cluster)" "sysctl keeps page-cluster=0"
+assert_not_contains "$(cat "$SYSCTL_CONFIG")" "zswap" "sysctl still has no zswap knob"
+assert_not_contains "$(cat "$ZRAM_CONFIG")" "mem_limit" "generator config adds no mem_limit"
+assert_not_contains "$(cat "$ZRAM_CONFIG")" "writeback" "generator config adds no writeback"
+
+# ---------------------------------------------------------------- PR 2: priority matching
+
+saved_optimal_fn=$(declare -f get_optimal_zram_config)
+get_optimal_zram_config() { printf 'min(ram / 2, 8192),100\n'; }
+
+reset_sandbox
+seed_device "min(ram / 2, 8192)"
+seed_sysctl 100
+seed_runtime_zram "min(ram / 2, 8192)"
+write_zswap_config
+printf 'N\n' > "$ZSWAP_ENABLED"
+ZRAM_ACTIVE=true
+ZRAM_USED=0
+ZRAM_PRIORITY=100
+assert_ok "comma expression is parsed and the size text is preserved" setup_zram >/dev/null 2>&1
+assert_eq "min(ram / 2, 8192)" "$(get_zram_config_value zram-size)" "size expression keeps its comma"
+assert_eq "100" "$(get_zram_sysctl_value vm.swappiness)" "parsed swappiness is 100"
+assert_no_call "systemctl stop" "missing priority text with running 100 does not rebuild"
+
+reset_sandbox
+seed_device "min(ram / 2, 8192)"
+seed_sysctl 100
+seed_runtime_zram "min(ram / 2, 8192)"
+write_zswap_config
+printf 'N\n' > "$ZSWAP_ENABLED"
+ZRAM_ACTIVE=true
+ZRAM_USED=0
+ZRAM_PRIORITY=50
+assert_ok "priority drift rebuilds the device" setup_zram >/dev/null 2>&1
+assert_call "systemctl stop" "running priority other than 100 triggers a rebuild"
+assert_eq "100" "$(get_zram_config_value swap-priority)" "rebuild writes priority 100"
+
+reset_sandbox
+seed_device "min(ram / 2, 8192)"
+seed_sysctl 100
+seed_runtime_zram "min(ram / 2, 8192)"
+write_zswap_config
+printf 'N\n' > "$ZSWAP_ENABLED"
+ZRAM_ACTIVE=true
+ZRAM_USED=2048
+ZRAM_PRIORITY=50
+assert_ok "priority drift with used pages is deferred" setup_zram >/dev/null 2>&1
+assert_no_call "systemctl stop" "used pages still block the priority rebuild"
+[[ -f "$STATE_DIR/zram-reconfigure.pending" ]] || fail "deferred priority rebuild must leave a pending marker"
+pass "deferred priority rebuild leaves a pending marker"
+
+eval "$saved_optimal_fn"
+
+# ---------------------------------------------------------------- PR 2: THP defrag
+
+# get_active_thp_mode 是既有实现：busybox awk 不会把 gsub 结果写回 $i，
+# 因此本环境用桩提供 modes，只测本 PR 的转换与写入门槛；CI 的 gawk/mawk 走真实实现。
+THP_DIR="$SYSFS_ROOT/kernel/mm/transparent_hugepage"
+probe_file="$TEMP_DIR/thp-probe"
+printf 'always [madvise] never\n' > "$probe_file"
+if [[ "$(get_active_thp_mode "$probe_file")" == "madvise" ]]; then
+    printf 'PASS: get_active_thp_mode strips mode brackets in this environment\n'
+else
+    printf 'SKIP: awk here does not strip THP mode brackets; THP policy is unit-tested with a stubbed getter\n'
+fi
+
+THP_ENABLED_MODE=""
+THP_DEFRAG_MODE=""
+get_active_thp_mode() {
+    case "$1" in
+        */defrag) printf '%s\n' "$THP_DEFRAG_MODE" ;;
+        *) printf '%s\n' "$THP_ENABLED_MODE" ;;
+    esac
+}
+
+reset_sandbox
+THP_ENABLED_MODE=always
+THP_DEFRAG_MODE=always
+printf 'always [madvise] never\n' > "$THP_DIR/enabled"
+printf 'always defer defer+madvise madvise never\n' > "$THP_DIR/defrag"
+assert_ok "THP always defrag is relaxed" setup_thp_policy
+assert_eq "madvise" "$(cat "$THP_DIR/enabled")" "THP enabled always becomes madvise"
+assert_eq "defer+madvise" "$(cat "$THP_DIR/defrag")" "THP defrag always becomes defer+madvise"
+assert_contains "$(cat "$THP_CONFIG")" "defer+madvise" "tmpfiles config records the defrag target"
+assert_eq "always" "$(cat "$STATE_DIR/thp-defrag.previous-runtime")" "pre-change defrag mode is snapshotted"
+
+reset_sandbox
+THP_ENABLED_MODE=madvise
+THP_DEFRAG_MODE=defer
+printf 'always [madvise] never\n' > "$THP_DIR/enabled"
+printf 'always defer defer+madvise madvise never\n' > "$THP_DIR/defrag"
+assert_ok "THP defer defrag is kept" setup_thp_policy
+assert_eq "defer" "$(cat "$THP_DIR/defrag")" "defer defrag is left untouched"
+
+reset_sandbox
+THP_ENABLED_MODE=never
+THP_DEFRAG_MODE=madvise
+printf 'always madvise [never]\n' > "$THP_DIR/enabled"
+printf 'always defer defer+madvise madvise never\n' > "$THP_DIR/defrag"
+assert_ok "THP madvise/never modes are kept" setup_thp_policy
+assert_eq "never" "$(cat "$THP_DIR/enabled")" "never enabled mode is untouched"
+assert_eq "madvise" "$(cat "$THP_DIR/defrag")" "madvise defrag is untouched"
+
+reset_sandbox
+THP_ENABLED_MODE=madvise
+THP_DEFRAG_MODE=always
+printf 'always [madvise] never\n' > "$THP_DIR/enabled"
+printf 'always defer madvise never\n' > "$THP_DIR/defrag"
+assert_fail "unsupported defrag target degrades instead of forcing" setup_thp_policy
+assert_eq "always defer madvise never" "$(cat "$THP_DIR/defrag")" "unsupported defrag mode is not written"
+assert_eq "always [madvise] never" "$(cat "$THP_DIR/enabled")" "unsupported defrag aborts before touching enabled"
+
+reset_sandbox
+THP_ENABLED_MODE=madvise
+THP_DEFRAG_MODE=""
+printf 'always [madvise] never\n' > "$THP_DIR/enabled"
+rm -f "$THP_DIR/defrag"
+assert_ok "missing defrag node is skipped" setup_thp_policy
+assert_eq "madvise" "$(cat "$THP_DIR/enabled")" "missing defrag still applies the enabled policy"
+
+# ---------------------------------------------------------------- PR 2: rollback
+
+reset_sandbox
+write_zram_config "min(ram / 2, 8192)" 100
+printf '# old zram config\n[zram0]\nzram-size = ram\ncompression-algorithm = lz4\n' > "$ZRAM_CONFIG.previous-backup"
+printf 'vm.swappiness=60\nvm.page-cluster=3\n' > "$STATE_DIR/zram.previous-runtime"
+for target in "$SYSCTL_CONFIG" "$SYSTEM_TUNING_CONFIG" "$JOURNALD_DROPIN" "$THP_CONFIG" \
+    "$ZSWAP_SERVICE_CONFIG" "$ZRAM_SWAP_DROPIN" "$SWAP_TARGET_DROPIN"; do
+    install -D -m 0600 /dev/null "$target.previous-absent"
+done
+printf 'N\n' > "$ZSWAP_ENABLED"
+printf 'N\n' > "$STATE_DIR/zswap-enabled.previous-runtime"
+reset_calls
+assert_ok "rollback restores the previous zram policy" restore_system_configs previous
+assert_contains "$(cat "$ZRAM_CONFIG")" "compression-algorithm = lz4" "previous generator config is restored"
+assert_call "sysctl -w vm.swappiness=60" "rollback restores vm.swappiness"
+assert_call "sysctl -w vm.page-cluster=3" "rollback restores vm.page-cluster"
+assert_no_call "swapoff" "rollback never forces swapoff"
 
 printf 'All system-optimize tests passed.\n'
