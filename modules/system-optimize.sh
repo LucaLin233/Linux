@@ -68,6 +68,49 @@ require_test_derived_path() {
         module_path_error "$name 逃逸测试根：$value"
 }
 
+# 文件叶节点不得是符号链接（含悬空链接），也不得是目录。
+require_test_leaf_path() {
+    local name="$1"
+    local value="$2"
+    local root="$3"
+
+    require_test_path "$name" "$value" "$root"
+    [[ ! -L "$value" ]] || module_path_error "$name 不能是符号链接：$value"
+    [[ ! -d "$value" ]] || module_path_error "$name 不能是目录：$value"
+}
+
+# 目录目标的自身物理路径必须落在测试根内，悬空链接直接拒绝。
+require_test_directory_path() {
+    local name="$1"
+    local value="$2"
+    local root="$3"
+    local real
+
+    require_test_path "$name" "$value" "$root"
+    if [[ -L "$value" && ! -d "$value" ]]; then
+        module_path_error "$name 是悬空链接：$value"
+    fi
+    if [[ -e "$value" ]]; then
+        [[ -d "$value" ]] || module_path_error "$name 必须是目录：$value"
+        real=$(cd -P "$value" 2>/dev/null && pwd -P) ||
+            module_path_error "$name 不可解析：$value"
+        case "$real" in
+            "$root" | "$root"/*) ;;
+            *) module_path_error "$name 自身的物理路径逃逸测试根：$value" ;;
+        esac
+    fi
+}
+
+require_test_derived_leaf() {
+    local name="$1"
+    local value="$2"
+    local root="$3"
+
+    require_test_derived_path "$name" "$value" "$root"
+    [[ ! -L "$value" ]] || module_path_error "$name 不能是符号链接：$value"
+    [[ ! -d "$value" ]] || module_path_error "$name 不能是目录：$value"
+}
+
 init_module_paths() {
     local test_root="${LINUX_SETUP_TEST_ROOT:-}"
     local real_root=""
@@ -90,10 +133,10 @@ init_module_paths() {
         real_root=$(cd -P "$test_root" && pwd -P) ||
             module_path_error "LINUX_SETUP_TEST_ROOT 不可解析：$test_root"
         case "$real_root" in
-            / | /etc | /usr | /var | /sys | /proc | /dev | /boot | /bin | /sbin | /lib | /lib64 | /root | /home)
+            / | /etc | /usr | /var | /run | /sys | /proc | /dev | /boot | /bin | /sbin | /lib | /lib64 | /root | /home)
                 module_path_error "LINUX_SETUP_TEST_ROOT 不能是系统目录：$real_root"
                 ;;
-            /etc/* | /usr/* | /var/* | /sys/* | /proc/* | /dev/* | /boot/* | /bin/* | /sbin/* | /lib/* | /lib64/* | /root/* | /home/*)
+            /etc/* | /usr/* | /var/* | /run/* | /sys/* | /proc/* | /dev/* | /boot/* | /bin/* | /sbin/* | /lib/* | /lib64/* | /root/* | /home/*)
                 module_path_error "LINUX_SETUP_TEST_ROOT 不能位于系统目录下：$real_root"
                 ;;
         esac
@@ -104,11 +147,11 @@ init_module_paths() {
         STATE_DIR="${LINUX_SETUP_STATE_DIR:-}"
         SYSFS_ROOT="${LINUX_SETUP_SYSFS_ROOT:-}"
 
-        require_test_path LINUX_SETUP_ZRAM_CONFIG "$ZRAM_CONFIG" "$real_root"
-        require_test_path LINUX_SETUP_SYSCTL_CONFIG "$SYSCTL_CONFIG" "$real_root"
-        require_test_path LINUX_SETUP_THP_CONFIG "$THP_CONFIG" "$real_root"
-        require_test_path LINUX_SETUP_STATE_DIR "$STATE_DIR" "$real_root"
-        require_test_path LINUX_SETUP_SYSFS_ROOT "$SYSFS_ROOT" "$real_root"
+        require_test_leaf_path LINUX_SETUP_ZRAM_CONFIG "$ZRAM_CONFIG" "$real_root"
+        require_test_leaf_path LINUX_SETUP_SYSCTL_CONFIG "$SYSCTL_CONFIG" "$real_root"
+        require_test_leaf_path LINUX_SETUP_THP_CONFIG "$THP_CONFIG" "$real_root"
+        require_test_directory_path LINUX_SETUP_STATE_DIR "$STATE_DIR" "$real_root"
+        require_test_directory_path LINUX_SETUP_SYSFS_ROOT "$SYSFS_ROOT" "$real_root"
         SYSTEM_TUNING_CONFIG="$(dirname "$ZRAM_CONFIG")/sysctl.d/99-system-optimize.conf"
         JOURNALD_DROPIN="$(dirname "$ZRAM_CONFIG")/journald.conf.d/90-linux-setup.conf"
     fi
@@ -118,9 +161,11 @@ init_module_paths() {
     SWAP_TARGET_DROPIN="$(dirname "$ZRAM_CONFIG")/system/swap.target.d/90-linux-setup-zswap.conf"
 
     if [[ "${LINUX_SETUP_TEST_MODE:-}" == "1" ]]; then
-        require_test_derived_path ZSWAP_SERVICE_CONFIG "$ZSWAP_SERVICE_CONFIG" "$real_root"
-        require_test_derived_path ZRAM_SWAP_DROPIN "$ZRAM_SWAP_DROPIN" "$real_root"
-        require_test_derived_path SWAP_TARGET_DROPIN "$SWAP_TARGET_DROPIN" "$real_root"
+        require_test_derived_leaf SYSTEM_TUNING_CONFIG "$SYSTEM_TUNING_CONFIG" "$real_root"
+        require_test_derived_leaf JOURNALD_DROPIN "$JOURNALD_DROPIN" "$real_root"
+        require_test_derived_leaf ZSWAP_SERVICE_CONFIG "$ZSWAP_SERVICE_CONFIG" "$real_root"
+        require_test_derived_leaf ZRAM_SWAP_DROPIN "$ZRAM_SWAP_DROPIN" "$real_root"
+        require_test_derived_leaf SWAP_TARGET_DROPIN "$SWAP_TARGET_DROPIN" "$real_root"
     fi
 
     readonly ZRAM_CONFIG SYSCTL_CONFIG SYSTEM_TUNING_CONFIG JOURNALD_DROPIN THP_CONFIG \
@@ -178,16 +223,38 @@ restore_managed_file() {
     local backup="${target}.${scope}-backup"
     local absent="${target}.${scope}-absent"
     local unknown="${target}.${scope}-unknown"
+    local target_dir
+    local temp_path
 
     if [[ -e "$backup" || -L "$backup" ]]; then
-        install -d -m 0755 "$(dirname "$target")"
-        rm -f "$target"
-        cp -a "$backup" "$target"
+        target_dir=$(dirname "$target")
+        if ! install -d -m 0755 "$target_dir"; then
+            log "无法创建配置目录：$target_dir" "error"
+            return 1
+        fi
+        # 先复制到目标目录内的临时文件，成功后再原子替换，避免先删后复制。
+        temp_path=$(mktemp "$target_dir/.restore.XXXXXX") || {
+            log "无法在 $target_dir 创建临时文件" "error"
+            return 1
+        }
+        if ! cp -a "$backup" "$temp_path"; then
+            log "复制备份失败：$backup" "error"
+            rm -f "$temp_path" || true
+            return 1
+        fi
+        if ! mv -f "$temp_path" "$target"; then
+            log "替换配置失败：$target" "error"
+            rm -f "$temp_path" || true
+            return 1
+        fi
         return 0
     fi
 
     if [[ -e "$absent" ]]; then
-        rm -f "$target"
+        if ! rm -f "$target"; then
+            log "删除配置失败：$target" "error"
+            return 1
+        fi
         return 0
     fi
 
@@ -238,30 +305,82 @@ capture_sysctl_values() {
     local config_file="$1"
     local output_file="$2"
     local key
+    local value
+    local temp_file
 
-    : > "$output_file"
-    [[ -f "$config_file" ]] || return 0
+    [[ -n "$output_file" ]] || return 1
+    temp_file=$(mktemp) || return 1
 
-    while IFS='=' read -r key _; do
-        key="${key//[[:space:]]/}"
-        [[ -n "$key" && "$key" != \#* ]] || continue
-        if sysctl -n "$key" >/dev/null 2>&1; then
-            printf '%s=%s\n' "$key" "$(sysctl -n "$key")" >> "$output_file"
-        fi
-    done < "$config_file"
+    if [[ -f "$config_file" ]]; then
+        while IFS='=' read -r key _; do
+            key="${key//[[:space:]]/}"
+            [[ -n "$key" && "$key" != \#* ]] || continue
+            # 每个键只读一次；读不到或为空都不写入快照。
+            value=$(sysctl -n "$key" 2>/dev/null) || continue
+            [[ -n "$value" ]] || continue
+            if ! printf '%s=%s\n' "$key" "$value" >> "$temp_file"; then
+                log "写入 sysctl 快照失败：$output_file" "error"
+                rm -f "$temp_file" || true
+                return 1
+            fi
+        done < "$config_file"
+    fi
+
+    # 完整快照先写临时文件，成功后才替换正式快照。
+    if ! mv -f "$temp_file" "$output_file"; then
+        log "替换 sysctl 快照失败：$output_file" "error"
+        rm -f "$temp_file" || true
+        return 1
+    fi
 }
 
+# 0=全部恢复，1=有失败，2=没有可信快照。
 restore_sysctl_values() {
     local values_file="$1"
     local key
     local value
+    local failed=false
 
-    [[ -f "$values_file" ]] || return 0
+    [[ -f "$values_file" ]] || return 2
     while IFS='=' read -r key value; do
         [[ -n "$key" ]] || continue
-        sysctl -w "$key=$value" >/dev/null 2>&1 ||
+        if ! sysctl -w "$key=$value" >/dev/null 2>&1; then
             log "运行值恢复失败：$key" "warn"
+            failed=true
+        fi
     done < "$values_file"
+
+    [[ "$failed" == "false" ]]
+}
+
+# zram 运行快照必须同时含两个有效值，缺失/空/损坏都不算完整。
+zram_sysctl_snapshot_complete() {
+    local values_file="$1"
+    local key
+    local value
+    local has_swappiness=false
+    local has_page_cluster=false
+
+    [[ -f "$values_file" ]] || return 1
+    while IFS='=' read -r key value; do
+        key="${key//[[:space:]]/}"
+        value="${value//[[:space:]]/}"
+        [[ -n "$key" && -n "$value" ]] || continue
+        case "$key" in
+            vm.swappiness)
+                if [[ "$value" =~ ^[0-9]+$ ]]; then
+                    has_swappiness=true
+                fi
+                ;;
+            vm.page-cluster)
+                if [[ "$value" =~ ^[0-9]+$ ]]; then
+                    has_page_cluster=true
+                fi
+                ;;
+        esac
+    done < "$values_file"
+
+    [[ "$has_swappiness" == "true" && "$has_page_cluster" == "true" ]]
 }
 
 # === APT 锁处理 ===
@@ -345,6 +464,47 @@ is_zram_active() {
         awk '$1 == "/dev/zram0" {found=1} END {exit !found}' /proc/swaps
 }
 
+# /proc/swaps 第五列是运行中的 swap 优先级。
+get_zram_priority() {
+    awk '
+        $1 == "/dev/zram0" {
+            print $5
+            exit
+        }
+    ' /proc/swaps
+}
+
+# 运行容量只从 /sys/block/zram0/disksize 读取，单位字节。
+get_zram_runtime_bytes() {
+    local path="$SYSFS_ROOT/block/zram0/disksize"
+    local value
+
+    [[ -r "$path" ]] || return 1
+    value=$(cat "$path" 2>/dev/null) || return 1
+    [[ "$value" =~ ^[0-9]+$ ]] || return 1
+    (( value > 0 )) || return 1
+    printf '%s\n' "$value"
+}
+
+# 活动压缩算法取 comp_algorithm 中被方括号标记的项。
+get_zram_active_algorithm() {
+    local path="$SYSFS_ROOT/block/zram0/comp_algorithm"
+
+    [[ -r "$path" ]] || return 1
+    awk '
+        {
+            for (i = 1; i <= NF; i++) {
+                if ($i ~ /^\[.*\]$/) {
+                    mode = $i
+                    gsub(/[\[\]]/, "", mode)
+                    print mode
+                    exit
+                }
+            }
+        }
+    ' "$path"
+}
+
 # === Zswap 控制 ===
 zswap_parameter_path() {
     printf '%s/module/zswap/parameters/%s\n' "$SYSFS_ROOT" "$1"
@@ -402,7 +562,6 @@ show_zswap_status() {
 }
 
 show_zram_compression_status() {
-    local algorithm_path="$SYSFS_ROOT/block/zram0/comp_algorithm"
     local mm_stat_path="$SYSFS_ROOT/block/zram0/mm_stat"
     local algorithm
     local orig_data_size
@@ -410,8 +569,7 @@ show_zram_compression_status() {
     local mem_used_total
     local ratio
 
-    algorithm=$(awk '{for (i = 1; i <= NF; i++) if ($i ~ /^\[.*\]$/) {gsub(/[\[\]]/, "", $i); print $i; exit}}' \
-        "$algorithm_path" 2>/dev/null || true)
+    algorithm=$(get_zram_active_algorithm || true)
     echo "Zram 活动压缩算法: ${algorithm:-unknown}"
 
     if [[ ! -r "$mm_stat_path" ]]; then
@@ -804,19 +962,65 @@ zram_config_matches() {
     return 0
 }
 
-# 只回答“设备是否需要重新激活”；sysctl、service、drop-in 的漂移都不算。
+# 尺寸表达式以 MiB 求值：ram 表示 MemTotal 的 MiB 数，只接受安全字符集。
+zram_size_expression_mib() {
+    local expression="$1"
+    local mem_mb="$2"
+    local program
+
+    case "$expression" in
+        "" | *[!0-9ramin\ \(\)*/.,+-]*) return 1 ;;
+    esac
+    program="${expression//min(/minimum(}"
+
+    awk -v ram="$mem_mb" "
+        function minimum(a, b) { return a < b ? a : b }
+        BEGIN { printf \"%.3f\n\", ($program) }
+    " 2>/dev/null
+}
+
+# 目标容量换算成字节，供运行态比较。
+zram_target_bytes() {
+    local expression="$1"
+    local mem_mb
+    local mib
+
+    mem_mb=$(awk '/^MemTotal:/ {print int($2 / 1024); exit}' /proc/meminfo) || return 1
+    if [[ ! "$mem_mb" =~ ^[0-9]+$ ]] || (( mem_mb <= 0 )); then
+        return 1
+    fi
+    mib=$(zram_size_expression_mib "$expression" "$mem_mb") || return 1
+    [[ -n "$mib" ]] || return 1
+    awk -v mib="$mib" 'BEGIN { printf "%.0f\n", mib * 1024 * 1024 }'
+}
+
+# 只回答“设备是否需要重新激活”；判据全部来自运行态（disksize/算法/priority），不看配置文件文本。
 zram_device_config_matches() {
     local target_size="$1"
-    local current_size
+    local expected_bytes
+    local actual_bytes
+    local diff
     local current_algorithm
+    local running_priority
 
     is_zram_active || return 1
 
-    current_size=$(get_zram_config_value "zram-size" || true)
-    current_algorithm=$(get_zram_config_value "compression-algorithm" || true)
+    expected_bytes=$(zram_target_bytes "$target_size") || return 1
+    actual_bytes=$(get_zram_runtime_bytes) || return 1
 
-    [[ "$current_size" == "$target_size" ]] || return 1
+    # 生成器以 MiB 求值，允许 1 MiB 的取整差。
+    if (( actual_bytes > expected_bytes )); then
+        diff=$(( actual_bytes - expected_bytes ))
+    else
+        diff=$(( expected_bytes - actual_bytes ))
+    fi
+    (( diff <= 1048576 )) || return 1
+
+    current_algorithm=$(get_zram_active_algorithm) || return 1
     [[ "$current_algorithm" == "zstd" ]] || return 1
+
+    running_priority=$(get_zram_priority) || return 1
+    [[ "$running_priority" == "100" ]] || return 1
 
     return 0
 }
@@ -976,7 +1180,10 @@ install_zram_generator() {
 }
 
 start_zram() {
-    systemctl daemon-reload
+    if ! systemctl daemon-reload; then
+        log "systemctl daemon-reload 失败，不启动 Zram 服务" "error"
+        return 1
+    fi
 
     if ! systemctl start systemd-zram-setup@zram0.service; then
         log "systemd-zram-setup@zram0 服务启动失败" "error"
@@ -987,6 +1194,26 @@ start_zram() {
 
     if ! is_zram_active; then
         log "Zram 服务未正常激活" "error"
+        return 1
+    fi
+}
+
+write_pending_marker() {
+    local content="$1"
+    local pending_file="$2"
+
+    if ! printf '%s\n' "$content" > "$pending_file"; then
+        log "无法记录待重建状态：$pending_file" "error"
+        return 1
+    fi
+}
+
+clear_pending_marker() {
+    local pending_file="$1"
+
+    [[ -e "$pending_file" ]] || return 0
+    if ! rm -f "$pending_file"; then
+        log "无法清除待重建标记：$pending_file" "warn"
         return 1
     fi
 }
@@ -1020,7 +1247,8 @@ setup_zram() {
     echo "检测到内存: ${mem_mb}MB"
     echo "目标 Zram: ${zram_size}，swappiness=${swappiness}"
 
-    # 是否重建只取决于设备本身，必须在覆盖原配置之前判断并保存结果。
+    # 是否重建只取决于设备运行态（disksize/算法/priority），必须在覆盖原配置之前判断。
+    # 配置文件文本不能作判据：延迟重建后配置已等于目标，设备仍是旧容量。
     if zram_device_config_matches "$zram_size"; then
         device_matches=true
     fi
@@ -1049,9 +1277,11 @@ setup_zram() {
     rm -f "$keys_file"
 
     if ! write_zram_config "$zram_size" "$swappiness"; then
-        log "Zram 配置写入失败" "error"
-        degraded=true
-    elif ! apply_zram_sysctl; then
+        log "Zram 配置写入失败，本次不重建设备" "error"
+        show_swap_status
+        return 1
+    fi
+    if ! apply_zram_sysctl; then
         log "Zram sysctl 未能立即生效" "warn"
         degraded=true
     fi
@@ -1066,9 +1296,12 @@ setup_zram() {
         current_size=$(get_zram_size)
         if zram_config_matches "$zram_size" "$swappiness"; then
             echo "Zram: ${current_size:-已启用}（配置已生效）"
-            rm -f "$pending_file" || true
         else
             echo "Zram: ${current_size:-已启用}（设备无需重建，配置已写入）"
+        fi
+        # 运行态已确证匹配，此前的待重建标记才失效。
+        if ! clear_pending_marker "$pending_file"; then
+            degraded=true
         fi
         show_swap_status
         if [[ "$degraded" == "true" ]]; then
@@ -1088,8 +1321,8 @@ setup_zram() {
 
     if [[ "$active" == "true" && "$used_known" == "false" ]]; then
         log "无法确认 Zram 已用交换页，按不安全处理：本次不重建设备" "error"
-        if ! printf 'used-unknown\n' > "$pending_file"; then
-            log "无法记录待重建状态：$pending_file" "warn"
+        if ! write_pending_marker "used-unknown" "$pending_file"; then
+            degraded=true
         fi
         show_swap_status
         return 1
@@ -1098,8 +1331,8 @@ setup_zram() {
     # Zram 已有交换页时不强制 swapoff，避免低内存机器触发 OOM。
     if [[ "$active" == "true" ]] && (( used_bytes > 0 )); then
         log "当前 Zram 已使用 ${used_bytes} 字节 Swap；新配置将在下次重启后生效" "warn"
-        if ! printf 'used-bytes=%s\n' "$used_bytes" > "$pending_file"; then
-            log "无法记录待重建状态：$pending_file" "warn"
+        if ! write_pending_marker "used-bytes=${used_bytes}" "$pending_file"; then
+            degraded=true
         fi
         show_swap_status
         if [[ "$degraded" == "true" ]]; then
@@ -1123,7 +1356,18 @@ setup_zram() {
         return 1
     fi
 
-    rm -f "$pending_file" || true
+    # 重建后必须验证运行态真的落到目标值，否则保留待重建标记并报失败。
+    if ! zram_device_config_matches "$zram_size"; then
+        log "Zram 重建后运行容量/算法/priority 与目标不符" "error"
+        if ! write_pending_marker "runtime-mismatch" "$pending_file"; then
+            degraded=true
+        fi
+        show_swap_status
+        return 1
+    fi
+    if ! clear_pending_marker "$pending_file"; then
+        degraded=true
+    fi
     actual_size=$(get_zram_size)
     echo "Zram: ${actual_size:-已启用}（zstd，swappiness=${swappiness}）"
     show_swap_status
@@ -1209,7 +1453,16 @@ EOF
 
 get_active_thp_mode() {
     local path="$1"
-    awk '{for (i=1; i<=NF; i++) if ($i ~ /^\[.*\]$/) {gsub(/[\[\]]/, "", $i); print $i; exit}}' "$path"
+    awk '{
+        for (i = 1; i <= NF; i++) {
+            if ($i ~ /^\[.*\]$/) {
+                mode = $i
+                gsub(/[\[\]]/, "", mode)
+                print mode
+                exit
+            }
+        }
+    }' "$path"
 }
 
 setup_thp_policy() {
@@ -1219,6 +1472,7 @@ setup_thp_policy() {
     local defrag_mode
     local enabled_target
     local defrag_target
+    local temp_file
 
     [[ -e "$enabled_path" ]] || return 0
 
@@ -1238,23 +1492,51 @@ setup_thp_policy() {
         esac
     fi
 
-    printf '%s\n' "$enabled_mode" > "$STATE_DIR/thp-enabled.previous-runtime"
-    printf '%s\n' "$defrag_mode" > "$STATE_DIR/thp-defrag.previous-runtime"
-    chmod 600 "$STATE_DIR"/thp-*.previous-runtime
+    if ! printf '%s\n' "$enabled_mode" > "$STATE_DIR/thp-enabled.previous-runtime"; then
+        log "无法写入 THP enabled 运行快照" "error"
+        return 1
+    fi
+    if ! printf '%s\n' "$defrag_mode" > "$STATE_DIR/thp-defrag.previous-runtime"; then
+        log "无法写入 THP defrag 运行快照" "error"
+        return 1
+    fi
+    if ! chmod 600 "$STATE_DIR/thp-enabled.previous-runtime" \
+        "$STATE_DIR/thp-defrag.previous-runtime"; then
+        log "无法设置 THP 运行快照权限" "error"
+        return 1
+    fi
     if [[ ! -f "$STATE_DIR/thp-enabled.initial-runtime" ]]; then
-        cp -a "$STATE_DIR/thp-enabled.previous-runtime" "$STATE_DIR/thp-enabled.initial-runtime"
-        cp -a "$STATE_DIR/thp-defrag.previous-runtime" "$STATE_DIR/thp-defrag.initial-runtime"
+        if ! cp -a "$STATE_DIR/thp-enabled.previous-runtime" \
+            "$STATE_DIR/thp-enabled.initial-runtime" ||
+            ! cp -a "$STATE_DIR/thp-defrag.previous-runtime" \
+                "$STATE_DIR/thp-defrag.initial-runtime"; then
+            log "无法保存 THP 初始运行快照" "error"
+            return 1
+        fi
     fi
 
-    install -d -m 0755 "$(dirname "$THP_CONFIG")"
-    {
+    if ! install -d -m 0755 "$(dirname "$THP_CONFIG")"; then
+        log "无法创建 THP 配置目录：$(dirname "$THP_CONFIG")" "error"
+        return 1
+    fi
+    temp_file=$(mktemp) || return 1
+    if ! {
         echo "# 由 system-optimize.sh 自动生成。"
         printf 'w- %s - - - - %s\n' "$enabled_path" "$enabled_target"
         if [[ -n "$defrag_target" ]]; then
             printf 'w- %s - - - - %s\n' "$defrag_path" "$defrag_target"
         fi
-    } > "$THP_CONFIG"
-    chmod 644 "$THP_CONFIG"
+    } > "$temp_file"; then
+        log "无法生成 THP 持久配置" "error"
+        rm -f "$temp_file" || true
+        return 1
+    fi
+    if ! install -m 0644 "$temp_file" "$THP_CONFIG"; then
+        log "无法写入 THP 持久配置：$THP_CONFIG" "error"
+        rm -f "$temp_file" || true
+        return 1
+    fi
+    rm -f "$temp_file" || true
 
     if ! printf '%s\n' "$enabled_target" > "$enabled_path"; then
         restore_managed_file "$THP_CONFIG" previous || true
@@ -1278,6 +1560,8 @@ restore_system_configs() {
     local status
     local thp_value
     local stop_ok=true
+    local unit_state=""
+    local query_status=0
 
     case "$scope" in previous | initial) ;;
         *)
@@ -1287,7 +1571,14 @@ restore_system_configs() {
     esac
 
     # 先停纠偏 unit，避免它在文件恢复后仍按旧配置干预 zswap 运行值。
-    if systemctl cat linux-setup-disable-zswap.service >/dev/null 2>&1; then
+    # systemctl cat 失败不等于 unit 不存在，改用 LoadState 区分。
+    query_status=0
+    unit_state=$(systemctl show -p LoadState --value linux-setup-disable-zswap.service 2>/dev/null) || query_status=$?
+    if (( query_status != 0 )) || [[ -z "$unit_state" ]]; then
+        log "无法确认 linux-setup-disable-zswap.service 状态，跳过停止与 zswap 运行值恢复" "error"
+        failed=true
+        stop_ok=false
+    elif [[ "$unit_state" != "not-found" ]]; then
         if ! systemctl stop linux-setup-disable-zswap.service; then
             log "停止 linux-setup-disable-zswap.service 失败" "error"
             failed=true
@@ -1339,11 +1630,31 @@ restore_system_configs() {
     if [[ -f "$SYSCTL_CONFIG" ]]; then
         sysctl -p "$SYSCTL_CONFIG" >/dev/null || log "Zram sysctl 恢复后部分参数应用失败" "warn"
     fi
-    restore_sysctl_values "$STATE_DIR/zram.${runtime_scope}-runtime"
+    if ! zram_sysctl_snapshot_complete "$STATE_DIR/zram.${runtime_scope}-runtime"; then
+        log "Zram sysctl 运行快照缺失或不完整，未按完整恢复处理" "warn"
+        unknown=true
+    else
+        status=0
+        restore_sysctl_values "$STATE_DIR/zram.${runtime_scope}-runtime" || status=$?
+        case "$status" in
+            0) ;;
+            2) unknown=true ;;
+            *) failed=true ;;
+        esac
+    fi
     if [[ -f "$SYSTEM_TUNING_CONFIG" ]]; then
         sysctl -p "$SYSTEM_TUNING_CONFIG" >/dev/null || log "系统 sysctl 恢复后部分参数应用失败" "warn"
     fi
-    restore_sysctl_values "$STATE_DIR/system-tuning.${runtime_scope}-runtime"
+    status=0
+    restore_sysctl_values "$STATE_DIR/system-tuning.${runtime_scope}-runtime" || status=$?
+    case "$status" in
+        0) ;;
+        2)
+            log "缺少系统 sysctl 运行快照，跳过" "warn"
+            unknown=true
+            ;;
+        *) failed=true ;;
+    esac
 
     if [[ -e "$SYSFS_ROOT/kernel/mm/transparent_hugepage/enabled" &&
         -f "$STATE_DIR/thp-enabled.${runtime_scope}-runtime" ]]; then

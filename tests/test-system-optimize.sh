@@ -146,6 +146,8 @@ reset_sandbox() {
         "$SB_SYSFS_ROOT/block/zram0" \
         "$SB_SYSFS_ROOT/kernel/mm/transparent_hugepage"
     : > "$CALLS"
+    printf 'vm.swappiness=60\nvm.page-cluster=0\n' > "$SB_STATE_DIR/zram.previous-runtime"
+    printf 'kernel.panic=30\nfs.file-max=1048576\n' > "$SB_STATE_DIR/system-tuning.previous-runtime"
     SYSTEMCTL_FAIL=""
     SYSTEMCTL_HOOK=""
     SYSTEMCTL_CAT_STATUS=0
@@ -156,6 +158,11 @@ reset_sandbox() {
     ZRAM_USED=""
     ZRAM_SIZE_LABEL="4.0G"
     SWAPON_OUTPUT=""
+    ZRAM_PRIORITY=100
+    SYSTEMCTL_SHOW_STATUS=0
+    SYSTEMCTL_SHOW_VALUE="loaded"
+    ZRAM_START_REBUILD=true
+    ZRAM_START_PRIORITY=100
 }
 
 reset_sandbox
@@ -172,6 +179,11 @@ ZRAM_ACTIVE=false
 ZRAM_USED=""
 ZRAM_SIZE_LABEL="4.0G"
 SWAPON_OUTPUT=""
+ZRAM_PRIORITY=100
+SYSTEMCTL_SHOW_STATUS=0
+SYSTEMCTL_SHOW_VALUE="loaded"
+ZRAM_START_REBUILD=true
+ZRAM_START_PRIORITY=100
 
 systemctl() {
     local line="systemctl $*"
@@ -184,6 +196,17 @@ systemctl() {
     fi
     if [[ "${1:-}" == "cat" ]]; then
         return "$SYSTEMCTL_CAT_STATUS"
+    fi
+    if [[ "${1:-}" == "show" ]]; then
+        printf '%s\n' "$SYSTEMCTL_SHOW_VALUE"
+        return "$SYSTEMCTL_SHOW_STATUS"
+    fi
+    # start zram unit 时模拟设备按目标参数重建。
+    if [[ "${1:-}" == "start" && "$*" == *zram* ]]; then
+        if [[ "$ZRAM_START_REBUILD" == "true" ]]; then
+            seed_runtime_zram "${ZRAM_START_SIZE_EXPR:-$TARGET_SIZE}"
+        fi
+        ZRAM_PRIORITY="$ZRAM_START_PRIORITY"
     fi
     return 0
 }
@@ -517,6 +540,10 @@ get_zram_size() {
     printf '%s\n' "$ZRAM_SIZE_LABEL"
 }
 
+get_zram_priority() {
+    printf '%s\n' "$ZRAM_PRIORITY"
+}
+
 seed_device() {
     printf '# Zram 配置：由 system-optimize.sh 自动生成\n[zram0]\nzram-size = %s\ncompression-algorithm = zstd\n' \
         "$1" > "$ZRAM_CONFIG"
@@ -527,9 +554,20 @@ seed_sysctl() {
         "$1" > "$SYSCTL_CONFIG"
 }
 
+# 运行态：disksize 按表达式求值写入，comp_algorithm 用方括号标记活动算法。
+seed_runtime_zram() {
+    local expression="$1"
+    local bytes
+
+    bytes=$(zram_target_bytes "$expression") || fail "cannot evaluate zram size: $expression"
+    printf '%s\n' "$bytes" > "$SYSFS_ROOT/block/zram0/disksize"
+    printf 'lzo [zstd] lz4\n' > "$SYSFS_ROOT/block/zram0/comp_algorithm"
+}
+
 seed_active_device() {
     seed_device "$1"
     seed_sysctl "${2:-$TARGET_SWAPPINESS}"
+    seed_runtime_zram "$1"
     write_zswap_config
     printf 'N\n' > "$ZSWAP_ENABLED"
     ZRAM_ACTIVE=true
@@ -570,6 +608,23 @@ assert_call_order "systemctl stop" "systemctl start" "rebuild stops before start
 assert_no_call "swapoff" "rebuild never calls swapoff"
 [[ ! -e "$STATE_DIR/zram-reconfigure.pending" ]] || fail "successful rebuild clears the pending marker"
 pass "successful rebuild clears the pending marker"
+
+# 回归：第一次因交换页延迟重建后配置文本已等于目标，但设备仍是旧容量；
+# 第二次运行必须继续按待重建处理，不能据配置文件报告「配置已生效」并清掉标记。
+reset_sandbox
+seed_active_device "ram * 7"
+ZRAM_USED=4096
+assert_ok "deferred rebuild writes the target config" setup_zram >/dev/null 2>&1
+[[ -f "$STATE_DIR/zram-reconfigure.pending" ]] || fail "deferred rebuild must leave a pending marker"
+assert_eq "$TARGET_SIZE" "$(get_zram_config_value zram-size)" "deferred rebuild still writes the target text"
+
+reset_calls
+second_run_output=$(setup_zram 2>&1) || fail "rerun with a pending marker must not fail"
+assert_not_contains "$second_run_output" "配置已生效" "pending rerun must not claim the config is in effect"
+[[ -f "$STATE_DIR/zram-reconfigure.pending" ]] || fail "pending rerun must keep the pending marker"
+pass "pending rerun keeps the pending marker"
+assert_no_call "systemctl stop" "pending rerun never stops the device"
+assert_no_call "systemctl start" "pending rerun never starts the device"
 
 reset_sandbox
 seed_active_device "ram * 7"
