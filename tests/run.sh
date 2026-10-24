@@ -67,21 +67,34 @@ for test_file in "$ROOT_DIR"/tests/test-*.sh; do
     plan+=("$test_file")
 done
 
-# Suites carrying CI segment guards are listed here; TEST_SEGMENTS sets how many
-# processes share the work.  With TEST_SEGMENTS=1 every suite runs in one process.
-readonly SEGMENTED_FAMILIES=(test-motd.sh test-cloudflare-tunnel.sh test-push-worker-registration.sh)
+# Suites carrying CI segment guards, with the number of segments their source
+# defines.  TEST_SEGMENTS sets how many processes share the work; with
+# TEST_SEGMENTS=1 every suite runs in one process, all segments in order.
+declare -rA SEGMENTED_SUITES=(
+    [test-motd.sh]=8
+    [test-cloudflare-tunnel.sh]=8
+    [test-push-worker-registration.sh]=4
+)
 segments=${TEST_SEGMENTS:-1}
-[[ "$segments" =~ ^[1-9][0-9]*$ ]] || { printf 'Invalid TEST_SEGMENTS: %s\n' "$segments" >&2; exit 2; }
+# One digit, at most the eight segments a suite actually has: no accepted value
+# can overflow shell arithmetic and every index below stays a single character.
+[[ "$segments" =~ ^[1-8]$ ]] || { printf 'Invalid TEST_SEGMENTS: %s\n' "$segments" >&2; exit 2; }
 
 # TEST_SEGMENT_SET narrows one job to a subset of the segments ("0 1 2 3"), so a
 # single suite can be spread over several jobs.  Unset or blank keeps every
 # segment; anything that is not a distinct in-range index aborts before a suite
-# starts.
+# starts.  `read -a` splits on IFS without pathname expansion, so an entry such
+# as "[1]" is compared literally instead of being matched against file names.
 segment_set=()
 seen_segments=" "
-if [[ -n ${TEST_SEGMENT_SET:-} && -n ${TEST_SEGMENT_SET//[[:space:]]/} ]]; then
-    for segment_index in $TEST_SEGMENT_SET; do
-        [[ "$segment_index" =~ ^[0-9]+$ ]] \
+if [[ -n "${TEST_SEGMENT_SET:-}" && -n "${TEST_SEGMENT_SET//[[:space:]]/}" ]]; then
+    # Flatten embedded newlines first: `read -a` stops at the first line, which
+    # would drop the rest of the set without a word.
+    segment_value=${TEST_SEGMENT_SET//$'\t'/ }
+    segment_value=${segment_value//$'\n'/ }
+    read -r -a segment_entries <<< "$segment_value"
+    for segment_index in "${segment_entries[@]}"; do
+        [[ "$segment_index" =~ ^[0-7]$ ]] \
             || { printf 'Invalid TEST_SEGMENT_SET entry: %s\n' "$segment_index" >&2; exit 2; }
         (( segment_index < segments )) \
             || { printf 'Segment %s out of range for TEST_SEGMENTS=%s\n' "$segment_index" "$segments" >&2; exit 2; }
@@ -90,15 +103,29 @@ if [[ -n ${TEST_SEGMENT_SET:-} && -n ${TEST_SEGMENT_SET//[[:space:]]/} ]]; then
         seen_segments+="$segment_index "
         segment_set+=("$segment_index")
     done
+    (( segments > 1 )) \
+        || { printf 'TEST_SEGMENT_SET requires TEST_SEGMENTS above 1\n' >&2; exit 2; }
 fi
 
+# The whole plan must agree with the segment counts above before the first suite
+# starts: a count that matches no suite (or a subset aimed at an unsegmented one)
+# would otherwise silently run part of the work and still exit 0.
+for test_file in "${plan[@]:-}"; do
+    [[ -n "$test_file" ]] || continue
+    test_name=$(basename "$test_file")
+    declared_segments=${SEGMENTED_SUITES[${test_name}]:-1}
+    if (( ${#segment_set[@]} )) && [[ -z "${SEGMENTED_SUITES[${test_name}]:-}" ]]; then
+        printf 'TEST_SEGMENT_SET does not apply to unsegmented suite: %s\n' "$test_name" >&2
+        exit 2
+    fi
+    (( segments == 1 || segments == declared_segments )) \
+        || { printf 'TEST_SEGMENTS=%s but %s has %s segments\n' "$segments" "$test_name" "$declared_segments" >&2; exit 2; }
+done
+
 is_segmented() {
-    local name=$1 entry
+    local name=$1
     (( segments > 1 )) || return 1
-    for entry in "${SEGMENTED_FAMILIES[@]}"; do
-        [[ "$entry" == "$name" ]] && return 0
-    done
-    return 1
+    [[ -n "${SEGMENTED_SUITES[${name}]:-}" ]]
 }
 
 run_suite() {
@@ -115,7 +142,7 @@ run_suite() {
     if [[ -n "$seg" ]]; then
         env -u TEST_JOBS -u TEST_SEGMENTS -u TEST_SEGMENT_SET TEST_SEGMENT="$seg" bash "$test_file"
     else
-        env -u TEST_JOBS -u TEST_SEGMENTS -u TEST_SEGMENT_SET bash "$test_file"
+        env -u TEST_JOBS -u TEST_SEGMENTS -u TEST_SEGMENT -u TEST_SEGMENT_SET bash "$test_file"
     fi
     status=$?
     set -e
