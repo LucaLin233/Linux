@@ -296,18 +296,18 @@ test-motd.sh-8
 test-motd.sh-9
 test-motd.sh-10'
 check_subset motd 1 '' 'test-motd.sh'
-check_subset cloudflare 12 '0 2 6 9' 'test-cloudflare-tunnel.sh-0
-test-cloudflare-tunnel.sh-2
-test-cloudflare-tunnel.sh-6
-test-cloudflare-tunnel.sh-9'
-check_subset cloudflare 12 '1 3 5 7' 'test-cloudflare-tunnel.sh-1
+check_subset cloudflare 12 '2 3 5 6 11' 'test-cloudflare-tunnel.sh-2
 test-cloudflare-tunnel.sh-3
 test-cloudflare-tunnel.sh-5
-test-cloudflare-tunnel.sh-7'
-check_subset cloudflare 12 '4 8 10 11' 'test-cloudflare-tunnel.sh-4
-test-cloudflare-tunnel.sh-8
-test-cloudflare-tunnel.sh-10
+test-cloudflare-tunnel.sh-6
 test-cloudflare-tunnel.sh-11'
+check_subset cloudflare 12 '0 1 4 7 8 9 10' 'test-cloudflare-tunnel.sh-0
+test-cloudflare-tunnel.sh-1
+test-cloudflare-tunnel.sh-4
+test-cloudflare-tunnel.sh-7
+test-cloudflare-tunnel.sh-8
+test-cloudflare-tunnel.sh-9
+test-cloudflare-tunnel.sh-10'
 check_subset cloudflare 12 '' 'test-cloudflare-tunnel.sh-0
 test-cloudflare-tunnel.sh-1
 test-cloudflare-tunnel.sh-2
