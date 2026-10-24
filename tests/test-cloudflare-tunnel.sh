@@ -11,7 +11,7 @@ seg_is() {
 set -euo pipefail
 
 if (( EUID != 0 )); then
-    exec sudo --preserve-env=PATH bash "$0" "$@"
+    exec sudo --preserve-env=PATH --preserve-env=TEST_SEGMENT bash "$0" "$@"
 fi
 
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
