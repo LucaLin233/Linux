@@ -71,7 +71,7 @@ jobs=${TEST_JOBS:-1}
 # disjoint share of the cases.  Every other suite runs once.
 segments=${TEST_SEGMENTS:-1}
 [[ "$segments" =~ ^[1-9][0-9]*$ ]] || { printf 'Invalid TEST_SEGMENTS: %s\n' "$segments" >&2; exit 2; }
-segmented_families=(test-motd.sh)
+segmented_families=(test-motd.sh test-cloudflare-tunnel.sh test-push-worker-registration.sh)
 
 job_files=()
 job_segs=()
