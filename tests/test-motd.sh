@@ -191,7 +191,6 @@ motd_snapshot_capture_hook() {
 motd_run_locked_operation install
 CHILD
 chmod 0700 "$TEST_DIR/building-signal-child.sh"
-
 if seg_is 0; then
 extract_payload "$ROOT_DIR/tools/setup-motd.sh">"$TEST_DIR/t";
 extract_payload "$ROOT_DIR/modules/system-customize.sh">"$TEST_DIR/m";
@@ -428,6 +427,9 @@ assert_fail "rollback failure nonzero" motd_run_locked_operation install;
 assert_eq 6 "$(wc -l<"$r/a")" "rollback attempts six";
 [[ -e "$MOTD_STATE_DIR/pending" ]]||fail journal
 )
+fi
+
+if seg_is 1; then
 for ph in snapshot-building snapshot-commit snapshot-publish install-first install-middle restore-first restore-middle;
 do for sig in HUP INT TERM;
 do(
@@ -589,8 +591,9 @@ for legacy_phase in random-id stat open create cat chown chmod sha256 manifest m
 )
 done
 pass "legacy I/O failure matrix preserves data and state"
+fi
 
-
+if seg_is 2; then
 for signal_name in HUP INT TERM; do
 (
     root="$TEST_DIR/pointer-signal-$signal_name"; create_fixture "$root"; export_paths "$root"
@@ -624,9 +627,7 @@ for pending_phase in pending-create pending-write pending-chown pending-chmod pe
     motd_run_locked_operation install
 )
 done
-fi
 
-if seg_is 1; then
 for pending_kind in broken-symlink symlink directory fifo mode owner gid; do
 (
     root="$TEST_DIR/pending-kind-$pending_kind"; create_fixture "$root"; export_paths "$root"
@@ -738,8 +739,9 @@ for native_id in uname motd_news; do
     [[ -L "$native_path" && "$(readlink "$native_path")" == "$root/external-$native_id" ]] || fail "$native_id previous symlink not restored"
 )
 done
+fi
 
-
+if seg_is 3; then
 for kill_phase in transaction-snapshot-building transaction-final-moved target-committed-motd target-committed-issue_net target-committed-motd_news committed-cleanup committed-old-generation-cleaned committed-pending-removed; do
 (
     root="$TEST_DIR/sigkill-$kill_phase"; create_fixture "$root"; export_paths "$root"
@@ -837,8 +839,9 @@ done
     [[ ! -e "$MOTD_STATE_DIR/pending" ]] || fail "rolledback cleanup retry left pending"
     assert_eq 2 "$(generation_count "$MOTD_STATE_DIR/generations")" "rolledback cleanup retry restores bounded generations"
 )
+fi
 
-
+if seg_is 4; then
 for hook_case in content-motd mode-issue_net inode-motd_news type-issue_net; do
 (
     root="$TEST_DIR/hook-target-$hook_case"; create_fixture "$root"; export_paths "$root"
@@ -931,10 +934,8 @@ for pending_hook_case in id extra-line inode; do
     assert_no_motd_residue "$root"
 )
 done
-fi
 
 
-if seg_is 2; then
 for building_phase in transaction-snapshot-building capture-motd capture-issue_net capture-motd_news snapshot-commit transaction-final-move; do
 (
     root="$TEST_DIR/building-fail-$building_phase"; create_fixture "$root"; export_paths "$root"
@@ -966,7 +967,9 @@ for building_phase in transaction-snapshot-building capture-motd capture-issue_n
     )
     done
 done
+fi
 
+if seg_is 5; then
 for previous_impl in tool module; do
 (
     root="$TEST_DIR/previous-only-$previous_impl"; create_fixture "$root"; export_paths "$root"
@@ -1060,7 +1063,9 @@ done
     assert_eq original "$(cat "$MOTD_ETC_ROOT/motd")" "localized stat wrapper preserves regular legacy import"
     LANG=zh_CN.UTF-8 bash -c '. "$1"; motd_run_locked_operation install' _ "$ROOT_DIR/modules/system-customize.sh"
 )
+fi
 
+if seg_is 6; then
 for missing_command in bash chown flock ln od readlink sha256sum touch wc; do
 (
     root="$TEST_DIR/module-missing-$missing_command"; create_fixture "$root"; export_paths "$root"
@@ -1119,9 +1124,7 @@ for noop_impl in tool module; do
     )
     done
 done
-fi
 
-if seg_is 3; then
 for group_impl in tool module; do
     for group_change in motd-content issue-mode custom-inode; do
     (
@@ -1195,8 +1198,9 @@ done
     assert_eq original "$(cat "$MOTD_ETC_ROOT/motd")" "legal state root regular backup imported"; [[ -e "$MOTD_STATE_DIR/initial.current" ]] || fail "legal state root import did not publish initial pointer"
     assert_eq "$legacy_times" "$(stat -c %X:%Y "$MOTD_STATE_DIR/motd.initial-backup")" "legacy root metadata validation/import preserves timestamps"; pass "legal state root regular, symlink, and markers import"
 )
+fi
 
-
+if seg_is 7; then
 for rollback_impl in tool module; do
     for rollback_damage in motd-content issue-mode custom-inode absent-regular absent-symlink absent-fifo symlink-target; do
     (

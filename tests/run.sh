@@ -73,6 +73,25 @@ readonly SEGMENTED_FAMILIES=(test-motd.sh test-cloudflare-tunnel.sh test-push-wo
 segments=${TEST_SEGMENTS:-1}
 [[ "$segments" =~ ^[1-9][0-9]*$ ]] || { printf 'Invalid TEST_SEGMENTS: %s\n' "$segments" >&2; exit 2; }
 
+# TEST_SEGMENT_SET narrows one job to a subset of the segments ("0 1 2 3"), so a
+# single suite can be spread over several jobs.  Unset or blank keeps every
+# segment; anything that is not a distinct in-range index aborts before a suite
+# starts.
+segment_set=()
+seen_segments=" "
+if [[ -n ${TEST_SEGMENT_SET:-} && -n ${TEST_SEGMENT_SET//[[:space:]]/} ]]; then
+    for segment_index in $TEST_SEGMENT_SET; do
+        [[ "$segment_index" =~ ^[0-9]+$ ]] \
+            || { printf 'Invalid TEST_SEGMENT_SET entry: %s\n' "$segment_index" >&2; exit 2; }
+        (( segment_index < segments )) \
+            || { printf 'Segment %s out of range for TEST_SEGMENTS=%s\n' "$segment_index" "$segments" >&2; exit 2; }
+        [[ "$seen_segments" != *" $segment_index "* ]] \
+            || { printf 'Duplicate segment in TEST_SEGMENT_SET: %s\n' "$segment_index" >&2; exit 2; }
+        seen_segments+="$segment_index "
+        segment_set+=("$segment_index")
+    done
+fi
+
 is_segmented() {
     local name=$1 entry
     (( segments > 1 )) || return 1
@@ -94,9 +113,9 @@ run_suite() {
     # Nested fixtures re-enter this script, so neither setting may leak to them.
     set +e
     if [[ -n "$seg" ]]; then
-        env -u TEST_JOBS -u TEST_SEGMENTS TEST_SEGMENT="$seg" bash "$test_file"
+        env -u TEST_JOBS -u TEST_SEGMENTS -u TEST_SEGMENT_SET TEST_SEGMENT="$seg" bash "$test_file"
     else
-        env -u TEST_JOBS -u TEST_SEGMENTS bash "$test_file"
+        env -u TEST_JOBS -u TEST_SEGMENTS -u TEST_SEGMENT_SET bash "$test_file"
     fi
     status=$?
     set -e
@@ -112,8 +131,14 @@ run_suite() {
 # runner; the suites of a shard still run one after another.
 run_segments() {
     local test_file=$1 dir k rc failed=0 pids=()
+    local -a queue=()
     dir=$(mktemp -d)
-    for (( k = 0; k < segments; k++ )); do
+    if (( ${#segment_set[@]} )); then
+        queue=("${segment_set[@]}")
+    else
+        for (( k = 0; k < segments; k++ )); do queue+=("$k"); done
+    fi
+    for k in "${queue[@]}"; do
         (
             rc=0
             run_suite "$test_file" "$k" > "$dir/$k.log" 2>&1 || rc=$?
@@ -122,7 +147,7 @@ run_segments() {
         pids+=("$!")
     done
     for k in "${pids[@]}"; do wait "$k" || true; done
-    for (( k = 0; k < segments; k++ )); do
+    for k in "${queue[@]}"; do
         cat "$dir/$k.log"
         rc=$(cat "$dir/$k.rc" 2>/dev/null || printf 1)
         (( rc == 0 )) || failed=1

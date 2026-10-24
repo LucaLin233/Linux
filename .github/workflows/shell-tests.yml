@@ -58,7 +58,34 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [motd, push-worker, push, cloudflare, other]
+        include:
+          # motd and cloudflare are cut into eight segments; each of their two
+          # jobs runs four of them, so a single suite spans two jobs.
+          - shard: motd-a
+            suite: motd
+            segments: 8
+            segment_set: "0 1 2 3"
+          - shard: motd-b
+            suite: motd
+            segments: 8
+            segment_set: "4 5 6 7"
+          - shard: push-worker
+            suite: push-worker
+            segments: 4
+          - shard: push
+            suite: push
+            segments: 1
+          - shard: cloudflare-a
+            suite: cloudflare
+            segments: 8
+            segment_set: "0 1 2 3"
+          - shard: cloudflare-b
+            suite: cloudflare
+            segments: 8
+            segment_set: "4 5 6 7"
+          - shard: other
+            suite: other
+            segments: 1
     steps:
       - uses: actions/checkout@v7
         with:
@@ -84,9 +111,10 @@ jobs:
         env:
           TEST_BASE_SHA: ${{ github.event.pull_request.base.sha }}
           TEST_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          TEST_SHARD: ${{ matrix.shard }}
-          TEST_SEGMENTS: 4
-        run: bash tests/run.sh "$TEST_SHARD"
+          TEST_SUITE: ${{ matrix.suite }}
+          TEST_SEGMENTS: ${{ matrix.segments }}
+          TEST_SEGMENT_SET: ${{ matrix.segment_set }}
+        run: bash tests/run.sh "$TEST_SUITE"
 
   debian-tests:
     name: Debian 13 / ${{ matrix.shard }}
@@ -96,7 +124,34 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [motd, push-worker, push, cloudflare, other]
+        include:
+          # motd and cloudflare are cut into eight segments; each of their two
+          # jobs runs four of them, so a single suite spans two jobs.
+          - shard: motd-a
+            suite: motd
+            segments: 8
+            segment_set: "0 1 2 3"
+          - shard: motd-b
+            suite: motd
+            segments: 8
+            segment_set: "4 5 6 7"
+          - shard: push-worker
+            suite: push-worker
+            segments: 4
+          - shard: push
+            suite: push
+            segments: 1
+          - shard: cloudflare-a
+            suite: cloudflare
+            segments: 8
+            segment_set: "0 1 2 3"
+          - shard: cloudflare-b
+            suite: cloudflare
+            segments: 8
+            segment_set: "4 5 6 7"
+          - shard: other
+            suite: other
+            segments: 1
     steps:
       - name: Install test dependencies
         run: |
@@ -126,9 +181,10 @@ jobs:
         env:
           TEST_BASE_SHA: ${{ github.event.pull_request.base.sha }}
           TEST_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          TEST_SHARD: ${{ matrix.shard }}
-          TEST_SEGMENTS: 4
-        run: bash tests/run.sh "$TEST_SHARD"
+          TEST_SUITE: ${{ matrix.suite }}
+          TEST_SEGMENTS: ${{ matrix.segments }}
+          TEST_SEGMENT_SET: ${{ matrix.segment_set }}
+        run: bash tests/run.sh "$TEST_SUITE"
 
   # Preserve existing required-check names; skipped/cancelled dependencies fail closed.
   ubuntu:

@@ -23,10 +23,13 @@
 生产宿主机（包括 Netcup）仅执行差异检查及改动脚本的 `bash -n`，不运行全量 ShellCheck 或完整测试集；
 分析和测试交由 CI：PR 按完整差异及依赖映射选择套件，README/许可证修改无需业务测试；
 公共设施或未知依赖改动回退全量，main 推送仍执行全量。两个必需 Job 始终运行，输出选择和跳过记录。
-每个 OS 的测试作业按五个 shard 并行：`motd`（`test-motd.sh`）、`push-worker`
-（`test-push-worker-registration.sh`）、`push`（仅 `test-push.sh`）、`cloudflare`
-（`test-cloudflare-tunnel.sh`）、`other`（其余全部套件）；本机全量用 `tests/run.sh all`。
-重套件（motd、Cloudflare Tunnel、push worker 注册）按语义分成四段，import 守卫 `seg_is`：`TEST_SEGMENTS` 个进程各跑互不重叠的一段并同时执行（CI 取 4，本机默认 1，即按原顺序串行）。
+每个 OS 的测试作业按七个 shard 并行：`motd-a`/`motd-b`（`test-motd.sh`，各跑四段）、
+`cloudflare-a`/`cloudflare-b`（`test-cloudflare-tunnel.sh`，各跑四段）、`push-worker`
+（`test-push-worker-registration.sh`）、`push`（仅 `test-push.sh`）、`other`（其余全部套件）；
+本机全量用 `tests/run.sh all`。
+重套件（motd、Cloudflare Tunnel、push worker 注册）按语义分段，import 守卫 `seg_is`：`TEST_SEGMENTS` 个进程各跑互不重叠的一段并同时执行（本机默认 1，即按原顺序串行）。
+motd 与 Cloudflare Tunnel 各切成八段：`-a` 作业用 `TEST_SEGMENT_SET="0 1 2 3"`、`-b` 作业用 `"4 5 6 7"`，两个作业的并集恰好覆盖全部段且互不重叠；push worker 注册仍为四段、单作业。
+`TEST_SEGMENT_SET` 只接受互不重复、且在 `TEST_SEGMENTS` 范围内的段下标，非法值时在任何套件启动前以状态 2 退出；未设置则照旧跑全部段。
 Ubuntu 使用固定 ShellCheck v0.10.0：所有受 Git 跟踪、位于 tests/ 之外的 .sh 文件执行 warning 门槛，tests/ 与 tests/lib/ 内的 .sh 文件执行 error 门槛；新目录中的生产 .sh 文件自动纳入，不维护生产文件白名单。Zsh 配置 p10k-config.zsh 不交给 Bash ShellCheck。两组 lint 都会执行并累计失败，Debian 不重复 lint。
 例外仅允许局部明确的 SC 规则编号和邻近理由；禁止文件级或全局 warning 抑制。测试 warning 不阻断不等于被 disable，禁止用抑制隐藏行为缺陷。CI 工作流改动继续触发全量测试回退；warning 门槛失败时后续 Ubuntu 行为套件不会执行，不能以 Debian 通过代替双环境验收。
 语法检查仍覆盖全部 .sh 脚本；文档修改无需本地全套测试，但仍须通过必需 CI。
