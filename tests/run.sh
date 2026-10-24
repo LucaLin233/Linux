@@ -63,30 +63,20 @@ for test_file in "$ROOT_DIR"/tests/test-*.sh; do
     plan+=("$test_file")
 done
 
-# Bounded parallelism: 1 keeps the original serial output byte for byte.
-jobs=${TEST_JOBS:-1}
-[[ "$jobs" =~ ^[1-9][0-9]*$ ]] || { printf 'Invalid TEST_JOBS: %s\n' "$jobs" >&2; exit 2; }
-
-# Suites carrying CI segment guards run TEST_SEGMENTS processes, each taking a
-# disjoint share of the cases.  Every other suite runs once.
+# Suites carrying CI segment guards are listed here; TEST_SEGMENTS sets how many
+# processes share the work.  With TEST_SEGMENTS=1 every suite runs in one process.
+readonly SEGMENTED_FAMILIES=(test-motd.sh test-cloudflare-tunnel.sh test-push-worker-registration.sh)
 segments=${TEST_SEGMENTS:-1}
 [[ "$segments" =~ ^[1-9][0-9]*$ ]] || { printf 'Invalid TEST_SEGMENTS: %s\n' "$segments" >&2; exit 2; }
-segmented_families=(test-motd.sh test-cloudflare-tunnel.sh test-push-worker-registration.sh)
 
-job_files=()
-job_segs=()
-for test_file in "${plan[@]}"; do
-    test_name=$(basename "$test_file")
-    if (( segments > 1 )) && [[ " ${segmented_families[*]} " == *" $test_name "* ]]; then
-        for (( k = 0; k < segments; k++ )); do
-            job_files+=("$test_file")
-            job_segs+=("$k")
-        done
-    else
-        job_files+=("$test_file")
-        job_segs+=("")
-    fi
-done
+is_segmented() {
+    local name=$1 entry
+    (( segments > 1 )) || return 1
+    for entry in "${SEGMENTED_FAMILIES[@]}"; do
+        [[ "$entry" == "$name" ]] && return 0
+    done
+    return 1
+}
 
 run_suite() {
     local test_file=$1 seg=${2:-} test_name started status
@@ -97,9 +87,8 @@ run_suite() {
     started=$SECONDS
     printf '\n==> %s\n' "$test_name"
     # Keep the child shell standalone: an if/|| wrapper can change errexit behavior.
+    # Nested fixtures re-enter this script, so neither setting may leak to them.
     set +e
-    # Nested fixtures re-enter this script; they must not inherit the pool or
-    # segment settings, or a stub suite would be duplicated.
     if [[ -n "$seg" ]]; then
         env -u TEST_JOBS -u TEST_SEGMENTS TEST_SEGMENT="$seg" bash "$test_file"
     else
@@ -115,47 +104,36 @@ run_suite() {
     return "$status"
 }
 
-if (( ${#job_files[@]} == 0 )); then
-    printf '\nAll selected shell tests passed.\n'
-    exit 0
-fi
-
-if (( jobs == 1 )); then
-    for idx in "${!job_files[@]}"; do
-        run_suite "${job_files[idx]}" "${job_segs[idx]}" || exit "$?"
-    done
-else
-    log_dir=$(mktemp -d)
-    trap 'rm -rf "$log_dir"' EXIT
-    running=0
-    for idx in "${!job_files[@]}"; do
-        test_file=${job_files[idx]}
-        seg=${job_segs[idx]}
-        key=$(basename "$test_file")
-        [[ -n "$seg" ]] && key+=".$seg"
+# Segments of one suite share no state, so they run together and fill the
+# runner; the suites of a shard still run one after another.
+run_segments() {
+    local test_file=$1 dir k rc failed=0 pids=()
+    dir=$(mktemp -d)
+    for (( k = 0; k < segments; k++ )); do
         (
             rc=0
-            run_suite "$test_file" "$seg" > "$log_dir/$key.log" 2>&1 || rc=$?
-            printf '%s' "$rc" > "$log_dir/$key.rc"
+            run_suite "$test_file" "$k" > "$dir/$k.log" 2>&1 || rc=$?
+            printf '%s' "$rc" > "$dir/$k.rc"
         ) &
-        running=$((running + 1))
-        if (( running >= jobs )); then
-            wait -n || true
-            running=$((running - 1))
-        fi
+        pids+=("$!")
     done
-    wait || true
-    failed=0
-    for idx in "${!job_files[@]}"; do
-        test_file=${job_files[idx]}
-        seg=${job_segs[idx]}
-        key=$(basename "$test_file")
-        [[ -n "$seg" ]] && key+=".$seg"
-        cat "$log_dir/$key.log"
-        rc=$(cat "$log_dir/$key.rc" 2>/dev/null || printf 1)
+    for k in "${pids[@]}"; do wait "$k" || true; done
+    for (( k = 0; k < segments; k++ )); do
+        cat "$dir/$k.log"
+        rc=$(cat "$dir/$k.rc" 2>/dev/null || printf 1)
         (( rc == 0 )) || failed=1
     done
-    (( failed == 0 )) || exit 1
-fi
+    rm -rf "$dir"
+    return "$failed"
+}
+
+for test_file in "${plan[@]:-}"; do
+    [[ -n "$test_file" ]] || continue
+    if is_segmented "$(basename "$test_file")"; then
+        run_segments "$test_file" || exit 1
+    else
+        run_suite "$test_file" || exit "$?"
+    fi
+done
 
 printf '\nAll selected shell tests passed.\n'
