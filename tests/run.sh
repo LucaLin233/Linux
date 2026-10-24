@@ -71,14 +71,14 @@ done
 # defines.  TEST_SEGMENTS sets how many processes share the work; with
 # TEST_SEGMENTS=1 every suite runs in one process, all segments in order.
 declare -rA SEGMENTED_SUITES=(
-    [test-motd.sh]=8
+    [test-motd.sh]=11
     [test-cloudflare-tunnel.sh]=8
-    [test-push-worker-registration.sh]=4
+    [test-push-worker-registration.sh]=7
 )
 segments=${TEST_SEGMENTS:-1}
-# One digit, at most the eight segments a suite actually has: no accepted value
-# can overflow shell arithmetic and every index below stays a single character.
-[[ "$segments" =~ ^[1-8]$ ]] || { printf 'Invalid TEST_SEGMENTS: %s\n' "$segments" >&2; exit 2; }
+# Bounded lexical form first, so no accepted value can overflow shell arithmetic
+# or smuggle in a sign, a prefix or a multi-digit index past the range checks.
+[[ "$segments" =~ ^([1-9]|1[0-2])$ ]] || { printf 'Invalid TEST_SEGMENTS: %s\n' "$segments" >&2; exit 2; }
 
 # TEST_SEGMENT_SET narrows one job to a subset of the segments ("0 1 2 3"), so a
 # single suite can be spread over several jobs.  Unset or blank keeps every
@@ -94,7 +94,7 @@ if [[ -n "${TEST_SEGMENT_SET:-}" && -n "${TEST_SEGMENT_SET//[[:space:]]/}" ]]; t
     segment_value=${segment_value//$'\n'/ }
     read -r -a segment_entries <<< "$segment_value"
     for segment_index in "${segment_entries[@]}"; do
-        [[ "$segment_index" =~ ^[0-7]$ ]] \
+        [[ "$segment_index" =~ ^([0-9]|1[01])$ ]] \
             || { printf 'Invalid TEST_SEGMENT_SET entry: %s\n' "$segment_index" >&2; exit 2; }
         (( segment_index < segments )) \
             || { printf 'Segment %s out of range for TEST_SEGMENTS=%s\n' "$segment_index" "$segments" >&2; exit 2; }
