@@ -20,7 +20,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          fetch-depth: 0
+          fetch-depth: 1
           persist-credentials: false
 
       - name: Install pinned ShellCheck
@@ -48,7 +48,7 @@ jobs:
           # Check both groups even when production lint fails.
           status=0
           git ls-files -z -- "*.sh" ":!:tests/**" | xargs -0 -r shellcheck -x --severity=warning -- || status=1
-          git ls-files -z -- "tests/*.sh" | xargs -0 -r shellcheck -x --severity=error -- || status=1
+          git ls-files -z -- "tests/*.sh" "tests/lib/*.sh" | xargs -0 -r shellcheck -x --severity=error -- || status=1
           exit "$status"
 
   ubuntu-tests:
@@ -85,6 +85,7 @@ jobs:
           TEST_BASE_SHA: ${{ github.event.pull_request.base.sha }}
           TEST_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           TEST_SHARD: ${{ matrix.shard }}
+          TEST_JOBS: 4
         run: bash tests/run.sh "$TEST_SHARD"
 
   debian-tests:
@@ -118,6 +119,7 @@ jobs:
           bash tests/test-selection-git.sh
 
       - name: Check Bash syntax
+        if: matrix.shard == 'other'
         run: find . -type f -name '*.sh' -print0 | xargs -0 -n1 bash -n
 
       - name: Run tests
@@ -125,6 +127,7 @@ jobs:
           TEST_BASE_SHA: ${{ github.event.pull_request.base.sha }}
           TEST_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           TEST_SHARD: ${{ matrix.shard }}
+          TEST_JOBS: 4
         run: bash tests/run.sh "$TEST_SHARD"
 
   # Preserve existing required-check names; skipped/cancelled dependencies fail closed.

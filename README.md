@@ -23,7 +23,8 @@
 生产宿主机（包括 Netcup）仅执行差异检查及改动脚本的 `bash -n`，不运行全量 ShellCheck 或完整测试集；
 分析和测试交由 CI：PR 按完整差异及依赖映射选择套件，README/许可证修改无需业务测试；
 公共设施或未知依赖改动回退全量，main 推送仍执行全量。两个必需 Job 始终运行，输出选择和跳过记录。
-Ubuntu 使用固定 ShellCheck v0.10.0：所有受 Git 跟踪、位于 tests/ 之外的 .sh 文件执行 warning 门槛，tests/ 内的 .sh 文件执行 error 门槛；新目录中的生产 .sh 文件自动纳入，不维护生产文件白名单。Zsh 配置 p10k-config.zsh 不交给 Bash ShellCheck。两组 lint 都会执行并累计失败，Debian 不重复 lint。
+motd、Cloudflare Tunnel 与 push worker 注册三个套件按用例族拆成 `<family>-NN.sh` 分片，共用 `tests/lib/<family>-common.sh` 的定义；同一分片内的文件由 `tests/run.sh` 以 `TEST_JOBS` 限定的并发执行（CI 取 4，本机默认串行）。
+Ubuntu 使用固定 ShellCheck v0.10.0：所有受 Git 跟踪、位于 tests/ 之外的 .sh 文件执行 warning 门槛，tests/ 与 tests/lib/ 内的 .sh 文件执行 error 门槛；新目录中的生产 .sh 文件自动纳入，不维护生产文件白名单。Zsh 配置 p10k-config.zsh 不交给 Bash ShellCheck。两组 lint 都会执行并累计失败，Debian 不重复 lint。
 例外仅允许局部明确的 SC 规则编号和邻近理由；禁止文件级或全局 warning 抑制。测试 warning 不阻断不等于被 disable，禁止用抑制隐藏行为缺陷。CI 工作流改动继续触发全量测试回退；warning 门槛失败时后续 Ubuntu 行为套件不会执行，不能以 Debian 通过代替双环境验收。
 语法检查仍覆盖全部 .sh 脚本；文档修改无需本地全套测试，但仍须通过必需 CI。
 本机重测试必须使用原生资源限制及权限隔离；无法隔离或超限时停止，不自动提高额度或转宿主机执行。
