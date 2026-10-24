@@ -507,8 +507,11 @@ find "$CLOUDFLARED_STATE_DIR" -maxdepth 1 -type d -name 'uninstall-*' -print -qu
 pass "configure then real repository uninstall removes source and preserves keyring"
 fi
 
-if seg_is 3; then
-for signal in HUP INT TERM; do
+# The uninstall signal matrix is 39 independent cases (3 signals x 13 phases),
+# each building its own fixture.  Segments 3 and 4 split it by signal, so the
+# serial order stays HUP, INT, TERM exactly as before.
+uninstall_signal_phase_cases() {
+    local signal=$1 phase
     case "$signal" in HUP) expected=129 ;; INT) expected=130 ;; TERM) expected=143 ;; esac
     for phase in before-snapshot-create capture-auto_update_script capture-auto_update_timer capture-legacy_marker lock-acquired before-disable-auto-update after-disable-auto-update before-apt-remove after-apt-remove before-source-remove after-source-remove final-apt-update before-lock-release; do
         new_case
@@ -537,10 +540,18 @@ for signal in HUP INT TERM; do
         release_repository_lock || fail "uninstall $signal at $phase lock cleanup failed"
         pass "uninstall $signal=$expected cleans $phase"
     done
-done
+}
+
+if seg_is 3; then
+uninstall_signal_phase_cases HUP
+uninstall_signal_phase_cases INT
 fi
 
 if seg_is 4; then
+uninstall_signal_phase_cases TERM
+fi
+
+if seg_is 5; then
 new_case
 set_old_generation
 configure_repository
@@ -667,7 +678,7 @@ for schema_case in version generation duplicate unknown order state mode uid gid
 done
 fi
 
-if seg_is 5; then
+if seg_is 6; then
 for ownership_case in owned foreign inode mode owner gid symlink directory fifo; do
     (
         new_case
@@ -966,7 +977,7 @@ for restore_id in auto_update_script auto_update_service auto_update_timer sourc
 done
 fi
 
-if seg_is 6; then
+if seg_is 7; then
 for target_id in auto_update_script auto_update_service auto_update_timer source current legacy_marker; do
     for bad_metadata in mode owner gid symlink directory fifo; do
         (
@@ -998,6 +1009,9 @@ for target_id in auto_update_script auto_update_service auto_update_timer source
         pass "capture rejects $target_id $bad_metadata without deleting target"
     done
 done
+fi
+
+if seg_is 8; then
 
 (
     unset CLOUDFLARED_TRUST_ANCHOR
@@ -1049,7 +1063,7 @@ for creation_phase in before-create-marker before-create-manifest-stage before-c
 done
 fi
 
-if seg_is 7; then
+if seg_is 9; then
 for bookkeeping_fault in marker stage rename; do
     (
         new_case
@@ -1148,6 +1162,9 @@ for capture_file in old-key old-source old-current; do
         pass "repository capture $capture_file $capture_fault preserves formal bytes and metadata"
     done
 done
+fi
+
+if seg_is 10; then
 
 (
     new_case
@@ -1255,6 +1272,10 @@ for restore_object in key source current; do
         pass "repository restore $restore_object $restore_fault rejects corruption and retains all backups"
     done
 done
+
+fi
+
+if seg_is 11; then
 
 for operation in install_cloudflared upgrade_cloudflared; do
     (
