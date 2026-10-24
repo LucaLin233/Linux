@@ -85,7 +85,6 @@ jobs:
           TEST_BASE_SHA: ${{ github.event.pull_request.base.sha }}
           TEST_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           TEST_SHARD: ${{ matrix.shard }}
-          TEST_JOBS: 4
           TEST_SEGMENTS: 4
         run: bash tests/run.sh "$TEST_SHARD"
 
@@ -128,7 +127,6 @@ jobs:
           TEST_BASE_SHA: ${{ github.event.pull_request.base.sha }}
           TEST_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           TEST_SHARD: ${{ matrix.shard }}
-          TEST_JOBS: 4
           TEST_SEGMENTS: 4
         run: bash tests/run.sh "$TEST_SHARD"
 
