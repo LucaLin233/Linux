@@ -880,9 +880,10 @@ read_process_stat() {
     [[ "$pid" =~ ^[0-9]+$ ]] || return 1
     # 整文件读取：read 内建在同一次 /proc 扫描中可能把上一个 status 读取
     # 遗留的缓冲字节交给这里的 stat 读取（fd 本身正确、pos=0），导致存活
-    # worker 的身份校验被误判；命令替换不做回退寻址，不会串内容。
-    # 读取失败在 errexit 下会让 shell 直接退出（if/|| 均不能豁免），故读取
-    # 期间临时关闭，读完立即按原状态恢复。
+    # worker 的身份校验被误判；命令替换只规避这条已观察到的跨读取路径，
+    # 不据此推断其他版本或实现的行为。
+    # Bash 5.2 下 $(<file) 的打开失败可能绕过 if/|| 直接终止 shell，故读取
+    # 期间临时关闭 errexit，读完立即按原状态恢复。
     case $- in *e*) had_errexit=true ;; esac
     set +e
     { stat_line=$(< "/proc/$pid/stat"); } 2>/dev/null || read_status=1
@@ -902,7 +903,9 @@ read_process_stat() {
 
 read_process_uid() {
     local pid="$1" status_text="" read_status=0 had_errexit=false
-    # 同 read_process_stat：整文件读取，避免 read 内建的跨读取缓冲串内容。
+    # 同 read_process_stat：整文件读取，规避已观察到的 read 内建跨读取缓冲
+    # 路径；$(<file) 打开失败可能绕过 if/|| 终止 shell（Bash 5.2），故读取
+    # 期间临时关闭 errexit，读完按原状态恢复。
     case $- in *e*) had_errexit=true ;; esac
     set +e
     { status_text=$(< "/proc/$pid/status"); } 2>/dev/null || read_status=1
