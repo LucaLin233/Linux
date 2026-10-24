@@ -14,14 +14,6 @@ case "$shard" in
     *) printf 'Invalid test shard: %s\n' "$shard" >&2; exit 2 ;;
 esac
 
-# Suites split across several files are named <family>-NN.sh; every part belongs
-# to the family's shard and every part is selected by a change to the family.
-family_of() {
-    local name=${1##*/}
-    name=${name%.sh}
-    printf '%s.sh\n' "${name%-[0-9][0-9]}"
-}
-
 declare -A selected=()
 full=true
 if [[ -n "${TEST_BASE_SHA:-}" && -n "${TEST_HEAD_SHA:-}" ]]; then
@@ -40,8 +32,8 @@ if [[ -n "${TEST_BASE_SHA:-}" && -n "${TEST_HEAD_SHA:-}" ]]; then
                 modules/system-optimize.sh) selected[test-system-optimize.sh]=1 ;;
                 linux_setup.sh) selected[test-linux-setup.sh]=1; selected[test-setup-exec.sh]=1 ;;
                 modules/zsh-setup.sh|p10k-config.zsh) selected[test-linux-setup.sh]=1 ;;
-                tests/test-*.sh|tests/lib/*.sh)
-                    if [[ -f "$ROOT_DIR/$path" ]]; then selected["$(family_of "$path")"]=1; else full=true; fi ;;
+                tests/test-*.sh)
+                    if [[ -f "$ROOT_DIR/$path" ]]; then selected["${path##*/}"]=1; else full=true; fi ;;
                 README.md|LICENSE) ;;
                 *) full=true ;;
             esac
@@ -52,19 +44,14 @@ if [[ -n "${TEST_BASE_SHA:-}" && -n "${TEST_HEAD_SHA:-}" ]]; then
 fi
 printf 'Test selection: full=%s\n' "$full"
 
-# Bounded parallelism: 1 keeps the original serial output byte for byte.
-jobs=${TEST_JOBS:-1}
-[[ "$jobs" =~ ^[1-9][0-9]*$ ]] || { printf 'Invalid TEST_JOBS: %s\n' "$jobs" >&2; exit 2; }
-
 plan=()
 for test_file in "$ROOT_DIR"/tests/test-*.sh; do
     test_name=$(basename "$test_file")
-    family=$(family_of "$test_name")
-    if [[ "$full" != true && -z "${selected[${family}]:-}" ]]; then
+    if [[ "$full" != true && -z "${selected[${test_name}]:-}" ]]; then
         printf 'SKIP: %s (unaffected by PR diff)\n' "$test_name"
         continue
     fi
-    case "$family" in
+    case "$test_name" in
         test-motd.sh) suite_shard=motd ;;
         test-push.sh|test-push-worker-registration.sh) suite_shard=push ;;
         *) suite_shard=other ;;
@@ -76,14 +63,46 @@ for test_file in "$ROOT_DIR"/tests/test-*.sh; do
     plan+=("$test_file")
 done
 
-run_suite() {
-    local test_file=$1 test_name started status
+# Bounded parallelism: 1 keeps the original serial output byte for byte.
+jobs=${TEST_JOBS:-1}
+[[ "$jobs" =~ ^[1-9][0-9]*$ ]] || { printf 'Invalid TEST_JOBS: %s\n' "$jobs" >&2; exit 2; }
+
+# Suites carrying CI segment guards run TEST_SEGMENTS processes, each taking a
+# disjoint share of the cases.  Every other suite runs once.
+segments=${TEST_SEGMENTS:-1}
+[[ "$segments" =~ ^[1-9][0-9]*$ ]] || { printf 'Invalid TEST_SEGMENTS: %s\n' "$segments" >&2; exit 2; }
+segmented_families=(test-motd.sh)
+
+job_files=()
+job_segs=()
+for test_file in "${plan[@]}"; do
     test_name=$(basename "$test_file")
+    if (( segments > 1 )) && [[ " ${segmented_families[*]} " == *" $test_name "* ]]; then
+        for (( k = 0; k < segments; k++ )); do
+            job_files+=("$test_file")
+            job_segs+=("$k")
+        done
+    else
+        job_files+=("$test_file")
+        job_segs+=("")
+    fi
+done
+
+run_suite() {
+    local test_file=$1 seg=${2:-} test_name started status
+    test_name=$(basename "$test_file")
+    if [[ -n "$seg" ]]; then
+        test_name+=" [segment $((seg + 1))/$segments]"
+    fi
     started=$SECONDS
     printf '\n==> %s\n' "$test_name"
     # Keep the child shell standalone: an if/|| wrapper can change errexit behavior.
     set +e
-    bash "$test_file"
+    if [[ -n "$seg" ]]; then
+        TEST_SEGMENT="$seg" TEST_SEGMENTS="$segments" bash "$test_file"
+    else
+        bash "$test_file"
+    fi
     status=$?
     set -e
     local elapsed=$((SECONDS - started))
@@ -94,25 +113,28 @@ run_suite() {
     return "$status"
 }
 
-if (( ${#plan[@]} == 0 )); then
+if (( ${#job_files[@]} == 0 )); then
     printf '\nAll selected shell tests passed.\n'
     exit 0
 fi
 
 if (( jobs == 1 )); then
-    for test_file in "${plan[@]}"; do
-        run_suite "$test_file" || exit "$?"
+    for idx in "${!job_files[@]}"; do
+        run_suite "${job_files[idx]}" "${job_segs[idx]}" || exit "$?"
     done
 else
     log_dir=$(mktemp -d)
     trap 'rm -rf "$log_dir"' EXIT
     running=0
-    for test_file in "${plan[@]}"; do
-        test_name=$(basename "$test_file")
+    for idx in "${!job_files[@]}"; do
+        test_file=${job_files[idx]}
+        seg=${job_segs[idx]}
+        key=$(basename "$test_file")
+        [[ -n "$seg" ]] && key+=".$seg"
         (
             rc=0
-            run_suite "$test_file" > "$log_dir/$test_name.log" 2>&1 || rc=$?
-            printf '%s' "$rc" > "$log_dir/$test_name.rc"
+            run_suite "$test_file" "$seg" > "$log_dir/$key.log" 2>&1 || rc=$?
+            printf '%s' "$rc" > "$log_dir/$key.rc"
         ) &
         running=$((running + 1))
         if (( running >= jobs )); then
@@ -122,10 +144,13 @@ else
     done
     wait || true
     failed=0
-    for test_file in "${plan[@]}"; do
-        test_name=$(basename "$test_file")
-        cat "$log_dir/$test_name.log"
-        rc=$(cat "$log_dir/$test_name.rc" 2>/dev/null || printf 1)
+    for idx in "${!job_files[@]}"; do
+        test_file=${job_files[idx]}
+        seg=${job_segs[idx]}
+        key=$(basename "$test_file")
+        [[ -n "$seg" ]] && key+=".$seg"
+        cat "$log_dir/$key.log"
+        rc=$(cat "$log_dir/$key.rc" 2>/dev/null || printf 1)
         (( rc == 0 )) || failed=1
     done
     (( failed == 0 )) || exit 1

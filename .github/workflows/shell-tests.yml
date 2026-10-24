@@ -48,7 +48,7 @@ jobs:
           # Check both groups even when production lint fails.
           status=0
           git ls-files -z -- "*.sh" ":!:tests/**" | xargs -0 -r shellcheck -x --severity=warning -- || status=1
-          git ls-files -z -- "tests/*.sh" "tests/lib/*.sh" | xargs -0 -r shellcheck -x --severity=error -- || status=1
+          git ls-files -z -- "tests/*.sh" | xargs -0 -r shellcheck -x --severity=error -- || status=1
           exit "$status"
 
   ubuntu-tests:
@@ -86,6 +86,7 @@ jobs:
           TEST_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           TEST_SHARD: ${{ matrix.shard }}
           TEST_JOBS: 4
+          TEST_SEGMENTS: 4
         run: bash tests/run.sh "$TEST_SHARD"
 
   debian-tests:
@@ -128,6 +129,7 @@ jobs:
           TEST_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           TEST_SHARD: ${{ matrix.shard }}
           TEST_JOBS: 4
+          TEST_SEGMENTS: 4
         run: bash tests/run.sh "$TEST_SHARD"
 
   # Preserve existing required-check names; skipped/cancelled dependencies fail closed.
