@@ -142,7 +142,8 @@ jobs=$(awk '
 # covered exactly once, union 0..N-1.
 check_matrix() {
     local job=$1 rows suite row_suite suite_segments segment_set_value
-    local declared covered index count total expected actual
+    local declared covered index count total expected actual token
+    local -a set_tokens=()
     rows=$(printf '%s\n' "$jobs" | awk -F'|' -v job="$job" '$1 == job')
     [[ -n "$rows" ]] || fail "no matrix rows for $job"
     if printf '%s\n' "$rows" | cut -d'|' -f2 | sort | uniq -d | grep -q .; then
@@ -156,6 +157,18 @@ check_matrix() {
             case "$suite_segments" in
                 ''|*[!0-9]*) fail "$job $suite has an unsupported segment count: '$suite_segments'" ;;
             esac
+            if [[ -n "$segment_set_value" ]]; then
+                # Strict tokens, checked before any coverage arithmetic: a set
+                # carries decimal indices of the declared range, so a trailing
+                # "x" (or "10x") fails here instead of being filtered out.
+                read -r -a set_tokens <<< "$segment_set_value"
+                for token in "${set_tokens[@]}"; do
+                    [[ "$token" =~ ^([0-9]|1[01])$ ]] \
+                        || fail "$job $suite has an invalid segment_set entry: '$token'"
+                    (( token < suite_segments )) \
+                        || fail "$job $suite segment_set entry $token is outside 0..$(( suite_segments - 1 ))"
+                done
+            fi
             if [[ -z "$declared" ]]; then
                 declared=$suite_segments
             elif [[ "$declared" != "$suite_segments" ]]; then
@@ -263,18 +276,25 @@ check_subset() {
         fail "subset '$set_value' for $suite ran: $actual"
     }
 }
-check_subset motd 8 '0 1 2 3' 'test-motd.sh-0
+check_subset motd 11 '0 1 2 3' 'test-motd.sh-0
 test-motd.sh-1
 test-motd.sh-2
 test-motd.sh-3'
-check_subset motd 8 '' 'test-motd.sh-0
+# Double-digit segments must run as themselves, not as "1" plus a stray "0".
+check_subset motd 11 '8 9 10' 'test-motd.sh-8
+test-motd.sh-9
+test-motd.sh-10'
+check_subset motd 11 '' 'test-motd.sh-0
 test-motd.sh-1
 test-motd.sh-2
 test-motd.sh-3
 test-motd.sh-4
 test-motd.sh-5
 test-motd.sh-6
-test-motd.sh-7'
+test-motd.sh-7
+test-motd.sh-8
+test-motd.sh-9
+test-motd.sh-10'
 check_subset motd 1 '' 'test-motd.sh'
 check_subset cloudflare 8 '4 5 6 7' 'test-cloudflare-tunnel.sh-4
 test-cloudflare-tunnel.sh-5
@@ -299,23 +319,31 @@ check_reject() {
 # A segment count the suite's source does not have would silently run part of it.
 check_reject 'motd cut into two' motd 2 ''
 check_reject 'motd cut into four' motd 4 ''
+check_reject 'motd cut into eight' motd 8 ''
+check_reject 'motd cut into twelve' motd 12 ''
 check_reject 'cloudflare cut into four' cloudflare 4 ''
 check_reject 'push-worker cut into eight' push-worker 8 ''
 check_reject 'push-worker cut into two' push-worker 2 ''
-check_reject 'motd segment past its source' motd 8 '8'
+check_reject 'motd segment past its source' motd 11 '11'
 check_reject 'subset for an unsegmented suite' push 2 '0'
 check_reject 'subset for the other bucket' other 2 '0'
 check_reject 'subset without segmented mode' motd 1 '0'
 check_reject 'mixed plan with one count' all 8 ''
 check_reject 'mixed plan with four segments' all 4 '0 1 2 3'
-# Anything but a distinct single-digit in-range index is refused; a file named 1
-# must not turn "[1]" into a real segment.
+# Anything but a distinct in-range index of the declared range is refused; a
+# file named 1 must not turn "[1]" into a real segment.
 : > "$TEMP_DIR/1"
 for bad in '1 01' '9223372036854775808' '18446744073709551616' '[1]' '1,2' '-1' '1 1' '+1' '0x1' 'x'; do
     : > "$CAPTURE"
     rc=0
     ( cd "$TEMP_DIR" && TEST_SEGMENTS=8 TEST_SEGMENT_SET="$bad" bash "$TEMP_DIR/tests/run.sh" motd > "$TEMP_DIR/output" 2>&1 ) || rc=$?
     [[ "$rc" == 2 && ! -s "$CAPTURE" ]] || { cat "$TEMP_DIR/output"; fail "subset '$bad' accepted (exit $rc)"; }
+done
+for bad in '10x' '11' '010' '1 10 10' '0 11'; do
+    : > "$CAPTURE"
+    rc=0
+    ( cd "$TEMP_DIR" && TEST_SEGMENTS=11 TEST_SEGMENT_SET="$bad" bash "$TEMP_DIR/tests/run.sh" motd > "$TEMP_DIR/output" 2>&1 ) || rc=$?
+    [[ "$rc" == 2 && ! -s "$CAPTURE" ]] || { cat "$TEMP_DIR/output"; fail "subset '$bad' accepted at TEST_SEGMENTS=11 (exit $rc)"; }
 done
 for bad in 0 9 08 '4x' '1 4' 9223372036854775808 18446744073709551616; do
     : > "$CAPTURE"

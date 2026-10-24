@@ -59,16 +59,20 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # motd and cloudflare are cut into eight segments; each of their two
-          # jobs runs four of them, so a single suite spans two jobs.
+          # motd is cut into eleven segments spread over three jobs of four,
+          # four and three; cloudflare is cut into eight, two jobs of four.
           - shard: motd-a
             suite: motd
-            segments: 8
+            segments: 11
             segment_set: "0 1 2 3"
           - shard: motd-b
             suite: motd
-            segments: 8
+            segments: 11
             segment_set: "4 5 6 7"
+          - shard: motd-c
+            suite: motd
+            segments: 11
+            segment_set: "8 9 10"
           - shard: push-worker
             suite: push-worker
             segments: 4
@@ -125,16 +129,20 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # motd and cloudflare are cut into eight segments; each of their two
-          # jobs runs four of them, so a single suite spans two jobs.
+          # motd is cut into eleven segments spread over three jobs of four,
+          # four and three; cloudflare is cut into eight, two jobs of four.
           - shard: motd-a
             suite: motd
-            segments: 8
+            segments: 11
             segment_set: "0 1 2 3"
           - shard: motd-b
             suite: motd
-            segments: 8
+            segments: 11
             segment_set: "4 5 6 7"
+          - shard: motd-c
+            suite: motd
+            segments: 11
+            segment_set: "8 9 10"
           - shard: push-worker
             suite: push-worker
             segments: 4
