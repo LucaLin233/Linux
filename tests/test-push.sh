@@ -179,13 +179,13 @@ assert_fail "reject port above 65535" parse_server_info "root@host:65536"
 # both errexit modes, inside `if !` and `||` callers, and must leave the caller's
 # errexit setting untouched afterwards.
 proc_reader_flow_case() {
-    local mode="$1" e_before="" e_after="" missing_pid="" candidate="" rc=0 expected_start="" expected_uid=""
+    local mode="$1" e_before="" e_after="" missing_pid="" candidate="" rc=0 expected_start="" expected_uid="" live_pid="$BASHPID"
     e_before=off; case $- in *e*) e_before=on ;; esac
-    expected_start=$(awk '{print $22}' "/proc/$BASHPID/stat") || return 1
+    expected_start=$(awk '{print $22}' "/proc/$live_pid/stat") || return 1
     expected_uid=$(id -u) || return 1
-    read_process_stat "$BASHPID" || return 1
+    read_process_stat "$live_pid" || return 1
     [[ "$PROC_START" == "$expected_start" ]] || return 1
-    read_process_uid "$BASHPID" || return 1
+    read_process_uid "$live_pid" || return 1
     [[ "$PROC_UID" == "$expected_uid" ]] || return 1
     printf 'live-read %s\n' "$mode"
 
