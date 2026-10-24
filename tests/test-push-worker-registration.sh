@@ -290,7 +290,7 @@ runtime_evidence_stress=${PUSH_RUNTIME_EVIDENCE_STRESS:-20}
 [[ "$runtime_evidence_stress" =~ ^[0-9]+$ ]] \
     || fail "invalid PUSH_RUNTIME_EVIDENCE_STRESS: $runtime_evidence_stress"
 # The ceiling keeps an odd count working: one half always holds the last run.
-runtime_evidence_split=$(( (runtime_evidence_stress + 1) / 2 ))
+runtime_evidence_split=$(( (10#$runtime_evidence_stress + 1) / 2 ))
 
 # The failed-reap child and case body are shared for the same reason: part one
 # of segment 0 costs about 18 s while each seeded run costs about 2.8 s, so the
@@ -900,7 +900,7 @@ chmod 0700 "$TEST_DIR/hard-timeout-cleanup-failure-child.sh"
 for runtime_evidence_run in $(seq 1 "$runtime_evidence_split"); do
     run_preserved_cleanup_retry_case "$runtime_evidence_run"
 done
-if (( runtime_evidence_split >= runtime_evidence_stress )); then
+if (( runtime_evidence_split >= 10#$runtime_evidence_stress )); then
     pass "failed cleanup evidence retry completed $runtime_evidence_stress deterministic run(s)"
 fi
 fi
@@ -910,7 +910,7 @@ if seg_is 3; then
 for runtime_evidence_run in $(seq $(( runtime_evidence_split + 1 )) "$runtime_evidence_stress"); do
     run_preserved_cleanup_retry_case "$runtime_evidence_run"
 done
-if (( runtime_evidence_split < runtime_evidence_stress )); then
+if (( runtime_evidence_split < 10#$runtime_evidence_stress )); then
     pass "failed cleanup evidence retry completed $runtime_evidence_stress deterministic run(s)"
 fi
 fi
