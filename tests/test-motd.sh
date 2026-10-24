@@ -689,7 +689,9 @@ for pending_phase in pending-create pending-write pending-chown pending-chmod pe
     motd_run_locked_operation install
 )
 done
+fi
 
+if seg_is 3; then
 for pending_kind in broken-symlink symlink directory fifo mode owner gid; do
 (
     root="$TEST_DIR/pending-kind-$pending_kind"; create_fixture "$root"; export_paths "$root"
@@ -803,7 +805,7 @@ for native_id in uname motd_news; do
 done
 fi
 
-if seg_is 3; then
+if seg_is 4; then
 for kill_phase in transaction-snapshot-building transaction-final-moved target-committed-motd target-committed-issue_net target-committed-motd_news committed-cleanup committed-old-generation-cleaned committed-pending-removed; do
 (
     root="$TEST_DIR/sigkill-$kill_phase"; create_fixture "$root"; export_paths "$root"
@@ -826,7 +828,9 @@ for kill_phase in transaction-snapshot-building transaction-final-moved target-c
     motd_take_lock; motd_release_lock
 )
 done
+fi
 
+if seg_is 5; then
 (
     root="$TEST_DIR/generation-bounded"; create_fixture "$root"; export_paths "$root"
     load_motd
@@ -903,7 +907,7 @@ done
 )
 fi
 
-if seg_is 4; then
+if seg_is 6; then
 for hook_case in content-motd mode-issue_net inode-motd_news type-issue_net; do
 (
     root="$TEST_DIR/hook-target-$hook_case"; create_fixture "$root"; export_paths "$root"
@@ -998,7 +1002,7 @@ for pending_hook_case in id extra-line inode; do
 done
 fi
 
-if seg_is 5; then
+if seg_is 7; then
 for building_phase in transaction-snapshot-building capture-motd capture-issue_net capture-motd_news snapshot-commit transaction-final-move; do
 (
     root="$TEST_DIR/building-fail-$building_phase"; create_fixture "$root"; export_paths "$root"
@@ -1032,7 +1036,7 @@ for building_phase in transaction-snapshot-building capture-motd capture-issue_n
 done
 fi
 
-if seg_is 6; then
+if seg_is 8; then
 for previous_impl in tool module; do
 (
     root="$TEST_DIR/previous-only-$previous_impl"; create_fixture "$root"; export_paths "$root"
@@ -1128,7 +1132,7 @@ done
 )
 fi
 
-if seg_is 7; then
+if seg_is 9; then
 for missing_command in bash chown flock ln od readlink sha256sum touch wc; do
 (
     root="$TEST_DIR/module-missing-$missing_command"; create_fixture "$root"; export_paths "$root"
@@ -1203,7 +1207,7 @@ for group_impl in tool module; do
 done
 fi
 
-if seg_is 8; then
+if seg_is 10; then
 for illegal_legacy_name in motd.previous-unknown issue.previous-unknown motd.invalid-backup evil.initial-backup; do
 (
     root="$TEST_DIR/legacy-name-${illegal_legacy_name//[^a-zA-Z0-9]/-}"; create_fixture "$root"; export_paths "$root"; load_motd; motd_run_locked_operation install
@@ -1265,11 +1269,11 @@ done
 )
 fi
 
-if seg_is 9; then
+if seg_is 11; then
 run_rollback_damage_cases tool
 fi
 
-if seg_is 10; then
+if seg_is 12; then
 run_rollback_damage_cases module
 
 for rollback_impl in tool module; do

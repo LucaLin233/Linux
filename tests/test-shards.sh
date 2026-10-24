@@ -163,7 +163,7 @@ check_matrix() {
                 # "x" (or "10x") fails here instead of being filtered out.
                 read -r -a set_tokens <<< "$segment_set_value"
                 for token in "${set_tokens[@]}"; do
-                    [[ "$token" =~ ^([0-9]|1[01])$ ]] \
+                    [[ "$token" =~ ^([0-9]|1[0-2])$ ]] \
                         || fail "$job $suite has an invalid segment_set entry: '$token'"
                     (( token < suite_segments )) \
                         || fail "$job $suite segment_set entry $token is outside 0..$(( suite_segments - 1 ))"
@@ -276,15 +276,17 @@ check_subset() {
         fail "subset '$set_value' for $suite ran: $actual"
     }
 }
-check_subset motd 11 '0 1 2 3' 'test-motd.sh-0
+check_subset motd 13 '0 1 2 3 4' 'test-motd.sh-0
 test-motd.sh-1
 test-motd.sh-2
-test-motd.sh-3'
+test-motd.sh-3
+test-motd.sh-4'
 # Double-digit segments must run as themselves, not as "1" plus a stray "0".
-check_subset motd 11 '8 9 10' 'test-motd.sh-8
-test-motd.sh-9
-test-motd.sh-10'
-check_subset motd 11 '' 'test-motd.sh-0
+check_subset motd 13 '9 10 11 12' 'test-motd.sh-9
+test-motd.sh-10
+test-motd.sh-11
+test-motd.sh-12'
+check_subset motd 13 '' 'test-motd.sh-0
 test-motd.sh-1
 test-motd.sh-2
 test-motd.sh-3
@@ -294,7 +296,9 @@ test-motd.sh-6
 test-motd.sh-7
 test-motd.sh-8
 test-motd.sh-9
-test-motd.sh-10'
+test-motd.sh-10
+test-motd.sh-11
+test-motd.sh-12'
 check_subset motd 1 '' 'test-motd.sh'
 check_subset cloudflare 12 '2 3 5 6 11' 'test-cloudflare-tunnel.sh-2
 test-cloudflare-tunnel.sh-3
@@ -350,6 +354,7 @@ check_reject() {
 check_reject 'motd cut into two' motd 2 ''
 check_reject 'motd cut into four' motd 4 ''
 check_reject 'motd cut into eight' motd 8 ''
+check_reject 'motd cut into eleven' motd 11 ''
 check_reject 'motd cut into twelve' motd 12 ''
 check_reject 'cloudflare cut into four' cloudflare 4 ''
 check_reject 'cloudflare cut into eight' cloudflare 8 ''
@@ -357,7 +362,7 @@ check_reject 'cloudflare cut into two' cloudflare 2 ''
 check_reject 'push-worker cut into eight' push-worker 8 ''
 check_reject 'push-worker cut into four' push-worker 4 ''
 check_reject 'push-worker cut into two' push-worker 2 ''
-check_reject 'motd segment past its source' motd 11 '11'
+check_reject 'motd segment past its source' motd 13 '13'
 check_reject 'subset for an unsegmented suite' push 2 '0'
 check_reject 'subset for the other bucket' other 2 '0'
 check_reject 'subset without segmented mode' motd 1 '0'
@@ -379,10 +384,10 @@ check_bad_set() {
 }
 : > "$TEMP_DIR/1"
 for bad in '1 01' '9223372036854775808' '18446744073709551616' '[1]' '1,2' '-1' '1 1' '+1' '0x1' 'x'; do
-    check_bad_set motd 11 "$bad"
+    check_bad_set motd 13 "$bad"
 done
-for bad in '10x' '11' '010' '1 10 10' '0 11'; do
-    check_bad_set motd 11 "$bad"
+for bad in '10x' '13' '010' '1 12 12' '0 13'; do
+    check_bad_set motd 13 "$bad"
 done
 # The seven-segment suite validates its own tokens the same way, so a set that
 # only matches a stale segment count cannot pass for a good one.
