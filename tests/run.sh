@@ -72,7 +72,7 @@ done
 # TEST_SEGMENTS=1 every suite runs in one process, all segments in order.
 declare -rA SEGMENTED_SUITES=(
     [test-motd.sh]=11
-    [test-cloudflare-tunnel.sh]=8
+    [test-cloudflare-tunnel.sh]=12
     [test-push-worker-registration.sh]=7
 )
 segments=${TEST_SEGMENTS:-1}

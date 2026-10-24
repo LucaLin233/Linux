@@ -70,7 +70,9 @@ jobs:
         include:
           # motd is cut into eleven segments spread over three jobs of four,
           # four and three; push-worker is cut into seven, two jobs of four and
-          # three; cloudflare is cut into eight, two jobs of four.
+          # three; cloudflare is cut into twelve, three jobs of four whose
+          # segment sets mix early and late segments so the slowest one is
+          # never paired with the other heavy halves.
           - shard: motd-a
             suite: motd
             segments: 11
@@ -96,12 +98,16 @@ jobs:
             segments: 1
           - shard: cloudflare-a
             suite: cloudflare
-            segments: 8
-            segment_set: "0 1 2 3"
+            segments: 12
+            segment_set: "0 2 6 9"
           - shard: cloudflare-b
             suite: cloudflare
-            segments: 8
-            segment_set: "4 5 6 7"
+            segments: 12
+            segment_set: "1 3 5 7"
+          - shard: cloudflare-c
+            suite: cloudflare
+            segments: 12
+            segment_set: "4 8 10 11"
           - shard: other
             suite: other
             segments: 1
@@ -146,7 +152,9 @@ jobs:
         include:
           # motd is cut into eleven segments spread over three jobs of four,
           # four and three; push-worker is cut into seven, two jobs of four and
-          # three; cloudflare is cut into eight, two jobs of four.
+          # three; cloudflare is cut into twelve, three jobs of four whose
+          # segment sets mix early and late segments so the slowest one is
+          # never paired with the other heavy halves.
           - shard: motd-a
             suite: motd
             segments: 11
@@ -172,12 +180,16 @@ jobs:
             segments: 1
           - shard: cloudflare-a
             suite: cloudflare
-            segments: 8
-            segment_set: "0 1 2 3"
+            segments: 12
+            segment_set: "0 2 6 9"
           - shard: cloudflare-b
             suite: cloudflare
-            segments: 8
-            segment_set: "4 5 6 7"
+            segments: 12
+            segment_set: "1 3 5 7"
+          - shard: cloudflare-c
+            suite: cloudflare
+            segments: 12
+            segment_set: "4 8 10 11"
           - shard: other
             suite: other
             segments: 1

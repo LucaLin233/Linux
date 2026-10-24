@@ -296,10 +296,30 @@ test-motd.sh-8
 test-motd.sh-9
 test-motd.sh-10'
 check_subset motd 1 '' 'test-motd.sh'
-check_subset cloudflare 8 '4 5 6 7' 'test-cloudflare-tunnel.sh-4
+check_subset cloudflare 12 '0 2 6 9' 'test-cloudflare-tunnel.sh-0
+test-cloudflare-tunnel.sh-2
+test-cloudflare-tunnel.sh-6
+test-cloudflare-tunnel.sh-9'
+check_subset cloudflare 12 '1 3 5 7' 'test-cloudflare-tunnel.sh-1
+test-cloudflare-tunnel.sh-3
+test-cloudflare-tunnel.sh-5
+test-cloudflare-tunnel.sh-7'
+check_subset cloudflare 12 '4 8 10 11' 'test-cloudflare-tunnel.sh-4
+test-cloudflare-tunnel.sh-8
+test-cloudflare-tunnel.sh-10
+test-cloudflare-tunnel.sh-11'
+check_subset cloudflare 12 '' 'test-cloudflare-tunnel.sh-0
+test-cloudflare-tunnel.sh-1
+test-cloudflare-tunnel.sh-2
+test-cloudflare-tunnel.sh-3
+test-cloudflare-tunnel.sh-4
 test-cloudflare-tunnel.sh-5
 test-cloudflare-tunnel.sh-6
-test-cloudflare-tunnel.sh-7'
+test-cloudflare-tunnel.sh-7
+test-cloudflare-tunnel.sh-8
+test-cloudflare-tunnel.sh-9
+test-cloudflare-tunnel.sh-10
+test-cloudflare-tunnel.sh-11'
 check_subset cloudflare 1 '' 'test-cloudflare-tunnel.sh'
 check_subset push-worker 7 '2' 'test-push-worker-registration.sh-2'
 check_subset push-worker 7 '0 1 2 3' 'test-push-worker-registration.sh-0
@@ -332,6 +352,8 @@ check_reject 'motd cut into four' motd 4 ''
 check_reject 'motd cut into eight' motd 8 ''
 check_reject 'motd cut into twelve' motd 12 ''
 check_reject 'cloudflare cut into four' cloudflare 4 ''
+check_reject 'cloudflare cut into eight' cloudflare 8 ''
+check_reject 'cloudflare cut into two' cloudflare 2 ''
 check_reject 'push-worker cut into eight' push-worker 8 ''
 check_reject 'push-worker cut into four' push-worker 4 ''
 check_reject 'push-worker cut into two' push-worker 2 ''
@@ -366,6 +388,12 @@ done
 # only matches a stale segment count cannot pass for a good one.
 for bad in '0 1 2 3x' '4 5 6x' '7' '6 6' '+1' '010'; do
     check_bad_set push-worker 7 "$bad"
+done
+
+# The twelve-segment suite validates its own tokens the same way, so a set that
+# only matches the old eight-segment layout cannot pass for a good one.
+for bad in '0 1 2 3x' '0 2 6x' '12' '11 11' '+1' '010'; do
+    check_bad_set cloudflare 12 "$bad"
 done
 for bad in 0 9 08 '4x' '1 4' 9223372036854775808 18446744073709551616; do
     : > "$CAPTURE"
