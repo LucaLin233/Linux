@@ -572,9 +572,7 @@ load_motd;
 motd_run_locked_operation restore previous;
 assert_eq legacy "$(cat "$MOTD_ETC_ROOT/motd")" "state legacy restore"
 )
-fi
 
-if seg_is 1; then
 for legacy_phase in random-id stat open create cat chown chmod sha256 manifest mv; do
 (
     root="$TEST_DIR/legacy-io-$legacy_phase"; create_fixture "$root"; export_paths "$root"
@@ -626,7 +624,9 @@ for pending_phase in pending-create pending-write pending-chown pending-chmod pe
     motd_run_locked_operation install
 )
 done
+fi
 
+if seg_is 1; then
 for pending_kind in broken-symlink symlink directory fifo mode owner gid; do
 (
     root="$TEST_DIR/pending-kind-$pending_kind"; create_fixture "$root"; export_paths "$root"
@@ -863,9 +863,7 @@ for hook_case in content-motd mode-issue_net inode-motd_news type-issue_net; do
     assert_no_motd_residue "$root"
 )
 done
-fi
 
-if seg_is 2; then
 (
     root="$TEST_DIR/hook-rollback-stage"; create_fixture "$root"; export_paths "$root"
     load_motd; motd_run_locked_operation install
@@ -933,8 +931,10 @@ for pending_hook_case in id extra-line inode; do
     assert_no_motd_residue "$root"
 )
 done
+fi
 
 
+if seg_is 2; then
 for building_phase in transaction-snapshot-building capture-motd capture-issue_net capture-motd_news snapshot-commit transaction-final-move; do
 (
     root="$TEST_DIR/building-fail-$building_phase"; create_fixture "$root"; export_paths "$root"
@@ -1087,9 +1087,7 @@ done
 grep -Fq 'error "缺少必要命令: $required_command"' "$ROOT_DIR/modules/system-customize.sh" || fail "module missing-command error output branch absent"
 pass "module dependency preflight retains missing-command output"
 
-fi
 
-if seg_is 3; then
 for noop_impl in tool module; do
     for noop_created_type in regular symlink fifo; do
     (
@@ -1121,7 +1119,9 @@ for noop_impl in tool module; do
     )
     done
 done
+fi
 
+if seg_is 3; then
 for group_impl in tool module; do
     for group_change in motd-content issue-mode custom-inode; do
     (
@@ -1271,6 +1271,6 @@ for rollback_impl in tool module; do
     assert_no_motd_residue "$root"
 )
 done
-fi
 
 printf 'All MOTD rollback final validation tests passed.\n'
+fi

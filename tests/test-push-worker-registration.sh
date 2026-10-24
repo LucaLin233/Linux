@@ -690,7 +690,9 @@ pass "failed managed-session reap remains bounded for 20 deterministic runs"
     [[ ! -e "$state_file" && -e "$root/capture/reaped" ]] || fail "parent fallback evidence incomplete"
     pass "parent fallback cleans a live failed session without PPID 1 zombie"
 )
+fi
 
+if seg_is 1; then
 (
     trap - EXIT HUP INT TERM
     sleep 60 & replacement=$!
@@ -777,9 +779,7 @@ chmod 0700 "$TEST_DIR/hard-timeout-cleanup-failure-child.sh"
     [[ -z "$(find "$root/runtime" -mindepth 1 -print -quit 2>/dev/null)" ]] || fail "hard timeout cleanup failure left runtime"
     pass "hard timeout cleanup failure is bounded and blocks subsequent command"
 )
-fi
 
-if seg_is 1; then
 run_preserved_cleanup_retry_case() (
     local run="$1" root runtime runtime_dev runtime_inode credential leader leader_start leader_pgid leader_sid state_file
     local owner watchdog rc=0 metadata="" state_status=0
@@ -852,7 +852,9 @@ for runtime_evidence_run in $(seq 1 "$runtime_evidence_stress"); do
     run_preserved_cleanup_retry_case "$runtime_evidence_run"
 done
 pass "failed cleanup evidence retry completed $runtime_evidence_stress deterministic run(s)"
+fi
 
+if seg_is 2; then
 (
     local_cleanup_root="$TEST_DIR/active-cleanup-evidence"; setup_fixture "$local_cleanup_root"
     runtime=$TEMP_DIR; runtime_dev=$TEMP_DIR_DEV; runtime_inode=$TEMP_DIR_INODE
@@ -969,9 +971,7 @@ done
         fail "clean runtime final proof did not clear state"
     pass "clean runtime final proof preserves normal success path"
 )
-fi
 
-if seg_is 2; then
 cat > "$TEST_DIR/runtime-retention-signal-child.sh" <<'CHILD'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -1336,7 +1336,9 @@ run_active_grace_signal_case() {
 run_active_grace_signal_case HUP 129
 run_active_grace_signal_case INT 130
 run_active_grace_signal_case TERM 143
+fi
 
+if seg_is 3; then
 cat > "$TEST_DIR/live-cleanup-failure-child.sh" <<'CHILD'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -1410,9 +1412,7 @@ run_live_cleanup_failure_signal_case() (
 run_live_cleanup_failure_signal_case HUP 129
 run_live_cleanup_failure_signal_case INT 130
 run_live_cleanup_failure_signal_case TERM 143
-fi
 
-if seg_is 3; then
 cat > "$TEST_DIR/state-publication-child.sh" <<'CHILD'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -1565,7 +1565,7 @@ done
     assert_no_registration_residue "$root"; cleanup_runtime; assert_no_registration_residue "$root"
     pass "normal registration/session lifecycle cleans all state"
 )
-fi
 
 printf 'All push worker registration tests passed.\n'
+fi
 
