@@ -1,5 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# --- CI segments (tools/segmentize_ranges.py) ---
+# TEST_SEGMENT unset: every segment runs in order, exactly like the original.
+seg_is() {
+    [[ -z ${TEST_SEGMENT:-} ]] || (( $1 == TEST_SEGMENT ))
+}
+# --- end CI segments ---
+
+#!/usr/bin/env bash
+set -euo pipefail
 # Safe runtime identity only: no environment dump, credentials, or xtrace.
 printf "DIAG: bash=%s kernel=%s\n" "$BASH_VERSION" "$(uname -r)"
 dpkg-query -W bash libc6 2>/dev/null || true
@@ -73,6 +82,139 @@ wait_test_process_start() {
     return 1
 }
 
+source "$SCRIPT"
+trap 'rm -rf "$TEST_DIR"' EXIT
+setup_fixture() {
+    local root="$1"
+    CURRENT_FIXTURE_ROOT=$root
+    mkdir -m 0700 "$root" "$root/runtime" "$root/capture"
+    TMPDIR="$root/runtime"; initialize_runtime
+    MAX_PARALLEL=2
+    MAX_RETRIES=1
+    BATCH_WORKER_FAILED=false
+    BATCH_WORKER_ERROR=false
+}
+assert_no_registration_residue() {
+    local root="$1"
+    [[ -z "$(find "$root/runtime" \( -name 'worker-registration.*' -o -name '.worker-registration.*' -o -name 'worker-session.*.state' \) -print -quit)" ]] || fail "registration/session residue remains"
+    (( ${#REGISTERING_WORKERS[@]} == 0 && ${#ACTIVE_WORKERS[@]} == 0 )) || fail "worker arrays remain"
+    (( ${#WORKER_REGISTRATION_READY_FILES[@]} == 0 && ${#WORKER_REGISTRATION_RELEASE_FILES[@]} == 0 && ${#WORKER_REGISTRATION_STARTS[@]} == 0 && ${#WORKER_REGISTRATION_STAGE_FILES[@]} == 0 )) || fail "registration arrays remain"
+}
+test_watchdog_process() {
+    local seconds="$1" marker="$2" target_pid="$3" timer=""
+    trap '[[ -z "$timer" ]] || kill "$timer" 2>/dev/null || true; [[ -z "$timer" ]] || wait "$timer" 2>/dev/null || true; exit 0' HUP INT TERM
+    sleep "$seconds" & timer=$!
+    wait "$timer" 2>/dev/null || exit 0
+    printf fired > "$marker"
+    kill -KILL "$target_pid" 2>/dev/null || true
+}
+
+run_with_watchdog() {
+    local name="$1" seconds="$2"; shift 2
+    local marker="$TEST_DIR/watchdog-$name" pid watchdog rc=0
+    "$@" & pid=$!
+    test_watchdog_process "$seconds" "$marker" "$pid" & watchdog=$!
+    wait "$pid" || rc=$?
+    kill "$watchdog" 2>/dev/null || true; wait "$watchdog" 2>/dev/null || true
+    [[ ! -e "$marker" ]] || fail "$name exceeded watchdog deadline"
+    return "$rc"
+}
+write_test_worker_session_manifest() {
+    local file="$1" state="$2" worker_pid="$3" worker_start="$4" leader_pid="$5" leader_start="$6" pgid="$7" sid="$8"
+    printf 'version=1\nstate=%s\nworker_pid=%s\nworker_start=%s\nleader_pid=%s\nleader_start=%s\npgid=%s\nsid=%s\n' \
+        "$state" "$worker_pid" "$worker_start" "$leader_pid" "$leader_start" "$pgid" "$sid" > "$file"
+    chmod 0600 "$file"
+}
+
+
+assert_retained_runtime_trusted() {
+    local path="$1" expected_dev="$2" expected_inode="$3" metadata="" dev inode owner gid mode trusted_gid
+    [[ -d "$path" && ! -L "$path" ]] || fail "retained runtime is not a regular directory: $path"
+    metadata=$(stat -Lc '%d:%i:%u:%g:%a' -- "$path") || fail "cannot stat retained runtime: $path"
+    IFS=: read -r dev inode owner gid mode <<< "$metadata"
+    trusted_gid=$(current_gid)
+    [[ "$dev" == "$expected_dev" && "$inode" == "$expected_inode" &&
+        "$owner" == "$EUID" && "$gid" == "$trusted_gid" && "$mode" == 700 ]] ||
+        fail "retained runtime trust mismatch: $metadata"
+}
+
+assert_retained_state_trusted() {
+    local file="$1" metadata="" owner gid mode trusted_gid
+    [[ -f "$file" && ! -L "$file" ]] || fail "retained worker state is not a regular file: $file"
+    metadata=$(stat -Lc '%u:%g:%a' -- "$file") || fail "cannot stat retained worker state: $file"
+    IFS=: read -r owner gid mode <<< "$metadata"
+    trusted_gid=$(current_gid)
+    [[ "$owner" == "$EUID" && "$gid" == "$trusted_gid" && "$mode" == 600 ]] ||
+        fail "retained worker state trust mismatch: $metadata"
+}
+write_active_grace_fixture() {
+    local root="$1"
+    mkdir -m 0700 "$root" "$root/bin" "$root/runtime" "$root/ssh" "$root/pids"
+    printf source > "$root/source"
+    cat > "$root/config.conf" <<EOF
+AUTH_METHOD="password"
+PASSWORD_METHOD="inline"
+PASSWORD="fixture-secret"
+DEFAULT_PORT=22
+DEFAULT_USER="root"
+MAX_PARALLEL=1
+CONNECTION_TIMEOUT=5
+TOTAL_TIMEOUT=60
+MAX_RETRIES=1
+RETRY_DELAY=1
+DELETE_EXTRA="false"
+ALLOW_DELETE_EXTRA="false"
+RSYNC_ARCHIVE="true"
+RSYNC_COMPRESS="false"
+SERVERS=("root@example.com")
+declare -A TASKS=()
+ENABLE_LOGGING="false"
+STRICT_HOST_KEY_CHECKING="accept-new"
+USER_KNOWN_HOSTS_FILE="$root/ssh/known_hosts"
+ALLOW_INSECURE_HOST_KEY_STORAGE="false"
+EOF
+    chmod 0600 "$root/config.conf"
+    cat > "$root/bin/timeout" <<'EOF'
+#!/usr/bin/env bash
+trap '' HUP INT TERM
+printf '%s\n' "$$" > "$PID_DIR/timeout.pid"
+[[ ${1:-} == --kill-after=* ]] && shift
+shift
+"$@" &
+wait "$!"
+EOF
+    cat > "$root/bin/sshpass" <<'EOF'
+#!/usr/bin/env bash
+trap '' HUP INT TERM
+printf '%s\n' "$$" > "$PID_DIR/sshpass.pid"
+[[ ${1:-} == -e ]] && shift
+"$@" &
+wait "$!"
+EOF
+    cat > "$root/bin/rsync" <<'EOF'
+#!/usr/bin/env bash
+trap '' HUP INT TERM
+set -m
+printf '%s\n' "$$" > "$PID_DIR/rsync.pid"
+ssh fake-target &
+wait "$!"
+EOF
+    cat > "$root/bin/ssh" <<'EOF'
+#!/usr/bin/env bash
+trap '' HUP INT TERM
+printf '%s\n' "$$" > "$PID_DIR/ssh.pid"
+if [[ "${STATE_PUBLISH_MODE:-active}" == cleanup ]]; then
+    while [[ ! -e "$STATE_CLEANUP_RELEASE" ]]; do sleep 0.01; done
+    exit 0
+fi
+sleep 300 &
+printf '%s\n' "$!" > "$PID_DIR/leaf.pid"
+wait "$!"
+EOF
+    chmod 0700 "$root/bin"/*
+}
+
+if seg_is 0; then
 source_root="$TEST_DIR/source"; mkdir -m 0700 "$source_root"
 source_result=$(env TMPDIR="$source_root" SCRIPT="$SCRIPT" bash -c '
 set -euo pipefail
@@ -84,7 +226,6 @@ printf source-safe
 ')
 assert_eq source-safe "$source_result" "source keeps zero runtime side effects"
 # shellcheck source=../tools/push.sh
-source "$SCRIPT"
 (
     # Inert direct-child job table: no SSH or production services.
     sleep 10 & snapshot_child=$!
@@ -98,7 +239,6 @@ source "$SCRIPT"
     trap - EXIT
     pass "job snapshot preserves direct-child matching and reap semantics"
 )
-trap 'rm -rf "$TEST_DIR"' EXIT
 
 # Deterministic coordinator contract: a live worker can republish after cleanup.
 (
@@ -121,22 +261,6 @@ trap 'rm -rf "$TEST_DIR"' EXIT
     pass "live publisher tracking survives successful active cleanup"
 )
 
-setup_fixture() {
-    local root="$1"
-    CURRENT_FIXTURE_ROOT=$root
-    mkdir -m 0700 "$root" "$root/runtime" "$root/capture"
-    TMPDIR="$root/runtime"; initialize_runtime
-    MAX_PARALLEL=2
-    MAX_RETRIES=1
-    BATCH_WORKER_FAILED=false
-    BATCH_WORKER_ERROR=false
-}
-assert_no_registration_residue() {
-    local root="$1"
-    [[ -z "$(find "$root/runtime" \( -name 'worker-registration.*' -o -name '.worker-registration.*' -o -name 'worker-session.*.state' \) -print -quit)" ]] || fail "registration/session residue remains"
-    (( ${#REGISTERING_WORKERS[@]} == 0 && ${#ACTIVE_WORKERS[@]} == 0 )) || fail "worker arrays remain"
-    (( ${#WORKER_REGISTRATION_READY_FILES[@]} == 0 && ${#WORKER_REGISTRATION_RELEASE_FILES[@]} == 0 && ${#WORKER_REGISTRATION_STARTS[@]} == 0 && ${#WORKER_REGISTRATION_STAGE_FILES[@]} == 0 )) || fail "registration arrays remain"
-}
 
 run_delayed_parent_reap_case() (
     local depth="$1" root leader leader_start leader_pgid leader_sid
@@ -233,25 +357,6 @@ CHILD
 if [[ "${PUSH_REAP_ONLY:-false}" == true ]]; then
     exit 0
 fi
-test_watchdog_process() {
-    local seconds="$1" marker="$2" target_pid="$3" timer=""
-    trap '[[ -z "$timer" ]] || kill "$timer" 2>/dev/null || true; [[ -z "$timer" ]] || wait "$timer" 2>/dev/null || true; exit 0' HUP INT TERM
-    sleep "$seconds" & timer=$!
-    wait "$timer" 2>/dev/null || exit 0
-    printf fired > "$marker"
-    kill -KILL "$target_pid" 2>/dev/null || true
-}
-
-run_with_watchdog() {
-    local name="$1" seconds="$2"; shift 2
-    local marker="$TEST_DIR/watchdog-$name" pid watchdog rc=0
-    "$@" & pid=$!
-    test_watchdog_process "$seconds" "$marker" "$pid" & watchdog=$!
-    wait "$pid" || rc=$?
-    kill "$watchdog" 2>/dev/null || true; wait "$watchdog" 2>/dev/null || true
-    [[ ! -e "$marker" ]] || fail "$name exceeded watchdog deadline"
-    return "$rc"
-}
 
 root_cause_regression_case() (
     root="$TEST_DIR/root-cause"; setup_fixture "$root"
@@ -585,7 +690,9 @@ pass "failed managed-session reap remains bounded for 20 deterministic runs"
     [[ ! -e "$state_file" && -e "$root/capture/reaped" ]] || fail "parent fallback evidence incomplete"
     pass "parent fallback cleans a live failed session without PPID 1 zombie"
 )
+fi
 
+if seg_is 1; then
 (
     trap - EXIT HUP INT TERM
     sleep 60 & replacement=$!
@@ -673,35 +780,6 @@ chmod 0700 "$TEST_DIR/hard-timeout-cleanup-failure-child.sh"
     pass "hard timeout cleanup failure is bounded and blocks subsequent command"
 )
 
-write_test_worker_session_manifest() {
-    local file="$1" state="$2" worker_pid="$3" worker_start="$4" leader_pid="$5" leader_start="$6" pgid="$7" sid="$8"
-    printf 'version=1\nstate=%s\nworker_pid=%s\nworker_start=%s\nleader_pid=%s\nleader_start=%s\npgid=%s\nsid=%s\n' \
-        "$state" "$worker_pid" "$worker_start" "$leader_pid" "$leader_start" "$pgid" "$sid" > "$file"
-    chmod 0600 "$file"
-}
-
-
-assert_retained_runtime_trusted() {
-    local path="$1" expected_dev="$2" expected_inode="$3" metadata="" dev inode owner gid mode trusted_gid
-    [[ -d "$path" && ! -L "$path" ]] || fail "retained runtime is not a regular directory: $path"
-    metadata=$(stat -Lc '%d:%i:%u:%g:%a' -- "$path") || fail "cannot stat retained runtime: $path"
-    IFS=: read -r dev inode owner gid mode <<< "$metadata"
-    trusted_gid=$(current_gid)
-    [[ "$dev" == "$expected_dev" && "$inode" == "$expected_inode" &&
-        "$owner" == "$EUID" && "$gid" == "$trusted_gid" && "$mode" == 700 ]] ||
-        fail "retained runtime trust mismatch: $metadata"
-}
-
-assert_retained_state_trusted() {
-    local file="$1" metadata="" owner gid mode trusted_gid
-    [[ -f "$file" && ! -L "$file" ]] || fail "retained worker state is not a regular file: $file"
-    metadata=$(stat -Lc '%u:%g:%a' -- "$file") || fail "cannot stat retained worker state: $file"
-    IFS=: read -r owner gid mode <<< "$metadata"
-    trusted_gid=$(current_gid)
-    [[ "$owner" == "$EUID" && "$gid" == "$trusted_gid" && "$mode" == 600 ]] ||
-        fail "retained worker state trust mismatch: $metadata"
-}
-
 run_preserved_cleanup_retry_case() (
     local run="$1" root runtime runtime_dev runtime_inode credential leader leader_start leader_pgid leader_sid state_file
     local owner watchdog rc=0 metadata="" state_status=0
@@ -774,7 +852,9 @@ for runtime_evidence_run in $(seq 1 "$runtime_evidence_stress"); do
     run_preserved_cleanup_retry_case "$runtime_evidence_run"
 done
 pass "failed cleanup evidence retry completed $runtime_evidence_stress deterministic run(s)"
+fi
 
+if seg_is 2; then
 (
     local_cleanup_root="$TEST_DIR/active-cleanup-evidence"; setup_fixture "$local_cleanup_root"
     runtime=$TEMP_DIR; runtime_dev=$TEMP_DIR_DEV; runtime_inode=$TEMP_DIR_INODE
@@ -891,7 +971,6 @@ done
         fail "clean runtime final proof did not clear state"
     pass "clean runtime final proof preserves normal success path"
 )
-
 
 cat > "$TEST_DIR/runtime-retention-signal-child.sh" <<'CHILD'
 #!/usr/bin/env bash
@@ -1199,72 +1278,6 @@ parallel_fallback_runs=${PUSH_WORKER_REGISTRATION_PARALLEL_STRESS:-1}
 for parallel_run in $(seq 1 "$parallel_fallback_runs"); do run_parallel_fallback_iteration "$parallel_run"; done
 pass "parallel fallback completed $parallel_fallback_runs deterministic run(s)"
 
-write_active_grace_fixture() {
-    local root="$1"
-    mkdir -m 0700 "$root" "$root/bin" "$root/runtime" "$root/ssh" "$root/pids"
-    printf source > "$root/source"
-    cat > "$root/config.conf" <<EOF
-AUTH_METHOD="password"
-PASSWORD_METHOD="inline"
-PASSWORD="fixture-secret"
-DEFAULT_PORT=22
-DEFAULT_USER="root"
-MAX_PARALLEL=1
-CONNECTION_TIMEOUT=5
-TOTAL_TIMEOUT=60
-MAX_RETRIES=1
-RETRY_DELAY=1
-DELETE_EXTRA="false"
-ALLOW_DELETE_EXTRA="false"
-RSYNC_ARCHIVE="true"
-RSYNC_COMPRESS="false"
-SERVERS=("root@example.com")
-declare -A TASKS=()
-ENABLE_LOGGING="false"
-STRICT_HOST_KEY_CHECKING="accept-new"
-USER_KNOWN_HOSTS_FILE="$root/ssh/known_hosts"
-ALLOW_INSECURE_HOST_KEY_STORAGE="false"
-EOF
-    chmod 0600 "$root/config.conf"
-    cat > "$root/bin/timeout" <<'EOF'
-#!/usr/bin/env bash
-trap '' HUP INT TERM
-printf '%s\n' "$$" > "$PID_DIR/timeout.pid"
-[[ ${1:-} == --kill-after=* ]] && shift
-shift
-"$@" &
-wait "$!"
-EOF
-    cat > "$root/bin/sshpass" <<'EOF'
-#!/usr/bin/env bash
-trap '' HUP INT TERM
-printf '%s\n' "$$" > "$PID_DIR/sshpass.pid"
-[[ ${1:-} == -e ]] && shift
-"$@" &
-wait "$!"
-EOF
-    cat > "$root/bin/rsync" <<'EOF'
-#!/usr/bin/env bash
-trap '' HUP INT TERM
-set -m
-printf '%s\n' "$$" > "$PID_DIR/rsync.pid"
-ssh fake-target &
-wait "$!"
-EOF
-    cat > "$root/bin/ssh" <<'EOF'
-#!/usr/bin/env bash
-trap '' HUP INT TERM
-printf '%s\n' "$$" > "$PID_DIR/ssh.pid"
-if [[ "${STATE_PUBLISH_MODE:-active}" == cleanup ]]; then
-    while [[ ! -e "$STATE_CLEANUP_RELEASE" ]]; do sleep 0.01; done
-    exit 0
-fi
-sleep 300 &
-printf '%s\n' "$!" > "$PID_DIR/leaf.pid"
-wait "$!"
-EOF
-    chmod 0700 "$root/bin"/*
-}
 cat > "$TEST_DIR/active-grace-child.sh" <<'CHILD'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -1323,7 +1336,9 @@ run_active_grace_signal_case() {
 run_active_grace_signal_case HUP 129
 run_active_grace_signal_case INT 130
 run_active_grace_signal_case TERM 143
+fi
 
+if seg_is 3; then
 cat > "$TEST_DIR/live-cleanup-failure-child.sh" <<'CHILD'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -1550,4 +1565,7 @@ done
     assert_no_registration_residue "$root"; cleanup_runtime; assert_no_registration_residue "$root"
     pass "normal registration/session lifecycle cleans all state"
 )
+
 printf 'All push worker registration tests passed.\n'
+fi
+

@@ -1,5 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# --- CI segments (tools/segmentize_ranges.py) ---
+# TEST_SEGMENT unset: every segment runs in order, exactly like the original.
+seg_is() {
+    [[ -z ${TEST_SEGMENT:-} ]] || (( $1 == TEST_SEGMENT ))
+}
+# --- end CI segments ---
+
+#!/usr/bin/env bash
+set -euo pipefail
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.."&&pwd);
 readonly ROOT_DIR
 TEST_DIR=$(mktemp -d);
@@ -57,6 +66,132 @@ else echo "O|$p|$(stat -c %F "$p")";
 fi;
 done;
 }
+create_legacy(){ printf legacy>"$MOTD_ETC_ROOT/motd.initial-backup";
+: >"$MOTD_ETC_ROOT/issue.initial-absent";
+printf net>"$MOTD_ETC_ROOT/issue.net.initial-backup";
+: >"$MOTD_ETC_ROOT/update-motd.d/00-custom-welcome.initial-unknown";
+printf uname>"$MOTD_ETC_ROOT/update-motd.d/10-uname.initial-backup";
+: >"$MOTD_ETC_ROOT/update-motd.d/50-motd-news.initial-absent";
+}
+cat >"$TEST_DIR/sig.sh"<<'CHILD'
+#!/usr/bin/env bash
+set -euo pipefail
+trap - HUP INT TERM
+. "$1";
+hit=false
+send(){ [[ $hit == false ]]||return;
+hit=true;
+kill -"$SIGNAL_NAME" "$BASHPID";
+}
+motd_snapshot_capture_hook(){ [[ $PHASE == snapshot-building&&$1 == issue ]]&&send;
+return 0;
+}
+motd_transaction_phase_hook(){ [[ $PHASE == snapshot-commit&&$1 == snapshot-commit ]]&&send;
+return 0;
+}
+motd_snapshot_commit_hook(){ [[ $PHASE == snapshot-publish&&$1 == initial&&$3 == pointer ]]&&send;
+return 0;
+}
+motd_target_commit_hook(){ case "$PHASE:$1:$2" in install-first:install:motd|install-middle:install:issue_net|restore-first:restore:motd|restore-middle:restore:issue_net)send;;
+esac;
+return 0;
+}
+case $PHASE in restore-*)motd_run_locked_operation restore previous;;
+*)motd_run_locked_operation install;;
+esac
+CHILD
+chmod 700 "$TEST_DIR/sig.sh"
+state_fingerprint() {
+    local root="$1" path
+    [[ -d "$root" ]] || { printf 'absent\n'; return; }
+    while IFS= read -r path; do
+        if [[ -L "$path" ]]; then printf 'L|%s|%s\n' "${path#$root/}" "$(readlink "$path")"
+        elif [[ -f "$path" ]]; then printf 'F|%s|%s|%s\n' "${path#$root/}" "$(stat -c %u:%g:%a "$path")" "$(sha256sum "$path" | awk '{print $1}')"
+        elif [[ -d "$path" ]]; then printf 'D|%s|%s\n' "${path#$root/}" "$(stat -c %u:%g:%a "$path")"
+        fi
+    done < <(find "$root" -mindepth 1 -print | sort)
+}
+
+generation_count() {
+    local directory="$1"
+    [[ -d "$directory" ]] || { printf '0\n'; return; }
+    find "$directory" -mindepth 1 -maxdepth 1 -type d ! -name '.*.stage' | wc -l
+}
+
+assert_no_motd_residue() {
+    local root="$1" residue
+    residue=$(find "$root" -name '.linux-setup-motd.*' -o -name '.*.pointer.*' -o -name '.pending.*' -o -name '.*.stage' 2>/dev/null)
+    [[ -z "$residue" ]] || fail "unexpected MOTD residue: $residue"
+    if [[ -d "$root/state/transactions" ]]; then [[ -z "$(find "$root/state/transactions" -mindepth 1 -print -quit)" ]] || fail "transaction residue remains"; fi
+}
+
+create_complete_legacy_scope() {
+    local scope="$1" prefix
+    cp -a "$MOTD_ETC_ROOT/motd" "$MOTD_ETC_ROOT/motd.${scope}-backup"
+    cp -a "$MOTD_ETC_ROOT/issue" "$MOTD_ETC_ROOT/issue.${scope}-backup"
+    : > "$MOTD_ETC_ROOT/issue.net.${scope}-absent"; chmod 0600 "$MOTD_ETC_ROOT/issue.net.${scope}-absent"
+    cp -a "$MOTD_ETC_ROOT/update-motd.d/00-custom-welcome" "$MOTD_ETC_ROOT/update-motd.d/00-custom-welcome.${scope}-backup"
+    cp -a "$MOTD_ETC_ROOT/update-motd.d/10-uname" "$MOTD_ETC_ROOT/update-motd.d/10-uname.${scope}-backup"
+    : > "$MOTD_ETC_ROOT/update-motd.d/50-motd-news.${scope}-absent"; chmod 0600 "$MOTD_ETC_ROOT/update-motd.d/50-motd-news.${scope}-absent"
+}
+cat > "$TEST_DIR/pointer-signal-child.sh" <<'CHILD'
+#!/usr/bin/env bash
+set -euo pipefail
+trap - HUP INT TERM
+. "$1"
+motd_snapshot_commit_hook() {
+    if [[ "$1" == previous && "$3" == pointer ]]; then kill -"$SIGNAL_NAME" "$BASHPID"; fi
+}
+motd_run_locked_operation install
+CHILD
+chmod 0700 "$TEST_DIR/pointer-signal-child.sh"
+cat > "$TEST_DIR/kill-pending-child.sh" <<'CHILD'
+#!/usr/bin/env bash
+set -euo pipefail
+. "$1"
+motd_transaction_phase_hook() { [[ "$1" == pending-active ]] && kill -KILL "$BASHPID"; return 0; }
+motd_run_locked_operation install
+CHILD
+cat > "$TEST_DIR/kill-previous-pointer-child.sh" <<'CHILD'
+#!/usr/bin/env bash
+set -euo pipefail
+. "$1"
+motd_snapshot_commit_hook() { [[ "$1" == previous && "$3" == pointer ]] && kill -KILL "$BASHPID"; return 0; }
+motd_run_locked_operation install
+CHILD
+chmod 0700 "$TEST_DIR/kill-pending-child.sh" "$TEST_DIR/kill-previous-pointer-child.sh"
+cat > "$TEST_DIR/sigkill-child.sh" <<'CHILD'
+#!/usr/bin/env bash
+set -euo pipefail
+. "$1"
+motd_transaction_phase_hook() {
+    [[ "$1" == "$KILL_PHASE" ]] && kill -KILL "$BASHPID"
+    return 0
+}
+motd_run_locked_operation install
+CHILD
+chmod 0700 "$TEST_DIR/sigkill-child.sh"
+cat > "$TEST_DIR/building-signal-child.sh" <<'CHILD'
+#!/usr/bin/env bash
+set -euo pipefail
+trap - HUP INT TERM
+. "$1"
+send_building_signal() { kill -"$SIGNAL_NAME" "$BASHPID"; }
+motd_transaction_phase_hook() {
+    case "$FAIL_PHASE:$1" in
+        transaction-snapshot-building:transaction-snapshot-building|snapshot-commit:snapshot-commit|transaction-final-move:transaction-final-move) send_building_signal ;;
+    esac
+    return 0
+}
+motd_snapshot_capture_hook() {
+    [[ "$MOTD_TRANSACTION_LIFECYCLE" == building ]] || return 0
+    case "$FAIL_PHASE:$1" in capture-motd:motd|capture-issue_net:issue_net|capture-motd_news:motd_news) send_building_signal ;; esac
+    return 0
+}
+motd_run_locked_operation install
+CHILD
+chmod 0700 "$TEST_DIR/building-signal-child.sh"
+if seg_is 0; then
 extract_payload "$ROOT_DIR/tools/setup-motd.sh">"$TEST_DIR/t";
 extract_payload "$ROOT_DIR/modules/system-customize.sh">"$TEST_DIR/m";
 cmp -s "$TEST_DIR/t" "$TEST_DIR/m"||fail payload;
@@ -231,13 +366,6 @@ assert_fail "state rejects $k" motd_prepare_state_layout;
 motd_release_lock
 );
 done
-create_legacy(){ printf legacy>"$MOTD_ETC_ROOT/motd.initial-backup";
-: >"$MOTD_ETC_ROOT/issue.initial-absent";
-printf net>"$MOTD_ETC_ROOT/issue.net.initial-backup";
-: >"$MOTD_ETC_ROOT/update-motd.d/00-custom-welcome.initial-unknown";
-printf uname>"$MOTD_ETC_ROOT/update-motd.d/10-uname.initial-backup";
-: >"$MOTD_ETC_ROOT/update-motd.d/50-motd-news.initial-absent";
-}
 (
  r="$TEST_DIR/legacy";
 create_fixture "$r";
@@ -299,34 +427,9 @@ assert_fail "rollback failure nonzero" motd_run_locked_operation install;
 assert_eq 6 "$(wc -l<"$r/a")" "rollback attempts six";
 [[ -e "$MOTD_STATE_DIR/pending" ]]||fail journal
 )
-cat >"$TEST_DIR/sig.sh"<<'CHILD'
-#!/usr/bin/env bash
-set -euo pipefail
-trap - HUP INT TERM
-. "$1";
-hit=false
-send(){ [[ $hit == false ]]||return;
-hit=true;
-kill -"$SIGNAL_NAME" "$BASHPID";
-}
-motd_snapshot_capture_hook(){ [[ $PHASE == snapshot-building&&$1 == issue ]]&&send;
-return 0;
-}
-motd_transaction_phase_hook(){ [[ $PHASE == snapshot-commit&&$1 == snapshot-commit ]]&&send;
-return 0;
-}
-motd_snapshot_commit_hook(){ [[ $PHASE == snapshot-publish&&$1 == initial&&$3 == pointer ]]&&send;
-return 0;
-}
-motd_target_commit_hook(){ case "$PHASE:$1:$2" in install-first:install:motd|install-middle:install:issue_net|restore-first:restore:motd|restore-middle:restore:issue_net)send;;
-esac;
-return 0;
-}
-case $PHASE in restore-*)motd_run_locked_operation restore previous;;
-*)motd_run_locked_operation install;;
-esac
-CHILD
-chmod 700 "$TEST_DIR/sig.sh"
+fi
+
+if seg_is 1; then
 for ph in snapshot-building snapshot-commit snapshot-publish install-first install-middle restore-first restore-middle;
 do for sig in HUP INT TERM;
 do(
@@ -472,40 +575,6 @@ motd_run_locked_operation restore previous;
 assert_eq legacy "$(cat "$MOTD_ETC_ROOT/motd")" "state legacy restore"
 )
 
-state_fingerprint() {
-    local root="$1" path
-    [[ -d "$root" ]] || { printf 'absent\n'; return; }
-    while IFS= read -r path; do
-        if [[ -L "$path" ]]; then printf 'L|%s|%s\n' "${path#$root/}" "$(readlink "$path")"
-        elif [[ -f "$path" ]]; then printf 'F|%s|%s|%s\n' "${path#$root/}" "$(stat -c %u:%g:%a "$path")" "$(sha256sum "$path" | awk '{print $1}')"
-        elif [[ -d "$path" ]]; then printf 'D|%s|%s\n' "${path#$root/}" "$(stat -c %u:%g:%a "$path")"
-        fi
-    done < <(find "$root" -mindepth 1 -print | sort)
-}
-
-generation_count() {
-    local directory="$1"
-    [[ -d "$directory" ]] || { printf '0\n'; return; }
-    find "$directory" -mindepth 1 -maxdepth 1 -type d ! -name '.*.stage' | wc -l
-}
-
-assert_no_motd_residue() {
-    local root="$1" residue
-    residue=$(find "$root" -name '.linux-setup-motd.*' -o -name '.*.pointer.*' -o -name '.pending.*' -o -name '.*.stage' 2>/dev/null)
-    [[ -z "$residue" ]] || fail "unexpected MOTD residue: $residue"
-    if [[ -d "$root/state/transactions" ]]; then [[ -z "$(find "$root/state/transactions" -mindepth 1 -print -quit)" ]] || fail "transaction residue remains"; fi
-}
-
-create_complete_legacy_scope() {
-    local scope="$1" prefix
-    cp -a "$MOTD_ETC_ROOT/motd" "$MOTD_ETC_ROOT/motd.${scope}-backup"
-    cp -a "$MOTD_ETC_ROOT/issue" "$MOTD_ETC_ROOT/issue.${scope}-backup"
-    : > "$MOTD_ETC_ROOT/issue.net.${scope}-absent"; chmod 0600 "$MOTD_ETC_ROOT/issue.net.${scope}-absent"
-    cp -a "$MOTD_ETC_ROOT/update-motd.d/00-custom-welcome" "$MOTD_ETC_ROOT/update-motd.d/00-custom-welcome.${scope}-backup"
-    cp -a "$MOTD_ETC_ROOT/update-motd.d/10-uname" "$MOTD_ETC_ROOT/update-motd.d/10-uname.${scope}-backup"
-    : > "$MOTD_ETC_ROOT/update-motd.d/50-motd-news.${scope}-absent"; chmod 0600 "$MOTD_ETC_ROOT/update-motd.d/50-motd-news.${scope}-absent"
-}
-
 for legacy_phase in random-id stat open create cat chown chmod sha256 manifest mv; do
 (
     root="$TEST_DIR/legacy-io-$legacy_phase"; create_fixture "$root"; export_paths "$root"
@@ -522,19 +591,9 @@ for legacy_phase in random-id stat open create cat chown chmod sha256 manifest m
 )
 done
 pass "legacy I/O failure matrix preserves data and state"
+fi
 
-cat > "$TEST_DIR/pointer-signal-child.sh" <<'CHILD'
-#!/usr/bin/env bash
-set -euo pipefail
-trap - HUP INT TERM
-. "$1"
-motd_snapshot_commit_hook() {
-    if [[ "$1" == previous && "$3" == pointer ]]; then kill -"$SIGNAL_NAME" "$BASHPID"; fi
-}
-motd_run_locked_operation install
-CHILD
-chmod 0700 "$TEST_DIR/pointer-signal-child.sh"
-
+if seg_is 2; then
 for signal_name in HUP INT TERM; do
 (
     root="$TEST_DIR/pointer-signal-$signal_name"; create_fixture "$root"; export_paths "$root"
@@ -596,21 +655,6 @@ for pending_kind in broken-symlink symlink directory fifo mode owner gid; do
 )
 done
 
-cat > "$TEST_DIR/kill-pending-child.sh" <<'CHILD'
-#!/usr/bin/env bash
-set -euo pipefail
-. "$1"
-motd_transaction_phase_hook() { [[ "$1" == pending-active ]] && kill -KILL "$BASHPID"; return 0; }
-motd_run_locked_operation install
-CHILD
-cat > "$TEST_DIR/kill-previous-pointer-child.sh" <<'CHILD'
-#!/usr/bin/env bash
-set -euo pipefail
-. "$1"
-motd_snapshot_commit_hook() { [[ "$1" == previous && "$3" == pointer ]] && kill -KILL "$BASHPID"; return 0; }
-motd_run_locked_operation install
-CHILD
-chmod 0700 "$TEST_DIR/kill-pending-child.sh" "$TEST_DIR/kill-previous-pointer-child.sh"
 
 for journal_case in pending-directory journal-transaction generation-scope generation-missing old-new-mix; do
 (
@@ -695,19 +739,9 @@ for native_id in uname motd_news; do
     [[ -L "$native_path" && "$(readlink "$native_path")" == "$root/external-$native_id" ]] || fail "$native_id previous symlink not restored"
 )
 done
+fi
 
-cat > "$TEST_DIR/sigkill-child.sh" <<'CHILD'
-#!/usr/bin/env bash
-set -euo pipefail
-. "$1"
-motd_transaction_phase_hook() {
-    [[ "$1" == "$KILL_PHASE" ]] && kill -KILL "$BASHPID"
-    return 0
-}
-motd_run_locked_operation install
-CHILD
-chmod 0700 "$TEST_DIR/sigkill-child.sh"
-
+if seg_is 3; then
 for kill_phase in transaction-snapshot-building transaction-final-moved target-committed-motd target-committed-issue_net target-committed-motd_news committed-cleanup committed-old-generation-cleaned committed-pending-removed; do
 (
     root="$TEST_DIR/sigkill-$kill_phase"; create_fixture "$root"; export_paths "$root"
@@ -805,8 +839,9 @@ done
     [[ ! -e "$MOTD_STATE_DIR/pending" ]] || fail "rolledback cleanup retry left pending"
     assert_eq 2 "$(generation_count "$MOTD_STATE_DIR/generations")" "rolledback cleanup retry restores bounded generations"
 )
+fi
 
-
+if seg_is 4; then
 for hook_case in content-motd mode-issue_net inode-motd_news type-issue_net; do
 (
     root="$TEST_DIR/hook-target-$hook_case"; create_fixture "$root"; export_paths "$root"
@@ -900,26 +935,6 @@ for pending_hook_case in id extra-line inode; do
 )
 done
 
-cat > "$TEST_DIR/building-signal-child.sh" <<'CHILD'
-#!/usr/bin/env bash
-set -euo pipefail
-trap - HUP INT TERM
-. "$1"
-send_building_signal() { kill -"$SIGNAL_NAME" "$BASHPID"; }
-motd_transaction_phase_hook() {
-    case "$FAIL_PHASE:$1" in
-        transaction-snapshot-building:transaction-snapshot-building|snapshot-commit:snapshot-commit|transaction-final-move:transaction-final-move) send_building_signal ;;
-    esac
-    return 0
-}
-motd_snapshot_capture_hook() {
-    [[ "$MOTD_TRANSACTION_LIFECYCLE" == building ]] || return 0
-    case "$FAIL_PHASE:$1" in capture-motd:motd|capture-issue_net:issue_net|capture-motd_news:motd_news) send_building_signal ;; esac
-    return 0
-}
-motd_run_locked_operation install
-CHILD
-chmod 0700 "$TEST_DIR/building-signal-child.sh"
 
 for building_phase in transaction-snapshot-building capture-motd capture-issue_net capture-motd_news snapshot-commit transaction-final-move; do
 (
@@ -952,7 +967,9 @@ for building_phase in transaction-snapshot-building capture-motd capture-issue_n
     )
     done
 done
+fi
 
+if seg_is 5; then
 for previous_impl in tool module; do
 (
     root="$TEST_DIR/previous-only-$previous_impl"; create_fixture "$root"; export_paths "$root"
@@ -1046,7 +1063,9 @@ done
     assert_eq original "$(cat "$MOTD_ETC_ROOT/motd")" "localized stat wrapper preserves regular legacy import"
     LANG=zh_CN.UTF-8 bash -c '. "$1"; motd_run_locked_operation install' _ "$ROOT_DIR/modules/system-customize.sh"
 )
+fi
 
+if seg_is 6; then
 for missing_command in bash chown flock ln od readlink sha256sum touch wc; do
 (
     root="$TEST_DIR/module-missing-$missing_command"; create_fixture "$root"; export_paths "$root"
@@ -1179,8 +1198,9 @@ done
     assert_eq original "$(cat "$MOTD_ETC_ROOT/motd")" "legal state root regular backup imported"; [[ -e "$MOTD_STATE_DIR/initial.current" ]] || fail "legal state root import did not publish initial pointer"
     assert_eq "$legacy_times" "$(stat -c %X:%Y "$MOTD_STATE_DIR/motd.initial-backup")" "legacy root metadata validation/import preserves timestamps"; pass "legal state root regular, symlink, and markers import"
 )
+fi
 
-
+if seg_is 7; then
 for rollback_impl in tool module; do
     for rollback_damage in motd-content issue-mode custom-inode absent-regular absent-symlink absent-fifo symlink-target; do
     (
@@ -1257,3 +1277,4 @@ for rollback_impl in tool module; do
 done
 
 printf 'All MOTD rollback final validation tests passed.\n'
+fi
