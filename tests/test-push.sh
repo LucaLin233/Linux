@@ -175,6 +175,73 @@ assert_fail "reject port above 65535" parse_server_info "root@host:65536"
     printf '%s\n' "$original_comm" > "/proc/$proc_pid/comm"
 )
 
+# proc identity helpers must stay total for absent pids: the same reads run under
+# both errexit modes, inside `if !` and `||` callers, and must leave the caller's
+# errexit setting untouched afterwards.
+proc_reader_flow_case() {
+    local mode="$1" e_before="" e_after="" missing_pid="" candidate="" rc=0 expected_start="" expected_uid="" live_pid="$BASHPID"
+    e_before=off; case $- in *e*) e_before=on ;; esac
+    expected_start=$(awk '{print $22}' "/proc/$live_pid/stat") || return 1
+    expected_uid=$(id -u) || return 1
+    read_process_stat "$live_pid" || return 1
+    [[ "$PROC_START" == "$expected_start" ]] || return 1
+    read_process_uid "$live_pid" || return 1
+    [[ "$PROC_UID" == "$expected_uid" ]] || return 1
+    printf 'live-read %s\n' "$mode"
+
+    # /proc/0 normally does not exist; fall back to the highest addressable pids
+    # so the case never depends on a fixed pid.
+    for candidate in 0 4194303 4194302 4194301 999999; do
+        [[ -e "/proc/$candidate" ]] || { missing_pid="$candidate"; break; }
+    done
+    [[ -n "$missing_pid" ]] || return 1
+
+    if ! read_process_stat "$missing_pid"; then
+        printf 'if-stat %s\n' "$mode"
+    else
+        return 1
+    fi
+    if ! read_process_uid "$missing_pid"; then
+        printf 'if-uid %s\n' "$mode"
+    else
+        return 1
+    fi
+    read_process_stat "$missing_pid" || rc=$?
+    [[ "$rc" -ne 0 ]] || { printf 'stat-absent-succeeded %s\n' "$mode"; return 1; }
+    printf 'or-stat %s\n' "$mode"
+    rc=0
+    read_process_uid "$missing_pid" || rc=$?
+    [[ "$rc" -ne 0 ]] || { printf 'uid-absent-succeeded %s\n' "$mode"; return 1; }
+    printf 'or-uid %s\n' "$mode"
+
+    e_after=off; case $- in *e*) e_after=on ;; esac
+    printf 'alive %s errexit-before=%s errexit-after=%s\n' "$mode" "$e_before" "$e_after"
+}
+
+for proc_reader_mode in errexit no-errexit; do
+    proc_reader_output=""
+    if [[ "$proc_reader_mode" == errexit ]]; then
+        proc_reader_output=$(set -e; proc_reader_flow_case "$proc_reader_mode") \
+            || fail "proc readers aborted the calling shell under $proc_reader_mode"
+    else
+        proc_reader_output=$(set +e; proc_reader_flow_case "$proc_reader_mode") \
+            || fail "proc readers aborted the calling shell under $proc_reader_mode"
+    fi
+    [[ "$proc_reader_output" == *"live-read $proc_reader_mode"* ]] \
+        || fail "proc readers rejected the live pid under $proc_reader_mode: $proc_reader_output"
+    pass "proc readers match kernel identity for live pid under $proc_reader_mode"
+    for proc_reader_marker in if-stat if-uid or-stat or-uid; do
+        [[ "$proc_reader_output" == *"$proc_reader_marker $proc_reader_mode"* ]] \
+            || fail "proc readers lost control flow after $proc_reader_marker under $proc_reader_mode: $proc_reader_output"
+    done
+    pass "proc readers reject absent pid without ending if/|| callers under $proc_reader_mode"
+    proc_reader_errexit=off
+    [[ "$proc_reader_mode" != errexit ]] || proc_reader_errexit=on
+    [[ "$proc_reader_output" == *"alive $proc_reader_mode errexit-before=$proc_reader_errexit errexit-after=$proc_reader_errexit"* ]] \
+        || fail "proc readers changed caller errexit state under $proc_reader_mode: $proc_reader_output"
+    pass "proc readers preserve caller errexit state under $proc_reader_mode"
+done
+
 # Runtime initialization publishes only a verified 0700 directory and supports idempotent cleanup.
 (
     trap - EXIT HUP INT TERM
