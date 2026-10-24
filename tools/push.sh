@@ -874,13 +874,21 @@ initialize_runtime() {
 }
 
 read_process_stat() {
-    local pid="$1" stat_line="" stat_rest="" stat_fd
+    local pid="$1" stat_line="" stat_rest="" read_status=0 had_errexit=false
     local -a fields=()
 
     [[ "$pid" =~ ^[0-9]+$ ]] || return 1
-    { exec {stat_fd}<"/proc/$pid/stat"; } 2>/dev/null || return 1
-    IFS= read -r stat_line <&"$stat_fd" || [[ -n "$stat_line" ]] || { exec {stat_fd}<&- || true; return 1; }
-    exec {stat_fd}<&- || true
+    # 整文件读取：read 内建在同一次 /proc 扫描中可能把上一个 status 读取
+    # 遗留的缓冲字节交给这里的 stat 读取（fd 本身正确、pos=0），导致存活
+    # worker 的身份校验被误判；命令替换不做回退寻址，不会串内容。
+    # 读取失败在 errexit 下会让 shell 直接退出（if/|| 均不能豁免），故读取
+    # 期间临时关闭，读完立即按原状态恢复。
+    case $- in *e*) had_errexit=true ;; esac
+    set +e
+    { stat_line=$(< "/proc/$pid/stat"); } 2>/dev/null || read_status=1
+    [[ "$had_errexit" == false ]] || set -e
+    (( read_status == 0 )) || return 1
+    [[ -n "$stat_line" ]] || return 1
     [[ "$stat_line" == "$pid ("* && "$stat_line" == *") "* ]] || return 1
     stat_rest=${stat_line##*) }
     read -r -a fields <<< "$stat_rest"
@@ -893,17 +901,15 @@ read_process_stat() {
 }
 
 read_process_uid() {
-    local pid="$1" uid_line="" status_key status_value status_fd
-    { exec {status_fd}<"/proc/$pid/status"; } 2>/dev/null || return 1
-    while read -r status_key status_value _ <&"$status_fd"; do
-        if [[ "$status_key" == Uid: ]]; then
-            uid_line=$status_value
-            break
-        fi
-    done
-    exec {status_fd}<&- || true
-    [[ "$uid_line" =~ ^[0-9]+$ ]] || return 1
-    PROC_UID=$uid_line
+    local pid="$1" status_text="" read_status=0 had_errexit=false
+    # 同 read_process_stat：整文件读取，避免 read 内建的跨读取缓冲串内容。
+    case $- in *e*) had_errexit=true ;; esac
+    set +e
+    { status_text=$(< "/proc/$pid/status"); } 2>/dev/null || read_status=1
+    [[ "$had_errexit" == false ]] || set -e
+    (( read_status == 0 )) || return 1
+    [[ "$status_text" =~ (^|$'\n')Uid:[[:space:]]+([0-9]+) ]] || return 1
+    PROC_UID=${BASH_REMATCH[2]}
 }
 
 read_process_record() {
