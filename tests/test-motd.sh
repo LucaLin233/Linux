@@ -60,26 +60,8 @@ done;
 extract_payload "$ROOT_DIR/tools/setup-motd.sh">"$TEST_DIR/t";
 extract_payload "$ROOT_DIR/modules/system-customize.sh">"$TEST_DIR/m";
 cmp -s "$TEST_DIR/t" "$TEST_DIR/m"||fail payload;
-# --- CI segment filter (tools/segmentize.py) ---
-# TEST_SEGMENT unset: every case runs, exactly like the unsplit suite.
-# TEST_SEGMENT=k: the k-th process of TEST_SEGMENTS runs its share only.
-__seg_plan=(1,3,3,3,3,1,2,2,2,1,2,2,3,1,1,3,1,2,3,3,1,1,1,3,3,3,1,2,3,1,2,0)
-__seg_n=0
-seg_skip() {
-    local slot=${__seg_plan[__seg_n]:-0}
-    __seg_n=$((__seg_n + 1))
-    [[ -z ${TEST_SEGMENT:-} ]] && return 1
-    (( slot != TEST_SEGMENT ))
-}
-# --- end CI segment filter ---
-
-if seg_skip; then :; else
 pass "MOTD payloads stay identical";
-fi
-if seg_skip; then :; else
 assert_eq cf2a4f8dfe2fe26bff5509cdaee56d9e0816fafd0594251b02e892201af5c4d5 "$(sha256sum "$TEST_DIR/t"|awk '{print $1}')" "payload hash"
-fi
-if seg_skip; then :; else
 (
  r="$TEST_DIR/source";
 mkdir -m700 "$r" "$r/lock";
@@ -88,11 +70,7 @@ b=$(trap -p EXIT HUP INT TERM ERR);
 load_motd;
 [[ "$b" == "$(trap -p EXIT HUP INT TERM ERR)"&&! -e "$MOTD_STATE_DIR"&&! -e "$MOTD_LOCK_FILE" ]]||fail source
 );
-fi
-if seg_skip; then :; else
 pass "source zero side effects"
-fi
-if seg_skip; then :; else
 (
  r="$TEST_DIR/basic";
 create_fixture "$r";
@@ -108,8 +86,6 @@ printf changed>"$MOTD_ETC_ROOT/motd";
 motd_run_locked_operation restore initial;
 assert_eq "$before" "$(target_hash "$r")" "restore initial group"
 )
-fi
-if seg_skip; then :; else
 (
  r="$TEST_DIR/types";
 create_fixture "$r";
@@ -126,8 +102,6 @@ assert_eq absent "${MOTD_SNAPSHOT_STATE[issue_net]}" "absent snapshot";
 motd_run_locked_operation restore previous;
 assert_eq "$before" "$(target_hash "$r")" "symlink restore"
 )
-fi
-if seg_skip; then :; else
 (
  r="$TEST_DIR/initial";
 create_fixture "$r";
@@ -140,8 +114,6 @@ assert_fail "initial capture atomic" motd_run_locked_operation install;
 [[ ! -e "$MOTD_STATE_DIR/initial.current" ]]||fail partial;
 assert_eq "$before" "$(target_hash "$r")" "initial failure no target change"
 )
-fi
-if seg_skip; then :; else
 (
  r="$TEST_DIR/previous";
 create_fixture "$r";
@@ -156,8 +128,6 @@ assert_fail "previous capture $id" motd_run_locked_operation install;
 assert_eq "$old" "$(motd_read_pointer previous)" "previous pointer $id";
 done
 )
-fi
-if seg_skip; then :; else
 for failing_id in motd issue_net motd_news;
 do
 (
@@ -187,8 +157,6 @@ assert_fail "restore failure $failing_id" motd_run_locked_operation restore prev
 assert_eq "$before" "$(target_hash "$r")" "restore rollback $failing_id"
 )
 done
-fi
-if seg_skip; then :; else
 (
  r="$TEST_DIR/manifest";
 create_fixture "$r";
@@ -211,8 +179,6 @@ assert_fail "manifest $k rejected" motd_run_locked_operation restore previous;
 assert_eq "$before" "$(target_hash "$r")" "manifest $k no target change";
 done
 )
-fi
-if seg_skip; then :; else
 (
  r="$TEST_DIR/lock";
 create_fixture "$r";
@@ -234,11 +200,7 @@ motd_lock_acquired_hook(){ :;
 motd_take_lock;
 motd_release_lock
 );
-fi
-if seg_skip; then :; else
 pass "shared lock nonblocking and reacquirable"
-fi
-if seg_skip; then :; else
 for k in symlink writable fifo;
 do(
  r="$TEST_DIR/l-$k";
@@ -254,8 +216,6 @@ esac;
 assert_fail "lock rejects $k" motd_take_lock
 );
 done
-fi
-if seg_skip; then :; else
 for k in symlink writable;
 do(
  r="$TEST_DIR/s-$k";
@@ -271,7 +231,6 @@ assert_fail "state rejects $k" motd_prepare_state_layout;
 motd_release_lock
 );
 done
-fi
 create_legacy(){ printf legacy>"$MOTD_ETC_ROOT/motd.initial-backup";
 : >"$MOTD_ETC_ROOT/issue.initial-absent";
 printf net>"$MOTD_ETC_ROOT/issue.net.initial-backup";
@@ -279,7 +238,6 @@ printf net>"$MOTD_ETC_ROOT/issue.net.initial-backup";
 printf uname>"$MOTD_ETC_ROOT/update-motd.d/10-uname.initial-backup";
 : >"$MOTD_ETC_ROOT/update-motd.d/50-motd-news.initial-absent";
 }
-if seg_skip; then :; else
 (
  r="$TEST_DIR/legacy";
 create_fixture "$r";
@@ -290,8 +248,6 @@ motd_run_locked_operation restore initial;
 assert_eq legacy "$(cat "$MOTD_ETC_ROOT/motd")" "legacy complete restore";
 [[ -e "$MOTD_ETC_ROOT/motd.initial-backup" ]]||fail legacymove
 )
-fi
-if seg_skip; then :; else
 for k in partial conflict commit;
 do(
  r="$TEST_DIR/lg-$k";
@@ -308,8 +264,6 @@ load_motd;
 assert_fail "legacy $k rejected" motd_run_locked_operation restore initial
 );
 done
-fi
-if seg_skip; then :; else
 (
  r="$TEST_DIR/interop";
 create_fixture "$r";
@@ -320,8 +274,6 @@ printf x>"$MOTD_ETC_ROOT/motd";
 bash -c '. "$1/tools/setup-motd.sh";motd_run_locked_operation restore previous' _ "$ROOT_DIR";
 assert_eq "$o" "$(target_hash "$r")" "module state tool restore"
 )
-fi
-if seg_skip; then :; else
 (
  r="$TEST_DIR/exit";
 create_fixture "$r";
@@ -332,8 +284,6 @@ bash -c '. "$1";motd_take_lock;motd_install_transaction_traps;motd_prepare_state
 assert_eq 1 "$n" "active exit zero maps one";
 assert_eq "$before" "$(target_hash "$r")" "active exit rollback"
 )
-fi
-if seg_skip; then :; else
 (
  r="$TEST_DIR/rbf";
 create_fixture "$r";
@@ -349,7 +299,6 @@ assert_fail "rollback failure nonzero" motd_run_locked_operation install;
 assert_eq 6 "$(wc -l<"$r/a")" "rollback attempts six";
 [[ -e "$MOTD_STATE_DIR/pending" ]]||fail journal
 )
-fi
 cat >"$TEST_DIR/sig.sh"<<'CHILD'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -400,7 +349,6 @@ assert_eq "$before" "$(target_hash "$r")" "$sig $ph rollback"
 );
 done;
 done
-if seg_skip; then :; else
 (
  r="$TEST_DIR/unknown";
 create_fixture "$r";
@@ -412,8 +360,6 @@ g=$(motd_read_pointer initial);
 motd_validate_snapshot "$MOTD_STATE_DIR/generations/$g" initial "$g";
 assert_eq unknown "${MOTD_SNAPSHOT_STATE[motd]}" "unknown initial state"
 )
-fi
-if seg_skip; then :; else
 (
  r="$TEST_DIR/readonly";
 create_fixture "$r";
@@ -422,11 +368,7 @@ bash "$ROOT_DIR/tools/setup-motd.sh" status>/dev/null;
 bash "$ROOT_DIR/tools/setup-motd.sh" help>/dev/null;
 [[ ! -e "$MOTD_STATE_DIR"&&! -e "$MOTD_LOCK_FILE" ]]||fail readonly
 );
-fi
-if seg_skip; then :; else
 pass "status help no lock"
-fi
-if seg_skip; then :; else
 (
  r="$TEST_DIR/publish";
 create_fixture "$r";
@@ -448,7 +390,6 @@ motd_snapshot_commit_hook(){ [[ "$1" != previous||"$3" != directory ]];
 assert_fail "previous directory commit failure" motd_run_locked_operation install;
 assert_eq "$old" "$(motd_read_pointer previous)" "directory failure preserves previous"
 )
-fi
 for k in owner gid;
 do(
  r="$TEST_DIR/lmeta-$k";
@@ -462,9 +403,7 @@ then [[ $k == owner ]]&&printf '99999:%s:600\n' "$MOTD_TRUSTED_GID"||printf '%s:
 else command stat "$@";
 fi;
 };
-if seg_skip; then :; else
 assert_fail "lock wrong $k" motd_take_lock
-fi
 );
 done
 for k in owner gid;
@@ -480,13 +419,10 @@ else command stat "$@";
 fi;
 };
 motd_take_lock;
-if seg_skip; then :; else
 assert_fail "state wrong $k" motd_prepare_state_layout;
-fi
 motd_release_lock
 );
 done
-if seg_skip; then :; else
 (
  r="$TEST_DIR/state-create";
 create_fixture "$r";
@@ -498,8 +434,6 @@ command chown "$@";
 assert_fail "state create failure" motd_run_locked_operation install;
 [[ ! -e "$MOTD_STATE_DIR" ]]||fail state-residue
 )
-fi
-if seg_skip; then :; else
 (
  r="$TEST_DIR/close";
 create_fixture "$r";
@@ -510,8 +444,6 @@ motd_lock_close_hook(){ return 1;
 };
 assert_fail "lock close failure" motd_release_lock
 )
-fi
-if seg_skip; then :; else
 (
  r="$TEST_DIR/device";
 create_fixture "$r";
@@ -524,8 +456,6 @@ assert_eq "$before" "$(target_hash "$r")" "device no target change";
 else pass "device test skipped";
 fi
 )
-fi
-if seg_skip; then :; else
 (
  r="$TEST_DIR/legacy-state";
 create_fixture "$r";
@@ -541,7 +471,6 @@ load_motd;
 motd_run_locked_operation restore previous;
 assert_eq legacy "$(cat "$MOTD_ETC_ROOT/motd")" "state legacy restore"
 )
-fi
 
 state_fingerprint() {
     local root="$1" path
@@ -577,7 +506,6 @@ create_complete_legacy_scope() {
     : > "$MOTD_ETC_ROOT/update-motd.d/50-motd-news.${scope}-absent"; chmod 0600 "$MOTD_ETC_ROOT/update-motd.d/50-motd-news.${scope}-absent"
 }
 
-if seg_skip; then :; else
 for legacy_phase in random-id stat open create cat chown chmod sha256 manifest mv; do
 (
     root="$TEST_DIR/legacy-io-$legacy_phase"; create_fixture "$root"; export_paths "$root"
@@ -593,10 +521,7 @@ for legacy_phase in random-id stat open create cat chown chmod sha256 manifest m
     assert_no_motd_residue "$root"
 )
 done
-fi
-if seg_skip; then :; else
 pass "legacy I/O failure matrix preserves data and state"
-fi
 
 cat > "$TEST_DIR/pointer-signal-child.sh" <<'CHILD'
 #!/usr/bin/env bash
@@ -610,7 +535,6 @@ motd_run_locked_operation install
 CHILD
 chmod 0700 "$TEST_DIR/pointer-signal-child.sh"
 
-if seg_skip; then :; else
 for signal_name in HUP INT TERM; do
 (
     root="$TEST_DIR/pointer-signal-$signal_name"; create_fixture "$root"; export_paths "$root"
@@ -1333,5 +1257,3 @@ for rollback_impl in tool module; do
 done
 
 printf 'All MOTD rollback final validation tests passed.\n'
-
-fi
