@@ -157,4 +157,22 @@ done
 checks=$(grep -c -- '= success' "$root/aggregate.yml" || true)
 [[ "$checks" == "$entries" ]] \
     || fail "the ubuntu job needs $entries jobs but asserts $checks results"
-printf 'PASS: ubuntu aggregation needs and asserts %s\n' "$needs"
+# Counting `= success` lines cannot tell which result is bound to which variable:
+# pointing LINT_TESTS_RESULT at needs.lint.result, or relaxing one `&&` to `||`,
+# leaves the count intact while the gate goes green on a failed job.  Require the
+# exact literal lines instead, so every variable must read its own needs entry
+# and all three assertions must be chained with `&&`.
+while IFS= read -r expected; do
+    grep -Fxq -- "$expected" "$root/aggregate.yml" \
+        || fail "the ubuntu aggregation job no longer has the line: $expected"
+done <<'CONTRACT'
+    if: ${{ always() }}
+          LINT_RESULT: ${{ needs.lint.result }}
+          LINT_TESTS_RESULT: ${{ needs.lint-tests.result }}
+          TEST_RESULT: ${{ needs.ubuntu-tests.result }}
+        run: >-
+          test "$LINT_RESULT" = success &&
+          test "$LINT_TESTS_RESULT" = success &&
+          test "$TEST_RESULT" = success
+CONTRACT
+printf 'PASS: ubuntu aggregation needs and asserts %s, each bound to its own result\n' "$needs"
