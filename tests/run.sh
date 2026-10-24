@@ -68,8 +68,9 @@ for test_file in "$ROOT_DIR"/tests/test-*.sh; do
 done
 
 # Suites carrying CI segment guards, with the number of segments their source
-# defines.  TEST_SEGMENTS sets how many processes share the work; with
-# TEST_SEGMENTS=1 every suite runs in one process, all segments in order.
+# defines.  TEST_SEGMENTS is the number of segments a suite is cut into;
+# TEST_SEGMENT_SET picks which of them this job runs.  With TEST_SEGMENTS=1 a
+# suite runs once, all segments in order.
 declare -rA SEGMENTED_SUITES=(
     [test-motd.sh]=13
     [test-cloudflare-tunnel.sh]=12
