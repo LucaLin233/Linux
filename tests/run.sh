@@ -6,11 +6,11 @@ readonly ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 # Positional, not exported: nested selection fixtures must still run all suites.
 shard=${1:-all}
 if (( $# > 1 )); then
-    printf 'Usage: tests/run.sh [all|motd|push|other]\n' >&2
+    printf 'Usage: tests/run.sh [all|motd|push-worker|push|cloudflare|other]\n' >&2
     exit 2
 fi
 case "$shard" in
-    all|motd|push|other) ;;
+    all|motd|push-worker|push|cloudflare|other) ;;
     *) printf 'Invalid test shard: %s\n' "$shard" >&2; exit 2 ;;
 esac
 
@@ -51,9 +51,13 @@ for test_file in "$ROOT_DIR"/tests/test-*.sh; do
         printf 'SKIP: %s (unaffected by PR diff)\n' "$test_name"
         continue
     fi
+    # One suite per heavy family so CI can schedule them independently; every
+    # other suite shares `other`.
     case "$test_name" in
         test-motd.sh) suite_shard=motd ;;
-        test-push.sh|test-push-worker-registration.sh) suite_shard=push ;;
+        test-push-worker-registration.sh) suite_shard=push-worker ;;
+        test-push.sh) suite_shard=push ;;
+        test-cloudflare-tunnel.sh) suite_shard=cloudflare ;;
         *) suite_shard=other ;;
     esac
     if [[ "$shard" != all && "$shard" != "$suite_shard" ]]; then
