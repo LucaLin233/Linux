@@ -73,7 +73,7 @@ done
 declare -rA SEGMENTED_SUITES=(
     [test-motd.sh]=11
     [test-cloudflare-tunnel.sh]=8
-    [test-push-worker-registration.sh]=4
+    [test-push-worker-registration.sh]=7
 )
 segments=${TEST_SEGMENTS:-1}
 # Bounded lexical form first, so no accepted value can overflow shell arithmetic

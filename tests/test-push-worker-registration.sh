@@ -214,6 +214,187 @@ EOF
     chmod 0700 "$root/bin"/*
 }
 
+# Two case bodies below are long enough to be shared by a pair of segments: the
+# retry stress and the failed-reap runs.  Each body lives here once and both
+# segments run a contiguous half of the runs, so no case body is duplicated and
+# no PASS summary is repeated.  Only the half holding the last run prints the
+# total, which keeps the summary text identical to the unsegmented suite.
+run_preserved_cleanup_retry_case() (
+    local run="$1" root runtime runtime_dev runtime_inode credential leader leader_start leader_pgid leader_sid state_file
+    local owner watchdog rc=0 metadata="" state_status=0
+    local -a session_pids=()
+    local -A session_starts=() session_ppids=() session_pgids=() session_states=()
+    root="$TEST_DIR/runtime-evidence-retry-$run"; setup_fixture "$root"
+    runtime=$TEMP_DIR; runtime_dev=$TEMP_DIR_DEV; runtime_inode=$TEMP_DIR_INODE
+    credential="$runtime/private-key"
+    printf 'fixture-credential-do-not-print\n' > "$credential"; chmod 0600 "$credential"
+    RUNTIME_KEY_FILE=$credential
+
+    setsid bash -c 'trap "" HUP INT TERM; kill -STOP "$BASHPID"; while :; do :; done' & leader=$!
+    leader_start=$(wait_test_process_start "$leader")
+    for _ in {1..100}; do
+        read_process_record "$leader" || true
+        [[ "$PROC_START" == "$leader_start" && "$PROC_STATE" == T ]] && break
+        sleep 0.01
+    done
+    read_process_record "$leader"
+    leader_pgid=$PROC_PGID; leader_sid=$PROC_SID
+    [[ "$leader_pgid" == "$leader" && "$leader_sid" == "$leader" ]] || fail "retry run $run leader identity invalid"
+    WORKER_TRANSFER_PID=$leader; WORKER_TRANSFER_START=$leader_start
+    WORKER_TRANSFER_PGID=$leader_pgid; WORKER_TRANSFER_SID=$leader_sid
+    publish_worker_session_state active
+    state_file=$WORKER_SESSION_STATE_FILE
+
+    eval "$(declare -f terminate_managed_session | sed '1s/terminate_managed_session/original_terminate_managed_session/')"
+    terminate_managed_session() { return 1; }
+    owner=$BASHPID
+    test_watchdog_process 3 "$root/watchdog-fired" "$owner" & watchdog=$!
+    cleanup_runtime > "$root/capture/first-cleanup.log" 2>&1 || rc=$?
+    kill -TERM "$watchdog" 2>/dev/null || true; wait "$watchdog" 2>/dev/null || true
+
+    (( rc != 0 )) || fail "retry run $run first cleanup unexpectedly succeeded"
+    [[ ! -e "$root/watchdog-fired" ]] || fail "retry run $run watchdog fired"
+    [[ "$TEMP_DIR" == "$runtime" && "$TEMP_DIR_DEV" == "$runtime_dev" && "$TEMP_DIR_INODE" == "$runtime_inode" ]] ||
+        fail "retry run $run lost runtime identity"
+    assert_retained_runtime_trusted "$runtime" "$runtime_dev" "$runtime_inode"
+    assert_retained_state_trusted "$state_file"
+    metadata=$(stat -Lc '%u:%g:%a' -- "$credential")
+    [[ "$metadata" == "$EUID:$(current_gid):600" ]] || fail "retry run $run credential permissions changed: $metadata"
+    grep -Fq 'fixture-credential-do-not-print' "$root/capture/first-cleanup.log" && fail "retry run $run printed credential content"
+    state_status=0; read_worker_session_state "$state_file" || state_status=$?
+    assert_eq 0 "$state_status" "retry run $run retained state parses"
+    [[ "$SESSION_STATE" == cleanup_failed && "$SESSION_LEADER_PID" == "$leader" &&
+        "$SESSION_LEADER_START" == "$leader_start" && "$SESSION_PGID" == "$leader_pgid" && "$SESSION_SID" == "$leader_sid" ]] ||
+        fail "retry run $run retained state identity mismatch"
+    [[ "$WORKER_TRANSFER_PID" == "$leader" && "$WORKER_TRANSFER_START" == "$leader_start" &&
+        "$WORKER_TRANSFER_PGID" == "$leader_pgid" && "$WORKER_TRANSFER_SID" == "$leader_sid" &&
+        "$WORKER_TRANSFER_CLEANUP_FAILED" == true && "$WORKER_SESSION_STATE_FILE" == "$state_file" &&
+        "$RUNTIME_CLEANUP_ACTIVE" == false ]] || fail "retry run $run lost cleanup globals"
+    test_process_identity_exists "$leader" "$leader_start" || fail "retry run $run lost live leader tracking"
+    read_process_record "$leader"
+    [[ "$PROC_PPID" == "$BASHPID" && "$PROC_STATE" != Z ]] || fail "retry run $run orphaned or zombified leader"
+
+    eval "$(declare -f original_terminate_managed_session | sed '1s/original_terminate_managed_session/terminate_managed_session/')"
+    cleanup_runtime
+    wait_test_process_identity_gone "$leader" "$leader_start" || fail "retry run $run left leader identity"
+    collect_owned_session_records "$leader_sid" session_pids session_starts session_ppids session_pgids session_states
+    assert_eq 0 "${#session_pids[@]}" "retry run $run clears managed SID"
+    [[ ! -e "$state_file" && ! -L "$state_file" && ! -e "$runtime" && ! -L "$runtime" ]] ||
+        fail "retry run $run left state or runtime"
+    runtime_lifecycle_globals_resolved || fail "retry run $run left lifecycle globals"
+    [[ "$RUNTIME_STATE" == none && "$RUNTIME_CLEANUP_ACTIVE" == false ]] || fail "retry run $run runtime state not reset"
+    pass "failed cleanup evidence retry run $run preserves then clears runtime"
+)
+
+runtime_evidence_stress=${PUSH_RUNTIME_EVIDENCE_STRESS:-20}
+[[ "$runtime_evidence_stress" =~ ^[0-9]+$ ]] \
+    || fail "invalid PUSH_RUNTIME_EVIDENCE_STRESS: $runtime_evidence_stress"
+# The ceiling keeps an odd count working: one half always holds the last run.
+runtime_evidence_split=$(( (runtime_evidence_stress + 1) / 2 ))
+
+# The failed-reap child and case body are shared for the same reason: part one
+# of segment 0 costs about 18 s while each seeded run costs about 2.8 s, so the
+# twenty runs split 8/12 and both segments stay inside the time budget.
+cat > "$TEST_DIR/failed-reap-child.sh" <<'CHILD'
+#!/usr/bin/env bash
+set -euo pipefail
+script="$1" root="$2" mode="$3"
+mkdir -p -m 0700 "$root/runtime" "$root/capture"
+export TMPDIR="$root/runtime"
+source "$script"
+initialize_runtime
+setsid bash -c 'trap "" HUP INT TERM; while :; do :; done' & leader=$!
+for _ in {1..100}; do
+    leader_start=$(get_process_start_time "$leader" 2>/dev/null || true)
+    leader_pgid=$(get_process_group_id "$leader" 2>/dev/null || true)
+    leader_sid=$(get_process_session_id "$leader" 2>/dev/null || true)
+    [[ -n "$leader_start" && "$leader_pgid" == "$leader" && "$leader_sid" == "$leader" ]] && break
+    sleep 0.01
+done
+[[ -n "$leader_start" && "$leader_pgid" == "$leader" && "$leader_sid" == "$leader" ]] || exit 90
+printf '%s\n%s\n%s\n%s\n' "$leader" "$leader_start" "$leader_pgid" "$leader_sid" > "$root/capture/leader"
+WORKER_TRANSFER_PID=$leader
+WORKER_TRANSFER_START=$leader_start
+WORKER_TRANSFER_PGID=$leader_pgid
+WORKER_TRANSFER_SID=$leader_sid
+publish_worker_session_state active
+state_file=$WORKER_SESSION_STATE_FILE
+eval "$(declare -f terminate_managed_session | sed '1s/terminate_managed_session/original_terminate_managed_session/')"
+terminate_managed_session() { return 1; }
+start_ns=$(date +%s%N)
+rc=0
+terminate_worker_transfer || rc=$?
+elapsed_ns=$(( $(date +%s%N) - start_ns ))
+[[ "$rc" != 0 && "$elapsed_ns" -lt 2000000000 ]] || exit 91
+[[ "$WORKER_TRANSFER_PID" == "$leader" && "$WORKER_TRANSFER_START" == "$leader_start" &&
+    "$WORKER_TRANSFER_PGID" == "$leader_pgid" && "$WORKER_TRANSFER_SID" == "$leader_sid" &&
+    "$WORKER_TRANSFER_CLEANUP_FAILED" == true ]] || exit 92
+read_worker_session_state "$state_file"
+[[ "$SESSION_STATE" == cleanup_failed ]] || exit 93
+next_rc=0
+run_managed_command "$TEMP_DIR/forbidden-next-command" true || next_rc=$?
+[[ "$next_rc" == "$MANAGED_CLEANUP_FAILURE_STATUS" && ! -e "$TEMP_DIR/forbidden-next-command" ]] || exit 94
+printf 'rc=%s\nelapsed_ns=%s\nnext_rc=%s\nstate_file=%s\n' "$rc" "$elapsed_ns" "$next_rc" "$state_file" > "$root/capture/result"
+: > "$root/capture/returned"
+if [[ "$mode" == hold ]]; then
+    while [[ ! -e "$root/capture/release-worker" ]]; do sleep 0.01; done
+    for _ in {1..400}; do
+        reap_status=0
+        reap_direct_managed_leader "$leader" "$leader_start" "$leader_pgid" "$leader_sid" || reap_status=$?
+        case "$reap_status" in
+            0|"$MANAGED_PROCESS_REUSED_STATUS") break ;;
+            *) sleep 0.01 ;;
+        esac
+    done
+    (( reap_status == 0 || reap_status == MANAGED_PROCESS_REUSED_STATUS )) || exit 95
+    : > "$root/capture/reaped"
+    for _ in {1..400}; do
+        [[ ! -e "$state_file" && ! -L "$state_file" ]] && break
+        sleep 0.01
+    done
+    [[ ! -e "$state_file" && ! -L "$state_file" ]] || exit 96
+    terminate_managed_session() { original_terminate_managed_session "$@"; }
+else
+    for _ in {1..400}; do [[ -e "$root/capture/release-recovery" ]] && break; sleep 0.01; done
+    [[ -e "$root/capture/release-recovery" ]] || exit 97
+    terminate_managed_session() { original_terminate_managed_session "$@"; }
+fi
+cleanup_runtime
+CHILD
+chmod 0700 "$TEST_DIR/failed-reap-child.sh"
+
+run_failed_reap_case() {
+    local run="$1" root="$TEST_DIR/failed-reap-$1" child watchdog rc=0
+    bash "$TEST_DIR/failed-reap-child.sh" "$SCRIPT" "$root" recover > "$root.log" 2>&1 & child=$!
+    test_watchdog_process 3 "$root.watchdog-fired" "$child" & watchdog=$!
+    for _ in {1..80}; do [[ -e "$root/capture/returned" ]] && break; sleep 0.05; done
+    [[ -e "$root/capture/returned" ]] || { cat "$root.log" >&2 || true; fail "failed reap run $run did not return before watchdog"; }
+    kill -TERM "$watchdog" 2>/dev/null || true; wait "$watchdog" 2>/dev/null || true
+    [[ ! -e "$root.watchdog-fired" ]] || fail "failed reap run $run fired watchdog"
+    : > "$root/capture/release-recovery"
+    wait "$child" || rc=$?
+    [[ "$rc" == 0 ]] || cat "$root.log" >&2 2>/dev/null || true
+    assert_eq 0 "$rc" "failed managed-session reap run $run returns bounded"
+    [[ -z "$(find "$root/runtime" -name 'worker-session.*.state' -print -quit 2>/dev/null)" ]] || fail "failed reap run $run left worker-session state"
+}
+
+# The state-publication matrix is shared by segments 5 and 6 the same way: the
+# combinations keep their original state, phase and signal order and split into
+# two contiguous halves, so overriding the variables below still puts every
+# combination in exactly one half.
+publication_states=${PUSH_STATE_PUBLICATION_STATES:-"active cleanup_failed"}
+publication_phases=${PUSH_STATE_PUBLICATION_PHASES:-"before-stage-create stage-ready after-rename state-file-assigned"}
+publication_signals=${PUSH_STATE_PUBLICATION_SIGNALS:-"HUP INT TERM"}
+publication_total=0
+for publication_state in $publication_states; do
+    for publication_phase in $publication_phases; do
+        for publication_signal in $publication_signals; do
+            publication_total=$(( publication_total + 1 ))
+        done
+    done
+done
+publication_split=$(( (publication_total + 1) / 2 ))
+
 if seg_is 0; then
 source_root="$TEST_DIR/source"; mkdir -m 0700 "$source_root"
 source_result=$(env TMPDIR="$source_root" SCRIPT="$SCRIPT" bash -c '
@@ -576,89 +757,23 @@ done
     pass "managed leader PID reuse is treated as original session gone"
 )
 
-cat > "$TEST_DIR/failed-reap-child.sh" <<'CHILD'
-#!/usr/bin/env bash
-set -euo pipefail
-script="$1" root="$2" mode="$3"
-mkdir -p -m 0700 "$root/runtime" "$root/capture"
-export TMPDIR="$root/runtime"
-source "$script"
-initialize_runtime
-setsid bash -c 'trap "" HUP INT TERM; while :; do :; done' & leader=$!
-for _ in {1..100}; do
-    leader_start=$(get_process_start_time "$leader" 2>/dev/null || true)
-    leader_pgid=$(get_process_group_id "$leader" 2>/dev/null || true)
-    leader_sid=$(get_process_session_id "$leader" 2>/dev/null || true)
-    [[ -n "$leader_start" && "$leader_pgid" == "$leader" && "$leader_sid" == "$leader" ]] && break
-    sleep 0.01
-done
-[[ -n "$leader_start" && "$leader_pgid" == "$leader" && "$leader_sid" == "$leader" ]] || exit 90
-printf '%s\n%s\n%s\n%s\n' "$leader" "$leader_start" "$leader_pgid" "$leader_sid" > "$root/capture/leader"
-WORKER_TRANSFER_PID=$leader
-WORKER_TRANSFER_START=$leader_start
-WORKER_TRANSFER_PGID=$leader_pgid
-WORKER_TRANSFER_SID=$leader_sid
-publish_worker_session_state active
-state_file=$WORKER_SESSION_STATE_FILE
-eval "$(declare -f terminate_managed_session | sed '1s/terminate_managed_session/original_terminate_managed_session/')"
-terminate_managed_session() { return 1; }
-start_ns=$(date +%s%N)
-rc=0
-terminate_worker_transfer || rc=$?
-elapsed_ns=$(( $(date +%s%N) - start_ns ))
-[[ "$rc" != 0 && "$elapsed_ns" -lt 2000000000 ]] || exit 91
-[[ "$WORKER_TRANSFER_PID" == "$leader" && "$WORKER_TRANSFER_START" == "$leader_start" &&
-    "$WORKER_TRANSFER_PGID" == "$leader_pgid" && "$WORKER_TRANSFER_SID" == "$leader_sid" &&
-    "$WORKER_TRANSFER_CLEANUP_FAILED" == true ]] || exit 92
-read_worker_session_state "$state_file"
-[[ "$SESSION_STATE" == cleanup_failed ]] || exit 93
-next_rc=0
-run_managed_command "$TEMP_DIR/forbidden-next-command" true || next_rc=$?
-[[ "$next_rc" == "$MANAGED_CLEANUP_FAILURE_STATUS" && ! -e "$TEMP_DIR/forbidden-next-command" ]] || exit 94
-printf 'rc=%s\nelapsed_ns=%s\nnext_rc=%s\nstate_file=%s\n' "$rc" "$elapsed_ns" "$next_rc" "$state_file" > "$root/capture/result"
-: > "$root/capture/returned"
-if [[ "$mode" == hold ]]; then
-    while [[ ! -e "$root/capture/release-worker" ]]; do sleep 0.01; done
-    for _ in {1..400}; do
-        reap_status=0
-        reap_direct_managed_leader "$leader" "$leader_start" "$leader_pgid" "$leader_sid" || reap_status=$?
-        case "$reap_status" in
-            0|"$MANAGED_PROCESS_REUSED_STATUS") break ;;
-            *) sleep 0.01 ;;
-        esac
-    done
-    (( reap_status == 0 || reap_status == MANAGED_PROCESS_REUSED_STATUS )) || exit 95
-    : > "$root/capture/reaped"
-    for _ in {1..400}; do
-        [[ ! -e "$state_file" && ! -L "$state_file" ]] && break
-        sleep 0.01
-    done
-    [[ ! -e "$state_file" && ! -L "$state_file" ]] || exit 96
-    terminate_managed_session() { original_terminate_managed_session "$@"; }
-else
-    for _ in {1..400}; do [[ -e "$root/capture/release-recovery" ]] && break; sleep 0.01; done
-    [[ -e "$root/capture/release-recovery" ]] || exit 97
-    terminate_managed_session() { original_terminate_managed_session "$@"; }
+# First half of the twenty failed-reap runs.  Segment 1 starts at run 9 and
+# holds the summary, so the runs keep their original order and the summary
+# still appears exactly once.
+for failed_reap_run in $(seq 1 8); do run_failed_reap_case "$failed_reap_run"; done
 fi
-cleanup_runtime
-CHILD
-chmod 0700 "$TEST_DIR/failed-reap-child.sh"
 
-run_failed_reap_case() {
-    local run="$1" root="$TEST_DIR/failed-reap-$1" child watchdog rc=0
-    bash "$TEST_DIR/failed-reap-child.sh" "$SCRIPT" "$root" recover > "$root.log" 2>&1 & child=$!
-    test_watchdog_process 3 "$root.watchdog-fired" "$child" & watchdog=$!
-    for _ in {1..80}; do [[ -e "$root/capture/returned" ]] && break; sleep 0.05; done
-    [[ -e "$root/capture/returned" ]] || { cat "$root.log" >&2 || true; fail "failed reap run $run did not return before watchdog"; }
-    kill -TERM "$watchdog" 2>/dev/null || true; wait "$watchdog" 2>/dev/null || true
-    [[ ! -e "$root.watchdog-fired" ]] || fail "failed reap run $run fired watchdog"
-    : > "$root/capture/release-recovery"
-    wait "$child" || rc=$?
-    [[ "$rc" == 0 ]] || cat "$root.log" >&2 2>/dev/null || true
-    assert_eq 0 "$rc" "failed managed-session reap run $run returns bounded"
-    [[ -z "$(find "$root/runtime" -name 'worker-session.*.state' -print -quit 2>/dev/null)" ]] || fail "failed reap run $run left worker-session state"
-}
-for failed_reap_run in $(seq 1 20); do run_failed_reap_case "$failed_reap_run"; done
+if seg_is 1; then
+# PUSH_REAP_ONLY keeps its original meaning for the whole suite: with it set,
+# nothing after the deadline case runs.  That used to be one exit inside
+# segment 0, so the second half carries the same guard.
+if [[ "${PUSH_REAP_ONLY:-false}" == true ]]; then
+    exit 0
+fi
+
+# Second half of the twenty failed-reap runs, then the parent fallback that
+# follows them in the original order.
+for failed_reap_run in $(seq 9 20); do run_failed_reap_case "$failed_reap_run"; done
 pass "failed managed-session reap remains bounded for 20 deterministic runs"
 
 (
@@ -692,7 +807,7 @@ pass "failed managed-session reap remains bounded for 20 deterministic runs"
 )
 fi
 
-if seg_is 1; then
+if seg_is 2; then
 (
     trap - EXIT HUP INT TERM
     sleep 60 & replacement=$!
@@ -780,81 +895,27 @@ chmod 0700 "$TEST_DIR/hard-timeout-cleanup-failure-child.sh"
     pass "hard timeout cleanup failure is bounded and blocks subsequent command"
 )
 
-run_preserved_cleanup_retry_case() (
-    local run="$1" root runtime runtime_dev runtime_inode credential leader leader_start leader_pgid leader_sid state_file
-    local owner watchdog rc=0 metadata="" state_status=0
-    local -a session_pids=()
-    local -A session_starts=() session_ppids=() session_pgids=() session_states=()
-    root="$TEST_DIR/runtime-evidence-retry-$run"; setup_fixture "$root"
-    runtime=$TEMP_DIR; runtime_dev=$TEMP_DIR_DEV; runtime_inode=$TEMP_DIR_INODE
-    credential="$runtime/private-key"
-    printf 'fixture-credential-do-not-print\n' > "$credential"; chmod 0600 "$credential"
-    RUNTIME_KEY_FILE=$credential
-
-    setsid bash -c 'trap "" HUP INT TERM; kill -STOP "$BASHPID"; while :; do :; done' & leader=$!
-    leader_start=$(wait_test_process_start "$leader")
-    for _ in {1..100}; do
-        read_process_record "$leader" || true
-        [[ "$PROC_START" == "$leader_start" && "$PROC_STATE" == T ]] && break
-        sleep 0.01
-    done
-    read_process_record "$leader"
-    leader_pgid=$PROC_PGID; leader_sid=$PROC_SID
-    [[ "$leader_pgid" == "$leader" && "$leader_sid" == "$leader" ]] || fail "retry run $run leader identity invalid"
-    WORKER_TRANSFER_PID=$leader; WORKER_TRANSFER_START=$leader_start
-    WORKER_TRANSFER_PGID=$leader_pgid; WORKER_TRANSFER_SID=$leader_sid
-    publish_worker_session_state active
-    state_file=$WORKER_SESSION_STATE_FILE
-
-    eval "$(declare -f terminate_managed_session | sed '1s/terminate_managed_session/original_terminate_managed_session/')"
-    terminate_managed_session() { return 1; }
-    owner=$BASHPID
-    test_watchdog_process 3 "$root/watchdog-fired" "$owner" & watchdog=$!
-    cleanup_runtime > "$root/capture/first-cleanup.log" 2>&1 || rc=$?
-    kill -TERM "$watchdog" 2>/dev/null || true; wait "$watchdog" 2>/dev/null || true
-
-    (( rc != 0 )) || fail "retry run $run first cleanup unexpectedly succeeded"
-    [[ ! -e "$root/watchdog-fired" ]] || fail "retry run $run watchdog fired"
-    [[ "$TEMP_DIR" == "$runtime" && "$TEMP_DIR_DEV" == "$runtime_dev" && "$TEMP_DIR_INODE" == "$runtime_inode" ]] ||
-        fail "retry run $run lost runtime identity"
-    assert_retained_runtime_trusted "$runtime" "$runtime_dev" "$runtime_inode"
-    assert_retained_state_trusted "$state_file"
-    metadata=$(stat -Lc '%u:%g:%a' -- "$credential")
-    [[ "$metadata" == "$EUID:$(current_gid):600" ]] || fail "retry run $run credential permissions changed: $metadata"
-    grep -Fq 'fixture-credential-do-not-print' "$root/capture/first-cleanup.log" && fail "retry run $run printed credential content"
-    state_status=0; read_worker_session_state "$state_file" || state_status=$?
-    assert_eq 0 "$state_status" "retry run $run retained state parses"
-    [[ "$SESSION_STATE" == cleanup_failed && "$SESSION_LEADER_PID" == "$leader" &&
-        "$SESSION_LEADER_START" == "$leader_start" && "$SESSION_PGID" == "$leader_pgid" && "$SESSION_SID" == "$leader_sid" ]] ||
-        fail "retry run $run retained state identity mismatch"
-    [[ "$WORKER_TRANSFER_PID" == "$leader" && "$WORKER_TRANSFER_START" == "$leader_start" &&
-        "$WORKER_TRANSFER_PGID" == "$leader_pgid" && "$WORKER_TRANSFER_SID" == "$leader_sid" &&
-        "$WORKER_TRANSFER_CLEANUP_FAILED" == true && "$WORKER_SESSION_STATE_FILE" == "$state_file" &&
-        "$RUNTIME_CLEANUP_ACTIVE" == false ]] || fail "retry run $run lost cleanup globals"
-    test_process_identity_exists "$leader" "$leader_start" || fail "retry run $run lost live leader tracking"
-    read_process_record "$leader"
-    [[ "$PROC_PPID" == "$BASHPID" && "$PROC_STATE" != Z ]] || fail "retry run $run orphaned or zombified leader"
-
-    eval "$(declare -f original_terminate_managed_session | sed '1s/original_terminate_managed_session/terminate_managed_session/')"
-    cleanup_runtime
-    wait_test_process_identity_gone "$leader" "$leader_start" || fail "retry run $run left leader identity"
-    collect_owned_session_records "$leader_sid" session_pids session_starts session_ppids session_pgids session_states
-    assert_eq 0 "${#session_pids[@]}" "retry run $run clears managed SID"
-    [[ ! -e "$state_file" && ! -L "$state_file" && ! -e "$runtime" && ! -L "$runtime" ]] ||
-        fail "retry run $run left state or runtime"
-    runtime_lifecycle_globals_resolved || fail "retry run $run left lifecycle globals"
-    [[ "$RUNTIME_STATE" == none && "$RUNTIME_CLEANUP_ACTIVE" == false ]] || fail "retry run $run runtime state not reset"
-    pass "failed cleanup evidence retry run $run preserves then clears runtime"
-)
-
-runtime_evidence_stress=${PUSH_RUNTIME_EVIDENCE_STRESS:-20}
-for runtime_evidence_run in $(seq 1 "$runtime_evidence_stress"); do
+# First half of the shared retry stress; the summary stays with the last run,
+# so a lower PUSH_RUNTIME_EVIDENCE_STRESS still reports its total once.
+for runtime_evidence_run in $(seq 1 "$runtime_evidence_split"); do
     run_preserved_cleanup_retry_case "$runtime_evidence_run"
 done
-pass "failed cleanup evidence retry completed $runtime_evidence_stress deterministic run(s)"
+if (( runtime_evidence_split >= runtime_evidence_stress )); then
+    pass "failed cleanup evidence retry completed $runtime_evidence_stress deterministic run(s)"
+fi
 fi
 
-if seg_is 2; then
+if seg_is 3; then
+# Second half of the shared retry stress.
+for runtime_evidence_run in $(seq $(( runtime_evidence_split + 1 )) "$runtime_evidence_stress"); do
+    run_preserved_cleanup_retry_case "$runtime_evidence_run"
+done
+if (( runtime_evidence_split < runtime_evidence_stress )); then
+    pass "failed cleanup evidence retry completed $runtime_evidence_stress deterministic run(s)"
+fi
+fi
+
+if seg_is 4; then
 (
     local_cleanup_root="$TEST_DIR/active-cleanup-evidence"; setup_fixture "$local_cleanup_root"
     runtime=$TEMP_DIR; runtime_dev=$TEMP_DIR_DEV; runtime_inode=$TEMP_DIR_INODE
@@ -1338,7 +1399,7 @@ run_active_grace_signal_case INT 130
 run_active_grace_signal_case TERM 143
 fi
 
-if seg_is 3; then
+if seg_is 5; then
 cat > "$TEST_DIR/live-cleanup-failure-child.sh" <<'CHILD'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -1413,6 +1474,8 @@ run_live_cleanup_failure_signal_case HUP 129
 run_live_cleanup_failure_signal_case INT 130
 run_live_cleanup_failure_signal_case TERM 143
 
+# Both publication halves carry their own child fixture and case runner: the
+# two halves are separate processes, so neither may rely on the other.
 cat > "$TEST_DIR/state-publication-child.sh" <<'CHILD'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -1510,12 +1573,130 @@ run_state_publication_signal_case() (
     trap - EXIT
     pass "$state/$phase/$signal_name publication window cleans process tree and runtime"
 )
-publication_states=${PUSH_STATE_PUBLICATION_STATES:-"active cleanup_failed"}
-publication_phases=${PUSH_STATE_PUBLICATION_PHASES:-"before-stage-create stage-ready after-rename state-file-assigned"}
-publication_signals=${PUSH_STATE_PUBLICATION_SIGNALS:-"HUP INT TERM"}
+
+# First half of the shared publication matrix, in the original state, phase and
+# signal order.
+publication_index=0
 for publication_state in $publication_states; do
     for publication_phase in $publication_phases; do
         for publication_signal in $publication_signals; do
+            publication_index=$(( publication_index + 1 ))
+            (( publication_index <= publication_split )) || break 3
+            case "$publication_signal" in HUP) publication_status=129 ;; INT) publication_status=130 ;; TERM) publication_status=143 ;; *) fail "unknown publication signal" ;; esac
+            run_state_publication_signal_case "$publication_state" "$publication_phase" "$publication_signal" "$publication_status"
+        done
+    done
+done
+fi
+
+if seg_is 6; then
+# Both publication halves carry their own child fixture and case runner: the
+# two halves are separate processes, so neither may rely on the other.
+cat > "$TEST_DIR/state-publication-child.sh" <<'CHILD'
+#!/usr/bin/env bash
+set -euo pipefail
+script="$1"
+shift
+source "$script"
+main_owner=$BASHPID
+eval "$(declare -f terminate_managed_session | sed '1s/terminate_managed_session/original_terminate_managed_session/')"
+terminate_managed_session() {
+    if [[ "$STATE_PUBLISH_MODE" == cleanup && "$BASHPID" != "$main_owner" ]]; then return 1; fi
+    original_terminate_managed_session "$@"
+}
+worker_session_state_publish_hook() {
+    local phase="$1" state="$2" state_file="$3" hook_stage="$4" marker_stage worker_start
+    if [[ "$STATE_PUBLISH_MODE" == cleanup && "$state" == active && "$phase" == state-file-assigned ]]; then
+        : > "$STATE_CLEANUP_RELEASE"
+    fi
+    [[ "$phase" == "$STATE_PUBLISH_PHASE" && "$state" == "$STATE_PUBLISH_STATE" ]] || return 0
+    [[ ! -e "$STATE_PUBLISH_MARKER" ]] || return 0
+    worker_start=""
+    for _ in {1..20}; do
+        if read_process_record "$BASHPID" && [[ "$PROC_UID" == "$EUID" && "$PROC_STATE" != Z ]]; then worker_start=$PROC_START; break; fi
+        sleep 0.01
+    done
+    [[ -n "$worker_start" ]] || return 1
+    marker_stage="$STATE_PUBLISH_MARKER.$BASHPID.stage"
+    (umask 077; set -o noclobber; : > "$marker_stage") || return 1
+    printf 'phase=%s\nstate=%s\nworker_pid=%s\nworker_start=%s\nleader_pid=%s\nleader_start=%s\npgid=%s\nsid=%s\nstate_file=%s\nhook_stage=%s\n' \
+        "$phase" "$state" "$BASHPID" "$worker_start" "$WORKER_TRANSFER_PID" "$WORKER_TRANSFER_START" \
+        "$WORKER_TRANSFER_PGID" "$WORKER_TRANSFER_SID" "$state_file" "$hook_stage" > "$marker_stage"
+    chmod 0600 "$marker_stage"; mv -fT "$marker_stage" "$STATE_PUBLISH_MARKER"
+    while :; do :; done
+}
+main "$@"
+CHILD
+chmod 0700 "$TEST_DIR/state-publication-child.sh"
+
+run_state_publication_signal_case() (
+    local state="$1" phase="$2" signal_name="$3" expected="$4" mode root main_pid="" main_start="" worker_pid="" worker_start="" leader_pid="" leader_start="" managed_sid=""
+    local watchdog="" watchdog_start="" unrelated="" unrelated_start="" rc=0 line key value marker state_file hook_stage
+    local -a session_pids=()
+    local -A session_starts=() session_ppids=() session_pgids=() session_states=()
+    cleanup_publication_fixture() {
+        [[ -z "$worker_pid" || -z "$worker_start" ]] || { test_process_identity_exists "$worker_pid" "$worker_start" && kill -KILL "$worker_pid" 2>/dev/null || true; }
+        [[ -z "$main_pid" || -z "$main_start" ]] || { test_process_identity_exists "$main_pid" "$main_start" && kill -KILL "$main_pid" 2>/dev/null || true; }
+        [[ -z "$watchdog" || -z "$watchdog_start" ]] || { test_process_identity_exists "$watchdog" "$watchdog_start" && kill -TERM "$watchdog" 2>/dev/null || true; }
+        [[ -z "$unrelated" || -z "$unrelated_start" ]] || { test_process_identity_exists "$unrelated" "$unrelated_start" && kill -TERM "$unrelated" 2>/dev/null || true; }
+        [[ -z "$main_pid" ]] || wait "$main_pid" 2>/dev/null || true
+        [[ -z "$watchdog" ]] || wait "$watchdog" 2>/dev/null || true
+        [[ -z "$unrelated" ]] || wait "$unrelated" 2>/dev/null || true
+    }
+    trap cleanup_publication_fixture EXIT
+    mode=active; [[ "$state" == cleanup_failed ]] && mode=cleanup
+    root="$TEST_DIR/state-publish-$state-$phase-$signal_name${5:-}"; CURRENT_FIXTURE_ROOT=$root
+    write_active_grace_fixture "$root"
+    mkdir -m 0700 "$root/capture"
+    marker="$root/capture/publish-marker"
+    sleep 60 & unrelated=$!; unrelated_start=$(wait_test_process_start "$unrelated")
+    (
+        cd "$root"
+        exec env --default-signal=HUP,INT,TERM PATH="$root/bin:$PATH" TMPDIR="$root/runtime" PID_DIR="$root/pids" \
+            STATE_PUBLISH_MODE="$mode" STATE_PUBLISH_STATE="$state" STATE_PUBLISH_PHASE="$phase" STATE_PUBLISH_MARKER="$marker" \
+            STATE_CLEANUP_RELEASE="$root/capture/cleanup-release" bash "$TEST_DIR/state-publication-child.sh" "$SCRIPT" "$root/source" /remote/path
+    ) > "$root/output.log" 2>&1 &
+    main_pid=$!; main_start=$(wait_test_process_start "$main_pid")
+    for _ in {1..600}; do [[ -f "$marker" ]] && break; sleep 0.05; done
+    [[ -f "$marker" && ! -L "$marker" && "$(stat -Lc %a "$marker")" == 600 ]] || { cat "$root/output.log" >&2 || true; fail "$state/$phase/$signal_name did not reach publish hook"; }
+    while IFS= read -r line; do key=${line%%=*}; value=${line#*=}; case "$key" in worker_pid) worker_pid=$value;;worker_start) worker_start=$value;;leader_pid) leader_pid=$value;;leader_start) leader_start=$value;;sid) managed_sid=$value;;state_file) state_file=$value;;hook_stage) hook_stage=$value;;esac; done < "$marker"
+    [[ "$worker_pid" =~ ^[1-9][0-9]*$ && "$worker_start" =~ ^[1-9][0-9]*$ && "$managed_sid" =~ ^[1-9][0-9]*$ ]] || fail "$state/$phase/$signal_name marker identity malformed"
+    wait_test_process_identity_present "$worker_pid" "$worker_start" || { cat "$marker" >&2; fail "$state/$phase/$signal_name worker identity missing at hook"; }
+    test_watchdog_process 30 "$root/watchdog-timeout" "$main_pid" & watchdog=$!; watchdog_start=$(wait_test_process_start "$watchdog")
+    printf "DIAG: publication state=%s phase=%s signal=%s main=%s/%s worker=%s/%s sid=%s\n" \
+        "$state" "$phase" "$signal_name" "$main_pid" "$main_start" "$worker_pid" "$worker_start" "$managed_sid"
+    kill "-$signal_name" "$main_pid"; wait "$main_pid" || rc=$?
+    kill -TERM "$watchdog" 2>/dev/null || true; wait "$watchdog" 2>/dev/null || true
+    [[ ! -e "$root/watchdog-timeout" ]] || fail "$state/$phase/$signal_name watchdog fired"
+    assert_eq "$expected" "$rc" "$state/$phase preserves $signal_name status"
+    wait_test_process_identity_gone "$worker_pid" "$worker_start" || fail "$state/$phase/$signal_name left worker identity"
+    if [[ "$leader_pid" =~ ^[1-9][0-9]*$ && "$leader_start" =~ ^[1-9][0-9]*$ ]]; then
+        if ! wait_test_process_identity_gone "$leader_pid" "$leader_start"; then
+            read_process_record "$leader_pid" || true
+            printf 'leader remains pid=%s expected_start=%s actual_start=%s state=%s ppid=%s pgid=%s sid=%s\n' \
+                "$leader_pid" "$leader_start" "${PROC_START:-unknown}" "${PROC_STATE:-unknown}" "${PROC_PPID:-unknown}" "${PROC_PGID:-unknown}" "${PROC_SID:-unknown}" >&2
+            cat "/proc/$leader_pid/stat" >&2 2>/dev/null || true
+            fail "$state/$phase/$signal_name left leader identity"
+        fi
+    fi
+    collect_owned_session_records "$managed_sid" session_pids session_starts session_ppids session_pgids session_states || fail "$state/$phase/$signal_name cannot verify managed SID"
+    (( ${#session_pids[@]} == 0 )) || fail "$state/$phase/$signal_name left managed SID member: ${session_pids[*]}"
+    [[ -z "$(find "$root/runtime" -mindepth 1 -print -quit 2>/dev/null)" ]] || fail "$state/$phase/$signal_name left runtime/session/registration state"
+    [[ ! -e "$state_file" && ! -e "$hook_stage" && ! -L "$state_file" && ! -L "$hook_stage" ]] || fail "$state/$phase/$signal_name left publication path"
+    test_process_identity_exists "$unrelated" "$unrelated_start" || fail "$state/$phase/$signal_name killed unrelated process"
+    kill -TERM "$unrelated"; wait "$unrelated" 2>/dev/null || true
+    unrelated=""; unrelated_start=""; main_pid=""; main_start=""; watchdog=""; watchdog_start=""
+    trap - EXIT
+    pass "$state/$phase/$signal_name publication window cleans process tree and runtime"
+)
+
+# Second half of the shared publication matrix.
+publication_index=0
+for publication_state in $publication_states; do
+    for publication_phase in $publication_phases; do
+        for publication_signal in $publication_signals; do
+            publication_index=$(( publication_index + 1 ))
+            (( publication_index > publication_split )) || continue
             case "$publication_signal" in HUP) publication_status=129 ;; INT) publication_status=130 ;; TERM) publication_status=143 ;; *) fail "unknown publication signal" ;; esac
             run_state_publication_signal_case "$publication_state" "$publication_phase" "$publication_signal" "$publication_status"
         done
@@ -1568,4 +1749,3 @@ done
 
 printf 'All push worker registration tests passed.\n'
 fi
-

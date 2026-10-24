@@ -301,11 +301,21 @@ test-cloudflare-tunnel.sh-5
 test-cloudflare-tunnel.sh-6
 test-cloudflare-tunnel.sh-7'
 check_subset cloudflare 1 '' 'test-cloudflare-tunnel.sh'
-check_subset push-worker 4 '2' 'test-push-worker-registration.sh-2'
-check_subset push-worker 4 '' 'test-push-worker-registration.sh-0
+check_subset push-worker 7 '2' 'test-push-worker-registration.sh-2'
+check_subset push-worker 7 '0 1 2 3' 'test-push-worker-registration.sh-0
 test-push-worker-registration.sh-1
 test-push-worker-registration.sh-2
 test-push-worker-registration.sh-3'
+check_subset push-worker 7 '4 5 6' 'test-push-worker-registration.sh-4
+test-push-worker-registration.sh-5
+test-push-worker-registration.sh-6'
+check_subset push-worker 7 '' 'test-push-worker-registration.sh-0
+test-push-worker-registration.sh-1
+test-push-worker-registration.sh-2
+test-push-worker-registration.sh-3
+test-push-worker-registration.sh-4
+test-push-worker-registration.sh-5
+test-push-worker-registration.sh-6'
 check_subset push-worker 1 '' 'test-push-worker-registration.sh'
 
 check_reject() {
@@ -323,6 +333,7 @@ check_reject 'motd cut into eight' motd 8 ''
 check_reject 'motd cut into twelve' motd 12 ''
 check_reject 'cloudflare cut into four' cloudflare 4 ''
 check_reject 'push-worker cut into eight' push-worker 8 ''
+check_reject 'push-worker cut into four' push-worker 4 ''
 check_reject 'push-worker cut into two' push-worker 2 ''
 check_reject 'motd segment past its source' motd 11 '11'
 check_reject 'subset for an unsegmented suite' push 2 '0'
@@ -330,20 +341,31 @@ check_reject 'subset for the other bucket' other 2 '0'
 check_reject 'subset without segmented mode' motd 1 '0'
 check_reject 'mixed plan with one count' all 8 ''
 check_reject 'mixed plan with four segments' all 4 '0 1 2 3'
-# Anything but a distinct in-range index of the declared range is refused; a
-# file named 1 must not turn "[1]" into a real segment.
+# Anything but a distinct in-range index of the declared range is refused, and
+# the refusal has to come from the segment validation itself: the declared count
+# stays untouched, so a count mismatch cannot stand in for a token that got
+# through.  A file named 1 must not turn "[1]" into a real segment.
+segment_rejection='Invalid TEST_SEGMENT_SET entry|Duplicate segment in TEST_SEGMENT_SET|out of range for TEST_SEGMENTS'
+check_bad_set() {
+    local suite=$1 segs=$2 bad=$3 rc=0
+    : > "$CAPTURE"
+    ( cd "$TEMP_DIR" && TEST_SEGMENTS="$segs" TEST_SEGMENT_SET="$bad" \
+        bash "$TEMP_DIR/tests/run.sh" "$suite" > "$TEMP_DIR/output" 2>&1 ) || rc=$?
+    [[ "$rc" == 2 && ! -s "$CAPTURE" ]] || { cat "$TEMP_DIR/output"; fail "subset '$bad' for $suite accepted (exit $rc)"; }
+    grep -qE "$segment_rejection" "$TEMP_DIR/output" \
+        || { cat "$TEMP_DIR/output"; fail "subset '$bad' for $suite was not refused by the segment validation"; }
+}
 : > "$TEMP_DIR/1"
 for bad in '1 01' '9223372036854775808' '18446744073709551616' '[1]' '1,2' '-1' '1 1' '+1' '0x1' 'x'; do
-    : > "$CAPTURE"
-    rc=0
-    ( cd "$TEMP_DIR" && TEST_SEGMENTS=8 TEST_SEGMENT_SET="$bad" bash "$TEMP_DIR/tests/run.sh" motd > "$TEMP_DIR/output" 2>&1 ) || rc=$?
-    [[ "$rc" == 2 && ! -s "$CAPTURE" ]] || { cat "$TEMP_DIR/output"; fail "subset '$bad' accepted (exit $rc)"; }
+    check_bad_set motd 11 "$bad"
 done
 for bad in '10x' '11' '010' '1 10 10' '0 11'; do
-    : > "$CAPTURE"
-    rc=0
-    ( cd "$TEMP_DIR" && TEST_SEGMENTS=11 TEST_SEGMENT_SET="$bad" bash "$TEMP_DIR/tests/run.sh" motd > "$TEMP_DIR/output" 2>&1 ) || rc=$?
-    [[ "$rc" == 2 && ! -s "$CAPTURE" ]] || { cat "$TEMP_DIR/output"; fail "subset '$bad' accepted at TEST_SEGMENTS=11 (exit $rc)"; }
+    check_bad_set motd 11 "$bad"
+done
+# The seven-segment suite validates its own tokens the same way, so a set that
+# only matches a stale segment count cannot pass for a good one.
+for bad in '0 1 2 3x' '4 5 6x' '7' '6 6' '+1' '010'; do
+    check_bad_set push-worker 7 "$bad"
 done
 for bad in 0 9 08 '4x' '1 4' 9223372036854775808 18446744073709551616; do
     : > "$CAPTURE"

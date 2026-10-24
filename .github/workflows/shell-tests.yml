@@ -45,10 +45,19 @@ jobs:
         shell: bash
         run: |
           # All tracked Bash scripts outside tests are production by default.
-          # Check both groups even when production lint fails.
+          # Both groups lint in parallel, one file per process, and both are
+          # started before the first wait so a failure in one cannot hide the
+          # other.  pipefail stays on, so a failed file enumeration fails its
+          # group even though xargs then sees empty input; any failure becomes
+          # a single exit 1.
+          set -o pipefail
           status=0
-          git ls-files -z -- "*.sh" ":!:tests/**" | xargs -0 -r shellcheck -x --severity=warning -- || status=1
-          git ls-files -z -- "tests/*.sh" | xargs -0 -r shellcheck -x --severity=error -- || status=1
+          git ls-files -z -- "*.sh" ":!:tests/**" | xargs -0 -r -n1 -P4 shellcheck -x --severity=warning -- &
+          production_pid=$!
+          git ls-files -z -- "tests/*.sh" | xargs -0 -r -n1 -P4 shellcheck -x --severity=error -- &
+          test_pid=$!
+          wait "$production_pid" || status=1
+          wait "$test_pid" || status=1
           exit "$status"
 
   ubuntu-tests:
@@ -60,7 +69,8 @@ jobs:
       matrix:
         include:
           # motd is cut into eleven segments spread over three jobs of four,
-          # four and three; cloudflare is cut into eight, two jobs of four.
+          # four and three; push-worker is cut into seven, two jobs of four and
+          # three; cloudflare is cut into eight, two jobs of four.
           - shard: motd-a
             suite: motd
             segments: 11
@@ -73,9 +83,14 @@ jobs:
             suite: motd
             segments: 11
             segment_set: "8 9 10"
-          - shard: push-worker
+          - shard: push-worker-a
             suite: push-worker
-            segments: 4
+            segments: 7
+            segment_set: "0 1 2 3"
+          - shard: push-worker-b
+            suite: push-worker
+            segments: 7
+            segment_set: "4 5 6"
           - shard: push
             suite: push
             segments: 1
@@ -130,7 +145,8 @@ jobs:
       matrix:
         include:
           # motd is cut into eleven segments spread over three jobs of four,
-          # four and three; cloudflare is cut into eight, two jobs of four.
+          # four and three; push-worker is cut into seven, two jobs of four and
+          # three; cloudflare is cut into eight, two jobs of four.
           - shard: motd-a
             suite: motd
             segments: 11
@@ -143,9 +159,14 @@ jobs:
             suite: motd
             segments: 11
             segment_set: "8 9 10"
-          - shard: push-worker
+          - shard: push-worker-a
             suite: push-worker
-            segments: 4
+            segments: 7
+            segment_set: "0 1 2 3"
+          - shard: push-worker-b
+            suite: push-worker
+            segments: 7
+            segment_set: "4 5 6"
           - shard: push
             suite: push
             segments: 1
