@@ -98,10 +98,12 @@ run_suite() {
     printf '\n==> %s\n' "$test_name"
     # Keep the child shell standalone: an if/|| wrapper can change errexit behavior.
     set +e
+    # Nested fixtures re-enter this script; they must not inherit the pool or
+    # segment settings, or a stub suite would be duplicated.
     if [[ -n "$seg" ]]; then
-        TEST_SEGMENT="$seg" TEST_SEGMENTS="$segments" bash "$test_file"
+        env -u TEST_JOBS -u TEST_SEGMENTS TEST_SEGMENT="$seg" bash "$test_file"
     else
-        bash "$test_file"
+        env -u TEST_JOBS -u TEST_SEGMENTS bash "$test_file"
     fi
     status=$?
     set -e

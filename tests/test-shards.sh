@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# These fixtures re-enter run.sh and require its serial, whole-shard behaviour.
+unset TEST_JOBS TEST_SEGMENTS TEST_SEGMENT
 # Inert fixtures only: verify partitioning without running production suites.
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 TEMP_DIR=$(mktemp -d)
