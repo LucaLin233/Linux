@@ -1904,7 +1904,6 @@ args=(
     -o ControlMaster=no
     -o ControlPath=none
     -o ClearAllForwardings=yes
-    -o ForkAfterAuthentication=no
 )
 if [[ "$PUSH_AUTH_METHOD" == key ]]; then
     args+=(
@@ -2804,6 +2803,8 @@ retry_rsync() {
         esac
         ((attempt += 1))
     done
+    # Show why the last attempt failed (auth, host key, missing remote rsync...).
+    [[ -n "$output" ]] && printf '%b    %s%b\n' "$RED" "$output" "$NC" >&2
     return 1
 }
 
