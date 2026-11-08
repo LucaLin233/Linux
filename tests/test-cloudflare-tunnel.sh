@@ -1,17 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
-# --- CI segments (tools/segmentize_ranges.py) ---
-# TEST_SEGMENT unset: every segment runs in order, exactly like the original.
-seg_is() {
-    [[ -z ${TEST_SEGMENT:-} ]] || (( $1 == TEST_SEGMENT ))
-}
-# --- end CI segments ---
-
-#!/usr/bin/env bash
-set -euo pipefail
 
 if (( EUID != 0 )); then
-    exec sudo --preserve-env=PATH --preserve-env=TEST_SEGMENT bash "$0" "$@"
+    exec sudo --preserve-env=PATH bash "$0" "$@"
 fi
 
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
@@ -181,14 +172,6 @@ run_failure_case() {
 
 ORIGINAL_PATH=$PATH
 
-# replay the state that a later segment inherited from an earlier one
-if [[ -n ${TEST_SEGMENT:-} ]] && (( TEST_SEGMENT != 0 )); then
-new_case
-require_root() { :; }
-check_platform() { :; }
-uninstall_transaction_hook() { [[ "$1" != after-disable-auto-update ]] || exit 0; }
-fi
-if seg_is 0; then
 
 new_case
 before=$(find "$CASE_DIR/root" -mindepth 1 -printf '%P %y %m\n' | sort)
@@ -420,9 +403,7 @@ pass "source remains old when key commit fails"
 
 run_failure_case "APT probe failure rollback" 'export FAKE_APT_UPDATE_FAIL=1' 'run_repository_apt_transaction install'
 run_failure_case "APT install failure rollback" 'export FAKE_APT_INSTALL_FAIL=1' 'run_repository_apt_transaction install'
-fi
 
-if seg_is 1; then
 for signal in HUP INT TERM; do
     case "$signal" in HUP) expected=129 ;; INT) expected=130 ;; TERM) expected=143 ;; esac
     for phase in download validate stage key-commit source-commit apt-probe apt-install; do
@@ -474,9 +455,7 @@ if configure_repository >/dev/null 2>&1; then fail "rollback failure unexpectedl
 find "$CLOUDFLARED_REPOSITORY_STATE_DIR" -maxdepth 2 -type f -name rollback.log -print -quit | grep -q . ||
     fail "rollback failure did not preserve evidence"
 )
-fi
 
-if seg_is 2; then
 pass "rollback failure returns nonzero and preserves evidence"
 
 new_case
@@ -505,7 +484,6 @@ find "$CLOUDFLARED_STATE_DIR" -maxdepth 1 -type d -name 'uninstall-*' -print -qu
     fail "managed source backup missing"
 [[ ! -d "$CLOUDFLARED_STATE_DIR.lock" ]] || fail "managed repository removal left lock"
 pass "configure then real repository uninstall removes source and preserves keyring"
-fi
 
 # The uninstall signal matrix is 39 independent cases (3 signals x 13 phases),
 # each building its own fixture.  Segments 3 and 4 split it by signal, so the
@@ -542,16 +520,11 @@ uninstall_signal_phase_cases() {
     done
 }
 
-if seg_is 3; then
 uninstall_signal_phase_cases HUP
 uninstall_signal_phase_cases INT
-fi
 
-if seg_is 4; then
 uninstall_signal_phase_cases TERM
-fi
 
-if seg_is 5; then
 new_case
 set_old_generation
 configure_repository
@@ -676,9 +649,7 @@ for schema_case in version generation duplicate unknown order state mode uid gid
     ) > "$TEST_DIR/schema-$schema_case.log" 2>&1 || fail "schema $schema_case (see $TEST_DIR/schema-$schema_case.log)"
     pass "uninstall manifest rejects $schema_case"
 done
-fi
 
-if seg_is 6; then
 for ownership_case in owned foreign inode mode owner gid symlink directory fifo; do
     (
         new_case
@@ -975,9 +946,7 @@ for restore_id in auto_update_script auto_update_service auto_update_timer sourc
     }
     pass "restore failure $restore_id continues remaining five targets and preserves original evidence"
 done
-fi
 
-if seg_is 7; then
 for target_id in auto_update_script auto_update_service auto_update_timer source current legacy_marker; do
     for bad_metadata in mode owner gid symlink directory fifo; do
         (
@@ -1009,9 +978,7 @@ for target_id in auto_update_script auto_update_service auto_update_timer source
         pass "capture rejects $target_id $bad_metadata without deleting target"
     done
 done
-fi
 
-if seg_is 8; then
 
 (
     unset CLOUDFLARED_TRUST_ANCHOR
@@ -1061,9 +1028,7 @@ for creation_phase in before-create-marker before-create-manifest-stage before-c
         pass "creation $creation_phase $creation_fault preserves ownership across publication"
     done
 done
-fi
 
-if seg_is 9; then
 for bookkeeping_fault in marker stage rename; do
     (
         new_case
@@ -1162,9 +1127,7 @@ for capture_file in old-key old-source old-current; do
         pass "repository capture $capture_file $capture_fault preserves formal bytes and metadata"
     done
 done
-fi
 
-if seg_is 10; then
 
 (
     new_case
@@ -1273,9 +1236,7 @@ for restore_object in key source current; do
     done
 done
 
-fi
 
-if seg_is 11; then
 
 for operation in install_cloudflared upgrade_cloudflared; do
     (
@@ -1596,4 +1557,3 @@ grep -Fq 'cloudflare_tunnel.sh install' <<< "$entrypoint_output" || fail "bash -
 pass "bash -c entrypoint remains compatible"
 
 printf 'All cloudflare wrapper tests passed. PASS=%d\n' "$pass_count"
-fi

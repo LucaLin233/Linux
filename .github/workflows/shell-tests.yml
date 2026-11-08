@@ -98,47 +98,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          # motd is cut into thirteen segments spread over three jobs of five,
-          # four and four; push-worker is cut into seven, two jobs of four and
-          # three; cloudflare is cut into twelve, two jobs of five and seven
-          # balanced by measured cost.  With lint split into a production and a
-          # tests job the plan is exactly twenty jobs, the twenty-job
-          # concurrency, so one more job would queue instead of running.
-          - shard: motd-a
-            suite: motd
-            segments: 13
-            segment_set: "0 1 2 3 4"
-          - shard: motd-b
-            suite: motd
-            segments: 13
-            segment_set: "5 6 7 8"
-          - shard: motd-c
-            suite: motd
-            segments: 13
-            segment_set: "9 10 11 12"
-          - shard: push-worker-a
-            suite: push-worker
-            segments: 7
-            segment_set: "0 1 2 3"
-          - shard: push-worker-b
-            suite: push-worker
-            segments: 7
-            segment_set: "4 5 6"
-          - shard: push
-            suite: push
-            segments: 1
-          - shard: cloudflare-a
-            suite: cloudflare
-            segments: 12
-            segment_set: "2 3 5 6 11"
-          - shard: cloudflare-b
-            suite: cloudflare
-            segments: 12
-            segment_set: "0 1 4 7 8 9 10"
-          - shard: other
-            suite: other
-            segments: 1
+        # One job per heavy suite; every other suite shares `other`.
+        shard: [motd, push-worker, push, cloudflare, other]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -164,10 +125,8 @@ jobs:
         env:
           TEST_BASE_SHA: ${{ github.event.pull_request.base.sha }}
           TEST_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          TEST_SUITE: ${{ matrix.suite }}
-          TEST_SEGMENTS: ${{ matrix.segments }}
-          TEST_SEGMENT_SET: ${{ matrix.segment_set }}
-        run: bash tests/run.sh "$TEST_SUITE"
+          TEST_SHARD: ${{ matrix.shard }}
+        run: bash tests/run.sh "$TEST_SHARD"
 
   debian-tests:
     name: Debian 13 / ${{ matrix.shard }}
@@ -177,47 +136,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          # motd is cut into thirteen segments spread over three jobs of five,
-          # four and four; push-worker is cut into seven, two jobs of four and
-          # three; cloudflare is cut into twelve, two jobs of five and seven
-          # balanced by measured cost.  With lint split into a production and a
-          # tests job the plan is exactly twenty jobs, the twenty-job
-          # concurrency, so one more job would queue instead of running.
-          - shard: motd-a
-            suite: motd
-            segments: 13
-            segment_set: "0 1 2 3 4"
-          - shard: motd-b
-            suite: motd
-            segments: 13
-            segment_set: "5 6 7 8"
-          - shard: motd-c
-            suite: motd
-            segments: 13
-            segment_set: "9 10 11 12"
-          - shard: push-worker-a
-            suite: push-worker
-            segments: 7
-            segment_set: "0 1 2 3"
-          - shard: push-worker-b
-            suite: push-worker
-            segments: 7
-            segment_set: "4 5 6"
-          - shard: push
-            suite: push
-            segments: 1
-          - shard: cloudflare-a
-            suite: cloudflare
-            segments: 12
-            segment_set: "2 3 5 6 11"
-          - shard: cloudflare-b
-            suite: cloudflare
-            segments: 12
-            segment_set: "0 1 4 7 8 9 10"
-          - shard: other
-            suite: other
-            segments: 1
+        # One job per heavy suite; every other suite shares `other`.
+        shard: [motd, push-worker, push, cloudflare, other]
     steps:
       - name: Install test dependencies
         run: |
@@ -247,10 +167,8 @@ jobs:
         env:
           TEST_BASE_SHA: ${{ github.event.pull_request.base.sha }}
           TEST_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          TEST_SUITE: ${{ matrix.suite }}
-          TEST_SEGMENTS: ${{ matrix.segments }}
-          TEST_SEGMENT_SET: ${{ matrix.segment_set }}
-        run: bash tests/run.sh "$TEST_SUITE"
+          TEST_SHARD: ${{ matrix.shard }}
+        run: bash tests/run.sh "$TEST_SHARD"
 
   # Preserve existing required-check names; skipped/cancelled dependencies fail closed.
   ubuntu:

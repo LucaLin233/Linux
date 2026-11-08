@@ -67,87 +67,18 @@ for test_file in "$ROOT_DIR"/tests/test-*.sh; do
     plan+=("$test_file")
 done
 
-# Suites carrying CI segment guards, with the number of segments their source
-# defines.  TEST_SEGMENTS is the number of segments a suite is cut into;
-# TEST_SEGMENT_SET picks which of them this job runs.  With TEST_SEGMENTS=1 a
-# suite runs once, all segments in order.
-declare -rA SEGMENTED_SUITES=(
-    [test-motd.sh]=13
-    [test-cloudflare-tunnel.sh]=12
-    [test-push-worker-registration.sh]=7
-)
-segments=${TEST_SEGMENTS:-1}
-# Bounded lexical form first, so no accepted value can overflow shell arithmetic
-# or smuggle in a sign, a prefix or a multi-digit index past the range checks.
-[[ "$segments" =~ ^([1-9]|1[0-3])$ ]] || { printf 'Invalid TEST_SEGMENTS: %s\n' "$segments" >&2; exit 2; }
-
-# TEST_SEGMENT_SET narrows one job to a subset of the segments ("0 1 2 3"), so a
-# single suite can be spread over several jobs.  Unset or blank keeps every
-# segment; anything that is not a distinct in-range index aborts before a suite
-# starts.  `read -a` splits on IFS without pathname expansion, so an entry such
-# as "[1]" is compared literally instead of being matched against file names.
-segment_set=()
-seen_segments=" "
-if [[ -n "${TEST_SEGMENT_SET:-}" && -n "${TEST_SEGMENT_SET//[[:space:]]/}" ]]; then
-    # Flatten embedded newlines first: `read -a` stops at the first line, which
-    # would drop the rest of the set without a word.
-    segment_value=${TEST_SEGMENT_SET//$'\t'/ }
-    segment_value=${segment_value//$'\n'/ }
-    read -r -a segment_entries <<< "$segment_value"
-    for segment_index in "${segment_entries[@]}"; do
-        [[ "$segment_index" =~ ^([0-9]|1[0-2])$ ]] \
-            || { printf 'Invalid TEST_SEGMENT_SET entry: %s\n' "$segment_index" >&2; exit 2; }
-        (( segment_index < segments )) \
-            || { printf 'Segment %s out of range for TEST_SEGMENTS=%s\n' "$segment_index" "$segments" >&2; exit 2; }
-        [[ "$seen_segments" != *" $segment_index "* ]] \
-            || { printf 'Duplicate segment in TEST_SEGMENT_SET: %s\n' "$segment_index" >&2; exit 2; }
-        seen_segments+="$segment_index "
-        segment_set+=("$segment_index")
-    done
-    (( segments > 1 )) \
-        || { printf 'TEST_SEGMENT_SET requires TEST_SEGMENTS above 1\n' >&2; exit 2; }
-fi
-
-# The whole plan must agree with the segment counts above before the first suite
-# starts: a count that matches no suite (or a subset aimed at an unsegmented one)
-# would otherwise silently run part of the work and still exit 0.
-for test_file in "${plan[@]:-}"; do
-    [[ -n "$test_file" ]] || continue
-    test_name=$(basename "$test_file")
-    declared_segments=${SEGMENTED_SUITES[${test_name}]:-1}
-    if (( ${#segment_set[@]} )) && [[ -z "${SEGMENTED_SUITES[${test_name}]:-}" ]]; then
-        printf 'TEST_SEGMENT_SET does not apply to unsegmented suite: %s\n' "$test_name" >&2
-        exit 2
-    fi
-    (( segments == 1 || segments == declared_segments )) \
-        || { printf 'TEST_SEGMENTS=%s but %s has %s segments\n' "$segments" "$test_name" "$declared_segments" >&2; exit 2; }
-done
-
-is_segmented() {
-    local name=$1
-    (( segments > 1 )) || return 1
-    [[ -n "${SEGMENTED_SUITES[${name}]:-}" ]]
-}
-
 run_suite() {
-    local test_file=$1 seg=${2:-} test_name started status
+    local test_file=$1 test_name started status elapsed
     test_name=$(basename "$test_file")
-    if [[ -n "$seg" ]]; then
-        test_name+=" [segment $((seg + 1))/$segments]"
-    fi
     started=$SECONDS
     printf '\n==> %s\n' "$test_name"
     # Keep the child shell standalone: an if/|| wrapper can change errexit behavior.
     # Nested fixtures re-enter this script, so neither setting may leak to them.
     set +e
-    if [[ -n "$seg" ]]; then
-        env -u TEST_JOBS -u TEST_SEGMENTS -u TEST_SEGMENT_SET TEST_SEGMENT="$seg" bash "$test_file"
-    else
-        env -u TEST_JOBS -u TEST_SEGMENTS -u TEST_SEGMENT -u TEST_SEGMENT_SET bash "$test_file"
-    fi
+    bash "$test_file"
     status=$?
     set -e
-    local elapsed=$((SECONDS - started))
+    elapsed=$((SECONDS - started))
     printf 'TIMING: %s elapsed=%ss exit=%s\n' "$test_name" "$elapsed" "$status"
     if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
         printf -- '- `%s`: %ss, exit %s\n' "$test_name" "$elapsed" "$status" >> "$GITHUB_STEP_SUMMARY"
@@ -155,42 +86,9 @@ run_suite() {
     return "$status"
 }
 
-# Segments of one suite share no state, so they run together and fill the
-# runner; the suites of a shard still run one after another.
-run_segments() {
-    local test_file=$1 dir k rc failed=0 pids=()
-    local -a queue=()
-    dir=$(mktemp -d)
-    if (( ${#segment_set[@]} )); then
-        queue=("${segment_set[@]}")
-    else
-        for (( k = 0; k < segments; k++ )); do queue+=("$k"); done
-    fi
-    for k in "${queue[@]}"; do
-        (
-            rc=0
-            run_suite "$test_file" "$k" > "$dir/$k.log" 2>&1 || rc=$?
-            printf '%s' "$rc" > "$dir/$k.rc"
-        ) &
-        pids+=("$!")
-    done
-    for k in "${pids[@]}"; do wait "$k" || true; done
-    for k in "${queue[@]}"; do
-        cat "$dir/$k.log"
-        rc=$(cat "$dir/$k.rc" 2>/dev/null || printf 1)
-        (( rc == 0 )) || failed=1
-    done
-    rm -rf "$dir"
-    return "$failed"
-}
-
 for test_file in "${plan[@]:-}"; do
     [[ -n "$test_file" ]] || continue
-    if is_segmented "$(basename "$test_file")"; then
-        run_segments "$test_file" || exit 1
-    else
-        run_suite "$test_file" || exit "$?"
-    fi
+    run_suite "$test_file" || exit "$?"
 done
 
 printf '\nAll selected shell tests passed.\n'
