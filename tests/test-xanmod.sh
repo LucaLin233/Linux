@@ -668,6 +668,21 @@ run_install_scenario postcheck-fail 1
 
 (
     reset_tool_files
+    candidate="$TEST_DIR/tool/unreachable.sources"; printf 'Types: deb\n' > "$candidate"
+    # Real apt (2.4 to 3.0) reports an unreachable mirror as a warning and exits
+    # 0; only APT::Update::Error-Mode=any turns it into exit 100.
+    apt-get() {
+        local arg
+        for arg in "$@"; do [[ "$arg" == APT::Update::Error-Mode=any ]] && return 100; done
+        return 0
+    }
+    rc=0; xanmod_source_is_usable "$candidate" > /dev/null 2>&1 || rc=$?
+    [[ "$rc" != 0 ]] || fail "unreachable mirror passed the usability probe"
+    pass "unreachable mirror fails the usability probe so the next mirror is tried"
+)
+
+(
+    reset_tool_files
     dangling="$TEST_DIR/tool/dangling-lists"
     ln -s "$TEST_DIR/tool/missing-lists-target" "$dangling"
     XANMOD_ACTIVE_APT_LISTS_DIR="$dangling"

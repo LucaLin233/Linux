@@ -3146,11 +3146,14 @@ xanmod_source_is_usable() {
         return 1
     fi
 
+    # Without Error-Mode=any a failed fetch is only a warning and apt exits 0,
+    # so an unreachable mirror would pass the probe and no fallback is tried.
     if apt-get update -qq \
         -o "Dir::Etc::sourcelist=$source_file" \
         -o 'Dir::Etc::sourceparts=-' \
         -o "Dir::State::lists=$XANMOD_ACTIVE_APT_LISTS_DIR" \
-        -o 'APT::Get::List-Cleanup=0'; then
+        -o 'APT::Get::List-Cleanup=0' \
+        -o 'APT::Update::Error-Mode=any'; then
         apt_status=0
     else
         apt_status=$?
