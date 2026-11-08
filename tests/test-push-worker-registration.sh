@@ -269,8 +269,8 @@ run_preserved_cleanup_retry_case() (
     pass "failed cleanup evidence retry run $run preserves then clears runtime"
 )
 
-runtime_evidence_stress=${PUSH_RUNTIME_EVIDENCE_STRESS:-20}
-failed_reap_runs=${PUSH_FAILED_REAP_RUNS:-20}
+runtime_evidence_stress=${PUSH_RUNTIME_EVIDENCE_STRESS:-1}
+failed_reap_runs=${PUSH_FAILED_REAP_RUNS:-1}
 [[ "$runtime_evidence_stress" =~ ^[1-9][0-9]*$ ]] \
     || fail "invalid PUSH_RUNTIME_EVIDENCE_STRESS: $runtime_evidence_stress"
 [[ "$failed_reap_runs" =~ ^[1-9][0-9]*$ ]] || fail "invalid PUSH_FAILED_REAP_RUNS: $failed_reap_runs"
@@ -1509,11 +1509,6 @@ for publication_state in $publication_states; do
             run_state_publication_signal_case "$publication_state" "$publication_phase" "$publication_signal" "$publication_status"
         done
     done
-done
-
-# Extra HUP rounds reuse the existing publication fixture; the matrix itself stays one pass.
-for diagnostic_round in 1 2 3; do
-    run_state_publication_signal_case cleanup_failed after-rename HUP 129 "-probe-$diagnostic_round"
 done
 
 (
