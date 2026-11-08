@@ -141,14 +141,18 @@ get_cron_schedule() {
     echo "自定义时间格式：分 时 日 月 周，例如：0 3 * * 1" >&2
 
     while true; do
-        read -r -p "请输入 Cron 表达式: " custom_expression
+        if ! read -r -p "请输入 Cron 表达式: " custom_expression; then
+            log "未读取到 Cron 表达式" "error" >&2
+            return 1
+        fi
 
         if validate_cron_expression "$custom_expression"; then
             echo "$custom_expression"
             return 0
         fi
 
-        log "Cron 表达式格式错误，请重新输入" "warn"
+        # stdout is the function's result; diagnostics must not leak into crontab.
+        log "Cron 表达式格式错误，请重新输入" "warn" >&2
     done
 }
 
@@ -486,7 +490,7 @@ main() {
 
     echo
     local cron_schedule
-    cron_schedule=$(get_cron_schedule)
+    cron_schedule=$(get_cron_schedule) || exit 1
 
     if has_update_cron; then
         echo "检测到现有自动更新任务，将自动替换为新配置。"
@@ -504,6 +508,7 @@ main() {
     echo "  查看任务: crontab -l"
 }
 
-trap 'log "自动更新配置脚本在第 $LINENO 行执行失败" "error"' ERR
-
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    trap 'log "自动更新配置脚本在第 $LINENO 行执行失败" "error"' ERR
+    main "$@"
+fi
