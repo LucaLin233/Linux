@@ -486,8 +486,7 @@ find "$CLOUDFLARED_STATE_DIR" -maxdepth 1 -type d -name 'uninstall-*' -print -qu
 pass "configure then real repository uninstall removes source and preserves keyring"
 
 # The uninstall signal matrix is 39 independent cases (3 signals x 13 phases),
-# each building its own fixture.  Segments 3 and 4 split it by signal, so the
-# serial order stays HUP, INT, TERM exactly as before.
+# each building its own fixture, run in HUP, INT, TERM order.
 uninstall_signal_phase_cases() {
     local signal=$1 phase
     case "$signal" in HUP) expected=129 ;; INT) expected=130 ;; TERM) expected=143 ;; esac
