@@ -867,6 +867,9 @@ assert_not_contains "$(cat "$ZRAM_CONFIG")" "writeback" "generator config adds n
 
 saved_optimal_fn=$(declare -f get_optimal_zram_config)
 get_optimal_zram_config() { printf 'min(ram / 2, 8192),100\n'; }
+# The start stub rebuilds to TARGET_SIZE, which follows this host's RAM; pin it
+# to the overridden target so the cases do not depend on runner memory.
+ZRAM_START_SIZE_EXPR="min(ram / 2, 8192)"
 
 reset_sandbox
 seed_device "min(ram / 2, 8192)"
@@ -910,6 +913,7 @@ assert_no_call "systemctl stop" "used pages still block the priority rebuild"
 pass "deferred priority rebuild leaves a pending marker"
 
 eval "$saved_optimal_fn"
+unset ZRAM_START_SIZE_EXPR
 
 # ---------------------------------------------------------------- PR 2: THP defrag
 
