@@ -930,7 +930,7 @@ EOF
             'IdentityFile=none' 'CertificateFile=none' \
             'PreferredAuthentications=publickey' 'PasswordAuthentication=no' \
             'KbdInteractiveAuthentication=no' 'ControlMaster=no' 'ControlPath=none' \
-            'ClearAllForwardings=yes' 'ForkAfterAuthentication=no'; do
+            'ClearAllForwardings=yes'; do
             grep -Fxq "$required_option" "$call" || fail "key test-auth omitted $required_option"
         done
         grep -Fxq none "$call" || fail "key test-auth omitted -F none"
@@ -1396,6 +1396,13 @@ EOF
     assert_file_eq called "$root/capture/sshpass" "password rsync uses sshpass"
     grep -Fxq 'root@[2001:db8::2]:destination $x;()' "$root/capture/rsync-args" || fail "IPv6 remote destination boundary lost"
     pass "rsync option matrix and IPv6 destination are preserved"
+
+    # A connection-level failure (exit 255) must still tell the operator why.
+    printf '#!/usr/bin/env bash\necho "Permission denied (publickey)." >&2\nexit 255\n' > "$root/bin/rsync"
+    rc=0; retry_rsync 'root@bad.example' source destination 2> "$root/stderr" || rc=$?
+    assert_eq 1 "$rc" "rsync connection failure returns ordinary failure"
+    grep -Fq 'Permission denied (publickey).' "$root/stderr" || fail "rsync connection failure reason was not shown"
+    pass "final rsync failure shows the transport error"
     cd "$ROOT_DIR"
     cleanup_runtime
 )

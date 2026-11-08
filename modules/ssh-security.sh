@@ -75,6 +75,42 @@ get_ssh_service_name() {
     return 1
 }
 
+# Ubuntu 22.10 起默认采用 ssh.socket；24.04 起由 sshd-socket-generator
+# 在 daemon-reload 时根据 sshd_config 生成监听配置。
+# 对该 generator 模式，改变端口还需重启 ssh.socket。
+ssh_socket_active() {
+    systemctl is-active --quiet ssh.socket 2>/dev/null
+}
+
+ssh_runtime_active() {
+    systemctl is-active --quiet "$1" || ssh_socket_active
+}
+
+# 运行模式在改动配置前确定一次，apply 失败后的回滚沿用同一模式：新 socket
+# 启动失败后 ssh_socket_active 为假，重新判断会让回滚误走 service 分支。
+detect_ssh_runtime_mode() {
+    if ssh_socket_active; then
+        printf 'socket'
+    else
+        printf 'service'
+    fi
+}
+
+reload_ssh_runtime() {
+    local service_name="$1"
+    local runtime_mode="${2:-auto}"
+
+    if [[ "$runtime_mode" == auto ]]; then
+        runtime_mode=$(detect_ssh_runtime_mode)
+    fi
+
+    if [[ "$runtime_mode" == socket ]]; then
+        systemctl daemon-reload && systemctl restart ssh.socket
+    else
+        systemctl reload "$service_name"
+    fi
+}
+
 normalize_root_login_policy() {
     case "$1" in
         without-password)
@@ -511,6 +547,11 @@ backup_ssh_config() {
 
 restore_ssh_config() {
     local service_name="$1"
+    local runtime_mode="${2:-auto}"
+
+    if [[ "$runtime_mode" == auto ]]; then
+        runtime_mode=$(detect_ssh_runtime_mode)
+    fi
 
     if [[ ! -f "$SSH_PREVIOUS_BACKUP" ]]; then
         error "未找到 SSH 配置备份，无法自动恢复"
@@ -529,12 +570,13 @@ restore_ssh_config() {
         return 1
     fi
 
-    if systemctl reload "$service_name" >/dev/null 2>&1; then
+    if reload_ssh_runtime "$service_name" "$runtime_mode" >/dev/null 2>&1; then
         warn "已恢复 SSH 配置并重新加载服务"
         return 0
     fi
 
-    if systemctl restart "$service_name" >/dev/null 2>&1; then
+    # socket 模式下 restart sshd 不会让 generator 重新生成端口，只掩盖 socket 故障。
+    if [[ "$runtime_mode" != socket ]] && systemctl restart "$service_name" >/dev/null 2>&1; then
         warn "已恢复 SSH 配置并重启服务"
         return 0
     fi
@@ -561,6 +603,9 @@ apply_ssh_config() {
     local temp_config="$1"
     local service_name="$2"
     local ports="$3"
+    local runtime_mode
+
+    runtime_mode=$(detect_ssh_runtime_mode)
 
     if ! backup_ssh_config; then
         rm -f "$temp_config"
@@ -575,15 +620,15 @@ apply_ssh_config() {
 
     rm -f "$temp_config"
 
-    if ! systemctl reload "$service_name"; then
+    if ! reload_ssh_runtime "$service_name" "$runtime_mode"; then
         error "SSH 服务重载失败，尝试恢复原配置"
-        restore_ssh_config "$service_name"
+        restore_ssh_config "$service_name" "$runtime_mode"
         return 1
     fi
 
-    if ! systemctl is-active --quiet "$service_name" || ! verify_listening_ports "$ports"; then
+    if ! ssh_runtime_active "$service_name" || ! verify_listening_ports "$ports"; then
         error "SSH 服务状态或端口监听验证失败，尝试恢复原配置"
-        restore_ssh_config "$service_name"
+        restore_ssh_config "$service_name" "$runtime_mode"
         return 1
     fi
 }
@@ -651,7 +696,7 @@ main() {
         exit 1
     fi
 
-    if ! systemctl is-active --quiet "$ssh_service"; then
+    if ! ssh_runtime_active "$ssh_service"; then
         error "SSH 服务未运行，拒绝修改配置"
         exit 1
     fi

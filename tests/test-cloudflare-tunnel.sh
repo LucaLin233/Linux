@@ -1555,4 +1555,152 @@ entrypoint_output=$(bash -c "$(cat "$ROOT_DIR/tools/cloudflare_tunnel.sh")" clou
 grep -Fq 'cloudflare_tunnel.sh install' <<< "$entrypoint_output" || fail "bash -c entrypoint broken"
 pass "bash -c entrypoint remains compatible"
 
+# purge 的安装状态判定：只有 installed / not-installed / config-files 是可信答案，
+# 半安装与未知状态一律拒绝删除；rm / uninstall_cloudflared / dpkg-query 全是记录型
+# mock，绝不真实删除 /etc。purge_config 要求 [[ -t 0 ]]，故除 no-tty 例外均在
+# script(1) 提供的 PTY 内运行，并由 timeout(1) 保证有界。
+command -v script > /dev/null || fail "purge cases require script(1) for a PTY"
+command -v timeout > /dev/null || fail "purge cases require timeout"
+PURGE_CASE="$TEST_DIR/purge-case.sh"
+cat > "$PURGE_CASE" <<'PURGECASE'
+#!/usr/bin/env bash
+set -euo pipefail
+ROOT_DIR=$1
+LOG=$2
+DPKG_RC=$3
+DPKG_STATUS=$4
+UNINSTALL_RC=$5
+MARKER=$6
+export CLOUDFLARED_TEST_INTERNALS=1
+export HOME=/root
+source "$ROOT_DIR/tools/cloudflare_tunnel.sh"
+REPOSITORY_STATE_DIR="$LOG.repo-state"
+STATE_DIR="$LOG.state"
+mkdir -p "$REPOSITORY_STATE_DIR" "$STATE_DIR"
+[[ "$MARKER" == managed ]] && : > "$STATE_DIR/repository-managed"
+check_platform() { :; }
+require_root() { :; }
+init_runtime_config() { :; }
+uninstall_cloudflared() { printf 'uninstall:%s\n' "$*" >> "$LOG"; return "$UNINSTALL_RC"; }
+dpkg-query() {
+    printf 'dpkg\n' >> "$LOG"
+    printf '%s' "$DPKG_STATUS"
+    return "$DPKG_RC"
+}
+rm() { printf 'rm:%s\n' "$*" >> "$LOG"; }
+printf 'entered\n' >> "$LOG"
+purge_config
+PURGECASE
+chmod 0700 "$PURGE_CASE"
+
+purge_rc() { cat "$TEST_DIR/purge-$1.rc"; }
+
+# 统计全部 rm: 记录（任意参数组合），以便把意外删除暴露为轨迹差异。
+purge_removals() {
+    local total=0 line
+    while IFS= read -r line; do
+        case "$line" in
+            rm:*) total=$((total + 1)) ;;
+        esac
+    done < "$TEST_DIR/purge-$1.log"
+    printf '%s\n' "$total"
+}
+
+run_purge_case() {
+    local name="$1" dpkg_rc="$2" dpkg_status="$3" uninstall_rc="$4" marker="$5" input="$6"
+    local log="$TEST_DIR/purge-$name.log" rc=0
+    : > "$log"
+    printf '%s\n' "$input" | timeout 15s script -qec \
+        "bash '$PURGE_CASE' '$ROOT_DIR' '$log' '$dpkg_rc' '$dpkg_status' '$uninstall_rc' '$marker'" /dev/null \
+        > "$TEST_DIR/purge-$name.out" 2>&1 || rc=$?
+    [[ "$rc" != 124 ]] || fail "$name hung past the 15s PTY budget"
+    printf '%s\n' "$rc" > "$TEST_DIR/purge-$name.rc"
+}
+
+# 无 TTY：必须在确认前拒绝，PURGE 输入不得被消费。
+run_purge_no_tty() {
+    local log="$TEST_DIR/purge-no-tty.log" rc=0
+    : > "$log"
+    printf 'PURGE\n' | timeout 15s bash "$PURGE_CASE" "$ROOT_DIR" "$log" 1 '' 0 none \
+        > "$TEST_DIR/purge-no-tty.out" 2>&1 || rc=$?
+    [[ "$rc" != 124 ]] || fail "no-tty purge hung past the 15s budget"
+    printf '%s\n' "$rc" > "$TEST_DIR/purge-no-tty.rc"
+}
+
+# PTY 内的真实 EOF（^D）：set -e 下的 read 失败应使 purge 以 1 退出，不是“取消 0”。
+run_purge_eof() {
+    local log="$TEST_DIR/purge-eof.log" rc=0
+    : > "$log"
+    printf '\004' | timeout 15s script -qec \
+        "bash '$PURGE_CASE' '$ROOT_DIR' '$log' 1 '' 0 none" /dev/null \
+        > "$TEST_DIR/purge-eof.out" 2>&1 || rc=$?
+    printf '%s\n' "$rc" > "$TEST_DIR/purge-eof.rc"
+}
+
+assert_purge_trace() {
+    local name="$1" expected_rc="$2" expected_trace="$3"
+    [[ "$(purge_rc "$name")" == "$expected_rc" ]] ||
+        fail "$name returned an unexpected status"
+    assert_same <(printf '%s' "$expected_trace") \
+        "$TEST_DIR/purge-$name.log" "$name call trace differs"
+}
+
+run_purge_case not-installed 1 '' 0 none PURGE
+assert_purge_trace not-installed 0 \
+    $'entered\ndpkg\nrm:-rf /etc/cloudflared /root/.cloudflared\n'
+assert_same <(printf '1\n') <(purge_removals not-installed) \
+    "absent package clears configuration exactly once"
+pass "purge clears configuration when dpkg reports the package missing"
+
+for status in not-installed config-files; do
+    name="absent-$status"
+    run_purge_case "$name" 0 "$status" 0 none PURGE
+    assert_purge_trace "$name" 0 \
+        $'entered\ndpkg\nrm:-rf /etc/cloudflared /root/.cloudflared\n'
+done
+pass "dpkg absent states clear configuration exactly once"
+
+for status in '' unexpected half-installed unpacked half-configured \
+    triggers-awaited triggers-pending; do
+    name="unknown-${status:-empty}"
+    run_purge_case "$name" 0 "$status" 0 none PURGE
+    assert_purge_trace "$name" 1 $'entered\ndpkg\n'
+done
+pass "unknown or half-installed dpkg states stop before deleting"
+
+run_purge_case installed-unmanaged 0 installed 1 none PURGE
+assert_purge_trace installed-unmanaged 1 $'entered\ndpkg\nuninstall:--confirmed\n'
+pass "installed package stays behind the managed uninstall guard"
+
+run_purge_case managed-success 1 '' 0 managed PURGE
+assert_purge_trace managed-success 0 \
+    $'entered\ndpkg\nuninstall:--confirmed\nrm:-rf /etc/cloudflared /root/.cloudflared\n'
+pass "repository-managed marker drives the managed uninstall and the cleanup"
+
+run_purge_case dpkg-error 2 '' 0 none PURGE
+assert_purge_trace dpkg-error 1 $'entered\ndpkg\n'
+run_purge_case dpkg-missing 127 '' 0 none PURGE
+assert_purge_trace dpkg-missing 1 $'entered\ndpkg\n'
+pass "unknown dpkg-query failures stop purge with zero removals"
+
+run_purge_case cancelled 1 '' 0 none nope
+assert_purge_trace cancelled 0 $'entered\n'
+assert_same <(printf '0\n') <(purge_removals cancelled) \
+    "cancelled purge deletes nothing"
+run_purge_case empty-input 1 '' 0 none ''
+assert_purge_trace empty-input 0 $'entered\n'
+pass "confirmation gate keeps configuration untouched"
+
+run_purge_no_tty
+run_purge_eof
+assert_purge_trace no-tty 1 $'entered\n'
+assert_purge_trace eof 1 $'entered\n'
+[[ "$(purge_removals eof)" == 0 ]] || fail "EOF must delete nothing"
+pass "purge refuses a non-interactive stdin and fails safely on EOF"
+
+run_purge_case managed-uninstall-failed 1 '' 1 managed PURGE
+assert_purge_trace managed-uninstall-failed 1 $'entered\ndpkg\nuninstall:--confirmed\n'
+[[ "$(purge_removals managed-uninstall-failed)" == 0 ]] || fail "failed managed uninstall must delete nothing"
+pass "failed managed uninstall leaves configuration in place"
+
 printf 'All cloudflare wrapper tests passed. PASS=%d\n' "$pass_count"
