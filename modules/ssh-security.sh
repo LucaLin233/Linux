@@ -75,6 +75,27 @@ get_ssh_service_name() {
     return 1
 }
 
+# Ubuntu 22.10+ 默认由 ssh.socket 持有监听端口：sshd-socket-generator 在
+# daemon-reload 时按 sshd_config 的 Port/ListenAddress 生成监听，单纯 reload
+# sshd 不会改变端口，必须重新生成并重启 socket。
+ssh_socket_active() {
+    systemctl is-active --quiet ssh.socket 2>/dev/null
+}
+
+ssh_runtime_active() {
+    systemctl is-active --quiet "$1" || ssh_socket_active
+}
+
+reload_ssh_runtime() {
+    local service_name="$1"
+
+    if ssh_socket_active; then
+        systemctl daemon-reload && systemctl restart ssh.socket
+    else
+        systemctl reload "$service_name"
+    fi
+}
+
 normalize_root_login_policy() {
     case "$1" in
         without-password)
@@ -529,7 +550,7 @@ restore_ssh_config() {
         return 1
     fi
 
-    if systemctl reload "$service_name" >/dev/null 2>&1; then
+    if reload_ssh_runtime "$service_name" >/dev/null 2>&1; then
         warn "已恢复 SSH 配置并重新加载服务"
         return 0
     fi
@@ -575,13 +596,13 @@ apply_ssh_config() {
 
     rm -f "$temp_config"
 
-    if ! systemctl reload "$service_name"; then
+    if ! reload_ssh_runtime "$service_name"; then
         error "SSH 服务重载失败，尝试恢复原配置"
         restore_ssh_config "$service_name"
         return 1
     fi
 
-    if ! systemctl is-active --quiet "$service_name" || ! verify_listening_ports "$ports"; then
+    if ! ssh_runtime_active "$service_name" || ! verify_listening_ports "$ports"; then
         error "SSH 服务状态或端口监听验证失败，尝试恢复原配置"
         restore_ssh_config "$service_name"
         return 1
@@ -651,7 +672,7 @@ main() {
         exit 1
     fi
 
-    if ! systemctl is-active --quiet "$ssh_service"; then
+    if ! ssh_runtime_active "$ssh_service"; then
         error "SSH 服务未运行，拒绝修改配置"
         exit 1
     fi

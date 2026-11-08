@@ -96,4 +96,28 @@ SSHD_OUTPUT=$'port 22\nport 2222\nlistenaddress 0.0.0.0:22\nlistenaddress [::]:2
 assert_fail "reject widened effective SSH listen scope" verify_effective_settings \
     "$CONFIG_FIXTURE" $'22\n2222' no prohibit-password "$restricted_addresses"
 
+# Ubuntu socket activation: ports only move after the generator reruns and the
+# socket restarts; a plain sshd reload would keep the old listener.
+SYSTEMCTL_CALLS=()
+SOCKET_STATE=active
+systemctl() {
+    SYSTEMCTL_CALLS+=("$*")
+    if [[ "$*" == "is-active --quiet ssh.socket" ]]; then
+        [[ "$SOCKET_STATE" == active ]]
+        return
+    fi
+    [[ "$1" != is-active ]]
+}
+reload_ssh_runtime ssh
+assert_eq "is-active --quiet ssh.socket|daemon-reload|restart ssh.socket" \
+    "$(IFS='|'; printf '%s' "${SYSTEMCTL_CALLS[*]}")" "socket activation regenerates and restarts ssh.socket"
+assert_ok "socket activation counts as a running SSH service" ssh_runtime_active ssh
+
+SYSTEMCTL_CALLS=()
+SOCKET_STATE=inactive
+reload_ssh_runtime ssh
+assert_eq "is-active --quiet ssh.socket|reload ssh" \
+    "$(IFS='|'; printf '%s' "${SYSTEMCTL_CALLS[*]}")" "classic service mode keeps reloading sshd"
+assert_fail "inactive service without socket is not running" ssh_runtime_active ssh
+
 printf 'All SSH security tests passed.\n'
