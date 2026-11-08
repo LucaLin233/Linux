@@ -1958,7 +1958,12 @@ purge_config() {
     local answer
     read -r -p "请输入 PURGE 确认: " answer
     [[ "$answer" == PURGE ]] || { info "已取消"; return 0; }
-    uninstall_cloudflared --confirmed || return $?
+    init_runtime_config
+    # 已卸载（或从未由本脚本安装）时没有受管 source 可验证，只需清理配置。
+    if [[ -e "$REPOSITORY_STATE_DIR/current" || -e "$STATE_DIR/repository-managed" ]] ||
+        dpkg-query -W -f='${db:Status-Status}' cloudflared 2>/dev/null | grep -qx installed; then
+        uninstall_cloudflared --confirmed || return $?
+    fi
     rm -rf /etc/cloudflared /root/.cloudflared
     if [[ "${HOME:-/root}" != /root ]]; then
         rm -rf "$HOME/.cloudflared"
