@@ -201,7 +201,7 @@ EOF
     chmod 0700 "$root/bin"/*
 }
 
-# Repeated deterministic runs keep the original counts; the env vars are local stress overrides.
+# Repeated deterministic runs are a local stress option; CI runs each case once.
 run_preserved_cleanup_retry_case() (
     local run="$1" root runtime runtime_dev runtime_inode credential leader leader_start leader_pgid leader_sid state_file
     local owner watchdog rc=0 metadata="" state_status=0
