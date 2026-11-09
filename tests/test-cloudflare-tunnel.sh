@@ -343,6 +343,106 @@ pass "reject unknown source fields and injection content"
 
 (
 new_case
+trap - EXIT
+FIXED_STAMP=20261109T120000Z
+FIXED_SEED=1848
+date() {
+    if [[ $# -eq 2 && "$1" == -u && "$2" == +%Y%m%dT%H%M%SZ ]]; then
+        printf '%s\n' "$FIXED_STAMP"
+        return 0
+    fi
+    command date "$@"
+}
+history_dirs() {
+    find "$CLOUDFLARED_REPOSITORY_STATE_DIR" -mindepth 1 -maxdepth 1 -type d -name 'history-*' -printf '%f\n' | sort
+}
+failure_dirs() {
+    find "$CLOUDFLARED_REPOSITORY_STATE_DIR" -mindepth 1 -maxdepth 1 -type d -name 'failure-*' -printf '%f\n' | sort
+}
+leftovers() {
+    find "$CLOUDFLARED_REPOSITORY_STATE_DIR" "$(dirname "$CLOUDFLARED_KEYRING")" \
+        "$(dirname "$CLOUDFLARED_SOURCE_FILE")" -mindepth 1 -maxdepth 1 \
+        \( -name 'transaction-*' -o -name '*.stage.*' -o -name 'pending-updater-*' \) -print
+}
+snapshot_tree() {
+    find "$1" -mindepth 1 -printf '%P %y %m %s\n' | sort > "$CASE_DIR/$2.meta"
+    find "$1" -mindepth 1 -type f -exec sha256sum {} + | sed "s|^[a-f0-9]*  $1/|FILE |" | sort > "$CASE_DIR/$2.sha"
+}
+assert_lock_reusable() {
+    [[ ! -d "$CLOUDFLARED_STATE_DIR.lock" ]] || fail "collision: lock retained"
+    acquire_repository_lock || fail "collision: lock not reacquirable"
+    release_repository_lock || fail "collision: lock release failed"
+}
+save_generation_files() {
+    cp -- "$CLOUDFLARED_KEYRING" "$CASE_DIR/key-$1"
+    cp -- "$CLOUDFLARED_SOURCE_FILE" "$CASE_DIR/source-$1"
+    cp -- "$CLOUDFLARED_REPOSITORY_STATE_DIR/current" "$CASE_DIR/current-$1"
+}
+
+set_old_generation
+RANDOM=$FIXED_SEED
+configure_repository > "$CASE_DIR/collision-1.log" 2>&1 || fail "collision: first configure failed"
+mapfile -t first_histories < <(history_dirs)
+(( ${#first_histories[@]} == 1 )) || fail "collision: first configure archived ${#first_histories[@]} generations"
+snapshot_tree "$CLOUDFLARED_REPOSITORY_STATE_DIR/${first_histories[0]}" first-archive
+save_generation_files first
+validate_current_repository_manifest || fail "collision: manifest invalid after first configure"
+assert_lock_reusable
+[[ -z "$(leftovers)" ]] || fail "collision: leftovers after first configure"
+
+RANDOM=$FIXED_SEED
+configure_repository > "$CASE_DIR/collision-2.log" 2>&1 || fail "collision: second configure failed"
+mapfile -t histories < <(history_dirs)
+(( ${#histories[@]} == 2 )) || fail "collision: expected two archives, got ${#histories[@]}"
+[[ "${histories[0]}" != "${histories[1]}" ]] || fail "collision: generation reused for archives"
+snapshot_tree "$CLOUDFLARED_REPOSITORY_STATE_DIR/${first_histories[0]}" first-archive-later
+cmp -s "$CASE_DIR/first-archive.meta" "$CASE_DIR/first-archive-later.meta" ||
+    fail "collision: old archive metadata changed"
+cmp -s "$CASE_DIR/first-archive.sha" "$CASE_DIR/first-archive-later.sha" ||
+    fail "collision: old archive content changed"
+save_generation_files second
+validate_current_repository_manifest || fail "collision: manifest invalid after second configure"
+assert_lock_reusable
+[[ -z "$(leftovers)" ]] || fail "collision: leftovers after second configure"
+
+export FAKE_APT_UPDATE_FAIL=1
+RANDOM=$FIXED_SEED
+if run_repository_apt_transaction install > "$CASE_DIR/collision-3.log" 2>&1; then
+    fail "collision: APT failure ignored"
+fi
+unset FAKE_APT_UPDATE_FAIL
+mapfile -t histories < <(history_dirs)
+(( ${#histories[@]} == 2 )) || fail "collision: rollback changed archive count"
+mapfile -t failures < <(failure_dirs)
+(( ${#failures[@]} == 1 )) || fail "collision: missing failure archive"
+assert_same "$CASE_DIR/key-second" "$CLOUDFLARED_KEYRING" "collision: key not restored"
+assert_same "$CASE_DIR/source-second" "$CLOUDFLARED_SOURCE_FILE" "collision: source not restored"
+assert_same "$CASE_DIR/current-second" "$CLOUDFLARED_REPOSITORY_STATE_DIR/current" "collision: current not restored"
+save_generation_files failed
+validate_current_repository_manifest || fail "collision: manifest invalid after rollback"
+assert_lock_reusable
+[[ -z "$(leftovers)" ]] || fail "collision: leftovers after rollback"
+
+RANDOM=$FIXED_SEED
+run_repository_apt_transaction install > "$CASE_DIR/collision-4.log" 2>&1 ||
+    fail "collision: post-failure configure failed"
+mapfile -t histories < <(history_dirs)
+(( ${#histories[@]} == 3 )) || fail "collision: expected three archives, got ${#histories[@]}"
+[[ "$(printf '%s\n' "${histories[@]}" | sort -u | wc -l)" == 3 ]] || fail "collision: archive names not unique"
+mapfile -t failures_later < <(failure_dirs)
+[[ "$(printf '%s\n' "${failures_later[@]}")" == "$(printf '%s\n' "${failures[@]}")" ]] ||
+    fail "collision: failure archive changed"
+validate_current_repository_manifest || fail "collision: manifest invalid after recovery"
+assert_lock_reusable
+[[ -z "$(leftovers)" ]] || fail "collision: leftovers after recovery"
+) > "$TEST_DIR/generation-collision.log" 2>&1 || {
+    cat "$TEST_DIR/generation-collision.log"
+    fail "repository generation collision"
+}
+pass "repository generation collision preserves archives and rollback"
+
+(
+new_case
 set_old_generation
 INSTALL_CALL=0
 FAIL_INSTALL_CALL=1
