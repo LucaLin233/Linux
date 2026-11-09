@@ -1555,8 +1555,8 @@ entrypoint_output=$(bash -c "$(cat "$ROOT_DIR/tools/cloudflare_tunnel.sh")" clou
 grep -Fq 'cloudflare_tunnel.sh install' <<< "$entrypoint_output" || fail "bash -c entrypoint broken"
 pass "bash -c entrypoint remains compatible"
 
-# purge 的安装状态判定：只有 installed / not-installed / config-files 是可信答案，
-# 半安装与未知状态一律拒绝删除；rm / uninstall_cloudflared / dpkg-query 全是记录型
+# purge 的安装状态判定：只有 dpkg 明确报告未安装且无受管标记时跳过卸载，
+# 其余状态都先经 uninstall_cloudflared；rm / uninstall_cloudflared / dpkg-query 全是记录型
 # mock，绝不真实删除 /etc。purge_config 要求 [[ -t 0 ]]，故除 no-tty 例外均在
 # script(1) 提供的 PTY 内运行，并由 timeout(1) 保证有界。
 command -v script > /dev/null || fail "purge cases require script(1) for a PTY"
@@ -1663,10 +1663,15 @@ pass "dpkg absent states clear configuration exactly once"
 for status in '' unexpected half-installed unpacked half-configured \
     triggers-awaited triggers-pending; do
     name="unknown-${status:-empty}"
-    run_purge_case "$name" 0 "$status" 0 none PURGE
-    assert_purge_trace "$name" 1 $'entered\ndpkg\n'
+    run_purge_case "$name" 0 "$status" 1 none PURGE
+    assert_purge_trace "$name" 1 $'entered\ndpkg\nuninstall:--confirmed\n'
 done
-pass "unknown or half-installed dpkg states stop before deleting"
+pass "unknown or half-installed dpkg states go through the managed uninstall guard"
+
+run_purge_case managed-half-configured 0 half-configured 0 managed PURGE
+assert_purge_trace managed-half-configured 0 \
+    $'entered\ndpkg\nuninstall:--confirmed\nrm:-rf /etc/cloudflared /root/.cloudflared\n'
+pass "repository-managed install in a transitional dpkg state can still be purged"
 
 run_purge_case installed-unmanaged 0 installed 1 none PURGE
 assert_purge_trace installed-unmanaged 1 $'entered\ndpkg\nuninstall:--confirmed\n'
@@ -1677,11 +1682,11 @@ assert_purge_trace managed-success 0 \
     $'entered\ndpkg\nuninstall:--confirmed\nrm:-rf /etc/cloudflared /root/.cloudflared\n'
 pass "repository-managed marker drives the managed uninstall and the cleanup"
 
-run_purge_case dpkg-error 2 '' 0 none PURGE
-assert_purge_trace dpkg-error 1 $'entered\ndpkg\n'
-run_purge_case dpkg-missing 127 '' 0 none PURGE
-assert_purge_trace dpkg-missing 1 $'entered\ndpkg\n'
-pass "unknown dpkg-query failures stop purge with zero removals"
+run_purge_case dpkg-error 2 '' 1 none PURGE
+assert_purge_trace dpkg-error 1 $'entered\ndpkg\nuninstall:--confirmed\n'
+run_purge_case dpkg-missing 127 '' 1 none PURGE
+assert_purge_trace dpkg-missing 1 $'entered\ndpkg\nuninstall:--confirmed\n'
+pass "dpkg-query failures go through the managed uninstall guard"
 
 run_purge_case cancelled 1 '' 0 none nope
 assert_purge_trace cancelled 0 $'entered\n'

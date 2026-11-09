@@ -1950,28 +1950,6 @@ uninstall_cloudflared() {
     info "卸载完成；/etc/cloudflared 与用户 .cloudflared 目录未删除。"
 }
 
-# dpkg 查询结果三态：installed/absent 为可信答案，查询本身失败则返回非零，
-# 调用方必须停止，不能把未知状态当成未安装而删除配置。
-detect_cloudflared_dpkg_state() {
-    local status="" rc=0
-    status=$(dpkg-query -W -f='${db:Status-Status}' cloudflared 2>/dev/null) ||
-        rc=$?
-    case "$rc" in
-        0)
-            case "$status" in
-                installed) printf 'installed' ;;
-                not-installed|config-files) printf 'absent' ;;
-                *) return 1 ;;
-            esac
-            ;;
-        1)
-            [[ -z "$status" ]] || return 1
-            printf 'absent'
-            ;;
-        *) return 1 ;;
-    esac
-}
-
 purge_config() {
     require_root
     check_platform || return $?
@@ -1981,14 +1959,13 @@ purge_config() {
     read -r -p "请输入 PURGE 确认: " answer
     [[ "$answer" == PURGE ]] || { info "已取消"; return 0; }
     init_runtime_config
-    # 已卸载（或从未由本脚本安装）时没有受管 source 可验证，只需清理配置。
-    local dpkg_state
-    if ! dpkg_state=$(detect_cloudflared_dpkg_state); then
-        error "无法确认 cloudflared 安装状态（dpkg-query 异常），已停止，未删除任何配置"
-        return 1
-    fi
-    if [[ "$dpkg_state" == installed ]] ||
-        [[ -e "$REPOSITORY_STATE_DIR/current" || -e "$STATE_DIR/repository-managed" ]]; then
+    # 只有 dpkg 明确报告未安装、且没有受管标记时才跳过卸载（已卸载后的 purge）；
+    # 中间状态和查询失败都交给 uninstall_cloudflared，它会拒绝非本脚本安装的包。
+    local status="" rc=0
+    status=$(dpkg-query -W -f='${db:Status-Status}' cloudflared 2>/dev/null) || rc=$?
+    [[ "$rc" != 1 ]] || status=not-installed
+    if [[ -e "$REPOSITORY_STATE_DIR/current" || -e "$STATE_DIR/repository-managed" ]] ||
+        [[ "$status" != not-installed && "$status" != config-files ]]; then
         uninstall_cloudflared --confirmed || return $?
     fi
     rm -rf /etc/cloudflared /root/.cloudflared
