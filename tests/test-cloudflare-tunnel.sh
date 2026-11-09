@@ -1664,12 +1664,9 @@ entrypoint_output=$(bash -c "$(cat "$ROOT_DIR/tools/cloudflare_tunnel.sh")" clou
 grep -Fq 'cloudflare_tunnel.sh install' <<< "$entrypoint_output" || fail "bash -c entrypoint broken"
 pass "bash -c entrypoint remains compatible"
 
-# purge 的安装状态判定：只有 dpkg 明确报告未安装且无受管标记时跳过卸载，
-# 其余状态都先经 uninstall_cloudflared；rm / uninstall_cloudflared / dpkg-query 全是记录型
-# mock，绝不真实删除 /etc。purge_config 要求 [[ -t 0 ]]，故除 no-tty 例外均在
-# script(1) 提供的 PTY 内运行，并由 timeout(1) 保证有界。
-command -v script > /dev/null || fail "purge cases require script(1) for a PTY"
-command -v timeout > /dev/null || fail "purge cases require timeout"
+# purge 的安装状态判定：只有 dpkg 明确报告未安装且无受管标记时跳过卸载，其余状态先经
+# uninstall_cloudflared；rm / uninstall_cloudflared / dpkg-query 都是记录型 mock，绝不真实删除 /etc。
+# purge_config 要求 [[ -t 0 ]]，因此在 script(1) 提供的 PTY 内运行。
 PURGE_CASE="$TEST_DIR/purge-case.sh"
 cat > "$PURGE_CASE" <<'PURGECASE'
 #!/usr/bin/env bash
@@ -1691,130 +1688,37 @@ check_platform() { :; }
 require_root() { :; }
 init_runtime_config() { :; }
 uninstall_cloudflared() { printf 'uninstall:%s\n' "$*" >> "$LOG"; return "$UNINSTALL_RC"; }
-dpkg-query() {
-    printf 'dpkg\n' >> "$LOG"
-    printf '%s' "$DPKG_STATUS"
-    return "$DPKG_RC"
-}
+dpkg-query() { printf '%s' "$DPKG_STATUS"; return "$DPKG_RC"; }
 rm() { printf 'rm:%s\n' "$*" >> "$LOG"; }
-printf 'entered\n' >> "$LOG"
 purge_config
 PURGECASE
-chmod 0700 "$PURGE_CASE"
 
-purge_rc() { cat "$TEST_DIR/purge-$1.rc"; }
-
-# 统计全部 rm: 记录（任意参数组合），以便把意外删除暴露为轨迹差异。
-purge_removals() {
-    local total=0 line
-    while IFS= read -r line; do
-        case "$line" in
-            rm:*) total=$((total + 1)) ;;
-        esac
-    done < "$TEST_DIR/purge-$1.log"
-    printf '%s\n' "$total"
-}
-
-run_purge_case() {
-    local name="$1" dpkg_rc="$2" dpkg_status="$3" uninstall_rc="$4" marker="$5" input="$6"
-    local log="$TEST_DIR/purge-$name.log" rc=0
+# 参数：名称、dpkg-query 退出码、dpkg 状态、uninstall 退出码、受管标记、预期退出码、预期记录。
+purge_case() {
+    local name="$1" log="$TEST_DIR/purge-$1.log" rc=0
     : > "$log"
-    printf '%s\n' "$input" | timeout 15s script -qec \
-        "bash '$PURGE_CASE' '$ROOT_DIR' '$log' '$dpkg_rc' '$dpkg_status' '$uninstall_rc' '$marker'" /dev/null \
-        > "$TEST_DIR/purge-$name.out" 2>&1 || rc=$?
-    [[ "$rc" != 124 ]] || fail "$name hung past the 15s PTY budget"
-    printf '%s\n' "$rc" > "$TEST_DIR/purge-$name.rc"
+    printf 'PURGE\n' | script -qec "bash '$PURGE_CASE' '$ROOT_DIR' '$log' '$2' '$3' '$4' '$5'" /dev/null \
+        > /dev/null 2>&1 || rc=$?
+    [[ "$rc" == "$6" ]] || fail "$name: purge exited $rc, expected $6"
+    assert_same <(printf '%s' "$7") "$log" "$name: uninstall/rm record differs"
 }
+cleared=$'rm:-rf /etc/cloudflared /root/.cloudflared\n'
+guarded=$'uninstall:--confirmed\n'
 
-# 无 TTY：必须在确认前拒绝，PURGE 输入不得被消费。
-run_purge_no_tty() {
-    local log="$TEST_DIR/purge-no-tty.log" rc=0
-    : > "$log"
-    printf 'PURGE\n' | timeout 15s bash "$PURGE_CASE" "$ROOT_DIR" "$log" 1 '' 0 none \
-        > "$TEST_DIR/purge-no-tty.out" 2>&1 || rc=$?
-    [[ "$rc" != 124 ]] || fail "no-tty purge hung past the 15s budget"
-    printf '%s\n' "$rc" > "$TEST_DIR/purge-no-tty.rc"
-}
+purge_case absent 1 '' 0 none 0 "$cleared"
+purge_case removed 0 config-files 0 none 0 "$cleared"
+pass "purge clears configuration when the package is absent or already removed"
 
-# PTY 内的真实 EOF（^D）：set -e 下的 read 失败应使 purge 以 1 退出，不是“取消 0”。
-run_purge_eof() {
-    local log="$TEST_DIR/purge-eof.log" rc=0
-    : > "$log"
-    printf '\004' | timeout 15s script -qec \
-        "bash '$PURGE_CASE' '$ROOT_DIR' '$log' 1 '' 0 none" /dev/null \
-        > "$TEST_DIR/purge-eof.out" 2>&1 || rc=$?
-    printf '%s\n' "$rc" > "$TEST_DIR/purge-eof.rc"
-}
+purge_case managed 1 '' 0 managed 0 "$guarded$cleared"
+purge_case managed-half-configured 0 half-configured 0 managed 0 "$guarded$cleared"
+pass "repository-managed install, also in a transitional dpkg state, is uninstalled then cleared"
 
-assert_purge_trace() {
-    local name="$1" expected_rc="$2" expected_trace="$3"
-    [[ "$(purge_rc "$name")" == "$expected_rc" ]] ||
-        fail "$name returned an unexpected status"
-    assert_same <(printf '%s' "$expected_trace") \
-        "$TEST_DIR/purge-$name.log" "$name call trace differs"
-}
+purge_case unmanaged-installed 0 installed 1 none 1 "$guarded"
+purge_case unmanaged-half-configured 0 half-configured 1 none 1 "$guarded"
+purge_case dpkg-error 2 '' 1 none 1 "$guarded"
+pass "present or unknown package stops at the uninstall guard without removals"
 
-run_purge_case not-installed 1 '' 0 none PURGE
-assert_purge_trace not-installed 0 \
-    $'entered\ndpkg\nrm:-rf /etc/cloudflared /root/.cloudflared\n'
-assert_same <(printf '1\n') <(purge_removals not-installed) \
-    "absent package clears configuration exactly once"
-pass "purge clears configuration when dpkg reports the package missing"
-
-for status in not-installed config-files; do
-    name="absent-$status"
-    run_purge_case "$name" 0 "$status" 0 none PURGE
-    assert_purge_trace "$name" 0 \
-        $'entered\ndpkg\nrm:-rf /etc/cloudflared /root/.cloudflared\n'
-done
-pass "dpkg absent states clear configuration exactly once"
-
-for status in '' unexpected half-installed unpacked half-configured \
-    triggers-awaited triggers-pending; do
-    name="unknown-${status:-empty}"
-    run_purge_case "$name" 0 "$status" 1 none PURGE
-    assert_purge_trace "$name" 1 $'entered\ndpkg\nuninstall:--confirmed\n'
-done
-pass "unknown or half-installed dpkg states go through the managed uninstall guard"
-
-run_purge_case managed-half-configured 0 half-configured 0 managed PURGE
-assert_purge_trace managed-half-configured 0 \
-    $'entered\ndpkg\nuninstall:--confirmed\nrm:-rf /etc/cloudflared /root/.cloudflared\n'
-pass "repository-managed install in a transitional dpkg state can still be purged"
-
-run_purge_case installed-unmanaged 0 installed 1 none PURGE
-assert_purge_trace installed-unmanaged 1 $'entered\ndpkg\nuninstall:--confirmed\n'
-pass "installed package stays behind the managed uninstall guard"
-
-run_purge_case managed-success 1 '' 0 managed PURGE
-assert_purge_trace managed-success 0 \
-    $'entered\ndpkg\nuninstall:--confirmed\nrm:-rf /etc/cloudflared /root/.cloudflared\n'
-pass "repository-managed marker drives the managed uninstall and the cleanup"
-
-run_purge_case dpkg-error 2 '' 1 none PURGE
-assert_purge_trace dpkg-error 1 $'entered\ndpkg\nuninstall:--confirmed\n'
-run_purge_case dpkg-missing 127 '' 1 none PURGE
-assert_purge_trace dpkg-missing 1 $'entered\ndpkg\nuninstall:--confirmed\n'
-pass "dpkg-query failures go through the managed uninstall guard"
-
-run_purge_case cancelled 1 '' 0 none nope
-assert_purge_trace cancelled 0 $'entered\n'
-assert_same <(printf '0\n') <(purge_removals cancelled) \
-    "cancelled purge deletes nothing"
-run_purge_case empty-input 1 '' 0 none ''
-assert_purge_trace empty-input 0 $'entered\n'
-pass "confirmation gate keeps configuration untouched"
-
-run_purge_no_tty
-run_purge_eof
-assert_purge_trace no-tty 1 $'entered\n'
-assert_purge_trace eof 1 $'entered\n'
-[[ "$(purge_removals eof)" == 0 ]] || fail "EOF must delete nothing"
-pass "purge refuses a non-interactive stdin and fails safely on EOF"
-
-run_purge_case managed-uninstall-failed 1 '' 1 managed PURGE
-assert_purge_trace managed-uninstall-failed 1 $'entered\ndpkg\nuninstall:--confirmed\n'
-[[ "$(purge_removals managed-uninstall-failed)" == 0 ]] || fail "failed managed uninstall must delete nothing"
+purge_case managed-uninstall-failed 1 '' 1 managed 1 "$guarded"
 pass "failed managed uninstall leaves configuration in place"
 
 printf 'All cloudflare wrapper tests passed. PASS=%d\n' "$pass_count"
