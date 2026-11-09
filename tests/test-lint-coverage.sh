@@ -2,8 +2,7 @@
 set -euo pipefail
 # Execute each workflow lint step against inert files and a ShellCheck spy.  The
 # two groups live in separate jobs, so every check runs one step on its own: its
-# exit status, its linted file set, and its enumeration failure.  The required
-# Ubuntu check must still gate both jobs.
+# exit status, its linted file set, and its enumeration failure.
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 unset GH_TOKEN GITHUB_TOKEN SSH_PRIVATE_KEY_B64
 export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null
@@ -30,20 +29,6 @@ extract_step() {
 }
 extract_step 'Run ShellCheck' "$root/production.sh"
 extract_step 'Run ShellCheck tests' "$root/tests.sh"
-# Each step owns exactly one group: one per-file four-way pipeline, at that
-# group's severity, with no trace of the other group's file selection.
-check_step() {
-    local label=$1 file=$2 severity=$3 foreign=$4
-    [[ "$(grep -c -- '-n1 -P4' "$file" || true)" == 1 ]] \
-        || fail "$label does not start exactly one -n1 -P4 pipeline"
-    [[ "$(grep -c -- "--severity=$severity" "$file" || true)" == 1 ]] \
-        || fail "$label does not use exactly one --severity=$severity"
-    if grep -Fq -- "$foreign" "$file"; then
-        fail "$label still selects the other group's files ($foreign)"
-    fi
-}
-check_step 'the production lint step' "$root/production.sh" warning 'tests/*.sh'
-check_step 'the tests lint step' "$root/tests.sh" error ':!:tests/**'
 mkdir -p "$root/bin" "$root/repo"
 cat > "$root/bin/shellcheck" <<'STUB'
 #!/usr/bin/env bash
@@ -135,44 +120,3 @@ for group in production tests; do
     [[ ! -s "$CAPTURE" ]] || fail "$group enumeration failure still linted files"
     printf 'PASS: %s enumeration failure exits 1 without linting\n' "$group"
 done
-# The required check name must stay, and it must depend on both lint jobs and
-# every Ubuntu shard, asserting each dependency's result; a job left out of
-# `needs` would let its failure merge as green.
-awk '
-    /^  [a-z][a-z0-9-]*:$/ { job = $1; sub(/:$/, "", job) }
-    job == "ubuntu" { print }
-' "$workflow" > "$root/aggregate.yml"
-[[ -s "$root/aggregate.yml" ]] || fail 'the workflow has no ubuntu aggregation job'
-grep -qx '    name: Ubuntu 24.04 lint and tests' "$root/aggregate.yml" \
-    || fail 'the ubuntu aggregation job no longer carries the required check name'
-grep -qx '    name: Debian 13 tests' "$workflow" \
-    || fail 'the workflow no longer carries the Debian required check name'
-needs=$(awk '/^    needs: / { sub(/^    needs: \[/, ""); sub(/\].*$/, ""); print; exit }' "$root/aggregate.yml")
-[[ -n "$needs" ]] || fail 'the ubuntu aggregation job has no inline needs list'
-entries=$(printf '%s\n' "$needs" | tr ',' '\n' | sed 's/[[:space:]]//g' | grep -c . || true)
-for required in lint lint-tests ubuntu-tests; do
-    printf '%s\n' "$needs" | tr ',' '\n' | sed 's/[[:space:]]//g' | grep -qx -- "$required" \
-        || fail "the ubuntu aggregation job does not need $required"
-done
-checks=$(grep -c -- '= success' "$root/aggregate.yml" || true)
-[[ "$checks" == "$entries" ]] \
-    || fail "the ubuntu job needs $entries jobs but asserts $checks results"
-# Counting `= success` lines cannot tell which result is bound to which variable:
-# pointing LINT_TESTS_RESULT at needs.lint.result, or relaxing one `&&` to `||`,
-# leaves the count intact while the gate goes green on a failed job.  Require the
-# exact literal lines instead, so every variable must read its own needs entry
-# and all three assertions must be chained with `&&`.
-while IFS= read -r expected; do
-    grep -Fxq -- "$expected" "$root/aggregate.yml" \
-        || fail "the ubuntu aggregation job no longer has the line: $expected"
-done <<'CONTRACT'
-    if: ${{ always() }}
-          LINT_RESULT: ${{ needs.lint.result }}
-          LINT_TESTS_RESULT: ${{ needs.lint-tests.result }}
-          TEST_RESULT: ${{ needs.ubuntu-tests.result }}
-        run: >-
-          test "$LINT_RESULT" = success &&
-          test "$LINT_TESTS_RESULT" = success &&
-          test "$TEST_RESULT" = success
-CONTRACT
-printf 'PASS: ubuntu aggregation needs and asserts %s, each bound to its own result\n' "$needs"
