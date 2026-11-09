@@ -667,17 +667,6 @@ begin_repository_transaction() {
         return 1
     fi
     REPOSITORY_GENERATION="$(date -u +%Y%m%dT%H%M%SZ)-$$-$RANDOM"
-    # 归档与失败归档都沿用同一世代名；覆盖已存在的非空目录会让 mv -fT 失败并回滚。
-    # 持锁时先避开既有 transaction/history/failure 路径，占用则递增末段数字，
-    # 世代仍是“时间-PID-数字”三段，清单校验规则不变。
-    while [[ -e "$REPOSITORY_STATE_DIR/transaction-$REPOSITORY_GENERATION" ||
-        -L "$REPOSITORY_STATE_DIR/transaction-$REPOSITORY_GENERATION" ||
-        -e "$REPOSITORY_STATE_DIR/history-$REPOSITORY_GENERATION" ||
-        -L "$REPOSITORY_STATE_DIR/history-$REPOSITORY_GENERATION" ||
-        -e "$REPOSITORY_STATE_DIR/failure-$REPOSITORY_GENERATION" ||
-        -L "$REPOSITORY_STATE_DIR/failure-$REPOSITORY_GENERATION" ]]; do
-        REPOSITORY_GENERATION="${REPOSITORY_GENERATION%-*}-$(( ${REPOSITORY_GENERATION##*-} + 1 ))"
-    done
     REPOSITORY_TRANSACTION_DIR="$REPOSITORY_STATE_DIR/transaction-$REPOSITORY_GENERATION"
     if ! mkdir -m 0700 -- "$REPOSITORY_TRANSACTION_DIR" ||
         ! validate_secure_directory "$REPOSITORY_TRANSACTION_DIR" 700; then
