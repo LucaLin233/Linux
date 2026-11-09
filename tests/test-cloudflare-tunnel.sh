@@ -366,7 +366,7 @@ leftovers() {
 }
 snapshot_tree() {
     find "$1" -mindepth 1 -printf '%P %y %m %s\n' | sort > "$CASE_DIR/$2.meta"
-    find "$1" -mindepth 1 -type f -exec sha256sum {} + | sed "s|^[a-f0-9]*  $1/|FILE |" | sort > "$CASE_DIR/$2.sha"
+    find "$1" -mindepth 1 -type f -exec sha256sum {} + | sed "s|  $1/|  |" | sort > "$CASE_DIR/$2.sha"
 }
 assert_lock_reusable() {
     [[ ! -d "$CLOUDFLARED_STATE_DIR.lock" ]] || fail "collision: lock retained"
