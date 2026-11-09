@@ -381,7 +381,10 @@ save_generation_files() {
 
 set_old_generation
 RANDOM=$FIXED_SEED
-configure_repository > "$CASE_DIR/collision-1.log" 2>&1 || fail "collision: first configure failed"
+configure_repository > "$CASE_DIR/collision-1.log" 2>&1 || {
+    cat -- "$CASE_DIR/collision-1.log"
+    fail "collision: first configure failed"
+}
 mapfile -t first_histories < <(history_dirs)
 (( ${#first_histories[@]} == 1 )) || fail "collision: first configure archived ${#first_histories[@]} generations"
 snapshot_tree "$CLOUDFLARED_REPOSITORY_STATE_DIR/${first_histories[0]}" first-archive
@@ -391,7 +394,10 @@ assert_lock_reusable
 [[ -z "$(leftovers)" ]] || fail "collision: leftovers after first configure"
 
 RANDOM=$FIXED_SEED
-configure_repository > "$CASE_DIR/collision-2.log" 2>&1 || fail "collision: second configure failed"
+configure_repository > "$CASE_DIR/collision-2.log" 2>&1 || {
+    cat -- "$CASE_DIR/collision-2.log"
+    fail "collision: second configure failed"
+}
 mapfile -t histories < <(history_dirs)
 (( ${#histories[@]} == 2 )) || fail "collision: expected two archives, got ${#histories[@]}"
 [[ "${histories[0]}" != "${histories[1]}" ]] || fail "collision: generation reused for archives"
@@ -408,6 +414,7 @@ assert_lock_reusable
 export FAKE_APT_UPDATE_FAIL=1
 RANDOM=$FIXED_SEED
 if run_repository_apt_transaction install > "$CASE_DIR/collision-3.log" 2>&1; then
+    cat -- "$CASE_DIR/collision-3.log"
     fail "collision: APT failure ignored"
 fi
 unset FAKE_APT_UPDATE_FAIL
@@ -424,8 +431,10 @@ assert_lock_reusable
 [[ -z "$(leftovers)" ]] || fail "collision: leftovers after rollback"
 
 RANDOM=$FIXED_SEED
-run_repository_apt_transaction install > "$CASE_DIR/collision-4.log" 2>&1 ||
+run_repository_apt_transaction install > "$CASE_DIR/collision-4.log" 2>&1 || {
+    cat -- "$CASE_DIR/collision-4.log"
     fail "collision: post-failure configure failed"
+}
 mapfile -t histories < <(history_dirs)
 (( ${#histories[@]} == 3 )) || fail "collision: expected three archives, got ${#histories[@]}"
 [[ "$(printf '%s\n' "${histories[@]}" | sort -u | wc -l)" == 3 ]] || fail "collision: archive names not unique"
