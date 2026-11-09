@@ -98,11 +98,7 @@ detect_ssh_runtime_mode() {
 
 reload_ssh_runtime() {
     local service_name="$1"
-    local runtime_mode="${2:-auto}"
-
-    if [[ "$runtime_mode" == auto ]]; then
-        runtime_mode=$(detect_ssh_runtime_mode)
-    fi
+    local runtime_mode="$2"
 
     if [[ "$runtime_mode" == socket ]]; then
         systemctl daemon-reload && systemctl restart ssh.socket
@@ -547,11 +543,7 @@ backup_ssh_config() {
 
 restore_ssh_config() {
     local service_name="$1"
-    local runtime_mode="${2:-auto}"
-
-    if [[ "$runtime_mode" == auto ]]; then
-        runtime_mode=$(detect_ssh_runtime_mode)
-    fi
+    local runtime_mode="$2"
 
     if [[ ! -f "$SSH_PREVIOUS_BACKUP" ]]; then
         error "未找到 SSH 配置备份，无法自动恢复"
