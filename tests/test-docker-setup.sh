@@ -49,3 +49,39 @@ if [[ -e "$mutation_log" ]]; then
     exit 1
 fi
 printf 'PASS: an empty response declines the Docker CE package replacement\n'
+
+(
+    backup="$test_dir/daemon.json.previous-backup"
+    printf '{}\n' > "$backup"
+    cp() { return 1; }
+    if restore_daemon_config "$backup" "$test_dir/daemon.json"; then
+        printf 'FAIL: failed restore copy was reported as success\n' >&2
+        exit 1
+    fi
+)
+printf 'PASS: a failed restore copy returns failure\n'
+
+require_root() { :; }
+install_docker() { :; }
+start_docker_service() { :; }
+systemctl() { return 1; }
+curl() { return 1; }
+ensure_docker_plugins() { return "$plugin_status"; }
+configure_log_rotation() { return "$rotation_status"; }
+show_docker_summary() { :; }
+
+for scenario in plugin-failure restore-failure; do
+    plugin_status=0 rotation_status=0
+    case "$scenario" in
+        plugin-failure) plugin_status=1; expected_status=2 ;;
+        restore-failure) rotation_status=2; expected_status=1 ;;
+    esac
+    status=0
+    main > "$test_dir/output" || status=$?
+    if [[ "$status" != "$expected_status" ]] || grep -Fq 'Docker 配置完成' "$test_dir/output"; then
+        cat "$test_dir/output" >&2
+        printf 'FAIL: %s gave exit %s, expected %s\n' "$scenario" "$status" "$expected_status" >&2
+        exit 1
+    fi
+    printf 'PASS: %s reports module status %s\n' "$scenario" "$status"
+done
