@@ -416,7 +416,11 @@ backup_python_packages() {
         return 1
     fi
 
-    mv -f "$temp_file" "$backup_file"
+    if ! mv -fT -- "$temp_file" "$backup_file"; then
+        rm -f -- "$temp_file"
+        log "无法保存 Python $version 的依赖备份，已取消升级" "error"
+        return 1
+    fi
     chmod 600 "$backup_file" 2>/dev/null || true
 
     PYTHON_PACKAGE_BACKUP="$backup_file"
@@ -628,7 +632,11 @@ backup_node_packages() {
     fi
 
     rm -f "$temp_json"
-    mv -f "$temp_file" "$backup_file"
+    if ! mv -fT -- "$temp_file" "$backup_file"; then
+        rm -f -- "$temp_file"
+        log "无法保存 Node.js $version 的依赖备份，已取消升级" "error"
+        return 1
+    fi
     chmod 600 "$backup_file" 2>/dev/null || true
 
     NODE_PACKAGE_BACKUP="$backup_file"
@@ -898,6 +906,7 @@ main() {
     echo "请重新登录，或根据当前 Shell 执行：exec zsh / exec bash"
 }
 
-trap 'exit_code=$?; (( exit_code == 2 )) || log "脚本在第 $LINENO 行执行失败" "error"' ERR
-
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    trap 'exit_code=$?; (( exit_code == 2 )) || log "脚本在第 $LINENO 行执行失败" "error"' ERR
+    main "$@"
+fi
