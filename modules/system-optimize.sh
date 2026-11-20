@@ -1431,7 +1431,7 @@ setup_journald_limits() {
     local temp_file
 
     temp_file=$(mktemp) || return 1
-    cat > "$temp_file" <<'EOF'
+    if ! cat > "$temp_file" <<'EOF'
 # 由 system-optimize.sh 自动生成。
 [Journal]
 SystemMaxUse=256M
@@ -1439,6 +1439,11 @@ SystemKeepFree=512M
 RuntimeMaxUse=64M
 MaxRetentionSec=7day
 EOF
+    then
+        rm -f -- "$temp_file"
+        log "生成 journald 配置失败" "error"
+        return 1
+    fi
 
     if [[ -f "$JOURNALD_DROPIN" ]] && cmp -s "$temp_file" "$JOURNALD_DROPIN"; then
         rm -f "$temp_file"

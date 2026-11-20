@@ -996,6 +996,22 @@ reset_calls
 assert_call "install -D -m 0644" "journald attempted to install its drop-in"
 assert_no_call "systemctl restart systemd-journald" "journald skips restart after a drop-in write failure"
 
+install -D -m 0644 /dev/null "$JOURNALD_DROPIN"
+printf '[Journal]\nSystemMaxUse=128M\n' > "$JOURNALD_DROPIN"
+reset_calls
+(
+    cat() {
+        if (( $# == 0 )); then
+            printf '[Journal]\n'
+            return 1
+        fi
+        command cat "$@"
+    }
+    assert_fail "journald stops when staging the drop-in fails partway" setup_journald_limits
+)
+assert_eq $'[Journal]\nSystemMaxUse=128M' "$(cat "$JOURNALD_DROPIN")" "journald preserves the existing drop-in"
+assert_no_call "systemctl restart systemd-journald" "journald skips restart after a staging write failure"
+
 # ---------------------------------------------------------------- PR 2: rollback
 
 reset_sandbox
