@@ -63,6 +63,7 @@ for choice in 1 2; do
         get_ssh_service_name() { printf 'ssh\n'; }
         ssh_runtime_active() { :; }
         ss() { :; }
+        systemctl() { return 1; }
         choose_password_authentication() { printf 'no\n'; }
         choose_root_login_policy() { printf 'prohibit-password\n'; }
         check_syntax() { :; }
@@ -79,7 +80,10 @@ for choice in 1 2; do
         SSHD_OUTPUT=$'port 2222\nlistenaddress 10.0.0.5:2022'
         expected_port=2022
         [[ "$choice" != 2 ]] || expected_port=2222
-        output=$(main <<< "$choice") || fail "main failed for SSH port choice $choice"
+        output=$(main <<< "$choice") || {
+            printf '%s\n' "$output" >&2
+            fail "main failed for SSH port choice $choice"
+        }
         grep -Fq "ssh -p $expected_port root@10.0.0.5" <<< "$output" ||
             fail "choice $choice reported the wrong connection port"
     )
