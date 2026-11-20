@@ -33,15 +33,40 @@ Ubuntu 使用固定 ShellCheck v0.10.0：所有受 Git 跟踪、位于 tests/ �
 
 ## 快速开始
 
-先把入口脚本下载到临时文件。下载成功后再运行，终端的标准输入留给部署菜单。
+在 Bash 中定义下面的函数，供本页的下载示例使用。下载成功后才执行，标准输入留给脚本的交互菜单。
+
+```bash
+run_linux_script() (
+  url=$1
+  runner=$2
+  shift 2
+  file=$(mktemp) || exit 1
+  trap 'rm -f -- "$file"' EXIT
+  curl -fsSLo "$file" "$url" || exit 1
+  if [[ "$runner" == sudo ]]; then
+    sudo bash "$file" "$@"
+  else
+    bash "$file" "$@"
+  fi
+)
+```
+
+运行部署入口：
+
+```bash
+run_linux_script https://raw.githubusercontent.com/LucaLin233/Linux/main/linux_setup.sh sudo
+```
+
+如需先审阅，单独下载后查看，再决定是否执行：
 
 ```bash
 setup_script=$(mktemp) &&
   curl -fsSLo "$setup_script" https://raw.githubusercontent.com/LucaLin233/Linux/main/linux_setup.sh &&
-  sudo bash "$setup_script"
+  less "$setup_script"
+# 下载成功且审阅完毕后再执行：
+# sudo bash "$setup_script"
+# rm -f -- "$setup_script"
 ```
-
-如需先审阅，可在下载成功后用 `less "$setup_script"` 查看，再执行 `sudo bash "$setup_script"`。用完可删除临时文件。
 
 需要修改脚本或保留本地副本时，可以克隆仓库。直接运行克隆中的入口仍会查询远端 `main`，并使用固定 Commit 的主脚本和模块，需要联网。
 
@@ -65,13 +90,13 @@ sudo ./linux_setup.sh
 5. 执行全部或用户选择的模块；
 6. 写入部署日志和摘要。
 
-下载完成后，可用同一个脚本文件查看状态或清理缓存。
+可按需运行以下命令查看状态或清理缓存。
 
 ```bash
-sudo bash "$setup_script" --check-status
-sudo bash "$setup_script" --clean-cache
-bash "$setup_script" --version
-bash "$setup_script" --help
+run_linux_script https://raw.githubusercontent.com/LucaLin233/Linux/main/linux_setup.sh sudo --check-status
+run_linux_script https://raw.githubusercontent.com/LucaLin233/Linux/main/linux_setup.sh sudo --clean-cache
+run_linux_script https://raw.githubusercontent.com/LucaLin233/Linux/main/linux_setup.sh bash --version
+run_linux_script https://raw.githubusercontent.com/LucaLin233/Linux/main/linux_setup.sh bash --help
 ```
 
 主要文件：
@@ -148,50 +173,50 @@ sudo apt install -y curl wget git jq rsync sudo dnsutils cron psmisc locales gpg
 RAW_BASE="https://raw.githubusercontent.com/LucaLin233/Linux/main/modules"
 
 # 1. Zram、系统调优、journald、THP、时区和 Chrony
-sudo bash <(curl -fsSL "$RAW_BASE/system-optimize.sh")
+run_linux_script "$RAW_BASE/system-optimize.sh" sudo
 
 # 2. 欢迎信息、中文环境和可选 XanMod
-sudo bash <(curl -fsSL "$RAW_BASE/system-customize.sh")
+run_linux_script "$RAW_BASE/system-customize.sh" sudo
 
 # 3. Zsh、Oh My Zsh、Powerlevel10k 和插件
-sudo bash <(curl -fsSL "$RAW_BASE/zsh-setup.sh")
+run_linux_script "$RAW_BASE/zsh-setup.sh" sudo
 
 # 4. Mise、Python 和 Node.js；请先完成第 3 项
-sudo bash <(curl -fsSL "$RAW_BASE/mise-setup.sh")
+run_linux_script "$RAW_BASE/mise-setup.sh" sudo
 
 # 5. NextTrace、Speedtest、htop、jq、tree 等工具
-sudo bash <(curl -fsSL "$RAW_BASE/tools-setup.sh")
+run_linux_script "$RAW_BASE/tools-setup.sh" sudo
 
 # 6. Docker Engine、Compose 和 Buildx
-sudo bash <(curl -fsSL "$RAW_BASE/docker-setup.sh")
+run_linux_script "$RAW_BASE/docker-setup.sh" sudo
 
 # 7. 每周系统与内核更新；需要时会自动重启
-sudo bash <(curl -fsSL "$RAW_BASE/auto-update-setup.sh")
+run_linux_script "$RAW_BASE/auto-update-setup.sh" sudo
 
 # 8. SSH 安全配置；操作前先确认控制台和云防火墙可用
-sudo bash <(curl -fsSL "$RAW_BASE/ssh-security.sh")
+run_linux_script "$RAW_BASE/ssh-security.sh" sudo
 ```
 
 `system-optimize.sh` 的 `restore` 只恢复该模块管理的配置和关联运行值，不卸载已安装软件：
 
 ```bash
 RAW_BASE="https://raw.githubusercontent.com/LucaLin233/Linux/main/modules"
-sudo bash <(curl -fsSL "$RAW_BASE/system-optimize.sh") restore
-sudo bash <(curl -fsSL "$RAW_BASE/system-optimize.sh") restore initial
+run_linux_script "$RAW_BASE/system-optimize.sh" sudo restore
+run_linux_script "$RAW_BASE/system-optimize.sh" sudo restore initial
 ```
 
 `system-customize.sh` 支持只运行指定功能：
 
 ```bash
 RAW_BASE="https://raw.githubusercontent.com/LucaLin233/Linux/main/modules"
-sudo bash <(curl -fsSL "$RAW_BASE/system-customize.sh") motd
-sudo bash <(curl -fsSL "$RAW_BASE/system-customize.sh") locale
-sudo bash <(curl -fsSL "$RAW_BASE/system-customize.sh") xanmod
-sudo bash <(curl -fsSL "$RAW_BASE/system-customize.sh") xanmod --yes
-sudo bash <(curl -fsSL "$RAW_BASE/system-customize.sh") status
-sudo bash <(curl -fsSL "$RAW_BASE/system-customize.sh") restore
-sudo bash <(curl -fsSL "$RAW_BASE/system-customize.sh") restore initial
-sudo bash <(curl -fsSL "$RAW_BASE/system-customize.sh") help
+run_linux_script "$RAW_BASE/system-customize.sh" sudo motd
+run_linux_script "$RAW_BASE/system-customize.sh" sudo locale
+run_linux_script "$RAW_BASE/system-customize.sh" sudo xanmod
+run_linux_script "$RAW_BASE/system-customize.sh" sudo xanmod --yes
+run_linux_script "$RAW_BASE/system-customize.sh" sudo status
+run_linux_script "$RAW_BASE/system-customize.sh" sudo restore
+run_linux_script "$RAW_BASE/system-customize.sh" sudo restore initial
+run_linux_script "$RAW_BASE/system-customize.sh" sudo help
 ```
 
 `restore` 会统一恢复 MOTD、Locale 和 XanMod 软件源文件；默认恢复上一次运行前状态，
@@ -245,13 +270,13 @@ fingerprint `CC94B39C77AE7342A68B89628A682D308D4E5E73` 与 UID
 受管的 APT systemd timer，默认不启用；也可稍后使用独立命令启用。
 
 ```bash
-sudo bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/tools/cloudflare_tunnel.sh) install
-sudo bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/tools/cloudflare_tunnel.sh) upgrade
-bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/tools/cloudflare_tunnel.sh) status
-sudo bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/tools/cloudflare_tunnel.sh) enable-auto-update
-sudo bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/tools/cloudflare_tunnel.sh) disable-auto-update
-sudo bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/tools/cloudflare_tunnel.sh) migrate-legacy
-sudo bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/tools/cloudflare_tunnel.sh) uninstall
+run_linux_script https://raw.githubusercontent.com/LucaLin233/Linux/main/tools/cloudflare_tunnel.sh sudo install
+run_linux_script https://raw.githubusercontent.com/LucaLin233/Linux/main/tools/cloudflare_tunnel.sh sudo upgrade
+run_linux_script https://raw.githubusercontent.com/LucaLin233/Linux/main/tools/cloudflare_tunnel.sh bash status
+run_linux_script https://raw.githubusercontent.com/LucaLin233/Linux/main/tools/cloudflare_tunnel.sh sudo enable-auto-update
+run_linux_script https://raw.githubusercontent.com/LucaLin233/Linux/main/tools/cloudflare_tunnel.sh sudo disable-auto-update
+run_linux_script https://raw.githubusercontent.com/LucaLin233/Linux/main/tools/cloudflare_tunnel.sh sudo migrate-legacy
+run_linux_script https://raw.githubusercontent.com/LucaLin233/Linux/main/tools/cloudflare_tunnel.sh sudo uninstall
 ```
 
 安装时 Token 使用隐藏输入，不会写入日志。APT 包会随普通 `apt upgrade` 或 `apt full-upgrade`
@@ -335,10 +360,10 @@ TERM→KILL 清理余量；worker 无响应或异常退出时，主进程会根�
 ### 独立动态 MOTD
 
 ```bash
-sudo bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/tools/setup-motd.sh) install
-sudo bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/tools/setup-motd.sh) status
-sudo bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/tools/setup-motd.sh) restore
-sudo bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/tools/setup-motd.sh) restore initial
+run_linux_script https://raw.githubusercontent.com/LucaLin233/Linux/main/tools/setup-motd.sh sudo install
+run_linux_script https://raw.githubusercontent.com/LucaLin233/Linux/main/tools/setup-motd.sh sudo status
+run_linux_script https://raw.githubusercontent.com/LucaLin233/Linux/main/tools/setup-motd.sh sudo restore
+run_linux_script https://raw.githubusercontent.com/LucaLin233/Linux/main/tools/setup-motd.sh sudo restore initial
 ```
 
 用于只部署动态登录欢迎信息，与 `modules/system-customize.sh` 使用相同模板、锁路径和组级
@@ -353,11 +378,11 @@ install/restore 提交失败或收到 HUP/INT/TERM 都会回滚整个文件组�
 ### XanMod 内核
 
 ```bash
-sudo bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/tools/xanmod-install.sh)
-sudo bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/tools/xanmod-install.sh) --yes
-sudo bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/tools/xanmod-install.sh) install --yes
-sudo bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/tools/xanmod-install.sh) status
-sudo bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/tools/xanmod-install.sh) help
+run_linux_script https://raw.githubusercontent.com/LucaLin233/Linux/main/tools/xanmod-install.sh sudo
+run_linux_script https://raw.githubusercontent.com/LucaLin233/Linux/main/tools/xanmod-install.sh sudo --yes
+run_linux_script https://raw.githubusercontent.com/LucaLin233/Linux/main/tools/xanmod-install.sh sudo install --yes
+run_linux_script https://raw.githubusercontent.com/LucaLin233/Linux/main/tools/xanmod-install.sh sudo status
+run_linux_script https://raw.githubusercontent.com/LucaLin233/Linux/main/tools/xanmod-install.sh sudo help
 ```
 
 脚本先执行只读规划，再检测 x86-64 psABI 并选择适合的 XanMod 包。独立工具保留动态 codename
