@@ -154,7 +154,7 @@ get_effective_listen_endpoints() {
 
 select_listen_endpoints() {
     local endpoints="$1" current_ports="$2" selected_ports="$3"
-    if [[ "$current_ports" == "$selected_ports" ]]; then
+    if [[ -z "$selected_ports" || "$current_ports" == "$selected_ports" ]]; then
         printf '%s\n' "$endpoints"
         return 0
     fi
@@ -180,6 +180,10 @@ select_listen_endpoints() {
         error "当前 SSH 地址使用不同端口组合，无法自动分配新端口，请选择保持当前设置" >&2
         return 1
     fi
+}
+
+listen_endpoint_ports() {
+    sed -n 's/^.*:\([0-9][0-9]*\)$/\1/p' <<< "$1" | sort -n -u
 }
 
 render_listen_endpoints() {
@@ -274,19 +278,19 @@ choose_ssh_ports() {
     choice="${choice:-1}"
 
     case "$choice" in
-        1) selected_ports="$current_ports" ;;
+        1) return 0 ;;
         2) selected_ports="2222" ;;
         3) selected_ports="2022" ;;
         4)
             read -r -p "输入端口，使用空格或逗号分隔（如 22,2222,443）: " input >&2
             selected_ports=$(tr ', ' '\n\n' <<< "$input" | awk '/^[0-9]+$/ {print}' | sort -n -u)
             ;;
-        *) selected_ports="$current_ports" ;;
+        *) return 0 ;;
     esac
 
     if [[ -z "$selected_ports" ]]; then
         warn "未输入有效端口，保持当前端口" >&2
-        selected_ports="$current_ports"
+        return 0
     fi
 
     while IFS= read -r port; do
@@ -690,8 +694,8 @@ show_summary() {
     local password_auth
     local keyboard_auth
 
-    ports=$(get_effective_ports)
     listen_endpoints=$(get_effective_listen_endpoints || echo "未知")
+    ports=$(listen_endpoint_ports "$listen_endpoints")
     root_login=$(get_effective_value "permitrootlogin")
     password_auth=$(get_effective_value "passwordauthentication")
     keyboard_auth=$(get_effective_value "kbdinteractiveauthentication")
@@ -760,10 +764,12 @@ main() {
 
     echo
     local current_ports selected_ports listen_endpoints
-    current_ports=$(get_effective_ports) || exit 1
-    current_ports="${current_ports:-22}"
+    current_ports=$(listen_endpoint_ports "$current_endpoints") || exit 1
     selected_ports=$(choose_ssh_ports "$current_ports") || exit 1
     listen_endpoints=$(select_listen_endpoints "$current_endpoints" "$current_ports" "$selected_ports") || exit 1
+    if [[ -z "$selected_ports" ]]; then
+        selected_ports=$(get_effective_ports) || exit 1
+    fi
 
     echo
     local password_auth
@@ -801,7 +807,7 @@ main() {
     fi
 
     if ! confirm_ssh_changes \
-        "$selected_ports" \
+        "$(listen_endpoint_ports "$listen_endpoints")" \
         "$listen_endpoints" \
         "$password_auth" \
         "$root_login"; then

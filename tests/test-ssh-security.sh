@@ -46,8 +46,8 @@ restricted_endpoints=$'10.0.0.5:22\n[2001:db8::5]:2222'
 SSHD_OUTPUT=$'listenaddress 10.0.0.5:22\nlistenaddress [2001:db8::5]:2222'
 assert_eq "$restricted_endpoints" "$(get_effective_listen_endpoints)" \
     "preserve distinct IPv4 and IPv6 address and port pairs"
-assert_eq "$restricted_endpoints" "$(select_listen_endpoints "$restricted_endpoints" $'22\n2222' $'22\n2222')" \
-    "keep existing pairs when the ports are unchanged"
+assert_eq "$restricted_endpoints" "$(select_listen_endpoints "$restricted_endpoints" $'22\n2222' '')" \
+    "keep existing pairs when the user keeps the current settings"
 assert_fail "refuse to guess when changing the ports of distinct address bindings" \
     select_listen_endpoints "$restricted_endpoints" $'22\n2222' 2022
 
@@ -56,6 +56,16 @@ assert_eq $'0.0.0.0:22\n[::]:22' "$(get_effective_listen_endpoints)" \
     "preserve wildcard scope when it was already effective"
 assert_eq $'0.0.0.0:2022\n[::]:2022' "$(select_listen_endpoints "$(get_effective_listen_endpoints)" 22 2022)" \
     "apply a new port to both addresses when they shared the old port"
+
+(
+    ss() { return 0; }
+    SSHD_OUTPUT=$'port 2222\nlistenaddress 10.0.0.5:2022'
+    endpoints=$(get_effective_listen_endpoints)
+    current_ports=$(listen_endpoint_ports "$endpoints")
+    selected_ports=$(choose_ssh_ports "$current_ports" <<< 2)
+    assert_eq '10.0.0.5:2222' "$(select_listen_endpoints "$endpoints" "$current_ports" "$selected_ports")" \
+        "an explicit choice of the configured Port replaces the old bound port"
+)
 
 run_locale_case() {
     local locale_name="$1" output
