@@ -64,10 +64,10 @@ sudo ./linux_setup.sh
 [`linux_setup.sh`](linux_setup.sh) 是主要入口。它会：
 
 1. 检查 Debian/Ubuntu 版本、root、磁盘和网络；
-2. 安装基础依赖并更新软件包索引；
-3. 获取 GitHub 最新 Commit；
-4. 从该固定 Commit 自动发现、下载和校验 `modules/*.sh`；
-5. 解析模块顺序和依赖，执行全部或用户选择的模块；
+2. 获取并固定 GitHub Commit，自动发现、下载和校验 `modules/*.sh`。缺少 `jq` 时单独询问是否安装菜单依赖；
+3. 解析模块顺序和依赖，显示执行计划并请用户确认；
+4. 确认后迁移旧软件源备份、安装基础依赖、更新软件包索引并修复 hosts 与 cloud-init 配置；
+5. 执行全部或用户选择的模块；
 6. 写入部署日志和摘要。
 
 常用选项：

@@ -330,6 +330,21 @@ migrate_legacy_apt_source_backups() {
 # 依赖安装
 # =============================================================================
 
+ensure_menu_dependency() {
+    command_exists jq && return 0
+
+    local choice
+    if ! read -r -p "模块菜单需要 jq，是否现在安装？[y/N]: " choice || [[ ! "$choice" =~ ^[Yy]$ ]]; then
+        log "用户取消部署" "info"
+        exit 0
+    fi
+
+    if ! apt-get update -qq || ! apt-get install -y jq || ! command_exists jq; then
+        log "无法安装模块菜单所需的 jq" "error"
+        return 1
+    fi
+}
+
 install_dependencies() {
     log "检查基础依赖"
 
@@ -1713,13 +1728,7 @@ main() {
     fi
 
     pre_check
-    migrate_legacy_apt_source_backups
-    install_dependencies
-    system_update
-    if ! fix_hosts_file; then
-        log "hosts 配置修复失败，停止执行" "error"
-        exit 1
-    fi
+    ensure_menu_dependency || exit 1
 
     if ! discover_and_prepare_modules; then
         exit 1
@@ -1738,12 +1747,18 @@ main() {
     echo "最终执行计划：${SELECTED_MODULES[*]}"
 
     local confirmation
-    read -r -p "确认执行以上模块？[Y/n]: " confirmation
-    confirmation="${confirmation:-Y}"
-
-    if [[ ! "$confirmation" =~ ^[Yy]$ ]]; then
+    if ! read -r -p "确认准备系统并执行以上模块？[Y/n]: " confirmation ||
+        [[ ! "${confirmation:-Y}" =~ ^[Yy]$ ]]; then
         log "用户取消部署" "info"
         exit 0
+    fi
+
+    migrate_legacy_apt_source_backups
+    install_dependencies
+    system_update
+    if ! fix_hosts_file; then
+        log "hosts 配置修复失败，停止执行" "error"
+        exit 1
     fi
 
     local module

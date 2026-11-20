@@ -336,7 +336,7 @@ printf 'All linux_setup integrity tests passed.\n'
 printf 'All module failure-status tests passed.\n'
 
 # Exercise the real main scheduler and final exit, stubbing only system/network/UI.
-for scenario in mixed valid; do
+for scenario in mixed valid decline eof; do
     main_root="$TEST_DIR/main-status-$scenario"; mkdir "$main_root"
     rc=0
     env ROOT_DIR="$ROOT_DIR" MAIN_ROOT="$main_root" SCENARIO="$scenario" \
@@ -344,8 +344,10 @@ for scenario in mixed valid; do
         source "$ROOT_DIR/linux_setup.sh"
         init_logging() { :; }; create_temp_dir() { TEMP_DIR=""; }
         self_update() { :; }; pre_check() { :; }; clear() { :; }
-        migrate_legacy_apt_source_backups() { :; }; install_dependencies() { :; }
-        system_update() { :; }; fix_hosts_file() { :; }
+        migrate_legacy_apt_source_backups() { touch "$MAIN_ROOT/backup-migration"; }
+        install_dependencies() { touch "$MAIN_ROOT/dependencies"; }
+        system_update() { touch "$MAIN_ROOT/apt-update"; }
+        fix_hosts_file() { touch "$MAIN_ROOT/hosts-and-cloud-init"; }
         discover_and_prepare_modules() {
             register_unavailable_module broken "download failed"
             MODULES[consumer]=consumer; MODULE_DEPS[consumer]=broken; MODULE_ORDER_VALUE[consumer]=1
@@ -359,10 +361,22 @@ for scenario in mixed valid; do
         }
         generate_summary() { declare -p MODULE_STATUS > "$MAIN_ROOT/status"; }
         show_recommendations() { :; }
-        main <<< $'\''y\ny\n'\''
+        case "$SCENARIO" in
+            decline) main <<< n ;;
+            eof) main </dev/null ;;
+            *) main <<< $'\''y\ny\n'\'' ;;
+        esac
         ' > "$main_root/output" 2>&1 || rc=$?
     expected=0; [[ $scenario != mixed ]] || expected=1
     assert_eq "$expected" "$rc" "real main $scenario returns exact deployment status"
+    if [[ "$scenario" == decline || "$scenario" == eof ]]; then
+        grep -Fq '用户取消部署' "$main_root/output" || fail "real main $scenario did not report cancellation"
+        for marker in backup-migration dependencies apt-update hosts-and-cloud-init executed; do
+            [[ ! -e "$main_root/$marker" ]] || fail "real main $scenario changed system state ($marker)"
+        done
+        pass "real main $scenario leaves system state untouched"
+        continue
+    fi
     [[ -f "$main_root/executed" ]]
     if [[ $scenario == mixed ]]; then
         grep -Fq '[consumer]="failed"' "$main_root/status"
