@@ -24,7 +24,7 @@
 分析和测试交由 CI：PR 按完整差异及依赖映射选择套件，README/许可证修改无需业务测试；
 公共设施或未知依赖改动回退全量，main 推送仍执行全量。两个必需 Job 始终运行，输出选择和跳过记录。
 每个 OS 的测试作业按五个 shard 并行：`motd`、`push-worker`、`push`、`cloudflare` 各跑一个重套件，
-`other` 跑其余全部套件；本机全量用 `tests/run.sh all`。并发回归的多轮重复只作为本机压力选项
+`other` 跑其余全部套件；本机全量用 `bash tests/run.sh all`。并发回归的多轮重复只作为本机压力选项
 （如 `PUSH_RUNTIME_EVIDENCE_STRESS`、`PUSH_FAILED_REAP_RUNS`、`PUSH_AUTH_SIGNAL_REPEATS`），CI 每个用例跑一次。
 Ubuntu 使用固定 ShellCheck v0.10.0：所有受 Git 跟踪、位于 tests/ 之外的 .sh 文件执行 warning 门槛，tests/ 与 tests/lib/ 内的 .sh 文件执行 error 门槛；新目录中的生产 .sh 文件自动纳入，不维护生产文件白名单。Zsh 配置 p10k-config.zsh 不交给 Bash ShellCheck。两组 lint 各在一个 Ubuntu 作业里跑（生产组 `ShellCheck`、测试组 `ShellCheck (tests)`），聚合检查 `Ubuntu 24.04 lint and tests` 要求两者都通过；Debian 不重复 lint。
 例外仅允许局部明确的 SC 规则编号和邻近理由；禁止文件级或全局 warning 抑制。测试 warning 不阻断不等于被 disable，禁止用抑制隐藏行为缺陷。CI 工作流改动继续触发全量测试回退；lint 已是独立作业，warning 门槛失败不会阻止 Ubuntu 行为套件执行，但会让 `Ubuntu 24.04 lint and tests` 聚合检查失败；不能以 Debian 通过代替双环境验收。
@@ -33,22 +33,17 @@ Ubuntu 使用固定 ShellCheck v0.10.0：所有受 Git 跟踪、位于 tests/ �
 
 ## 快速开始
 
-推荐直接远程运行最新主脚本。脚本需要交互输入，因此使用进程替换，避免将标准输入占用为脚本内容：
+先把入口脚本下载到临时文件。下载成功后再运行，终端的标准输入留给部署菜单。
 
 ```bash
-sudo bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/linux_setup.sh)
+setup_script=$(mktemp) &&
+  curl -fsSLo "$setup_script" https://raw.githubusercontent.com/LucaLin233/Linux/main/linux_setup.sh &&
+  sudo bash "$setup_script"
 ```
 
-如需先审阅再执行：
+如需先审阅，可在下载成功后用 `less "$setup_script"` 查看，再执行 `sudo bash "$setup_script"`。用完可删除临时文件。
 
-```bash
-curl -fsSLo /tmp/linux_setup.sh \
-  https://raw.githubusercontent.com/LucaLin233/Linux/main/linux_setup.sh
-less /tmp/linux_setup.sh
-sudo bash /tmp/linux_setup.sh
-```
-
-需要修改脚本或离线保留副本时，再克隆仓库：
+需要修改脚本或保留本地副本时，可以克隆仓库。直接运行克隆中的入口仍会查询远端 `main`，并使用固定 Commit 的主脚本和模块，需要联网。
 
 ```bash
 git clone https://github.com/LucaLin233/Linux.git
@@ -70,13 +65,13 @@ sudo ./linux_setup.sh
 5. 执行全部或用户选择的模块；
 6. 写入部署日志和摘要。
 
-常用选项：
+下载完成后，可用同一个脚本文件查看状态或清理缓存。
 
 ```bash
-sudo bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/linux_setup.sh) --check-status
-sudo bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/linux_setup.sh) --clean-cache
-bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/linux_setup.sh) --version
-bash <(curl -fsSL https://raw.githubusercontent.com/LucaLin233/Linux/main/linux_setup.sh) --help
+sudo bash "$setup_script" --check-status
+sudo bash "$setup_script" --clean-cache
+bash "$setup_script" --version
+bash "$setup_script" --help
 ```
 
 主要文件：
