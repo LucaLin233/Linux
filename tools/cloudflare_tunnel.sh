@@ -1891,11 +1891,77 @@ finish_uninstall_transaction() {
     if [[ "$failed" == true ]]; then error "卸载收尾失败；状态 FAILED/PENDING；锁或证据: $lock_path $UNINSTALL_SNAPSHOT_DIR"; return 1; fi
 }
 
+stop_tunnel_service() {
+    local properties related_units
+    properties=$(systemctl show --property=Id,LoadState,ActiveState,UnitFileState cloudflared.service) || return $?
+    if ! grep -Fxq 'Id=cloudflared.service' <<< "$properties"; then
+        error "cloudflared.service 并非实际 unit 名称，请先手动处理别名"
+        return 1
+    fi
+    if grep -Fxq 'LoadState=not-found' <<< "$properties"; then
+        if ! grep -Fxq 'ActiveState=inactive' <<< "$properties"; then
+            systemctl stop cloudflared.service || return $?
+        fi
+        return 0
+    fi
+    if grep -Fxq 'LoadState=masked' <<< "$properties"; then
+        systemctl stop cloudflared.service
+        return $?
+    fi
+    if [[ -L "$SERVICE_FILE" ]] || grep -Eq '^UnitFileState=linked(-runtime)?$' <<< "$properties"; then
+        error "cloudflared.service 是链接的 unit，请先手动停用并处理链接"
+        return 1
+    fi
+
+    # disable follows Also= in unit files and drop-ins. A continuation after
+    # the key can place the equals sign on the next line.
+    related_units=$(systemctl cat cloudflared.service | LC_ALL=C awk '
+        { sub(/^\357\273\277/, ""); sub(/\r$/, "") }
+        /^[[:space:]]*Also([[:space:]]*=[[:space:]]*[^[:space:]]|[[:space:]]*\\$)/ { related = 1 }
+        END { print related + 0 }
+    ') || return $?
+    if [[ "$related_units" == 1 ]]; then
+        error "cloudflared.service 的 Also= 会影响其他 unit，请先手动处理关联 unit"
+        return 1
+    fi
+    systemctl disable --now cloudflared.service
+}
+
+remove_generated_tunnel_unit() {
+    [[ -e "$SERVICE_FILE" || -L "$SERVICE_FILE" ]] || return 0
+    # Match the upstream systemd template for a file-backed Token. Older
+    # versions put the Token in ExecStart, so preserve any other unit intact.
+    if validate_directory_chain "$(dirname -- "$SERVICE_FILE")" &&
+        validate_secure_file "$SERVICE_FILE" 644 &&
+        cmp -s -- "$SERVICE_FILE" <(cat <<EOF
+[Unit]
+Description=Cloudflare Tunnel client
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+TimeoutStartSec=15
+Type=notify
+ExecStart=$APT_BIN --no-autoupdate tunnel run --token-file /etc/cloudflared/token
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target
+EOF
+        ); then
+        rm -- "$SERVICE_FILE" || return $?
+        systemctl daemon-reload || return $?
+    else
+        warn "已保留非受管或内含凭据的服务文件: $SERVICE_FILE"
+    fi
+}
+
 uninstall_cloudflared() {
     local confirmed="${1:-}" uninstall_status=0 irreversible=false
     require_root
     check_platform || return $?
-    warn "将删除 cloudflared 服务和 APT 包；Tunnel 配置与凭据默认保留。"
+    warn "将停用 cloudflared 服务并删除受管 unit 和 APT 包；Tunnel 配置与凭据保留。"
     if [[ "$confirmed" != --confirmed ]]; then
         confirm "继续卸载？" || { info "已取消"; return 0; }
     fi
@@ -1932,10 +1998,10 @@ uninstall_cloudflared() {
     disable_auto_update_locked --confirmed || uninstall_status=$?
     uninstall_transaction_hook after-disable-auto-update
     if (( uninstall_status == 0 )); then
-        if command -v cloudflared >/dev/null 2>&1; then
-            cloudflared service uninstall >/dev/null 2>&1 || true
-        fi
-        systemctl disable --now cloudflared.service >/dev/null 2>&1 || true
+        # Upstream service uninstall also deletes /etc/cloudflared/token.
+        stop_tunnel_service || uninstall_status=$?
+    fi
+    if (( uninstall_status == 0 )); then
         uninstall_transaction_hook before-apt-remove
         irreversible=true
         DEBIAN_FRONTEND=noninteractive apt-get remove -y cloudflared || uninstall_status=$?
@@ -1949,6 +2015,9 @@ uninstall_cloudflared() {
     if (( uninstall_status == 0 )); then
         uninstall_transaction_hook final-apt-update
         apt-get update || uninstall_status=$?
+    fi
+    if (( uninstall_status == 0 )); then
+        remove_generated_tunnel_unit || uninstall_status=$?
     fi
 
     if (( uninstall_status != 0 )); then
@@ -1995,8 +2064,8 @@ show_help() {
   cloudflare_tunnel.sh enable-auto-update    启用每日 APT 更新检测与安装
   cloudflare_tunnel.sh disable-auto-update   禁用并备份自动更新组件
   cloudflare_tunnel.sh migrate-legacy   备份并清理旧二进制和自定义更新器
-  cloudflare_tunnel.sh uninstall        删除服务、APT 包和本工具管理的软件源，保留配置
-  cloudflare_tunnel.sh purge            二次确认后彻底删除本地 Tunnel 配置
+  cloudflare_tunnel.sh uninstall        停用服务，删除受管 unit、APT 包和受管软件源，保留凭据
+  cloudflare_tunnel.sh purge            二次确认后删除 /etc/cloudflared 和用户 .cloudflared 目录
   cloudflare_tunnel.sh help             显示帮助
 
 APT 包会随系统 apt upgrade/full-upgrade 更新。enable-auto-update 会每日运行 apt-get update，
