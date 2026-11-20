@@ -1810,18 +1810,21 @@ purge_case managed-uninstall-failed 1 '' 1 managed 1 "$guarded"
 pass "failed managed uninstall leaves configuration in place"
 
 (
+    CLOUDFLARED_TEST_INTERNALS=1
     # shellcheck source=../tools/cloudflare_tunnel.sh
     source "$ROOT_DIR/tools/cloudflare_tunnel.sh"
+    start_attempted=false
     systemctl() {
         case "$*" in
             'cat cloudflared.service') return 0 ;;
-            'enable --now cloudflared.service') return 1 ;;
+            'enable --now cloudflared.service') start_attempted=true; return 1 ;;
             *) fail "unexpected systemctl command: $*" ;;
         esac
     }
     if install_service </dev/null; then
         fail "existing cloudflared service start failure was reported as success"
     fi
+    [[ "$start_attempted" == true ]] || fail "existing cloudflared service start was not attempted"
 )
 pass "failure to start the existing cloudflared service propagates"
 
