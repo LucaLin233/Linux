@@ -17,7 +17,8 @@ crontab() {
     if [[ "$1" == -l ]]; then
         cat "$test_dir/cron"
     else
-        grep -Fq "0 2 * * 0 $fixture_script" "$1" && touch "$test_dir/install-attempted"
+        touch "$test_dir/install-attempted"
+        grep -Fq "0 2 * * 0 $fixture_script" "$1" && touch "$test_dir/schedule-matched"
         return 1
     fi
 }
@@ -26,8 +27,27 @@ if install_update_schedule '0 2 * * 0' "$fixture_script"; then
     printf 'FAIL: failed crontab installation was reported as success\n' >&2
     exit 1
 fi
-[[ -e "$test_dir/install-attempted" ]]
+[[ -e "$test_dir/install-attempted" && -e "$test_dir/schedule-matched" ]]
 grep -Fxq "0 1 * * 0 $fixture_script" "$test_dir/cron"
 cmp -s -- "$test_dir/original" "$fixture_script"
 [[ -x "$fixture_script" ]]
 printf 'PASS: failed crontab installation leaves the old updater in place\n'
+
+rm -f -- "$test_dir/install-attempted"
+(
+    printf() {
+        if [[ "$*" == *"$CRON_COMMENT"* ]]; then
+            builtin printf 'partial cron table\n'
+            touch "$test_dir/partial-write"
+            return 1
+        fi
+        builtin printf "$@"
+    }
+    if install_update_schedule '0 2 * * 0' "$fixture_script"; then
+        exit 1
+    fi
+)
+[[ -e "$test_dir/partial-write" && ! -e "$test_dir/install-attempted" ]]
+grep -Fxq "0 1 * * 0 $fixture_script" "$test_dir/cron"
+cmp -s -- "$test_dir/original" "$fixture_script"
+printf 'PASS: a staging write error preserves the existing cron table and updater\n'

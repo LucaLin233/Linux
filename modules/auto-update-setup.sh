@@ -174,14 +174,18 @@ configure_cron_job() {
 
     current_cron=$(crontab -l 2>/dev/null || true)
 
-    {
-        printf '%s\n' "$current_cron" |
-            grep -Fv "$CRON_COMMENT" |
-            grep -Fv "$update_script" || true
-
-        echo "$CRON_COMMENT"
-        echo "$cron_expression $update_script"
-    } > "$temp_cron"
+    local retained_cron
+    retained_cron=$(awk -v comment="$CRON_COMMENT" -v script="$update_script" '
+        !index($0, comment) && !index($0, script) { print }
+    ' <<< "$current_cron") || {
+        rm -f -- "$temp_cron"
+        return 1
+    }
+    if ! printf '%s\n' "$retained_cron" "$CRON_COMMENT" "$cron_expression $update_script" > "$temp_cron"; then
+        rm -f -- "$temp_cron"
+        log "无法生成自动更新 Cron 配置" "error"
+        return 1
+    fi
 
     if ! crontab "$temp_cron"; then
         rm -f "$temp_cron"
