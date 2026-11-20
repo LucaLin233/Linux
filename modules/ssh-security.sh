@@ -5,7 +5,7 @@
 # linux-setup:enabled=true
 # SSH 安全配置模块
 # 功能：配置 SSH 端口、Root 登录策略与认证方式。
-# 策略：完整替换主配置，保留现有监听地址，并在末尾加载扩展配置。
+# 策略：完整替换主配置，保留地址和端口的监听关系，并在末尾加载扩展配置。
 
 set -euo pipefail
 
@@ -140,37 +140,57 @@ get_effective_ports() {
         sort -n -u
 }
 
-get_effective_listen_addresses_from_config() {
+get_effective_listen_endpoints() {
     local config_file="${1:-}"
-    local addresses
+    local endpoints
     local -a sshd_args=(-T)
 
     [[ -n "$config_file" ]] && sshd_args+=(-f "$config_file")
-    addresses=$(sshd "${sshd_args[@]}" 2>/dev/null | awk '$1 == "listenaddress" {
-        value=$2
-        if (value ~ /^\[.*\]:[0-9]+$/) {
-            sub(/^\[/, "", value)
-            sub(/\]:[0-9]+$/, "", value)
-        } else if (value ~ /^[^:]+:[0-9]+$/) {
-            sub(/:[0-9]+$/, "", value)
+    endpoints=$(sshd "${sshd_args[@]}" 2>/dev/null |
+        awk '$1 == "listenaddress" { print $2 }' | LC_ALL=C sort -u) || return $?
+    [[ -n "$endpoints" ]] || return 1
+    printf '%s\n' "$endpoints"
+}
+
+select_listen_endpoints() {
+    local endpoints="$1" current_ports="$2" selected_ports="$3"
+    if [[ -z "$selected_ports" || "$current_ports" == "$selected_ports" ]]; then
+        printf '%s\n' "$endpoints"
+        return 0
+    fi
+
+    # Changing ports is unambiguous only when every address currently
+    # listens on the same set of ports.
+    if ! awk -v selected_ports="$selected_ports" '
+        {
+            address = $0
+            sub(/:[0-9]+$/, "", address)
+            addresses[address] = 1
+            port = $0
+            sub(/^.*:/, "", port)
+            ports[port] = 1
         }
-        print value
-    }' | LC_ALL=C sort -u)
-    [[ -n "$addresses" ]] || return 1
-    printf '%s\n' "$addresses"
+        END {
+            if (NR != length(addresses) * length(ports)) exit 1
+            count = split(selected_ports, selected, "\n")
+            for (address in addresses)
+                for (i = 1; i <= count; i++) print address ":" selected[i]
+        }
+    ' <<< "$endpoints" | LC_ALL=C sort -u; then
+        error "当前 SSH 地址使用不同端口组合，无法自动分配新端口，请选择保持当前设置" >&2
+        return 1
+    fi
 }
 
-get_effective_listen_addresses() {
-    get_effective_listen_addresses_from_config
+listen_endpoint_ports() {
+    awk -F: '$NF ~ /^[0-9]+$/ {print $NF}' <<< "$1" | sort -n -u
 }
 
-render_listen_addresses() {
-    local addresses="$1"
-    local address
-
-    while IFS= read -r address; do
-        [[ -n "$address" ]] && printf 'ListenAddress %s\n' "$address"
-    done <<< "$addresses"
+render_listen_endpoints() {
+    local endpoints="$1" endpoint
+    while IFS= read -r endpoint; do
+        [[ -n "$endpoint" ]] && printf 'ListenAddress %s\n' "$endpoint"
+    done <<< "$endpoints"
 }
 
 port_is_in_list() {
@@ -242,14 +262,11 @@ format_root_login_display() {
 
 # === 交互选择 ===
 choose_ssh_ports() {
-    local current_ports
+    local current_ports="$1"
     local choice
     local input
     local selected_ports
     local port
-
-    current_ports=$(get_effective_ports)
-    current_ports="${current_ports:-22}"
 
     echo "当前 SSH 监听端口: $(tr '\n' ' ' <<< "$current_ports")" >&2
     echo "端口配置：" >&2
@@ -261,19 +278,19 @@ choose_ssh_ports() {
     choice="${choice:-1}"
 
     case "$choice" in
-        1) selected_ports="$current_ports" ;;
+        1) return 0 ;;
         2) selected_ports="2222" ;;
         3) selected_ports="2022" ;;
         4)
             read -r -p "输入端口，使用空格或逗号分隔（如 22,2222,443）: " input >&2
             selected_ports=$(tr ', ' '\n\n' <<< "$input" | awk '/^[0-9]+$/ {print}' | sort -n -u)
             ;;
-        *) selected_ports="$current_ports" ;;
+        *) return 0 ;;
     esac
 
     if [[ -z "$selected_ports" ]]; then
         warn "未输入有效端口，保持当前端口" >&2
-        selected_ports="$current_ports"
+        return 0
     fi
 
     while IFS= read -r port; do
@@ -354,7 +371,7 @@ create_temp_ssh_config() {
     local ports="$1"
     local password_auth="$2"
     local root_login="$3"
-    local listen_addresses="$4"
+    local listen_endpoints="$4"
     local temp_config
 
     if ! temp_config=$(mktemp /etc/ssh/sshd_config.new.XXXXXX); then
@@ -370,7 +387,7 @@ create_temp_ssh_config() {
 # 网络
 $(while IFS= read -r port; do [[ -n "$port" ]] && echo "Port $port"; done <<< "$ports")
 AddressFamily any
-$(render_listen_addresses "$listen_addresses")
+$(render_listen_endpoints "$listen_endpoints")
 
 # 认证
 PermitRootLogin $root_login
@@ -448,10 +465,10 @@ verify_effective_settings() {
     local expected_ports="$2"
     local expected_password_auth="$3"
     local expected_root_login="$4"
-    local expected_listen_addresses="$5"
+    local expected_listen_endpoints="$5"
     local actual_value
     local ports
-    local listen_addresses
+    local listen_endpoints
     local key
 
     declare -A expected_values=(
@@ -479,13 +496,13 @@ verify_effective_settings() {
         return 1
     fi
 
-    listen_addresses=$(get_effective_listen_addresses_from_config "$config_file") || {
-        error "无法读取最终 SSH 监听地址"
+    listen_endpoints=$(get_effective_listen_endpoints "$config_file") || {
+        error "无法读取最终 SSH 监听地址和端口"
         return 1
     }
-    if [[ "$listen_addresses" != "$expected_listen_addresses" ]]; then
-        error "最终 SSH 监听地址不符合预期：$(tr '\n' ' ' <<< "$listen_addresses")"
-        error "预期保留：$(tr '\n' ' ' <<< "$expected_listen_addresses")"
+    if [[ "$listen_endpoints" != "$expected_listen_endpoints" ]]; then
+        error "最终 SSH 监听地址和端口不符合预期：$(tr '\n' ' ' <<< "$listen_endpoints")"
+        error "预期监听：$(tr '\n' ' ' <<< "$expected_listen_endpoints")"
         return 1
     fi
 }
@@ -514,7 +531,7 @@ report_shadowed_dropin_settings() {
 
 confirm_ssh_changes() {
     local ports="$1"
-    local listen_addresses="$2"
+    local listen_endpoints="$2"
     local password_auth="$3"
     local root_login="$4"
     local answer
@@ -522,7 +539,7 @@ confirm_ssh_changes() {
     echo
     info "即将应用的 SSH 生效策略："
     echo "  端口: $(tr '\n' ' ' <<< "$ports")"
-    echo "  监听地址: $(tr '\n' ' ' <<< "$listen_addresses")"
+    echo "  监听地址和端口: $(tr '\n' ' ' <<< "$listen_endpoints")"
     echo "  Root 登录: $(format_root_login_display "$root_login")"
     echo "  密码认证: $password_auth"
     report_shadowed_dropin_settings
@@ -577,29 +594,71 @@ restore_ssh_config() {
     return 1
 }
 
-verify_listening_ports() {
-    local ports="$1"
-    local port
+get_process_listen_endpoints() {
+    ss -ltnpH | awk -v pid="$1" 'index($0, ",pid=" pid ",") { print $4 }'
+}
 
-    sleep 1
-    while IFS= read -r port; do
-        [[ -n "$port" ]] || continue
-        if ! ss -ltnH | awk '{print $4}' | grep -Eq "(^|[:.])${port}$"; then
-            error "SSH 未实际监听端口: $port"
+get_ssh_socket_endpoints() {
+    local declared systemd_listeners endpoint dual_stack_endpoint
+    declared=$(systemctl show --property=Listen --value ssh.socket | awk '{
+        for (i = 2; i <= NF; i++)
+            if ($i == "(Stream)" && $(i-1) ~ /:[0-9]+$/) print $(i-1)
+    }') || return $?
+    [[ -n "$declared" ]] || return 1
+    systemd_listeners=$(get_process_listen_endpoints 1) || return $?
+    while IFS= read -r endpoint; do
+        dual_stack_endpoint="*:${endpoint##*:}"
+        if [[ "$endpoint" == '[::]:'* ]] && grep -Fxq "$dual_stack_endpoint" <<< "$systemd_listeners"; then
+            printf '%s\n' "$dual_stack_endpoint"
+        elif grep -Fxq "$endpoint" <<< "$systemd_listeners"; then
+            printf '%s\n' "$endpoint"
+        else
+            error "ssh.socket 未实际监听: $endpoint" >&2
             return 1
         fi
-    done <<< "$ports"
+    done <<< "$declared"
+}
+
+verify_listening_endpoints() {
+    local service_name="$1" runtime_mode="$2" expected="$3"
+    local actual main_pid
+
+    if [[ "$runtime_mode" == socket ]]; then
+        ssh_socket_active || return 1
+        actual=$(get_ssh_socket_endpoints) || return $?
+    else
+        systemctl is-active --quiet "$service_name" || return 1
+        main_pid=$(systemctl show --property=MainPID --value "$service_name") || return $?
+        [[ "$main_pid" =~ ^[1-9][0-9]*$ ]] || return 1
+        actual=$(get_process_listen_endpoints "$main_pid") || return $?
+    fi
+    # ss shows an IPv6 wildcard that also accepts IPv4 as *:port.
+    actual=$(awk '/^\*:/ { print "[::]:" substr($0, 3); print "0.0.0.0:" substr($0, 3); next }
+        NF { print }' <<< "$actual" | LC_ALL=C sort -u) || return $?
+
+    if [[ "$actual" != "$expected" ]]; then
+        error "SSH 实际监听与预期不符：$(tr '\n' ' ' <<< "${actual:-未检测到监听}")"
+        error "预期监听：$(tr '\n' ' ' <<< "$expected")"
+        return 1
+    fi
 }
 
 apply_ssh_config() {
     local temp_config="$1"
     local service_name="$2"
-    local ports="$3"
+    local listen_endpoints="$3"
+    local current_endpoints="$4"
     local runtime_mode
 
     runtime_mode=$(detect_ssh_runtime_mode)
 
-    if ! backup_ssh_config; then
+    if ! verify_listening_endpoints "$service_name" "$runtime_mode" "$current_endpoints"; then
+        rm -f "$temp_config"
+        error "当前 SSH 实际监听与配置不一致，已取消写入"
+        return 1
+    fi
+
+    if ! mkdir -p "$SSH_DROPIN_DIR" || ! backup_ssh_config; then
         rm -f "$temp_config"
         return 1
     fi
@@ -618,8 +677,9 @@ apply_ssh_config() {
         return 1
     fi
 
-    if ! ssh_runtime_active "$service_name" || ! verify_listening_ports "$ports"; then
-        error "SSH 服务状态或端口监听验证失败，尝试恢复原配置"
+    sleep 1
+    if ! verify_listening_endpoints "$service_name" "$runtime_mode" "$listen_endpoints"; then
+        error "SSH 服务状态或监听地址验证失败，尝试恢复原配置"
         restore_ssh_config "$service_name" "$runtime_mode"
         return 1
     fi
@@ -629,13 +689,13 @@ apply_ssh_config() {
 show_summary() {
     local service_name="$1"
     local ports
-    local listen_addresses
+    local listen_endpoints
     local root_login
     local password_auth
     local keyboard_auth
 
-    ports=$(get_effective_ports)
-    listen_addresses=$(get_effective_listen_addresses || echo "未知")
+    listen_endpoints=$(get_effective_listen_endpoints || echo "未知")
+    ports=$(listen_endpoint_ports "$listen_endpoints")
     root_login=$(get_effective_value "permitrootlogin")
     password_auth=$(get_effective_value "passwordauthentication")
     keyboard_auth=$(get_effective_value "kbdinteractiveauthentication")
@@ -644,7 +704,7 @@ show_summary() {
     info "🎯 SSH 安全配置摘要："
     echo "  SSH 服务: $service_name（运行中）"
     echo "  监听端口: $(tr '\n' ' ' <<< "$ports")"
-    echo "  监听地址: $(tr '\n' ' ' <<< "$listen_addresses")"
+    echo "  监听地址和端口: $(tr '\n' ' ' <<< "$listen_endpoints")"
     echo "  Root 登录: $(format_root_login_display "$root_login")"
     echo "  密码认证: $password_auth"
     echo "  交互式认证: $keyboard_auth"
@@ -693,20 +753,24 @@ main() {
         exit 1
     fi
 
-    mkdir -p "$SSH_DROPIN_DIR"
-
-    local listen_addresses
-    if ! listen_addresses=$(get_effective_listen_addresses); then
+    local current_endpoints
+    if ! current_endpoints=$(get_effective_listen_endpoints); then
         error "无法读取当前 SSH 监听地址，拒绝改为通配监听"
         exit 1
     fi
 
     info "🔐 配置 SSH 安全策略..."
-    echo "当前 SSH 监听地址: $(tr '\n' ' ' <<< "$listen_addresses")"
+    echo "当前 SSH 监听地址和端口: $(tr '\n' ' ' <<< "$current_endpoints")"
 
     echo
-    local selected_ports
-    selected_ports=$(choose_ssh_ports) || exit 1
+    local current_ports selected_ports listen_endpoints listen_ports
+    current_ports=$(listen_endpoint_ports "$current_endpoints") || exit 1
+    selected_ports=$(choose_ssh_ports "$current_ports") || exit 1
+    listen_endpoints=$(select_listen_endpoints "$current_endpoints" "$current_ports" "$selected_ports") || exit 1
+    if [[ -z "$selected_ports" ]]; then
+        selected_ports=$(get_effective_ports) || exit 1
+    fi
+    listen_ports=$(listen_endpoint_ports "$listen_endpoints") || exit 1
 
     echo
     local password_auth
@@ -724,7 +788,7 @@ main() {
         "$selected_ports" \
         "$password_auth" \
         "$root_login" \
-        "$listen_addresses"); then
+        "$listen_endpoints"); then
         exit 1
     fi
 
@@ -738,14 +802,14 @@ main() {
         "$selected_ports" \
         "$password_auth" \
         "$root_login" \
-        "$listen_addresses"; then
+        "$listen_endpoints"; then
         rm -f "$temp_config"
         exit 1
     fi
 
     if ! confirm_ssh_changes \
-        "$selected_ports" \
-        "$listen_addresses" \
+        "$listen_ports" \
+        "$listen_endpoints" \
         "$password_auth" \
         "$root_login"; then
         rm -f "$temp_config"
@@ -753,12 +817,12 @@ main() {
         exit 0
     fi
 
-    if ! apply_ssh_config "$temp_config" "$ssh_service" "$selected_ports"; then
+    if ! apply_ssh_config "$temp_config" "$ssh_service" "$listen_endpoints" "$current_endpoints"; then
         exit 1
     fi
 
     show_summary "$ssh_service"
-    show_connection_warning "$selected_ports"
+    show_connection_warning "$listen_ports"
 
     echo
     success "SSH 安全配置完成"
