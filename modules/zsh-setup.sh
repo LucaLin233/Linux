@@ -465,6 +465,7 @@ setup_theme() {
     local choice
     local config_url=""
     local repository_ref="${RUN_COMMIT:-main}"
+    local theme_file
 
     read -r -t 30 -p "请选择 [1-6]（默认 5）: " choice >&2 || choice="5"
     choice="${choice:-5}"
@@ -501,16 +502,22 @@ setup_theme() {
             ;;
     esac
 
+    theme_file=$(mktemp "${P10K_FILE}.XXXXXX") || return 1
     if curl -fsSL \
         --connect-timeout 10 \
         --max-time 30 \
         "$config_url" \
-        -o "$P10K_FILE"; then
-        chmod 644 "$P10K_FILE" 2>/dev/null || true
-        return 0
+        -o "$theme_file"; then
+        if chmod 644 "$theme_file" && mv -fT -- "$theme_file" "$P10K_FILE"; then
+            return 0
+        fi
+        rm -f -- "$theme_file"
+        log "无法保存主题配置" "warn"
+        return 1
     fi
 
-    log "主题配置下载失败，首次进入 Zsh 时可运行 p10k configure 配置" "warn"
+    rm -f -- "$theme_file"
+    log "主题配置下载失败，可运行 p10k configure 配置" "warn"
     return 1
 }
 
@@ -580,6 +587,7 @@ main() {
     log "✅ Zsh 配置完成，重新登录或执行 'exec zsh' 后生效" "info"
 }
 
-trap 'log "Zsh 配置脚本在第 $LINENO 行执行失败" "error"' ERR
-
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    trap 'log "Zsh 配置脚本在第 $LINENO 行执行失败" "error"' ERR
+    main "$@"
+fi
