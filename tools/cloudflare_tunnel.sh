@@ -1274,21 +1274,23 @@ install_package() {
 install_service() {
     if systemctl cat cloudflared.service >/dev/null 2>&1; then
         info "cloudflared.service 已存在，不重复写入 Token"
-        systemctl enable --now cloudflared.service
-        return 0
+    else
+        local token
+        read -r -s -p "粘贴 Cloudflare Tunnel Token: " token
+        printf '\n'
+        [[ -n "$token" ]] || { error "Token 不能为空"; return 1; }
+        if ! cloudflared service install --no-update-service "$token"; then
+            unset token
+            error "官方 service install 执行失败"
+            return 1
+        fi
+        unset token
     fi
 
-    local token
-    read -r -s -p "粘贴 Cloudflare Tunnel Token: " token
-    printf '\n'
-    [[ -n "$token" ]] || { error "Token 不能为空"; return 1; }
-    if ! cloudflared service install --no-update-service "$token"; then
-        unset token
-        error "官方 service install 执行失败"
+    if ! systemctl enable --now cloudflared.service; then
+        error "无法启用并启动 cloudflared.service"
         return 1
     fi
-    unset token
-    systemctl enable --now cloudflared.service
     systemctl is-active --quiet cloudflared.service || {
         error "服务未处于运行状态"
         return 1

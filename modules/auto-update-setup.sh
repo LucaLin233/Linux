@@ -163,6 +163,7 @@ has_update_cron() {
 
 configure_cron_job() {
     local cron_expression="$1"
+    local update_script="$2"
     local temp_cron
     local current_cron
 
@@ -173,14 +174,18 @@ configure_cron_job() {
 
     current_cron=$(crontab -l 2>/dev/null || true)
 
-    {
-        printf '%s\n' "$current_cron" |
-            grep -Fv "$CRON_COMMENT" |
-            grep -Fv "$UPDATE_SCRIPT" || true
-
-        echo "$CRON_COMMENT"
-        echo "$cron_expression $UPDATE_SCRIPT"
-    } > "$temp_cron"
+    local retained_cron
+    retained_cron=$(awk -v comment="$CRON_COMMENT" -v script="$update_script" '
+        !index($0, comment) && !index($0, script) { print }
+    ' <<< "$current_cron") || {
+        rm -f -- "$temp_cron"
+        return 1
+    }
+    if ! printf '%s\n' "$retained_cron" "$CRON_COMMENT" "$cron_expression $update_script" > "$temp_cron"; then
+        rm -f -- "$temp_cron"
+        log "无法生成自动更新 Cron 配置" "error"
+        return 1
+    fi
 
     if ! crontab "$temp_cron"; then
         rm -f "$temp_cron"
@@ -195,7 +200,8 @@ configure_cron_job() {
 
 # === 更新脚本生成 ===
 create_update_script() {
-    cat > "$UPDATE_SCRIPT" <<EOF
+    local target="$1"
+    cat > "$target" <<EOF || return 1
 #!/usr/bin/env bash
 # 由 auto-update-setup.sh 自动生成。
 # 功能：安全执行系统与内核更新，必要时自动重启。
@@ -408,15 +414,41 @@ trap 'exit_code=\$?; if (( exit_code != 0 )); then log error "自动更新异常
 main "\$@"
 EOF
 
-    chmod 700 "$UPDATE_SCRIPT"
-
-    if [[ ! -x "$UPDATE_SCRIPT" ]] || ! bash -n "$UPDATE_SCRIPT"; then
+    if ! chmod 700 "$target" || ! bash -n "$target"; then
         log "更新脚本创建或语法验证失败" "error"
         return 1
     fi
-
-    echo "更新脚本: 已创建并通过语法检查（$UPDATE_SCRIPT）"
 }
+
+install_update_schedule() (
+    local cron_schedule="$1" update_script="$2" stage
+    stage=$(mktemp -d "${update_script}.stage.XXXXXX") || return 1
+    trap 'rm -f -- "$stage/script" "$stage/previous"; rmdir -- "$stage"' EXIT
+
+    create_update_script "$stage/script" || return 1
+    if [[ -e "$update_script" || -L "$update_script" ]]; then
+        if [[ ! -f "$update_script" && ! -L "$update_script" ]]; then
+            log "更新脚本路径不是普通文件：$update_script" "error"
+            return 1
+        fi
+        cp -a -- "$update_script" "$stage/previous" || return 1
+    fi
+    mv -fT -- "$stage/script" "$update_script" || return 1
+
+    if ! configure_cron_job "$cron_schedule" "$update_script"; then
+        if [[ -e "$stage/previous" || -L "$stage/previous" ]]; then
+            mv -fT -- "$stage/previous" "$update_script" || {
+                log "无法恢复原更新脚本，请从 ${update_script}.previous-backup 恢复" "error"
+                return 1
+            }
+        elif ! rm -f -- "$update_script"; then
+            log "无法删除新生成的更新脚本：$update_script" "error"
+        fi
+        return 1
+    fi
+
+    echo "更新脚本: 已创建并通过语法检查（$update_script）"
+)
 
 # === 摘要 ===
 show_update_summary() {
@@ -486,9 +518,6 @@ main() {
     backup_managed_cron_entries || exit 1
 
     echo
-    create_update_script || exit 1
-
-    echo
     local cron_schedule
     cron_schedule=$(get_cron_schedule) || exit 1
 
@@ -496,7 +525,7 @@ main() {
         echo "检测到现有自动更新任务，将自动替换为新配置。"
     fi
 
-    configure_cron_job "$cron_schedule" || exit 1
+    install_update_schedule "$cron_schedule" "$UPDATE_SCRIPT" || exit 1
 
     show_update_summary
 

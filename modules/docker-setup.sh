@@ -414,11 +414,12 @@ backup_daemon_config() {
 }
 
 restore_daemon_config() {
-    if [[ -f "$DOCKER_DAEMON_PREVIOUS_BACKUP" ]]; then
-        cp -a "$DOCKER_DAEMON_PREVIOUS_BACKUP" "$DOCKER_DAEMON_CONFIG"
+    local backup="$1" config="$2"
+    if [[ -f "$backup" ]]; then
+        cp -a -- "$backup" "$config" || return 1
         warn "已恢复 Docker 上一次配置"
     else
-        rm -f "$DOCKER_DAEMON_CONFIG"
+        rm -f -- "$config" || return 1
         warn "已删除本次新建的 Docker 配置文件"
     fi
 }
@@ -522,10 +523,15 @@ EOF
 
     if ! systemctl restart docker || ! systemctl is-active --quiet docker; then
         error "Docker 重启失败，开始恢复原配置"
-        restore_daemon_config
+        if ! restore_daemon_config "$DOCKER_DAEMON_PREVIOUS_BACKUP" "$DOCKER_DAEMON_CONFIG"; then
+            error "恢复原 Docker 配置失败，请检查 $DOCKER_DAEMON_CONFIG 和备份"
+            return 2
+        fi
 
-        if [[ "$docker_was_active" == "true" ]]; then
-            systemctl restart docker >/dev/null 2>&1 || true
+        if [[ "$docker_was_active" == "true" ]] &&
+            { ! systemctl restart docker || ! systemctl is-active --quiet docker; }; then
+            error "已恢复原 Docker 配置，但 Docker 服务未能恢复运行"
+            return 2
         fi
 
         return 1
@@ -585,7 +591,7 @@ main() {
     require_root
     detect_supported_distribution || exit 1
 
-    local command_name
+    local command_name log_rotation_status=0 degraded=false
     for command_name in apt-get curl dpkg dpkg-query grep install jq mktemp systemctl; do
         if ! command -v "$command_name" >/dev/null 2>&1; then
             error "缺少必要命令: $command_name"
@@ -602,15 +608,22 @@ main() {
     start_docker_service || exit 1
 
     echo
-    ensure_docker_plugins || true
+    ensure_docker_plugins || degraded=true
 
     echo
-    configure_log_rotation ||
-        warn "Docker 日志轮转配置失败，已保留或恢复原有 Docker 配置"
+    configure_log_rotation || log_rotation_status=$?
+    case "$log_rotation_status" in
+        1) warn "Docker 日志轮转配置失败" ;;
+        2) return 1 ;;
+    esac
 
     show_docker_summary
 
     echo
+    if [[ "$degraded" == true ]]; then
+        warn "Docker 配置部分完成，插件补装失败"
+        return 2
+    fi
     success "Docker 配置完成"
     echo "常用命令："
     echo "  查看容器: docker ps"

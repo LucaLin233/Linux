@@ -252,6 +252,19 @@ assert_fail "symlink cache directory rejected" prepare_cache_dir >/dev/null 2>&1
 
 grep -Fq 'readonly RUN_COMMIT="${RUN_COMMIT:-}"' "$ROOT_DIR/modules/zsh-setup.sh" || fail "zsh RUN_COMMIT missing"
 grep -Fq 'Linux/${repository_ref}/p10k-config.zsh' "$ROOT_DIR/modules/zsh-setup.sh" || fail "theme URL not pinned"
+theme_home="$TEST_DIR/theme-home"
+mkdir "$theme_home"
+printf 'existing theme\n' > "$theme_home/.p10k.zsh"
+env HOME="$theme_home" ROOT_DIR="$ROOT_DIR" bash -c '
+    source "$ROOT_DIR/modules/zsh-setup.sh"
+    curl() {
+        printf "partial download\n" > "${@: -1}"
+        return 18
+    }
+    if setup_theme <<< 1; then exit 1; fi
+    [[ $(<"$P10K_FILE") == "existing theme" ]]
+' || fail "interrupted theme download must preserve the existing theme"
+pass "interrupted theme download preserves the existing theme"
 pass "pin repository module resource"
 
 printf 'All linux_setup integrity tests passed.\n'
