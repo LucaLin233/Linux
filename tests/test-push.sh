@@ -1815,6 +1815,34 @@ run_accounting_failure_case close
     pass "explicit non-interactive delete authorization remains supported"
 )
 
+# A terminal user must confirm deletion even when both config switches are set.
+(
+    export PUSH_DELETE_TEST_SCRIPT="$SCRIPT"
+    export PUSH_DELETE_TEST_ENTRY="$TEST_DIR/delete-confirmation.sh"
+    export PUSH_DELETE_TEST_TRANSFER="$TEST_DIR/delete-transfer-called"
+    cat > "$PUSH_DELETE_TEST_ENTRY" <<'EOF'
+set -euo pipefail
+source "$PUSH_DELETE_TEST_SCRIPT"
+check_and_generate_config() { return 0; }
+load_config() { DELETE_EXTRA=true; ALLOW_DELETE_EXTRA=true; }
+validate_config() { return 0; }
+resolve_transfer_arguments() { return 0; }
+check_dependencies() { return 0; }
+install_runtime_traps() { return 0; }
+initialize_runtime() { return 0; }
+prepare_ssh_runtime() { return 0; }
+run_transfer() { touch "$PUSH_DELETE_TEST_TRANSFER"; }
+main source destination
+EOF
+    output="$TEST_DIR/delete-confirmation.log"
+    status=0
+    printf 'NO\n' | script -qec 'bash "$PUSH_DELETE_TEST_ENTRY"' /dev/null > "$output" || status=$?
+    assert_eq 1 "$status" "interactive delete refuses a response other than DELETE"
+    grep -Fq '请输入 DELETE 确认' "$output" || fail "interactive delete omitted the confirmation prompt"
+    [[ ! -e "$PUSH_DELETE_TEST_TRANSFER" ]] || fail "interactive delete ran transfer without confirmation"
+    pass "interactive delete refusal prevents transfer"
+)
+
 # EXIT cleanup preserves normal success and ordinary failure statuses.
 run_exit_cleanup_case() {
     local requested_status="$1" root="$TEST_DIR/exit-$1" rc=0

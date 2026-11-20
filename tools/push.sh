@@ -1941,8 +1941,8 @@ prepare_ssh_runtime() {
 
 prepare_delete_authorization() {
     [[ "$DELETE_EXTRA" == true ]] || return 0
-    [[ "$ALLOW_DELETE_EXTRA" == true ]] && return 0
     if [[ ! -t 0 ]]; then
+        [[ "$ALLOW_DELETE_EXTRA" == true ]] && return 0
         echo -e "${RED}${ICON_ERROR} 非交互启用 --delete 必须设置 ALLOW_DELETE_EXTRA=true${NC}" >&2
         return 1
     fi
@@ -3157,7 +3157,7 @@ $SCRIPT_NAME v$SCRIPT_VERSION
   $0 SOURCE DESTINATION
 
 --test-auth 会连接全部配置服务器，仅执行无副作用的 SSH true，不运行 rsync。
-默认不删除远端文件；DELETE_EXTRA=true 仍需要显式授权。
+默认不删除远端文件。DELETE_EXTRA=true 时，交互运行需输入 DELETE，非交互运行需设置 ALLOW_DELETE_EXTRA=true。
 EOF
 }
 
