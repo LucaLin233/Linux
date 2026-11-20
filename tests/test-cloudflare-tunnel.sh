@@ -1809,4 +1809,20 @@ pass "present or unknown package stops at the uninstall guard without removals"
 purge_case managed-uninstall-failed 1 '' 1 managed 1 "$guarded"
 pass "failed managed uninstall leaves configuration in place"
 
+(
+    # shellcheck source=../tools/cloudflare_tunnel.sh
+    source "$ROOT_DIR/tools/cloudflare_tunnel.sh"
+    systemctl() {
+        case "$*" in
+            'cat cloudflared.service') return 0 ;;
+            'enable --now cloudflared.service') return 1 ;;
+            *) fail "unexpected systemctl command: $*" ;;
+        esac
+    }
+    if install_service </dev/null; then
+        fail "existing cloudflared service start failure was reported as success"
+    fi
+)
+pass "failure to start the existing cloudflared service propagates"
+
 printf 'All cloudflare wrapper tests passed. PASS=%d\n' "$pass_count"
