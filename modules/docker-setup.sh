@@ -290,7 +290,7 @@ install_docker() {
     configure_docker_repository || return 1
     apt_update_once || return 1
 
-    local plan package
+    local plan package choice
     local -a conflicts=() removals=() packages=("${DOCKER_PACKAGES[@]}") apt_options=()
     mapfile -t conflicts < <(docker_conflicting_packages)
     for package in "${conflicts[@]}"; do
@@ -306,6 +306,10 @@ install_docker() {
     if (( ${#removals[@]} )); then
         warn "Docker CE 安装需要卸载以下软件包："
         printf '  %s\n' "${removals[@]}"
+        if ! read -r -p "是否卸载以上软件包并安装 Docker CE？[y/N]: " choice || [[ ! "$choice" =~ ^[Yy]$ ]]; then
+            warn "已取消 Docker CE 软件包替换"
+            return 1
+        fi
         apt_options=(-o quiet=0 -o APT::Get::Assume-Yes=false)
     else
         apt_options=(-y --no-remove)
@@ -316,7 +320,7 @@ install_docker() {
     if ! apt-get "${apt_options[@]}" install "${packages[@]}"; then
         error "Docker CE 安装未完成。当前软件包状态："
         dpkg-query -W -f='  ${binary:Package}\t${db:Status-Abbrev}\t${Version}\n' \
-            "${DOCKER_PACKAGES[@]}" "${removals[@]}" 2>/dev/null || true
+            "${DOCKER_PACKAGES[@]}" "${removals[@]}" || true
         error "请先核对上述状态和 /var/log/apt/history.log，再决定恢复原运行时或完成安装。"
         return 1
     fi
