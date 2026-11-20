@@ -87,11 +87,24 @@ FAKE
     cat > "$bin/systemctl" <<'FAKE'
 #!/usr/bin/env bash
 printf 'systemctl:%s\n' "$*" >> "$FAKE_LOG"
+case "$*" in
+    'show --property=Id,LoadState,ActiveState,UnitFileState cloudflared.service')
+        [[ "${FAKE_SYSTEMCTL_SHOW_FAIL:-}" != 1 ]] || exit 1
+        if [[ -f "$CLOUDFLARED_SERVICE_FILE" ]]; then load_state=loaded; else load_state=not-found; fi
+        printf 'Id=%s\nLoadState=%s\nActiveState=%s\n' "${FAKE_TUNNEL_UNIT_ID:-cloudflared.service}" \
+            "${FAKE_TUNNEL_LOAD_STATE:-$load_state}" "${FAKE_TUNNEL_ACTIVE_STATE:-inactive}"
+        ;;
+    'cat cloudflared.service') cat "${FAKE_TUNNEL_FRAGMENT_PATH:-$CLOUDFLARED_SERVICE_FILE}" || exit $? ;;
+esac
 exit 0
 FAKE
     cat > "$bin/cloudflared" <<'FAKE'
 #!/usr/bin/env bash
 printf 'cloudflared:%s\n' "$*" >> "$FAKE_LOG"
+# The upstream service-uninstall command removes the Token as well as the unit.
+if [[ "$*" == 'service uninstall' ]]; then
+    rm -f -- "$CASE_DIR/root/etc/cloudflared/token" "$CLOUDFLARED_SERVICE_FILE"
+fi
 exit 0
 FAKE
     chmod 0755 "$bin"/*
@@ -253,14 +266,89 @@ new_case
 configure_repository || fail "configure before real uninstall failed"
 require_root() { :; }
 check_platform() { :; }
+token_file="$CASE_DIR/root/etc/cloudflared/token"
+mkdir -p "$(dirname "$token_file")"
+printf 'test-tunnel-token\n' > "$token_file"
+chmod 0600 "$token_file"
+# Cloudflare 2026.11.1 linux_service.go systemd template with file-backed Token.
+cat > "$CLOUDFLARED_SERVICE_FILE" <<EOF
+[Unit]
+Description=Cloudflare Tunnel client
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+TimeoutStartSec=15
+Type=notify
+ExecStart=$CLOUDFLARED_APT_BIN --no-autoupdate tunnel run --token-file /etc/cloudflared/token
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target
+EOF
+chmod 0644 "$CLOUDFLARED_SERVICE_FILE"
 uninstall_cloudflared --confirmed || fail "uninstall normal path failed"
+assert_same <(printf 'test-tunnel-token\n') "$token_file" "uninstall deleted or changed the Tunnel Token"
+grep -Fxq 'systemctl:disable --now cloudflared.service' "$FAKE_LOG" || fail "uninstall did not disable and stop the service"
+assert_absent "$CLOUDFLARED_SERVICE_FILE" "uninstall retained the generated Token-file unit"
 [[ ! -d "$CLOUDFLARED_STATE_DIR.lock" ]] || fail "uninstall left repository lock"
 grep -Fxq 'apt-get:remove -y cloudflared' "$FAKE_LOG" || fail "uninstall skipped package removal"
 assert_absent "$CLOUDFLARED_SOURCE_FILE" "real uninstall retained source"
 assert_absent "$CLOUDFLARED_REPOSITORY_STATE_DIR/current" "real uninstall retained current"
 [[ -f "$CLOUDFLARED_KEYRING" ]] || fail "real uninstall removed keyring"
-pass "configure then real uninstall preserves keyring and releases lock"
+pass "uninstall disables the service, removes its generated unit and preserves the Token and keyring"
 init_runtime_config
+
+new_case
+configure_repository || fail "configure before legacy service uninstall failed"
+printf '[Service]\nExecStart=%s --no-autoupdate tunnel run --token legacy-placeholder\n' "$CLOUDFLARED_APT_BIN" > "$CASE_DIR/legacy-unit"
+install -m 0644 "$CASE_DIR/legacy-unit" "$CLOUDFLARED_SERVICE_FILE"
+uninstall_cloudflared --confirmed || fail "uninstall with inline Token failed"
+assert_same "$CASE_DIR/legacy-unit" "$CLOUDFLARED_SERVICE_FILE" "uninstall deleted or changed the inline Token unit"
+pass "uninstall preserves a legacy service unit containing an inline Token"
+
+for unit_case in linked related continued-related alias; do
+    new_case
+    configure_repository || fail "configure before $unit_case service uninstall failed"
+    unit_id=cloudflared.service
+    unit_fragment="$CLOUDFLARED_SERVICE_FILE"
+    case "$unit_case" in
+        linked)
+            printf '[Service]\nExecStart=/usr/bin/cloudflared\n' > "$CASE_DIR/custom.service"
+            ln -s "$CASE_DIR/custom.service" "$CLOUDFLARED_SERVICE_FILE"
+            ;;
+        related) printf '[Install]\nAlso=another.service\n' > "$CLOUDFLARED_SERVICE_FILE" ;;
+        continued-related) printf '%s\n' '[Install]' 'Also\' '=another.service' > "$CLOUDFLARED_SERVICE_FILE" ;;
+        alias)
+            unit_id=another.service
+            unit_fragment="$CASE_DIR/another.service"
+            printf '[Service]\nExecStart=/usr/bin/true\n' > "$unit_fragment"
+            ;;
+    esac
+    : > "$FAKE_LOG"
+    if FAKE_TUNNEL_UNIT_ID="$unit_id" FAKE_TUNNEL_LOAD_STATE=loaded FAKE_TUNNEL_FRAGMENT_PATH="$unit_fragment" \
+        uninstall_cloudflared --confirmed; then
+        fail "uninstall accepted the $unit_case unit"
+    fi
+    if [[ "$unit_case" == linked ]]; then
+        [[ "$(readlink -- "$CLOUDFLARED_SERVICE_FILE")" == "$CASE_DIR/custom.service" ]] || fail "uninstall changed the unit link"
+    fi
+    ! grep -Eq 'systemctl:(disable --now|stop) cloudflared\.service|apt-get:remove' "$FAKE_LOG" || fail "uninstall changed service or package state for the $unit_case unit"
+    pass "uninstall leaves the $unit_case unit and package untouched"
+done
+
+new_case
+configure_repository || fail "configure before active missing unit case failed"
+FAKE_TUNNEL_ACTIVE_STATE=active uninstall_cloudflared --confirmed || fail "uninstall failed with an active missing unit"
+grep -Fxq 'systemctl:stop cloudflared.service' "$FAKE_LOG" || fail "uninstall left the missing unit active"
+pass "uninstall stops an active service whose unit file is missing"
+
+new_case
+configure_repository || fail "configure before service query failure case failed"
+if FAKE_SYSTEMCTL_SHOW_FAIL=1 uninstall_cloudflared --confirmed; then fail "uninstall ignored a service query failure"; fi
+! grep -Fxq 'apt-get:remove -y cloudflared' "$FAKE_LOG" || fail "uninstall removed the package after the service query failed"
+pass "uninstall leaves the package installed when service state is unknown"
 
 new_case
 mkdir -p "$CLOUDFLARED_STATE_DIR.lock"
