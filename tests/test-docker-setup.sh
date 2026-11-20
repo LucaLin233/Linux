@@ -70,7 +70,8 @@ systemctl() {
     esac
 }
 cp() {
-    if [[ "$scenario" == restore-failure && "${@: -2:1}" == "$DOCKER_DAEMON_PREVIOUS_BACKUP" ]]; then
+    local source_path="${@: -2:1}"
+    if [[ "$scenario" == restore-failure && "$source_path" == "$DOCKER_DAEMON_PREVIOUS_BACKUP" ]]; then
         restore_attempted=true
         return 1
     fi
