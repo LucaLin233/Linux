@@ -57,15 +57,33 @@ assert_eq $'0.0.0.0:22\n[::]:22' "$(get_effective_listen_endpoints)" \
 assert_eq $'0.0.0.0:2022\n[::]:2022' "$(select_listen_endpoints "$(get_effective_listen_endpoints)" 22 2022)" \
     "apply a new port to both addresses when they shared the old port"
 
-(
-    ss() { return 0; }
-    SSHD_OUTPUT=$'port 2222\nlistenaddress 10.0.0.5:2022'
-    endpoints=$(get_effective_listen_endpoints)
-    current_ports=$(listen_endpoint_ports "$endpoints")
-    selected_ports=$(choose_ssh_ports "$current_ports" <<< 2)
-    assert_eq '10.0.0.5:2222' "$(select_listen_endpoints "$endpoints" "$current_ports" "$selected_ports")" \
-        "an explicit choice of the configured Port replaces the old bound port"
-)
+for choice in 1 2; do
+    (
+        require_root() { :; }
+        get_ssh_service_name() { printf 'ssh\n'; }
+        ssh_runtime_active() { :; }
+        ss() { :; }
+        choose_password_authentication() { printf 'no\n'; }
+        choose_root_login_policy() { printf 'prohibit-password\n'; }
+        check_syntax() { :; }
+        verify_effective_settings() { :; }
+        confirm_ssh_changes() { assert_eq "$expected_port" "$1" "choice $choice confirms the bound port"; }
+        apply_ssh_config() {
+            assert_eq "ListenAddress 10.0.0.5:$expected_port" "$(grep '^ListenAddress ' "$1")" \
+                "choice $choice applies the intended address and port"
+            rm -f -- "$1"
+        }
+        show_summary() { :; }
+        hostname() { printf '10.0.0.5\n'; }
+        export TMPDIR="$TEMP_DIR"
+        SSHD_OUTPUT=$'port 2222\nlistenaddress 10.0.0.5:2022'
+        expected_port=2022
+        [[ "$choice" != 2 ]] || expected_port=2222
+        output=$(main <<< "$choice") || fail "main failed for SSH port choice $choice"
+        grep -Fq "ssh -p $expected_port root@10.0.0.5" <<< "$output" ||
+            fail "choice $choice reported the wrong connection port"
+    )
+done
 
 run_locale_case() {
     local locale_name="$1" output

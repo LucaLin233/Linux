@@ -183,7 +183,7 @@ select_listen_endpoints() {
 }
 
 listen_endpoint_ports() {
-    sed -n 's/^.*:\([0-9][0-9]*\)$/\1/p' <<< "$1" | sort -n -u
+    awk -F: '$NF ~ /^[0-9]+$/ {print $NF}' <<< "$1" | sort -n -u
 }
 
 render_listen_endpoints() {
@@ -763,13 +763,14 @@ main() {
     echo "当前 SSH 监听地址和端口: $(tr '\n' ' ' <<< "$current_endpoints")"
 
     echo
-    local current_ports selected_ports listen_endpoints
+    local current_ports selected_ports listen_endpoints listen_ports
     current_ports=$(listen_endpoint_ports "$current_endpoints") || exit 1
     selected_ports=$(choose_ssh_ports "$current_ports") || exit 1
     listen_endpoints=$(select_listen_endpoints "$current_endpoints" "$current_ports" "$selected_ports") || exit 1
     if [[ -z "$selected_ports" ]]; then
         selected_ports=$(get_effective_ports) || exit 1
     fi
+    listen_ports=$(listen_endpoint_ports "$listen_endpoints") || exit 1
 
     echo
     local password_auth
@@ -807,7 +808,7 @@ main() {
     fi
 
     if ! confirm_ssh_changes \
-        "$(listen_endpoint_ports "$listen_endpoints")" \
+        "$listen_ports" \
         "$listen_endpoints" \
         "$password_auth" \
         "$root_login"; then
@@ -821,7 +822,7 @@ main() {
     fi
 
     show_summary "$ssh_service"
-    show_connection_warning "$selected_ports"
+    show_connection_warning "$listen_ports"
 
     echo
     success "SSH 安全配置完成"
