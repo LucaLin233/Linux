@@ -75,7 +75,7 @@ for choice in 1 2; do
         }
         show_summary() { :; }
         hostname() { printf '10.0.0.5\n'; }
-        export TMPDIR="$TEMP_DIR"
+        mktemp() { command mktemp "$TEMP_DIR/sshd_config.new.XXXXXX"; }
         SSHD_OUTPUT=$'port 2222\nlistenaddress 10.0.0.5:2022'
         expected_port=2022
         [[ "$choice" != 2 ]] || expected_port=2222
