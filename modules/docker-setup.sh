@@ -202,8 +202,8 @@ configure_docker_repository() {
         return 1
     }
 
-    architecture=$(dpkg --print-architecture)
-    install -d -m 0755 /etc/apt/keyrings
+    architecture=$(dpkg --print-architecture) || return 1
+    install -d -m 0755 /etc/apt/keyrings || return 1
     backup_managed_file "$DOCKER_KEYRING" || return 1
     backup_managed_file "$DOCKER_SOURCE" || return 1
 
@@ -238,7 +238,7 @@ configure_docker_repository() {
 
     rm -f "$key_temp"
 
-    cat > "$DOCKER_SOURCE" <<EOF
+    cat > "$DOCKER_SOURCE" <<EOF || return 1
 Types: deb
 URIs: $DOCKER_REPO_URL
 Suites: $codename
@@ -267,24 +267,14 @@ docker_installed() {
     command -v docker >/dev/null 2>&1
 }
 
-handle_conflicting_packages() {
+docker_conflicting_packages() {
     local package
-    local choice
-    local conflicts=()
-    local candidates=(docker.io docker-compose docker-doc docker-buildx podman-docker containerd runc)
 
-    for package in "${candidates[@]}"; do
-        package_is_installed "$package" && conflicts+=("$package")
+    for package in docker.io docker-compose docker-doc docker-buildx podman-docker containerd runc; do
+        if package_is_installed "$package"; then
+            printf '%s\n' "$package"
+        fi
     done
-
-    (( ${#conflicts[@]} == 0 )) && return 0
-
-    warn "检测到与 Docker CE 冲突的软件包: ${conflicts[*]}"
-    echo "现有 /var/lib/docker 数据不会被删除。"
-    read -r -p "是否卸载冲突包并继续安装 Docker CE？[y/N]: " choice
-    [[ "$choice" =~ ^[Yy]$ ]] || return 1
-
-    apt-get remove -y "${conflicts[@]}"
 }
 
 get_docker_version() {
@@ -297,18 +287,37 @@ install_docker() {
         return 0
     fi
 
-    handle_conflicting_packages || {
-        error "未处理冲突软件包，已取消 Docker CE 安装"
-        return 1
-    }
-
     configure_docker_repository || return 1
     apt_update_once || return 1
 
+    local plan package
+    local -a conflicts=() removals=() packages=("${DOCKER_PACKAGES[@]}") apt_options=()
+    mapfile -t conflicts < <(docker_conflicting_packages)
+    for package in "${conflicts[@]}"; do
+        packages+=("$package-")
+    done
+
+    if ! plan=$(LC_ALL=C apt-get --simulate install "${packages[@]}"); then
+        error "无法生成 Docker CE 安装计划，已取消软件包替换"
+        return 1
+    fi
+
+    mapfile -t removals < <(awk '$1 == "Remv" { print $2 }' <<< "$plan")
+    if (( ${#removals[@]} )); then
+        warn "Docker CE 安装需要卸载以下软件包："
+        printf '  %s\n' "${removals[@]}"
+        apt_options=(-o quiet=0 -o APT::Get::Assume-Yes=false)
+    else
+        apt_options=(-y --no-remove)
+    fi
+
     info "安装 Docker、Compose 和 Buildx..."
 
-    if ! apt-get install -y "${DOCKER_PACKAGES[@]}"; then
-        error "Docker 安装失败"
+    if ! apt-get "${apt_options[@]}" install "${packages[@]}"; then
+        error "Docker CE 安装未完成。当前软件包状态："
+        dpkg-query -W -f='  ${binary:Package}\t${db:Status-Abbrev}\t${Version}\n' \
+            "${DOCKER_PACKAGES[@]}" "${removals[@]}" 2>/dev/null || true
+        error "请先核对上述状态和 /var/log/apt/history.log，再决定恢复原运行时或完成安装。"
         return 1
     fi
 
@@ -607,4 +616,6 @@ main() {
 
 trap 'error "Docker 配置脚本在第 $LINENO 行执行失败"' ERR
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi
