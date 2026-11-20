@@ -1813,7 +1813,7 @@ run_accounting_failure_case close
     ALLOW_DELETE_EXTRA=true
     prepare_delete_authorization
     pass "explicit non-interactive delete authorization remains supported"
-)
+) </dev/null
 
 # A terminal user must confirm deletion even when both config switches are set.
 (
