@@ -1445,7 +1445,11 @@ EOF
         return 0
     fi
 
-    install -D -m 0644 "$temp_file" "$JOURNALD_DROPIN"
+    if ! install -D -m 0644 "$temp_file" "$JOURNALD_DROPIN"; then
+        rm -f -- "$temp_file"
+        log "写入 journald 配置失败：$JOURNALD_DROPIN" "error"
+        return 1
+    fi
     rm -f "$temp_file"
 
     # journald 没有稳定的独立配置校验命令；cat-config 至少确认 drop-in 可被发现。

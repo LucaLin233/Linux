@@ -982,6 +982,20 @@ rm -f "$THP_DIR/defrag"
 assert_ok "missing defrag node is skipped" setup_thp_policy
 assert_eq "madvise" "$(cat "$THP_DIR/enabled")" "missing defrag still applies the enabled policy"
 
+# ---------------------------------------------------------------- journald write failure
+
+reset_sandbox
+reset_calls
+(
+    install() {
+        record "install $*"
+        return 1
+    }
+    assert_fail "journald returns failure when installing its drop-in fails" setup_journald_limits
+)
+assert_call "install -D -m 0644" "journald attempted to install its drop-in"
+assert_no_call "systemctl restart systemd-journald" "journald skips restart after a drop-in write failure"
+
 # ---------------------------------------------------------------- PR 2: rollback
 
 reset_sandbox
