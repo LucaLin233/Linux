@@ -71,9 +71,9 @@ setup_script=$(mktemp) &&
 需要修改脚本或保留本地副本时，可以克隆仓库。直接运行克隆中的入口仍会查询远端 `main`，并使用固定 Commit 的主脚本和模块，需要联网。
 
 ```bash
-git clone https://github.com/LucaLin233/Linux.git
-cd Linux
-sudo ./linux_setup.sh
+git clone https://github.com/LucaLin233/Linux.git &&
+  cd Linux &&
+  sudo ./linux_setup.sh
 ```
 
 > 运行过程中可能安装软件、修改 sysctl、SSH、Shell、定时任务和 systemd 服务。不要在未备份、
@@ -316,11 +316,17 @@ HUP/INT/TERM 分别返回 129/130/143；终态归档开始后的中断不会再�
 
 [`tools/push.sh`](tools/push.sh) 使用 SSH 和 rsync 并发同步文件，支持密钥或密码认证。
 
-该工具依赖本地 `config.conf` 和待推送文件，不适合远程即用方式，请克隆仓库后运行：
+该工具依赖本地 `config.conf` 和待推送文件。先克隆仓库并生成配置：
+
 ```bash
-git clone https://github.com/LucaLin233/Linux.git
-cd Linux
-./tools/push.sh --generate-config
+git clone https://github.com/LucaLin233/Linux.git &&
+  cd Linux &&
+  ./tools/push.sh --generate-config
+```
+
+配置完成后，在该仓库目录按需运行以下命令：
+
+```bash
 ./tools/push.sh --test-auth
 ./tools/push.sh TASK_NAME
 ./tools/push.sh /local/path/ /remote/path/
